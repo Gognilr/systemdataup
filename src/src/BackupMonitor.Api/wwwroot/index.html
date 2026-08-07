@@ -6,90 +6,200 @@
 <link rel="icon" href="data:,">
 <title>BackupMonitor 管理控制台</title>
 <style>
+/* =====================================================================
+   设计令牌 —— UI-REDESIGN §4：唯一的颜色与字号来源。
+   组件只引用令牌，不写字面值颜色。刻意避开 Tailwind 默认色板。
+   ===================================================================== */
 :root{
-  --primary:#2563eb; --primary-dark:#1d4ed8; --bg:#f1f5f9; --card:#fff;
-  --border:#e2e8f0; --text:#0f172a; --muted:#64748b; --sidebar:#1e293b;
-  --ok:#16a34a; --warn:#d97706; --err:#dc2626; --info:#0891b2;
+  /* ── 中性：承载界面（极轻微冷偏） ── */
+  --ink-0:#ffffff;  --ink-50:#f4f6f8;  --ink-100:#e6ebee; --ink-200:#ccd5da;
+  --ink-300:#a7b4bc;--ink-400:#7f8f99; --ink-500:#5e6d77; --ink-600:#46545d;
+  --ink-700:#333f47;--ink-800:#232d34; --ink-900:#161e23; --ink-950:#0c1216;
+
+  /* ── 强调：只用于「可交互且需引导」，刻意选在语义色相之外 ── */
+  --accent:#5b4fc7; --accent-hover:#4a3fb0; --accent-weak:#eeecfa; --accent-fg:#ffffff;
+
+  /* ── 语义：只用于状态偏离 ── */
+  --ok-fg:#0f7a4a;   --ok-bg:#e6f4ec;   --ok-bd:#a8d9be;
+  --warn-fg:#96590a; --warn-bg:#fcf1df; --warn-bd:#ebc98a;
+  --err-fg:#b3261e;  --err-bg:#fcebea;  --err-bd:#f0b4b0;
+  --info-fg:#0b5fa5; --info-bg:#e6f0fa; --info-bd:#a9cceb;
+
+  /* ── 语义别名（组件只引用这一层） ── */
+  --bg:var(--ink-50); --surface:var(--ink-0); --surface-sunk:var(--ink-50);
+  --border:var(--ink-100); --border-strong:var(--ink-200);
+  --text:var(--ink-900); --text-muted:var(--ink-500); --text-faint:var(--ink-400);
+
+  /* ── 兼容别名：JS 内联样式仍按旧名引用，这里做成主题感知映射 ── */
+  --primary:var(--accent); --primary-dark:var(--accent-hover);
+  --card:var(--surface); --muted:var(--text-muted);
+  --sidebar:var(--ink-900); --sidebar-bd:var(--ink-700); --sidebar-hover:var(--ink-800);
+  --ok:var(--ok-fg); --warn:var(--warn-fg); --err:var(--err-fg); --info:var(--info-fg);
+  --toast-fg:var(--ink-0);
+
+  /* ── 排版（§4.2）：只用 400/500/600 三档字重 ── */
+  --font-sans:system-ui,-apple-system,"Segoe UI Variable Text","Segoe UI","PingFang SC","HarmonyOS Sans SC","Microsoft YaHei UI","Noto Sans SC",sans-serif;
+  --font-mono:ui-monospace,"Cascadia Mono","JetBrains Mono",Consolas,"Noto Sans Mono CJK SC",monospace;
+  --t-micro:11px/16px var(--font-sans); /* 表头、单位、时间戳 */
+  --t-sm:12px/18px var(--font-sans);    /* 徽标、次要信息 */
+  --t-body:13px/20px var(--font-sans);  /* 表格正文、表单 —— 默认 */
+  --t-md:14px/22px var(--font-sans);    /* 段落 */
+  --t-lg:16px/24px var(--font-sans);    /* 区块标题 */
+  --t-xl:20px/28px var(--font-sans);    /* 页标题 */
+  --t-num:28px/32px var(--font-sans);   /* 关键指标 */
+
+  /* ── 间距 / 圆角 / 层级 / 动效（§4.3）：间距一律落在 4px 栅格 ── */
+  --s-1:4px; --s-2:8px; --s-3:12px; --s-4:16px; --s-6:24px; --s-8:32px; --s-12:48px;
+  --r-sm:4px; --r-md:6px; --r-lg:10px;
+  --e-1:0 1px 2px rgba(12,18,22,.06);
+  --e-2:0 8px 24px -4px rgba(12,18,22,.14);
+  --dur-fast:120ms; --dur-base:180ms; --ease:cubic-bezier(.2,0,0,1);
+  --row-h:32px;
+  color-scheme:light;
 }
+:root[data-density="comfortable"]{--row-h:40px}
+
+/* ── 暗色：手动切换优先（§4.1）—— 层级用表面提亮表达，不用阴影 ── */
+:root[data-theme="dark"]{
+  --bg:var(--ink-950); --surface:var(--ink-900); --surface-sunk:var(--ink-950);
+  --border:var(--ink-800); --border-strong:var(--ink-700);
+  --text:var(--ink-100); --text-muted:var(--ink-400); --text-faint:var(--ink-500);
+  --accent:#8b7ee8; --accent-hover:#9e93ee; --accent-weak:#211d3d; --accent-fg:var(--ink-950);
+  --ok-fg:#5cd69a;   --ok-bg:#0e2a1d;   --ok-bd:#1f5c3e;
+  --warn-fg:#f0c069; --warn-bg:#2e2113; --warn-bd:#6b4e1e;
+  --err-fg:#f58c84;  --err-bg:#2e1614;  --err-bd:#6e2e29;
+  --info-fg:#7fb8ed; --info-bg:#10222e; --info-bd:#24506e;
+  --primary:var(--accent); --primary-dark:var(--accent-hover);
+  --card:var(--surface); --muted:var(--text-muted);
+  --sidebar:var(--ink-950); --sidebar-bd:var(--ink-800); --sidebar-hover:var(--ink-800);
+  --ok:var(--ok-fg); --warn:var(--warn-fg); --err:var(--err-fg); --info:var(--info-fg);
+  --toast-fg:var(--ink-950);
+  color-scheme:dark;
+}
+/* ── 暗色：未手动选择时跟随系统 ── */
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:var(--ink-950); --surface:var(--ink-900); --surface-sunk:var(--ink-950);
+    --border:var(--ink-800); --border-strong:var(--ink-700);
+    --text:var(--ink-100); --text-muted:var(--ink-400); --text-faint:var(--ink-500);
+    --accent:#8b7ee8; --accent-hover:#9e93ee; --accent-weak:#211d3d; --accent-fg:var(--ink-950);
+    --ok-fg:#5cd69a;   --ok-bg:#0e2a1d;   --ok-bd:#1f5c3e;
+    --warn-fg:#f0c069; --warn-bg:#2e2113; --warn-bd:#6b4e1e;
+    --err-fg:#f58c84;  --err-bg:#2e1614;  --err-bd:#6e2e29;
+    --info-fg:#7fb8ed; --info-bg:#10222e; --info-bd:#24506e;
+    --primary:var(--accent); --primary-dark:var(--accent-hover);
+    --card:var(--surface); --muted:var(--text-muted);
+    --sidebar:var(--ink-950); --sidebar-bd:var(--ink-800); --sidebar-hover:var(--ink-800);
+    --ok:var(--ok-fg); --warn:var(--warn-fg); --err:var(--err-fg); --info:var(--info-fg);
+    --toast-fg:var(--ink-950);
+    color-scheme:dark;
+  }
+}
+
+/* ── 动效只用于状态变化/抽屉/Toast；尊重系统减少动效偏好 ── */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation:none !important;transition:none !important}
+}
+
+/* ================= 基础 ================= */
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;background:var(--bg);color:var(--text);font-size:14px}
-a{color:var(--primary);text-decoration:none}
-h2{font-size:18px;margin-bottom:14px}
-h3{font-size:15px;margin:14px 0 8px}
-input,select,textarea{font:inherit;padding:6px 9px;border:1px solid var(--border);border-radius:6px;background:#fff;color:var(--text);width:100%}
-input:focus,select:focus,textarea:focus{outline:2px solid #bfdbfe;border-color:var(--primary)}
-textarea{min-height:70px;resize:vertical}
-button{font:inherit;padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:#fff;cursor:pointer;color:var(--text)}
-button:hover{background:#f8fafc}
-button.primary{background:var(--primary);border-color:var(--primary);color:#fff}
-button.primary:hover{background:var(--primary-dark)}
-button.danger{color:var(--err);border-color:#fecaca}
-button.small{padding:2px 9px;font-size:12.5px}
-table{width:100%;border-collapse:collapse;background:var(--card)}
-th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
-th{background:#f8fafc;font-weight:600;font-size:13px;color:var(--muted);white-space:nowrap}
-tr:hover td{background:#fafcff}
-.badge{display:inline-block;padding:1px 9px;border-radius:99px;font-size:12px;white-space:nowrap}
-.b-ok{background:#dcfce7;color:#15803d}.b-warn{background:#fef3c7;color:#b45309}
-.b-err{background:#fee2e2;color:#b91c1c}.b-info{background:#cffafe;color:#0e7490}
-.b-mut{background:#e2e8f0;color:#475569}.b-pri{background:#dbeafe;color:#1d4ed8}
+body{font:var(--t-body);font-family:var(--font-sans);background:var(--bg);color:var(--text)}
+b,strong{font-weight:600}
+a{color:var(--accent);text-decoration:none}
+h1{font:600 var(--t-xl)}
+h2{font:600 var(--t-xl);margin-bottom:var(--s-4)}
+h3{font:600 var(--t-lg);margin:var(--s-4) 0 var(--s-2)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+input,select,textarea{font:inherit;padding:var(--s-1) var(--s-2);border:1px solid var(--border-strong);border-radius:var(--r-md);background:var(--surface);color:var(--text);width:100%}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:0;border-color:var(--accent)}
+textarea{min-height:68px;resize:vertical}
+button{font:inherit;padding:var(--s-1) var(--s-3);border-radius:var(--r-md);border:1px solid var(--border-strong);background:var(--surface);cursor:pointer;color:var(--text);transition:background var(--dur-fast) var(--ease),border-color var(--dur-fast) var(--ease)}
+button:hover{background:var(--surface-sunk)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+button.primary:hover{background:var(--accent-hover)}
+button.danger{color:var(--err-fg);border-color:var(--err-bd)}
+button.small{padding:var(--s-1) var(--s-2);font:var(--t-sm)}
+table{width:100%;border-collapse:collapse;background:var(--surface)}
+th,td{padding:var(--s-2) var(--s-3);text-align:left;border-bottom:1px solid var(--border);vertical-align:top}
+th{background:var(--surface-sunk);font-weight:600;font:600 var(--t-body);color:var(--text-muted);white-space:nowrap}
+tr:hover td{background:var(--surface-sunk)}
+/* 数字要能扫（§4.2）：数字单元格一律表格数字，ID/哈希/路径/主机名等宽 */
+td,.stat .n,.pager{font-variant-numeric:tabular-nums}
+.mono,pre.json{font-family:var(--font-mono)}
+.badge{display:inline-block;padding:0 var(--s-2);border-radius:99px;font:var(--t-sm);white-space:nowrap;border:1px solid transparent}
+.b-ok{background:var(--ok-bg);color:var(--ok-fg);border-color:var(--ok-bd)}
+.b-warn{background:var(--warn-bg);color:var(--warn-fg);border-color:var(--warn-bd)}
+.b-err{background:var(--err-bg);color:var(--err-fg);border-color:var(--err-bd)}
+.b-info{background:var(--info-bg);color:var(--info-fg);border-color:var(--info-bd)}
+.b-mut{background:var(--surface-sunk);color:var(--text-muted);border-color:var(--border)}
+.b-pri{background:var(--accent-weak);color:var(--accent);border-color:transparent}
 .layout{display:flex;min-height:100vh}
-.sidebar{width:200px;background:var(--sidebar);color:#cbd5e1;flex-shrink:0;display:flex;flex-direction:column}
-.sidebar .logo{padding:18px 16px;font-size:16px;font-weight:700;color:#fff;border-bottom:1px solid #334155}
-.sidebar .logo small{display:block;font-weight:400;font-size:11px;color:#94a3b8;margin-top:3px}
-.sidebar nav{flex:1;padding:10px 0;overflow-y:auto}
-.sidebar nav a{display:block;padding:9px 18px;color:#cbd5e1;font-size:13.5px}
-.sidebar nav a:hover{background:#334155;color:#fff}
-.sidebar nav a.active{background:var(--primary);color:#fff}
-.sidebar .foot{padding:12px 16px;font-size:11px;color:#64748b;border-top:1px solid #334155}
+.sidebar{width:200px;background:var(--sidebar);color:var(--ink-200);flex-shrink:0;display:flex;flex-direction:column}
+.sidebar .logo{padding:var(--s-4);font:600 var(--t-lg);color:var(--ink-0);border-bottom:1px solid var(--sidebar-bd)}
+.sidebar .logo small{display:block;font-weight:400;font:var(--t-micro);color:var(--ink-400);margin-top:var(--s-1)}
+.sidebar nav{flex:1;padding:var(--s-2) 0;overflow-y:auto}
+.sidebar nav a{display:block;padding:var(--s-2) var(--s-4);color:var(--ink-200);font:var(--t-body);transition:background var(--dur-fast) var(--ease)}
+.sidebar nav a:hover{background:var(--sidebar-hover);color:var(--ink-0)}
+.sidebar nav a.active{background:var(--accent);color:var(--accent-fg)}
+.sidebar .foot{padding:var(--s-3) var(--s-4);font:var(--t-micro);color:var(--ink-400);border-top:1px solid var(--sidebar-bd)}
 .main{flex:1;display:flex;flex-direction:column;min-width:0}
-.topbar{background:#fff;border-bottom:1px solid var(--border);padding:10px 22px;display:flex;justify-content:space-between;align-items:center}
-.topbar .who{color:var(--muted);font-size:13px}
+.topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:var(--s-2) var(--s-6);display:flex;justify-content:space-between;align-items:center}
+.topbar .who{color:var(--text-muted);font:var(--t-body)}
 .topbar .who b{color:var(--text)}
-.content{padding:20px 22px;flex:1;overflow-x:auto}
-.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px 18px;margin-bottom:16px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:16px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
-.stat .n{font-size:26px;font-weight:700;margin-top:4px}
-.stat .t{color:var(--muted);font-size:13px}
-.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.content{padding:var(--s-6);flex:1;overflow-x:auto}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--s-4);margin-bottom:var(--s-4)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:var(--s-4);margin-bottom:var(--s-4)}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--s-4)}
+.stat .n{font:600 var(--t-num);margin-top:var(--s-1)}
+.stat .t{color:var(--text-muted);font:var(--t-body)}
+.toolbar{display:flex;gap:var(--s-2);align-items:center;flex-wrap:wrap;margin-bottom:var(--s-3)}
 .toolbar .spacer{flex:1}
 .toolbar select,.toolbar input{width:auto;min-width:130px}
-.pager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:12px;color:var(--muted);font-size:13px}
-.kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:6px 24px}
-.kv .row{display:flex;gap:8px;padding:4px 0;border-bottom:1px dashed #eef2f7;font-size:13px}
-.kv .k{color:var(--muted);min-width:110px;flex-shrink:0}
+.pager{display:flex;gap:var(--s-2);align-items:center;justify-content:flex-end;margin-top:var(--s-3);color:var(--text-muted);font:var(--t-body)}
+.kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:var(--s-1) var(--s-6)}
+.kv .row{display:flex;gap:var(--s-2);padding:var(--s-1) 0;border-bottom:1px dashed var(--border);font:var(--t-body)}
+.kv .k{color:var(--text-muted);min-width:110px;flex-shrink:0}
 .kv .v{word-break:break-all}
-.overlay{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:flex-start;justify-content:center;z-index:50;overflow-y:auto;padding:40px 16px}
-.modal{background:#fff;border-radius:10px;width:560px;max-width:100%;padding:18px 20px}
+.overlay{position:fixed;inset:0;background:rgba(12,18,22,.45);display:flex;align-items:flex-start;justify-content:center;z-index:50;overflow-y:auto;padding:40px var(--s-4)}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);width:560px;max-width:100%;padding:var(--s-4) 20px;box-shadow:var(--e-2)}
 .modal.wide{width:820px}
-.modal h3{margin:0 0 14px;font-size:16px}
-.modal .mfoot{display:flex;justify-content:flex-end;gap:10px;margin-top:16px}
-.frow{margin-bottom:11px}
-.frow label{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}
-.frow .hint{font-size:12px;color:#94a3b8;margin-top:3px}
-.frow input[type=checkbox]{width:auto;margin-right:6px}
+.modal h3{margin:0 0 var(--s-4);font:600 var(--t-lg)}
+.modal .mfoot{display:flex;justify-content:flex-end;gap:var(--s-2);margin-top:var(--s-4)}
+.frow{margin-bottom:var(--s-3)}
+.frow label{display:block;font:var(--t-body);color:var(--text-muted);margin-bottom:var(--s-1)}
+.frow .hint{font:var(--t-sm);color:var(--text-muted);margin-top:var(--s-1)}
+.frow input[type=checkbox]{width:auto;margin-right:var(--s-1)}
 .frow.inline{display:flex;align-items:center}
-#toasts{position:fixed;top:16px;right:16px;z-index:99;display:flex;flex-direction:column;gap:8px}
-.toast{padding:10px 16px;border-radius:8px;color:#fff;font-size:13.5px;max-width:420px;box-shadow:0 4px 14px rgba(0,0,0,.15)}
+#toasts{position:fixed;top:var(--s-4);right:var(--s-4);z-index:99;display:flex;flex-direction:column;gap:var(--s-2)}
+.toast{padding:var(--s-2) var(--s-4);border-radius:var(--r-md);color:var(--toast-fg);font:var(--t-body);max-width:420px;box-shadow:var(--e-2)}
 .toast.ok{background:var(--ok)}.toast.err{background:var(--err)}.toast.info{background:var(--info)}
-.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1e293b,#334155)}
-.login-box{background:#fff;border-radius:12px;padding:34px 36px;width:380px;max-width:92vw}
-.login-box h1{font-size:20px;margin-bottom:4px}
-.login-box .sub{color:var(--muted);font-size:13px;margin-bottom:22px}
+/* 登录页：纯净背景（去掉原装饰性渐变，UI-REDESIGN §7.5） */
+.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg)}
+.login-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--s-8);width:380px;max-width:92vw;box-shadow:var(--e-2)}
+.login-box h1{margin-bottom:var(--s-1)}
+.login-box .sub{color:var(--text-muted);font:var(--t-body);margin-bottom:var(--s-6)}
 .login-box .frow label{font-weight:600;color:var(--text)}
-.bars{display:flex;gap:5px;align-items:flex-end;height:90px;padding-top:6px}
-.bars .bar{flex:1;background:var(--primary);border-radius:3px 3px 0 0;min-height:2px;position:relative}
-.bars .bar span{position:absolute;bottom:-18px;left:0;right:0;text-align:center;font-size:10px;color:var(--muted);transform:rotate(0)}
-.mono{font-family:Consolas,monospace;font-size:12.5px}
-pre.json{background:#f8fafc;border:1px solid var(--border);border-radius:6px;padding:10px;font-size:12px;overflow-x:auto;max-height:300px;white-space:pre-wrap;word-break:break-all}
-.empty{padding:30px;text-align:center;color:var(--muted)}
-.chip{display:inline-flex;align-items:center;gap:6px;padding:3px 12px;border-radius:99px;background:#f0fdf4;color:#15803d;border:1px solid #bbf7d0;font-size:12.5px}
-.chip.bad{background:#fef2f2;color:#b91c1c;border-color:#fecaca}
-.chkgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:4px;max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;padding:8px}
-.chkgrid label{display:flex;align-items:center;gap:6px;font-size:13px;padding:2px 4px}
+.bars{display:flex;gap:var(--s-1);align-items:flex-end;height:90px;padding-top:var(--s-2)}
+.bars .bar{flex:1;background:var(--accent);border-radius:2px 2px 0 0;min-height:2px;position:relative}
+.bars .bar span{position:absolute;bottom:-18px;left:0;right:0;text-align:center;font:var(--t-micro);font-size:10px;color:var(--text-muted)}
+.mono{font-size:12px}
+pre.json{background:var(--surface-sunk);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--s-3);font-size:12px;overflow-x:auto;max-height:300px;white-space:pre-wrap;word-break:break-all}
+.empty{padding:var(--s-8);text-align:center;color:var(--text-muted)}
+.chip{display:inline-flex;align-items:center;gap:var(--s-1);padding:0 var(--s-3);border-radius:99px;background:var(--ok-bg);color:var(--ok-fg);border:1px solid var(--ok-bd);font:var(--t-sm)}
+.chip.bad{background:var(--err-bg);color:var(--err-fg);border-color:var(--err-bd)}
+.chkgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:var(--s-1);max-height:180px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--r-md);padding:var(--s-2)}
+.chkgrid label{display:flex;align-items:center;gap:var(--s-1);font:var(--t-body);padding:0 var(--s-1)}
 .chkgrid input{width:auto}
 </style>
+<script>
+/* 主题首帧初始化（P1）：手动选择优先于系统偏好。
+   只还原显式保存过的选择；未保存则不加 data-theme，
+   由 CSS 的 prefers-color-scheme 跟随系统，避免暗色用户首帧闪白。 */
+try{
+  var bmT = localStorage.getItem('bm_theme');
+  if(bmT === 'light' || bmT === 'dark') document.documentElement.dataset.theme = bmT;
+}catch(e){}
+</script>
 </head>
 <body>
 <div id="app"></div>
@@ -103,6 +213,22 @@ const store = {
   set: (k, v) => localStorage.setItem('bm_' + k, v),
   del: k => localStorage.removeItem('bm_' + k)
 };
+/* ============ 主题切换（UI-REDESIGN P1：明暗主题，选择持久化） ============ */
+function effTheme(){
+  const t = store.get('theme');
+  if(t === 'light' || t === 'dark') return t;
+  return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+function applyTheme(){
+  const t = effTheme();
+  document.documentElement.dataset.theme = t;
+  const b = document.getElementById('themeBtn');
+  if(b) b.textContent = t === 'dark' ? '☀ 浅色' : '☾ 深色';
+}
+applyTheme();
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  if(!store.get('theme')) applyTheme(); // 未手动选择时才跟随系统
+});
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 const L = {
@@ -152,6 +278,11 @@ function prettyJson(s){
 
 /* ================= API 封装 ================= */
 const App = { user:null, timer:null, state:{} };
+// 主题切换（P1）：明暗互换，选择持久化（见脚本开头 effTheme/applyTheme）
+App.toggleTheme = function(){
+  store.set('theme', effTheme() === 'dark' ? 'light' : 'dark');
+  applyTheme();
+};
 
 async function api(path, opts={}){
   const doFetch = async () => {
@@ -322,7 +453,8 @@ function shell(active, title, body){
     <div class="topbar">
       <div style="font-weight:600">${esc(title)}</div>
       <div class="who">${App.user ? esc(App.user.displayName||App.user.username) : ''}
-        &nbsp;<button class="small" onclick="App.logout()">退出登录</button></div>
+        &nbsp;<button class="small" id="themeBtn" onclick="App.toggleTheme()" aria-label="切换明暗主题">${effTheme()==='dark'?'☀ 浅色':'☾ 深色'}</button>
+        <button class="small" onclick="App.logout()">退出登录</button></div>
     </div>
     <div class="content" id="view">${body}</div>
   </div></div>`;
@@ -923,7 +1055,7 @@ ACTIONS['restores:token'] = async id => {
     <div class="frow"><input readonly value="${esc(url)}" onclick="this.select()" class="mono"></div>
     <p style="margin:10px 0;color:var(--muted);font-size:13px">单文件下载：在 URL 后追加 <span class="mono">?path=相对路径</span>（支持 Range 断点续传）。</p>
     <div style="display:flex;gap:10px">
-      <a class="primary" style="padding:6px 14px;border-radius:6px;color:#fff;background:var(--primary)" href="${esc(url)}" target="_blank">打开下载</a>
+      <a class="primary" style="padding:var(--s-1) var(--s-3);border-radius:var(--r-md);color:var(--accent-fg);background:var(--primary)" href="${esc(url)}" target="_blank">打开下载</a>
       <button onclick="navigator.clipboard.writeText('${esc(url)}').then(()=>toast('已复制','ok'))">复制链接</button>
     </div>`);
   LOADERS.restores();
