@@ -13,7 +13,9 @@ appsettings.*.local.json
 *.pfx
 *.p12
 *.key
-data/
+# 仅指仓库根目录的开发 CA 目录（data/dev-ca.pfx）；
+# 不锚定会误伤 src/src/BackupMonitor.Infrastructure/Data/（Windows 忽略匹配大小写不敏感）。
+/data/
 
 # ---- 运行时产物 ----
 logs/

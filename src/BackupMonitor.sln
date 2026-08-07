@@ -1,10 +1,7 @@
-
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-# (c) Microsoft Corporation. All rights reserved.
-
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{A0000001-0000-0000-0000-000000000001}"
-EndProjectSection
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BackupMonitor.Api", "src\BackupMonitor.Api\BackupMonitor.Api.csproj", "{B0000001-0000-0000-0000-000000000001}"
 EndProject
@@ -13,6 +10,10 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BackupMonitor.Infrastructure", "src\BackupMonitor.Infrastructure\BackupMonitor.Infrastructure.csproj", "{B0000001-0000-0000-0000-000000000003}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BackupMonitor.Shared", "src\BackupMonitor.Shared\BackupMonitor.Shared.csproj", "{B0000001-0000-0000-0000-000000000004}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{712FADD5-D8CD-4181-A784-2103DAF9D233}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BackupMonitor.Infrastructure.Tests", "tests\BackupMonitor.Infrastructure.Tests\BackupMonitor.Infrastructure.Tests.csproj", "{BFE6A087-E87D-4DE5-A185-369066D068D4}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -36,11 +37,16 @@ Global
 		{B0000001-0000-0000-0000-000000000004}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{B0000001-0000-0000-0000-000000000004}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{B0000001-0000-0000-0000-000000000004}.Release|Any CPU.Build.0 = Release|Any CPU
+		{BFE6A087-E87D-4DE5-A185-369066D068D4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{BFE6A087-E87D-4DE5-A185-369066D068D4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{BFE6A087-E87D-4DE5-A185-369066D068D4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{BFE6A087-E87D-4DE5-A185-369066D068D4}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{B0000001-0000-0000-0000-000000000001} = {A0000001-0000-0000-0000-000000000001}
 		{B0000001-0000-0000-0000-000000000002} = {A0000001-0000-0000-0000-000000000001}
 		{B0000001-0000-0000-0000-000000000003} = {A0000001-0000-0000-0000-000000000001}
 		{B0000001-0000-0000-0000-000000000004} = {A0000001-0000-0000-0000-000000000001}
+		{BFE6A087-E87D-4DE5-A185-369066D068D4} = {712FADD5-D8CD-4181-A784-2103DAF9D233}
 	EndGlobalSection
 EndGlobal
