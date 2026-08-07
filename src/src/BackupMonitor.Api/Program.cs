@@ -1,17 +1,19 @@
 using System.Net;
 using System.Text.Json;
+using BackupMonitor.Api.Health;
 using BackupMonitor.Api.Middleware;
 using BackupMonitor.Api.Security;
-using BackupMonitor.Core.Entities.System;
 using BackupMonitor.Infrastructure;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Infrastructure.Security;
 using BackupMonitor.Shared.Models;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Server.Kestrel.Https;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.OpenApi.Models;
 using Serilog;
 
@@ -46,6 +48,17 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 // Infrastructure 服务层
 builder.Services.AddInfrastructure(builder.Configuration);
 builder.Services.AddHttpContextAccessor();
+
+// 健康检查（OPEN-ISSUES #6）：/health/db 改为只读自检。
+// 使用框架内置 AddHealthChecks + 自定义只读 DatabaseHealthCheck；
+// 不引入第三方 AspNetCore.HealthChecks.NpgSql（AddNpgSql），遵守"不新增第三方依赖"约束。
+// 工厂在请求作用域内解析 AppDbContext（DefaultHealthCheckService 按作用域解析，安全）。
+builder.Services.AddHealthChecks()
+    .Add(new HealthCheckRegistration(
+        "database",
+        sp => new DatabaseHealthCheck(sp.GetRequiredService<AppDbContext>()),
+        failureStatus: HealthStatus.Unhealthy,
+        tags: null));
 
 // Kestrel：若直接对外终结 HTTPS，则允许客户端证书（mTLS，设计书 23.1）。
 // 当前生产形态由 nginx 终结 TLS/mTLS，Kestrel 只监听回环 HTTP，此配置不生效但保留以支持直连部署。
@@ -243,104 +256,32 @@ app.MapControllers();
 // 健康检查端点
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", timestamp = DateTime.UtcNow }));
 
-// 数据库联调诊断端点：EF 模型 ↔ 真实 PostgreSQL 的全面自检
-// 1) 原生连接  2) 种子数据读取 + snake_case 枚举转换  3) 乐观锁写入/并发冲突/清理
+// 数据库健康检查端点（OPEN-ISSUES #6）：只读连通性自检（SELECT version + 结构可达）。
+// 原实现为验证乐观锁会向 system_settings 写探针行（diag_probe）、更新三次再删除，
+// 污染生产表审计、异常路径可能残留探针行、并发互相干扰。乐观锁与枚举映射自检
+// 已迁入测试工程（DatabaseSelfCheckTests），本端点只保留只读检查。
 //
-// 会回显数据库版本、角色列表与 admin 账号信息，并向 system_settings 写入探针行，
-// 因此要求 system.manage 权限，不能匿名开放。
-var defaultConnStr = builder.Configuration.GetConnectionString("Default");
-
-app.MapGet("/health/db", async (AppDbContext db) =>
+// 仍要求 system.manage 权限（会回显数据库版本与表统计），不匿名开放。
+app.MapHealthChecks("/health/db", new HealthCheckOptions
 {
-    var report = new Dictionary<string, object?>();
-    try
+    ResponseWriter = static async (context, report) =>
     {
-        // 1) 原生连接
-        var dbVersion = await db.Database
-            .SqlQueryRaw<string>("SELECT version() AS \"Value\"")
-            .FirstAsync();
-        report["rawConnection"] = dbVersion;
-
-        // 2) 种子数据读取 + 枚举转换（DOMAIN snake_case → C# PascalCase 枚举）
-        var roleCodes = await db.Roles.AsNoTracking()
-            .OrderBy(r => r.Code).Select(r => r.Code).ToListAsync();
-        var templates = await db.BackupTaskTemplates.AsNoTracking()
-            .OrderBy(t => t.Code)
-            .Select(t => new { t.Code, recognizer = t.RecognizerType.ToString(), hasConfig = t.DefaultConfig != null })
-            .ToListAsync();
-        var settingsCount = await db.SystemSettings.CountAsync();
-        var admin = await db.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Username == "admin");
-
-        report["seedData"] = new
+        context.Response.ContentType = "application/json";
+        var payload = new
         {
-            roleCodes,
-            settingsCount,
-            templates,
-            adminUser = admin == null ? null : new { admin.Id, admin.Username, status = admin.Status.ToString() }
+            ok = report.Status == HealthStatus.Healthy,
+            status = report.Status.ToString(),
+            entries = report.Entries.Select(e => new
+            {
+                name = e.Key,
+                status = e.Value.Status.ToString(),
+                description = e.Value.Description,
+                error = e.Value.Exception?.Message
+            }),
+            timestamp = DateTime.UtcNow
         };
-
-        // 3) 乐观锁写入测试（一次性探针行，测完即删）
-        const string probeKey = "diag_probe";
-        var staleProbe = await db.SystemSettings.FirstOrDefaultAsync(s => s.SettingKey == probeKey);
-        if (staleProbe != null)
-        {
-            db.SystemSettings.Remove(staleProbe);
-            await db.SaveChangesAsync();
-        }
-
-        var probe = new SystemSetting { SettingKey = probeKey, SettingValue = "1", Encrypted = false };
-        db.SystemSettings.Add(probe);
-        await db.SaveChangesAsync();
-        var versionAfterInsert = probe.RowVersion;
-
-        probe.SettingValue = "2";
-        await db.SaveChangesAsync();
-        var versionAfterFirstUpdate = probe.RowVersion;
-
-        // 第二个上下文模拟并发：先读到旧版本号
-        var options = new DbContextOptionsBuilder<AppDbContext>().UseNpgsql(defaultConnStr).Options;
-        await using var ctx2 = new AppDbContext(options);
-        var probe2 = await ctx2.SystemSettings.SingleAsync(s => s.SettingKey == probeKey);
-
-        probe.SettingValue = "3";
-        await db.SaveChangesAsync(); // 先提交成功，row_version 再 +1
-        var versionAfterSecondUpdate = probe.RowVersion;
-
-        bool conflictDetected;
-        try
-        {
-            probe2.SettingValue = "99";
-            await ctx2.SaveChangesAsync(); // 持旧版本号，应当冲突
-            conflictDetected = false;
-        }
-        catch (DbUpdateConcurrencyException)
-        {
-            conflictDetected = true;
-        }
-
-        // 清理探针行
-        db.SystemSettings.Remove(probe);
-        await db.SaveChangesAsync();
-
-        report["optimisticLock"] = new
-        {
-            versionAfterInsert,
-            versionAfterFirstUpdate,
-            versionAfterSecondUpdate,
-            conflictDetected
-        };
-        report["ok"] = true;
+        await context.Response.WriteAsync(JsonSerializer.Serialize(payload));
     }
-    catch (Exception ex)
-    {
-        report["ok"] = false;
-        report["error"] = $"{ex.GetType().Name}: {ex.Message}";
-        if (ex.InnerException != null)
-            report["innerError"] = ex.InnerException.Message;
-    }
-
-    var success = report.TryGetValue("ok", out var ok) && ok is true;
-    return Results.Json(report, statusCode: success ? 200 : 500);
 })
 .RequireAuthorization("perm:system.manage");
 

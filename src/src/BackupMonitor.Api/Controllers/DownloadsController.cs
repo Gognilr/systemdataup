@@ -54,7 +54,14 @@ public class DownloadsController : ApiBaseController
             // 预检全部文件：此时尚未写出响应头，错误仍以统一 JSON 形状返回；
             // 放在 try 内保证失败时也执行下载记账，请求不会无声卡在 downloading
             foreach (var file in context.Files)
+            {
+                // OPEN-ISSUES #8：zip-slip 纵深防御——条目名必须是规范化相对路径。
+                // 入库时已过 PathSafety 校验，此处是交给下游解压方之前的服务端复检。
+                if (!PathSafety.IsValidRelativePath(file.RelativePath))
+                    throw new BusinessException("INVALID_REQUEST", $"非法的归档条目名：{file.RelativePath}", 400);
+
                 RequireFileExists(context.RepositoryPath, file);
+            }
 
             Response.StatusCode = StatusCodes.Status200OK;
             Response.ContentType = "application/zip";
@@ -65,7 +72,8 @@ public class DownloadsController : ApiBaseController
                 foreach (var file in context.Files)
                 {
                     var fullPath = ResolveFile(context.RepositoryPath, file);
-                    var entry = zip.CreateEntry(file.RelativePath, CompressionLevel.Fastest);
+                    // ZIP 条目名统一正斜杠（跨平台解压兼容）
+                    var entry = zip.CreateEntry(file.RelativePath.Replace('\\', '/'), CompressionLevel.Fastest);
                     await using var entryStream = entry.Open();
                     await using var fileStream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
                     await fileStream.CopyToAsync(entryStream, ct);

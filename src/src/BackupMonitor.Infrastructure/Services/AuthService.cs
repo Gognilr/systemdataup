@@ -51,8 +51,9 @@ public class AuthService : IAuthService
 
     public async Task<LoginResponse> LoginAsync(LoginRequest request, string? clientIp, string? userAgent, CancellationToken ct = default)
     {
+        // OPEN-ISSUES #4：主查询不带 Include（两层集合导航在 SingleQuery 下是笛卡尔积）。
+        // user 本身仍需跟踪——后面要写 FailedLoginCount / LockedUntil / LastLoginAt。
         var user = await _db.Users
-            .Include(u => u.UserRoles).ThenInclude(ur => ur.Role).ThenInclude(r => r.RolePermissions).ThenInclude(rp => rp.Permission)
             .FirstOrDefaultAsync(u => u.Username == request.Username, ct);
 
         // 统一错误信息，不暴露用户是否存在
@@ -113,12 +114,8 @@ public class AuthService : IAuthService
         user.LockedUntil = null;
         user.LastLoginAt = now;
 
-        var roles = user.UserRoles.Select(ur => ur.Role.Code).Distinct().ToList();
-        var permissions = user.UserRoles
-            .SelectMany(ur => ur.Role.RolePermissions)
-            .Select(rp => rp.Permission.Code)
-            .Distinct()
-            .ToList();
+        // OPEN-ISSUES #4：角色码/权限码改用两条窄投影查询（无笛卡尔积、无实体物化）
+        var (roles, permissions) = await LoadRoleAndPermissionCodesAsync(user.Id, ct);
 
         var accessToken = _jwt.CreateAccessToken(user, roles, permissions);
         var refreshToken = await CreateRefreshTokenAsync(user, clientIp, userAgent, ct);
@@ -169,9 +166,8 @@ public class AuthService : IAuthService
         if (stored.User.Status != UserStatus.Active)
             throw new BusinessException("FORBIDDEN", "账号状态异常，无法刷新令牌", 403);
 
-        var user = await _db.Users
-            .Include(u => u.UserRoles).ThenInclude(ur => ur.Role).ThenInclude(r => r.RolePermissions).ThenInclude(rp => rp.Permission)
-            .FirstAsync(u => u.Id == stored.UserId, ct);
+        // OPEN-ISSUES #4：去掉两层集合 Include，角色/权限走投影查询
+        var user = await _db.Users.FirstAsync(u => u.Id == stored.UserId, ct);
 
         // 轮换：旧令牌标记吊销，签发新令牌
         var newToken = await CreateRefreshTokenAsync(user, clientIp, userAgent, ct);
@@ -179,12 +175,7 @@ public class AuthService : IAuthService
         stored.RevokeReason = "rotated";
         stored.ReplacedByHash = TokenHasher.Sha256Hex(newToken);
 
-        var roles = user.UserRoles.Select(ur => ur.Role.Code).Distinct().ToList();
-        var permissions = user.UserRoles
-            .SelectMany(ur => ur.Role.RolePermissions)
-            .Select(rp => rp.Permission.Code)
-            .Distinct()
-            .ToList();
+        var (roles, permissions) = await LoadRoleAndPermissionCodesAsync(user.Id, ct);
 
         await _db.SaveChangesAsync(ct);
 
@@ -280,10 +271,12 @@ public class AuthService : IAuthService
 
     public async Task<CurrentUserDto> GetCurrentUserAsync(Guid userId, CancellationToken ct = default)
     {
-        var user = await _db.Users
-            .Include(u => u.UserRoles).ThenInclude(ur => ur.Role).ThenInclude(r => r.RolePermissions).ThenInclude(rp => rp.Permission)
+        // OPEN-ISSUES #4：只读路径不再拉整个角色/权限对象图，改投影查询
+        var user = await _db.Users.AsNoTracking()
             .FirstOrDefaultAsync(u => u.Id == userId, ct)
             ?? throw new NotFoundException("用户", userId);
+
+        var (roles, permissions) = await LoadRoleAndPermissionCodesAsync(userId, ct);
 
         return new CurrentUserDto
         {
@@ -291,10 +284,33 @@ public class AuthService : IAuthService
             Username = user.Username,
             DisplayName = user.DisplayName,
             Email = user.Email,
-            Roles = user.UserRoles.Select(ur => ur.Role.Code).Distinct().ToList(),
-            Permissions = user.UserRoles.SelectMany(ur => ur.Role.RolePermissions)
-                .Select(rp => rp.Permission.Code).Distinct().ToList()
+            Roles = roles,
+            Permissions = permissions
         };
+    }
+
+    /// <summary>
+    /// OPEN-ISSUES #4：取某用户的角色码与权限码。
+    /// 原先用两层集合 Include（UserRoles→Role→RolePermissions→Permission）在 SingleQuery 下
+    /// 产生笛卡尔积（3 角色 × 每角色 16 权限 = 48 行重复数据）；改为两条窄投影查询，
+    /// 无重复行、无实体物化、AsNoTracking。
+    /// </summary>
+    private async Task<(List<string> Roles, List<string> Permissions)> LoadRoleAndPermissionCodesAsync(
+        Guid userId, CancellationToken ct)
+    {
+        var roles = await _db.UserRoles.AsNoTracking()
+            .Where(ur => ur.UserId == userId)
+            .Select(ur => ur.Role.Code)
+            .Distinct()
+            .ToListAsync(ct);
+
+        var permissions = await _db.UserRoles.AsNoTracking()
+            .Where(ur => ur.UserId == userId)
+            .SelectMany(ur => ur.Role.RolePermissions.Select(rp => rp.Permission.Code))
+            .Distinct()
+            .ToListAsync(ct);
+
+        return (roles, permissions);
     }
 
     private async Task<string> CreateRefreshTokenAsync(User user, string? clientIp, string? userAgent, CancellationToken ct)
