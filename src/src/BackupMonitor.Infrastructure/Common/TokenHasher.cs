@@ -13,7 +13,7 @@ public static class TokenHasher
         return Convert.ToHexString(bytes).ToLowerInvariant();
     }
 
-    /// <summary>生成加密安全的随机令牌（base64url）</summary>
+    /// <summary>生成加密安全的随机令牌（小写十六进制，长度为 byteLength × 2）</summary>
     public static string GenerateToken(int byteLength = 48)
     {
         var bytes = RandomNumberGenerator.GetBytes(byteLength);

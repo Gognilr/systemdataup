@@ -22,6 +22,9 @@ public class LoginResponse
     public int ExpiresIn { get; set; }
 
     public CurrentUserDto User { get; set; } = null!;
+
+    /// <summary>是否必须立即修改口令（初始管理员首次登录为 true，OPEN-ISSUES #2）</summary>
+    public bool MustChangePassword { get; set; }
 }
 
 /// <summary>当前登录用户信息</summary>
@@ -48,4 +51,14 @@ public class RefreshTokenResponse
     public string AccessToken { get; set; } = null!;
     public string RefreshToken { get; set; } = null!;
     public int ExpiresIn { get; set; }
+}
+
+/// <summary>修改口令请求（OPEN-ISSUES #2，需 Bearer 登录态）</summary>
+public class ChangePasswordRequest
+{
+    [Required]
+    public string OldPassword { get; set; } = null!;
+
+    [Required]
+    public string NewPassword { get; set; } = null!;
 }

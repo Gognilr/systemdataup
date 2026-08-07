@@ -23,6 +23,9 @@ public class UserConfiguration : IEntityTypeConfiguration<User>
         builder.Property(e => e.LockedUntil).HasColumnName("locked_until");
         builder.Property(e => e.LastLoginAt).HasColumnName("last_login_at");
         builder.Property(e => e.PasswordChangedAt).HasColumnName("password_changed_at").HasDefaultValueSql("now()");
+        // 不配置 HasDefaultValue(false)：false 恰为 CLR 默认值（批 1 哨兵值教训），
+        // 否则改密成功后显式写 false 会被 EF 视为"未设置"而从 UPDATE 中省略，标志永远清不掉。
+        builder.Property(e => e.MustChangePassword).HasColumnName("must_change_password");
         builder.Property(e => e.MfaEnabled).HasColumnName("mfa_enabled").HasDefaultValue(false);
         builder.Property(e => e.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("now()").ValueGeneratedOnAdd();
         builder.Property(e => e.UpdatedAt).HasColumnName("updated_at").HasDefaultValueSql("now()").ValueGeneratedOnAddOrUpdate();

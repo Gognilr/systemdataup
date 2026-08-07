@@ -40,13 +40,24 @@ public class AuthController : ApiBaseController
         return OkData(result);
     }
 
-    /// <summary>退出登录（9.3，吊销刷新令牌）</summary>
+    /// <summary>退出登录（9.3，吊销刷新令牌；请求体可选，OPEN-ISSUES #9）</summary>
     [HttpPost("logout")]
     [Authorize(AuthenticationSchemes = "Bearer")]
-    public async Task<ActionResult<ApiResponse>> Logout([FromBody] RefreshTokenRequest request, CancellationToken ct)
+    public async Task<ActionResult<ApiResponse>> Logout([FromBody] RefreshTokenRequest? request, CancellationToken ct)
     {
-        await _authService.LogoutAsync(request.RefreshToken, ct);
+        await _authService.LogoutAsync(request?.RefreshToken, ct);
         return OkMessage("已退出登录");
+    }
+
+    /// <summary>修改当前用户口令（OPEN-ISSUES #2：校验旧口令，成功后吊销全部刷新令牌）</summary>
+    [HttpPost("change-password")]
+    [Authorize(AuthenticationSchemes = "Bearer")]
+    public async Task<ActionResult<ApiResponse>> ChangePassword([FromBody] ChangePasswordRequest request, CancellationToken ct)
+    {
+        var userId = UserId
+            ?? throw new BusinessException("UNAUTHORIZED", "无法识别当前用户", 401);
+        await _authService.ChangePasswordAsync(userId, request, ct);
+        return OkMessage("口令修改成功，请使用新口令重新登录");
     }
 
     /// <summary>当前用户信息（9.4）</summary>

@@ -348,7 +348,7 @@ App.logout = async function(){
       body: JSON.stringify({refreshToken: rt})
     });
   }catch(e){}
-  store.del('accessToken'); store.del('refreshToken');
+  store.del('accessToken'); store.del('refreshToken'); store.del('mustChange');
   location.hash = '#/login'; location.reload();
 };
 
@@ -372,11 +372,46 @@ function vLogin(){
       store.set('accessToken', data.accessToken);
       store.set('refreshToken', data.refreshToken);
       App.user = data.user;
-      location.hash = '#/dashboard';
+      if(data.mustChangePassword){
+        // OPEN-ISSUES #2：初始口令必须先修改，改密前拦截一切路由
+        store.set('mustChange', '1');
+        location.hash = '#/change-password';
+      } else {
+        store.del('mustChange');
+        location.hash = '#/dashboard';
+      }
     }catch(e){ errToast(e); btn.disabled = false; }
   };
   $('#lg_btn').onclick = doLogin;
   $('#lg_pass').onkeydown = ev => { if(ev.key === 'Enter') doLogin(); };
+}
+
+/* ================= 修改口令页（OPEN-ISSUES #2 强制改密） ================= */
+function vChangePassword(){
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-box">
+    <h1>修改登录口令</h1>
+    <div class="sub">为保障账户安全，请立即设置新口令。新口令长度不少于 12 位，且不能与用户名相同。</div>
+    <div class="frow"><label>当前口令</label><input id="cp_old" type="password" autocomplete="current-password"></div>
+    <div class="frow"><label>新口令</label><input id="cp_new" type="password" autocomplete="new-password"></div>
+    <div class="frow"><label>确认新口令</label><input id="cp_new2" type="password" autocomplete="new-password"></div>
+    <button class="primary" style="width:100%;margin-top:8px" id="cp_btn">确认修改</button>
+  </div></div>`;
+  const doChange = async () => {
+    const oldPw = $('#cp_old').value, np = $('#cp_new').value, np2 = $('#cp_new2').value;
+    if(np !== np2){ toast('两次输入的新口令不一致', 'err'); return; }
+    const btn = $('#cp_btn'); btn.disabled = true;
+    try{
+      await api('/api/v1/auth/change-password', {method:'POST',
+        body:{oldPassword: oldPw, newPassword: np}});
+      // 成功后服务端已吊销全部刷新令牌，本地清空登录态，用新口令重新登录
+      store.del('accessToken'); store.del('refreshToken'); store.del('mustChange');
+      toast('口令修改成功，请使用新口令重新登录', 'ok');
+      location.hash = '#/login';
+      setTimeout(() => location.reload(), 1200);
+    }catch(e){ errToast(e); btn.disabled = false; }
+  };
+  $('#cp_btn').onclick = doChange;
+  $('#cp_new2').onkeydown = ev => { if(ev.key === 'Enter') doChange(); };
 }
 
 /* ================= 仪表盘 ================= */
@@ -1309,7 +1344,13 @@ async function route(){
   const parts = hash.replace(/^#\//,'').split('/');
   const page = parts[0], param = parts[1];
   if(!store.get('accessToken')){ vLogin(); return; }
+  // OPEN-ISSUES #2：强制改密期间除改密页外一律拦截
+  if(store.get('mustChange') === '1'){
+    if(page === 'change-password'){ vChangePassword(); return; }
+    location.hash = '#/change-password'; return;
+  }
   if(page === 'login'){ location.hash = '#/dashboard'; return; }
+  if(page === 'change-password'){ vChangePassword(); return; }
   if(page === 'clients' && param){ vClientDetail(param); return; }
   if(page === 'backups' && param){ vBackupDetail(param); return; }
   const fn = ROUTES[page];

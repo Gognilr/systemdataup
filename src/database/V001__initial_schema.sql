@@ -1073,40 +1073,29 @@ INSERT INTO role_permissions (role_id, permission_id) VALUES
     ('a0000001-0000-0000-0000-000000000004', 'b0000001-0000-0000-0000-000000000012'), -- audit.read
     ('a0000001-0000-0000-0000-000000000004', 'b0000001-0000-0000-0000-000000000015'); -- groups.read
 
--- 4.4 默认管理员账户（密码: Admin@2026，使用 pgcrypto 的 crypt + gen_salt）
-INSERT INTO users (id, username, display_name, password_hash, status, password_changed_at)
-VALUES (
-    'c0000001-0000-0000-0000-000000000001',
-    'admin',
-    '系统管理员',
-    crypt('Admin@2026', gen_salt('bf', 12)),
-    'active',
-    now()
-);
-
--- 分配系统管理员角色
-INSERT INTO user_roles (user_id, role_id, scope_type)
-VALUES ('c0000001-0000-0000-0000-000000000001', 'a0000001-0000-0000-0000-000000000001', 'global');
+-- 4.4 默认管理员账户：已移至 V005__admin_password_bootstrap.sql。
+--     口令不再硬编码于版本库，由 dbinit 部署时经 ADMIN_PW 注入，
+--     且初始账户带 must_change_password=true 强制首次改密。
 
 -- 4.5 默认系统配置
 INSERT INTO system_settings (setting_key, setting_value, encrypted, updated_by) VALUES
-    ('heartbeat_interval_seconds',    '60'::jsonb,              false, 'c0000001-0000-0000-0000-000000000001'),
-    ('max_concurrent_uploads',        '2'::jsonb,               false, 'c0000001-0000-0000-0000-000000000001'),
-    ('client_offline_threshold_seconds','300'::jsonb,           false, 'c0000001-0000-0000-0000-000000000001'),
-    ('client_suspected_offline_seconds','180'::jsonb,           false, 'c0000001-0000-0000-0000-000000000001'),
-    ('upload_session_timeout_seconds',  '3600'::jsonb,          false, 'c0000001-0000-0000-0000-000000000001'),
-    ('staging_cleanup_days',            '7'::jsonb,             false, 'c0000001-0000-0000-0000-000000000001'),
-    ('max_login_attempts',              '5'::jsonb,             false, 'c0000001-0000-0000-0000-000000000001'),
-    ('lockout_duration_seconds',        '900'::jsonb,           false, 'c0000001-0000-0000-0000-000000000001'),
-    ('access_token_ttl_seconds',        '3600'::jsonb,          false, 'c0000001-0000-0000-0000-000000000001'),
-    ('refresh_token_ttl_days',          '7'::jsonb,             false, 'c0000001-0000-0000-0000-000000000001'),
-    ('max_page_size',                   '200'::jsonb,           false, 'c0000001-0000-0000-0000-000000000001'),
-    ('default_page_size',               '50'::jsonb,            false, 'c0000001-0000-0000-0000-000000000001'),
-    ('max_single_file_bytes',           '1099511627776'::jsonb, false, 'c0000001-0000-0000-0000-000000000001'), -- 1TB
-    ('max_files_per_session',           '100000'::jsonb,        false, 'c0000001-0000-0000-0000-000000000001'),
-    ('max_path_length',                 '2048'::jsonb,          false, 'c0000001-0000-0000-0000-000000000001'),
-    ('repository_path',                 '"E:\\BackupRepository"'::jsonb, false, 'c0000001-0000-0000-0000-000000000001'),
-    ('staging_path',                    '"D:\\BackupStaging"'::jsonb,   false, 'c0000001-0000-0000-0000-000000000001');
+    ('heartbeat_interval_seconds',    '60'::jsonb,              false, NULL),
+    ('max_concurrent_uploads',        '2'::jsonb,               false, NULL),
+    ('client_offline_threshold_seconds','300'::jsonb,           false, NULL),
+    ('client_suspected_offline_seconds','180'::jsonb,           false, NULL),
+    ('upload_session_timeout_seconds',  '3600'::jsonb,          false, NULL),
+    ('staging_cleanup_days',            '7'::jsonb,             false, NULL),
+    ('max_login_attempts',              '5'::jsonb,             false, NULL),
+    ('lockout_duration_seconds',        '900'::jsonb,           false, NULL),
+    ('access_token_ttl_seconds',        '3600'::jsonb,          false, NULL),
+    ('refresh_token_ttl_days',          '7'::jsonb,             false, NULL),
+    ('max_page_size',                   '200'::jsonb,           false, NULL),
+    ('default_page_size',               '50'::jsonb,            false, NULL),
+    ('max_single_file_bytes',           '1099511627776'::jsonb, false, NULL), -- 1TB
+    ('max_files_per_session',           '100000'::jsonb,        false, NULL),
+    ('max_path_length',                 '2048'::jsonb,          false, NULL),
+    ('repository_path',                 '"E:\\BackupRepository"'::jsonb, false, NULL),
+    ('staging_path',                    '"D:\\BackupStaging"'::jsonb,   false, NULL);
 
 -- 4.6 默认保留策略
 INSERT INTO retention_policies (id, name, keep_last_count, keep_weekly_count, keep_monthly_count, keep_yearly_count, minimum_retention_days, recycle_bin_days)

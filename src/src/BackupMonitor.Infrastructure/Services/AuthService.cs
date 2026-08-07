@@ -17,11 +17,18 @@ public interface IAuthService
     Task<RefreshTokenResponse> RefreshAsync(RefreshTokenRequest request, string? clientIp, string? userAgent, CancellationToken ct = default);
     Task LogoutAsync(string? refreshToken, CancellationToken ct = default);
     Task<CurrentUserDto> GetCurrentUserAsync(Guid userId, CancellationToken ct = default);
+
+    /// <summary>修改当前用户口令（校验旧口令 + 强度校验 + 吊销全部刷新令牌，OPEN-ISSUES #2）</summary>
+    Task ChangePasswordAsync(Guid userId, ChangePasswordRequest request, CancellationToken ct = default);
 }
 
 /// <summary>管理员认证实现（bcrypt 密码校验 + JWT + 可吊销刷新令牌轮换）</summary>
 public class AuthService : IAuthService
 {
+    // OPEN-ISSUES #7：用户不存在时也执行一次 bcrypt 校验（成本 12 与真实哈希一致），
+    // 使攻击者无法通过响应时延探测用户名是否存在。
+    private static readonly string DummyHash = BCrypt.Net.BCrypt.HashPassword("dummy", workFactor: 12);
+
     private readonly AppDbContext _db;
     private readonly JwtTokenService _jwt;
     private readonly SystemSettingsProvider _settings;
@@ -51,6 +58,8 @@ public class AuthService : IAuthService
         // 统一错误信息，不暴露用户是否存在
         if (user is null)
         {
+            // OPEN-ISSUES #7：先做一次等成本的 bcrypt 校验，避免时延泄露用户名存在性
+            BCrypt.Net.BCrypt.Verify(request.Password, DummyHash);
             await _audit.RecordAsync("auth.login", AuditResult.Failure, "user", null,
                 errorMessage: $"用户 {request.Username} 登录失败（用户不存在）", ct: ct);
             throw new BusinessException("UNAUTHORIZED", "用户名或密码错误", 401);
@@ -122,6 +131,7 @@ public class AuthService : IAuthService
             AccessToken = accessToken,
             RefreshToken = refreshToken,
             ExpiresIn = _jwt.AccessTokenTtlSeconds,
+            MustChangePassword = user.MustChangePassword,
             User = new CurrentUserDto
             {
                 Id = user.Id,
@@ -200,6 +210,73 @@ public class AuthService : IAuthService
         stored.RevokeReason = "logout";
         await _db.SaveChangesAsync(ct);
     }
+
+    public async Task ChangePasswordAsync(Guid userId, ChangePasswordRequest request, CancellationToken ct = default)
+    {
+        var user = await _db.Users.FirstOrDefaultAsync(u => u.Id == userId, ct)
+            ?? throw new NotFoundException("用户", userId);
+
+        // 1. 校验旧口令：错误时仅记审计，不做任何状态变更
+        bool oldOk;
+        try
+        {
+            oldOk = BCrypt.Net.BCrypt.Verify(request.OldPassword, user.PasswordHash);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "旧口令哈希校验异常 user={Username}", user.Username);
+            oldOk = false;
+        }
+
+        if (!oldOk)
+        {
+            await _audit.RecordAsync("auth.change_password", AuditResult.Failure, "user", user.Id,
+                errorMessage: "旧口令错误", ct: ct);
+            throw new BusinessException("UNAUTHORIZED", "旧口令错误", 401);
+        }
+
+        // 2. 强度校验放在服务端（OPEN-ISSUES #2），不能只依赖前端
+        var strengthError = ValidatePasswordStrength(request.NewPassword, user.Username);
+        if (strengthError is not null)
+            throw new BusinessException("INVALID_REQUEST", strengthError, 400);
+
+        // 3. 更新口令（bcrypt 成本 12，与 V001/V005 的 gen_salt('bf',12) 一致）
+        var now = DateTime.UtcNow;
+        user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.NewPassword, workFactor: 12);
+        user.PasswordChangedAt = now;
+        user.MustChangePassword = false;
+        await _db.SaveChangesAsync(ct);
+
+        // 4. 吊销该用户全部刷新令牌，强制所有会话用新口令重新登录
+        //    （访问令牌为无状态 JWT，仍有效至自然过期——符合验收口径）
+        await RevokeAllUserTokensAsync(user.Id, "password_changed", ct);
+
+        await _audit.RecordAsync("auth.change_password", AuditResult.Success, "user", user.Id, ct: ct);
+        _logger.LogInformation("用户 {Username} 口令修改成功，已吊销其全部刷新令牌", user.Username);
+    }
+
+    /// <summary>口令强度校验：长度 ≥ 12、不等于用户名、不属于常见弱口令。返回错误信息，null 表示通过</summary>
+    private static string? ValidatePasswordStrength(string newPassword, string username)
+    {
+        if (string.IsNullOrEmpty(newPassword) || newPassword.Length < 12)
+            return "新口令长度不得少于 12 位";
+
+        if (string.Equals(newPassword, username, StringComparison.OrdinalIgnoreCase))
+            return "新口令不能与用户名相同";
+
+        if (CommonWeakPasswords.Contains(newPassword.ToLowerInvariant()))
+            return "新口令属于常见弱口令，请更换";
+
+        return null;
+    }
+
+    /// <summary>常见弱口令表（长度 ≥ 12 的条目仍可能被弱口令字典收录，兜底拦截）</summary>
+    private static readonly HashSet<string> CommonWeakPasswords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "password123456", "123456789012", "abcdefghijkl", "qwertyuiop12",
+        "admin@2026!!!!", "administrator1", "changeme1234", "welcome12345",
+        "aa123456789012", "111111111111", "000000000000"
+    };
 
     public async Task<CurrentUserDto> GetCurrentUserAsync(Guid userId, CancellationToken ct = default)
     {

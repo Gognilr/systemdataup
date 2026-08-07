@@ -5,11 +5,17 @@ namespace BackupMonitor.Infrastructure.Tests;
 
 /// <summary>
 /// 数据库夹具：通过 Testcontainers 启动一次性 PostgreSQL 容器，
-/// 并按顺序执行 database/V001~V004 迁移脚本，得到与生产一致的真实库结构。
+/// 并按顺序执行 database/V001~V005 迁移脚本，得到与生产一致的真实库结构。
 /// 整个测试集合共享一个容器，避免重复拉取/启动开销。
 /// </summary>
 public sealed class PostgresDatabaseFixture : IAsyncLifetime
 {
+    /// <summary>
+    /// 测试环境注入的管理员引导口令。V005 中的 admin_pw 是 psql 变量（:'admin_pw'），
+    /// Npgsql 无法解析，执行前统一替换为本常量（生产由 dbinit.bat 注入 ADMIN_PW）。
+    /// </summary>
+    public const string AdminBootstrapPassword = "Test-Admin-Pw-2026!";
+
     private PostgreSqlContainer _container = null!;
 
     /// <summary>容器连接串（postgres 超级用户）。</summary>
@@ -26,7 +32,9 @@ public sealed class PostgresDatabaseFixture : IAsyncLifetime
 
         foreach (var script in MigrationScripts)
         {
-            var sql = File.ReadAllText(script);
+            var sql = File.ReadAllText(script)
+                // psql 变量只能在 psql 中求值，这里替换为测试常量（常量不含单引号，拼接安全）
+                .Replace(":'admin_pw'", $"'{AdminBootstrapPassword}'");
             await using var connection = new NpgsqlConnection(ConnectionString);
             await connection.OpenAsync();
             await using var command = new NpgsqlCommand(sql, connection);

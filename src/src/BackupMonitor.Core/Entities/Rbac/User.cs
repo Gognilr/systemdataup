@@ -34,6 +34,9 @@ public class User : IHasRowVersion
 
     public DateTime PasswordChangedAt { get; set; }
 
+    /// <summary>是否强制修改口令（初始管理员首次登录为 true，改密成功后清除，OPEN-ISSUES #2）</summary>
+    public bool MustChangePassword { get; set; }
+
     /// <summary>是否启用 MFA</summary>
     public bool MfaEnabled { get; set; }
 
