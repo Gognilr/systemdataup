@@ -1,0 +1,137 @@
+using BackupMonitor.Infrastructure.Common;
+
+namespace BackupMonitor.Infrastructure.Tests;
+
+/// <summary>
+/// 路径安全单元测试（设计书 23.4 路径安全 / DEV-PROMPTS 提示词 3c）：
+/// 覆盖 ..、UNC、\\?\、盘符、尾随空格与点、大小写穿越、超长路径。
+/// 纯逻辑测试，不依赖数据库。
+/// </summary>
+public class PathSafetyTests
+{
+    // ---------- IsValidRelativePath：合法路径 ----------
+
+    [Theory]
+    [InlineData("a/b/c.bak")]
+    [InlineData("data_2026/u8_backup.rar")]
+    [InlineData("file.bak")]
+    [InlineData("a/b..c/d.txt")]      // 段内含 ".." 但段本身不是 ".."，合法
+    [InlineData("backup/2026/08/07/db.tar.gz")]
+    public void 合法相对路径应通过(string path)
+        => Assert.True(PathSafety.IsValidRelativePath(path), path);
+
+    // ---------- IsValidRelativePath：非法路径 ----------
+
+    [Theory]
+    [InlineData("../x")]                          // 头部 ..
+    [InlineData("..")]                            // 纯 ..
+    [InlineData("a/../../etc/passwd")]            // 段级 .. 穿越
+    [InlineData("a/./b")]                         // 段级 .
+    [InlineData("/abs/path")]                     // 绝对路径
+    [InlineData("a//b")]                          // 空段
+    [InlineData(@"\\server\share\file")]          // UNC
+    [InlineData(@"\\.\PhysicalDrive0")]           // 设备路径
+    [InlineData(@"\\?\C:\Windows")]               // 设备路径（长路径前缀）
+    [InlineData(@"\\?\UNC\server\share")]         // 设备路径（UNC 变体）
+    [InlineData(@"C:\abs")]                       // 盘符绝对路径
+    [InlineData("C:x")]                           // 盘符相对路径
+    [InlineData("a/b ")]                          // 段尾随空格
+    [InlineData("a/b.")]                          // 段尾随点（NTFS 静默剥离）
+    [InlineData("a/b.../c")]                      // 中间段尾随点
+    public void 非法路径应拒绝(string path)
+        => Assert.False(PathSafety.IsValidRelativePath(path), path);
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void 空值应拒绝(string? path)
+        => Assert.False(PathSafety.IsValidRelativePath(path));
+
+    [Fact]
+    public void 超长路径应拒绝()
+    {
+        var path = "a/" + new string('x', 2048);
+        Assert.True(path.Length > 2048);
+        Assert.False(PathSafety.IsValidRelativePath(path));
+
+        // 边界内（<=2048）仍然合法
+        var ok = "a/" + new string('x', 2040);
+        Assert.True(ok.Length <= 2048);
+        Assert.True(PathSafety.IsValidRelativePath(ok));
+    }
+
+    [Fact]
+    public void 含操作系统非法字符的段应拒绝()
+    {
+        // 平台感知：Windows 含 <>:"|?* 等，Linux 仅 '\0' 与 '/'；
+        // 分隔符已由规范化步骤处理，这里只验证其余非法字符。
+        var invalidChars = Path.GetInvalidFileNameChars()
+            .Where(c => c is not ('/' or '\\'))
+            .ToArray();
+        Assert.NotEmpty(invalidChars);
+
+        foreach (var c in invalidChars)
+        {
+            var path = $"a/b{c}c.txt";
+            Assert.False(PathSafety.IsValidRelativePath(path),
+                $"字符 0x{(int)c:X2} 应被拒绝");
+        }
+    }
+
+    // ---------- ResolveUnderBase ----------
+
+    [Fact]
+    public void ResolveUnderBase_穿越应返回null()
+    {
+        var basePath = Path.Combine(Path.GetTempPath(), "bm_pathsafety_base");
+        Assert.Null(PathSafety.ResolveUnderBase(basePath, "../escape.txt"));
+        Assert.Null(PathSafety.ResolveUnderBase(basePath, @"..\escape.txt"));
+        Assert.Null(PathSafety.ResolveUnderBase(basePath, "a/../../escape.txt"));
+    }
+
+    [Fact]
+    public void ResolveUnderBase_合法拼接应位于基目录内()
+    {
+        var basePath = Path.Combine(Path.GetTempPath(), "bm_pathsafety_base");
+        var resolved = PathSafety.ResolveUnderBase(basePath, "sub/file.txt");
+        Assert.NotNull(resolved);
+
+        var fullBase = Path.GetFullPath(basePath);
+        var prefix = fullBase.EndsWith(Path.DirectorySeparatorChar)
+            ? fullBase
+            : fullBase + Path.DirectorySeparatorChar;
+        Assert.StartsWith(prefix, resolved, StringComparison.OrdinalIgnoreCase);
+        Assert.EndsWith("file.txt", resolved);
+    }
+
+    [Fact]
+    public void ResolveUnderBase_大小写不同的基目录不应误拒()
+    {
+        // OrdinalIgnoreCase 包含判断：Windows 大小写不敏感盘上不能把同目录判成逃逸
+        var basePath = Path.Combine(Path.GetTempPath(), "bm_PS_Base");
+        Assert.NotNull(PathSafety.ResolveUnderBase(basePath, "f.txt"));
+        Assert.NotNull(PathSafety.ResolveUnderBase(basePath.ToUpperInvariant(), "f.txt"));
+        Assert.NotNull(PathSafety.ResolveUnderBase(basePath.ToLowerInvariant(), "f.txt"));
+    }
+
+    // ---------- SanitizePathComponent ----------
+
+    [Theory]
+    [InlineData("a..b", "a_b")]        // ".." 替换为下划线
+    [InlineData("..", "_")]
+    [InlineData("name.", "name")]      // 尾随点去除
+    [InlineData("name...", "name_")]   // ".." 替换先于尾随点去除（顺序产物，安全）
+    [InlineData("  x  ", "x")]         // 首尾空格去除
+    [InlineData("", "unnamed")]
+    [InlineData("   ", "unnamed")]
+    public void SanitizePathComponent_清理行为(string input, string expected)
+        => Assert.Equal(expected, PathSafety.SanitizePathComponent(input));
+
+    [Fact]
+    public void SanitizePathComponent_超长截断到100()
+    {
+        var result = PathSafety.SanitizePathComponent(new string('a', 150));
+        Assert.Equal(100, result.Length);
+    }
+}

@@ -16,8 +16,11 @@ public static class PathSafety
         if (relativePath.Length > MaxPathLength)
             return false;
 
-        // 统一为正斜杠后检查
-        var normalized = relativePath.Replace('\\', '/').Trim();
+        // 统一为正斜杠；段级检查基于未去首尾空白的版本，
+        // 否则整条路径末尾的尾随空格会被 Trim 吃掉而漏检。
+        // NTFS 写盘时会静默剥离文件名尾随空格与点，此类路径必须拒绝（23.4）。
+        var replaced = relativePath.Replace('\\', '/');
+        var normalized = replaced.Trim();
 
         if (normalized.StartsWith('/') || normalized.StartsWith(".."))
             return false;
@@ -33,11 +36,11 @@ public static class PathSafety
             relativePath.StartsWith(@"\\?\", StringComparison.Ordinal))
             return false;
 
-        foreach (var segment in normalized.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        foreach (var segment in replaced.Split('/', StringSplitOptions.RemoveEmptyEntries))
         {
             if (segment is "." or "..")
                 return false;
-            if (segment.EndsWith(' '))
+            if (segment.EndsWith(' ') || segment.EndsWith('.'))
                 return false;
             if (segment.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
                 return false;

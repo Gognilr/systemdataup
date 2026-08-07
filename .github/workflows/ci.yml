@@ -1,0 +1,13 @@
+# CI：build + test，push 与 PR 都执行（DEV-PROMPTS 提示词 3 / OPEN-ISSUES #3）。
+# 测试依赖 Docker（Testcontainers 启动一次性 PostgreSQL 容器），ubuntu-latest 运行器自带。
+name: ci
+on: [push, pull_request]
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '8.0.x' }
+      - run: dotnet build src/BackupMonitor.sln -c Release --nologo
+      - run: dotnet test  src/BackupMonitor.sln -c Release --nologo --no-build
