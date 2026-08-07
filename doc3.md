@@ -1,0 +1,2332 @@
+# 轻量级集中备份采集与监控系统
+# 详细数据库及接口设计书
+
+**文档版本：** V1.0  
+**编制日期：** 2026-07-31  
+**适用阶段：** 详细设计、开发、联调、测试  
+**数据库建议：** PostgreSQL 15+ 或 SQL Server 2019+  
+**试点可选：** SQLite  
+**接口风格：** RESTful HTTPS API  
+**客户端通信：** HTTPS + 客户端独立身份  
+**字符集：** UTF-8  
+**时间标准：** 数据库存储 UTC，界面按本地时区显示
+
+---
+
+## 1. 文档目的
+
+本文档定义系统数据库逻辑模型、核心表结构、字段约束、索引、状态枚举、数据保留规则、API 分组、认证方式、请求响应格式、上传协议、错误码及接口安全要求。
+
+本文档用于：
+
+- 数据库建模；
+- 服务端开发；
+- Agent 开发；
+- 前后端联调；
+- 自动化测试；
+- 安全评审；
+- 数据迁移和运维。
+
+---
+
+## 2. 总体技术约束
+
+### 2.1 数据库原则
+
+- 使用关系型数据库保存元数据；
+- 原始备份文件不存入数据库；
+- 文件清单和哈希存数据库，同时保存 `manifest.json`；
+- 全部主键使用 UUID；
+- 业务时间和系统时间分开；
+- 所有敏感操作必须审计；
+- 状态字段使用受控枚举；
+- 大体量监控数据限制保留周期；
+- 删除正式业务数据优先采用软删除；
+- 审计日志原则上只追加、不修改。
+
+### 2.2 API 原则
+
+- 全部接口使用 HTTPS；
+- 客户端接口与管理接口逻辑隔离；
+- 客户端必须使用独立身份；
+- 管理接口使用用户会话或 JWT；
+- 写接口支持幂等；
+- 批量接口必须返回逐项结果；
+- 长任务采用异步状态查询；
+- 上传采用会话和分块协议；
+- 服务端生成正式存储路径；
+- API 不提供任意操作系统命令执行。
+
+### 2.3 命名规范
+
+数据库表名使用小写蛇形：
+
+```text
+backup_tasks
+backup_sets
+upload_sessions
+```
+
+字段名使用小写蛇形：
+
+```text
+created_at
+client_id
+total_bytes
+```
+
+API 使用复数名词：
+
+```text
+/api/v1/clients
+/api/v1/backup-tasks
+/api/v1/upload-sessions
+```
+
+---
+
+## 3. 逻辑数据模型
+
+核心关系：
+
+```text
+users ── user_roles ── roles ── role_permissions ── permissions
+
+client_groups ── clients ── backup_tasks ── business_units
+                         └─ client_heartbeats
+                         └─ client_disks
+                         └─ monitored_service_definitions
+                         └─ commands
+
+backup_tasks ── candidate_backup_sets ── candidate_files
+             └─ backup_sets ── backup_files
+             └─ upload_sessions ── upload_files ── upload_chunks
+             └─ alerts
+
+backup_sets ── restore_requests
+backup_sets ── retention_locks
+
+all major entities ── audit_logs
+```
+
+---
+
+## 4. 通用字段约定
+
+除特殊表外，业务表建议包含：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID | 主键 |
+| created_at | timestamptz | 创建时间 |
+| created_by | UUID，可空 | 创建用户 |
+| updated_at | timestamptz | 更新时间 |
+| updated_by | UUID，可空 | 更新用户 |
+| row_version | bigint | 乐观锁版本 |
+| is_deleted | boolean | 软删除标记 |
+| deleted_at | timestamptz，可空 | 删除时间 |
+| deleted_by | UUID，可空 | 删除用户 |
+
+服务端更新数据时必须检查 `row_version`，防止并发覆盖。
+
+---
+
+## 5. 枚举定义
+
+### 5.1 客户端状态 `client_status`
+
+- `pending_approval`
+- `online`
+- `suspected_offline`
+- `offline`
+- `disabled`
+- `revoked`
+- `certificate_expired`
+
+### 5.2 任务模式 `task_mode`
+
+- `automatic`
+- `approval_required`
+- `manual`
+- `monitor_only`
+- `paused`
+
+### 5.3 识别类型 `recognizer_type`
+
+- `latest_single_file`
+- `latest_directory`
+- `multi_file_set`
+- `subdirectory_units`
+
+### 5.4 预检状态 `precheck_status`
+
+- `not_scanned`
+- `scanning`
+- `candidate_found`
+- `waiting_stable`
+- `passed`
+- `no_new_backup`
+- `still_changing`
+- `required_file_missing`
+- `size_abnormal`
+- `path_not_found`
+- `access_denied`
+- `failed`
+
+### 5.5 指令状态 `command_status`
+
+- `pending`
+- `claimed`
+- `running`
+- `succeeded`
+- `failed`
+- `cancelled`
+- `expired`
+- `rejected`
+
+### 5.6 指令类型 `command_type`
+
+- `precheck_task`
+- `precheck_all`
+- `upload_candidate`
+- `upload_latest`
+- `pause_upload`
+- `resume_upload`
+- `cancel_upload`
+- `rescan`
+- `rehash`
+- `sync_config`
+- `refresh_metrics`
+- `upgrade_agent`
+
+### 5.7 上传会话状态 `upload_status`
+
+- `created`
+- `waiting_permission`
+- `uploading`
+- `paused`
+- `retry_wait`
+- `received`
+- `verifying`
+- `verified`
+- `committed`
+- `failed`
+- `cancelled`
+- `expired`
+
+### 5.8 备份版本状态 `backup_set_status`
+
+- `verifying`
+- `available`
+- `verification_failed`
+- `quarantined`
+- `retention_pending`
+- `recycle_bin`
+- `deleted`
+
+### 5.9 告警等级 `alert_level`
+
+- `critical`
+- `warning`
+- `notice`
+
+### 5.10 告警状态 `alert_status`
+
+- `open`
+- `acknowledged`
+- `in_progress`
+- `recovered`
+- `closed`
+- `ignored`
+
+---
+
+## 6. 核心表设计
+
+### 6.1 用户表 `users`
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | UUID | PK | 用户 ID |
+| username | varchar(64) | UNIQUE NOT NULL | 登录名 |
+| display_name | varchar(128) | NOT NULL | 显示名称 |
+| password_hash | varchar(255) | NOT NULL | 密码哈希 |
+| email | varchar(255) | NULL | 邮箱 |
+| mobile | varchar(32) | NULL | 手机 |
+| status | varchar(32) | NOT NULL | active/locked/disabled |
+| failed_login_count | int | NOT NULL DEFAULT 0 | 连续失败次数 |
+| locked_until | timestamptz | NULL | 锁定截止 |
+| last_login_at | timestamptz | NULL | 最近登录 |
+| password_changed_at | timestamptz | NOT NULL | 密码更新时间 |
+| mfa_enabled | boolean | NOT NULL DEFAULT false | 是否启用 MFA |
+| created_at | timestamptz | NOT NULL | 创建时间 |
+| updated_at | timestamptz | NOT NULL | 更新时间 |
+| row_version | bigint | NOT NULL DEFAULT 1 | 乐观锁 |
+
+索引：
+
+- 唯一索引：`username`；
+- 普通索引：`status`。
+
+密码必须采用 Argon2id、bcrypt 或 PBKDF2，不得使用可逆加密。
+
+### 6.2 角色表 `roles`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 角色 ID |
+| code | varchar(64) UNIQUE | 角色编码 |
+| name | varchar(128) | 角色名称 |
+| description | varchar(500) | 描述 |
+| is_system | boolean | 是否系统内置 |
+| created_at | timestamptz | 创建时间 |
+| updated_at | timestamptz | 更新时间 |
+
+内置角色：
+
+- `system_admin`
+- `backup_admin`
+- `restore_operator`
+- `auditor`
+
+### 6.3 权限表 `permissions`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 权限 ID |
+| code | varchar(128) UNIQUE | 权限编码 |
+| name | varchar(128) | 权限名称 |
+| module | varchar(64) | 模块 |
+| description | varchar(500) | 描述 |
+
+示例：
+
+```text
+clients.read
+clients.manage
+tasks.read
+tasks.manage
+tasks.precheck
+tasks.upload
+backups.read
+backups.download
+alerts.handle
+audit.read
+system.manage
+```
+
+### 6.4 用户角色表 `user_roles`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| user_id | UUID FK | 用户 |
+| role_id | UUID FK | 角色 |
+| scope_type | varchar(32) | global/client_group |
+| scope_id | UUID NULL | 数据范围 |
+| created_at | timestamptz | 创建时间 |
+
+复合唯一约束：
+
+```text
+(user_id, role_id, scope_type, scope_id)
+```
+
+### 6.5 角色权限表 `role_permissions`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| role_id | UUID FK | 角色 |
+| permission_id | UUID FK | 权限 |
+| created_at | timestamptz | 创建时间 |
+
+复合主键：
+
+```text
+(role_id, permission_id)
+```
+
+### 6.6 客户端分组表 `client_groups`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 分组 ID |
+| parent_id | UUID NULL FK | 父分组 |
+| name | varchar(128) | 名称 |
+| code | varchar(64) UNIQUE | 编码 |
+| description | varchar(500) | 描述 |
+| default_bandwidth_limit_kbps | int NULL | 默认限速 |
+| default_concurrency | int | 默认并发 |
+| created_at | timestamptz | 创建时间 |
+| updated_at | timestamptz | 更新时间 |
+
+### 6.7 注册令牌表 `registration_tokens`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 令牌 ID |
+| token_hash | varchar(255) | 令牌哈希 |
+| name | varchar(128) | 名称 |
+| client_group_id | UUID NULL | 默认分组 |
+| expires_at | timestamptz | 过期时间 |
+| max_uses | int | 最大次数 |
+| used_count | int | 已使用次数 |
+| status | varchar(32) | active/revoked/expired |
+| created_by | UUID | 创建人 |
+| created_at | timestamptz | 创建时间 |
+
+明文令牌不得存库，只保存哈希。
+
+### 6.8 客户端表 `clients`
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | UUID | PK | 客户端 ID |
+| machine_id | varchar(128) | UNIQUE NOT NULL | 机器唯一标识 |
+| hostname | varchar(255) | NOT NULL | 计算机名 |
+| display_name | varchar(255) | NOT NULL | 显示名称 |
+| client_group_id | UUID | NULL FK | 所属分组 |
+| os_name | varchar(255) | NULL | 系统名称 |
+| os_version | varchar(128) | NULL | 系统版本 |
+| architecture | varchar(32) | NULL | x64 |
+| agent_version | varchar(64) | NULL | Agent 版本 |
+| ip_addresses | json/jsonb | NULL | IP 列表 |
+| status | varchar(32) | NOT NULL | 客户端状态 |
+| approved_at | timestamptz | NULL | 审批时间 |
+| approved_by | UUID | NULL | 审批人 |
+| last_heartbeat_at | timestamptz | NULL | 最后心跳 |
+| last_config_version | bigint | NOT NULL DEFAULT 0 | 已同步配置版本 |
+| certificate_thumbprint | varchar(128) | NULL | 证书指纹 |
+| certificate_expires_at | timestamptz | NULL | 证书过期 |
+| time_offset_seconds | int | NULL | 与服务端时间差 |
+| notes | varchar(1000) | NULL | 备注 |
+| created_at | timestamptz | NOT NULL | 创建时间 |
+| updated_at | timestamptz | NOT NULL | 更新时间 |
+| row_version | bigint | NOT NULL DEFAULT 1 | 乐观锁 |
+
+索引：
+
+- `machine_id` 唯一；
+- `(status, last_heartbeat_at)`；
+- `client_group_id`；
+- `hostname`。
+
+### 6.9 客户端证书表 `client_certificates`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 证书记录 ID |
+| client_id | UUID FK | 客户端 |
+| thumbprint | varchar(128) UNIQUE | 指纹 |
+| serial_number | varchar(128) | 序列号 |
+| issued_at | timestamptz | 签发时间 |
+| expires_at | timestamptz | 过期时间 |
+| status | varchar(32) | active/revoked/expired |
+| revoked_at | timestamptz NULL | 吊销时间 |
+| revoke_reason | varchar(500) NULL | 原因 |
+
+### 6.10 心跳表 `client_heartbeats`
+
+该表用于短期历史，建议按月分区或定期归档。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | bigint/UUID PK | 记录 ID |
+| client_id | UUID FK | 客户端 |
+| received_at | timestamptz | 服务端收到时间 |
+| client_time | timestamptz | 客户端时间 |
+| agent_uptime_seconds | bigint | Agent 运行时长 |
+| system_uptime_seconds | bigint | 系统运行时长 |
+| cpu_percent | decimal(5,2) | CPU |
+| memory_percent | decimal(5,2) | 内存 |
+| memory_available_bytes | bigint | 可用内存 |
+| agent_memory_bytes | bigint | Agent 内存 |
+| network_send_bps | bigint | 发送速率 |
+| network_receive_bps | bigint | 接收速率 |
+| active_command_count | int | 活跃指令 |
+| active_upload_count | int | 活跃上传 |
+| payload | json/jsonb | 扩展数据 |
+
+索引：
+
+- `(client_id, received_at DESC)`；
+- `received_at`。
+
+保留策略：
+
+- 原始分钟数据 30 天；
+- 小时汇总数据 12 个月；
+- 当前状态同步更新到 `clients` 或专门快照表。
+
+### 6.11 客户端磁盘状态表 `client_disks`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 记录 ID |
+| client_id | UUID FK | 客户端 |
+| drive_name | varchar(32) | 盘符 |
+| volume_label | varchar(128) | 卷标 |
+| filesystem | varchar(32) | NTFS/ReFS |
+| total_bytes | bigint | 总容量 |
+| free_bytes | bigint | 剩余容量 |
+| is_source_volume | boolean | 是否备份源盘 |
+| sampled_at | timestamptz | 采集时间 |
+
+### 6.12 关键服务定义表 `monitored_service_definitions`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | ID |
+| client_id | UUID FK | 客户端 |
+| service_name | varchar(255) | Windows 服务名 |
+| display_name | varchar(255) | 显示名 |
+| expected_state | varchar(32) | running/stopped |
+| alert_on_mismatch | boolean | 是否告警 |
+| enabled | boolean | 是否启用 |
+
+### 6.13 关键服务状态表 `client_service_states`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | ID |
+| definition_id | UUID FK | 服务定义 |
+| client_id | UUID FK | 客户端 |
+| actual_state | varchar(32) | running/stopped/paused/not_found |
+| start_type | varchar(32) | auto/manual/disabled |
+| sampled_at | timestamptz | 采集时间 |
+
+### 6.14 任务模板表 `backup_task_templates`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 模板 ID |
+| code | varchar(64) UNIQUE | 模板编码 |
+| name | varchar(128) | 名称 |
+| recognizer_type | varchar(32) | 识别类型 |
+| default_config | json/jsonb | 默认规则 |
+| is_system | boolean | 内置模板 |
+| version | int | 模板版本 |
+| created_at | timestamptz | 创建时间 |
+| updated_at | timestamptz | 更新时间 |
+
+### 6.15 备份任务表 `backup_tasks`
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | UUID | PK | 任务 ID |
+| client_id | UUID | FK NOT NULL | 客户端 |
+| template_id | UUID | NULL FK | 模板 |
+| name | varchar(255) | NOT NULL | 任务名称 |
+| application_name | varchar(255) | NOT NULL | 应用名称 |
+| source_path | varchar(2048) | NOT NULL | 源路径 |
+| recognizer_type | varchar(32) | NOT NULL | 识别类型 |
+| task_mode | varchar(32) | NOT NULL | 运行模式 |
+| enabled | boolean | NOT NULL | 是否启用 |
+| priority | int | NOT NULL DEFAULT 100 | 优先级 |
+| importance_level | varchar(32) | NOT NULL DEFAULT 'normal' | 重要等级 |
+| scan_schedule | varchar(255) | NULL | Cron/计划表达式 |
+| upload_window_start | time | NULL | 上传窗口开始 |
+| upload_window_end | time | NULL | 上传窗口结束 |
+| schedule_timezone | varchar(64) | NOT NULL | 时区 |
+| random_delay_minutes | int | NOT NULL DEFAULT 0 | 随机延迟 |
+| stability_interval_seconds | int | NOT NULL DEFAULT 600 | 稳定间隔 |
+| max_stability_wait_seconds | int | NOT NULL DEFAULT 7200 | 最大等待 |
+| min_total_bytes | bigint | NULL | 最小容量 |
+| max_total_bytes | bigint | NULL | 最大容量 |
+| min_file_count | int | NULL | 最小文件数 |
+| bandwidth_limit_kbps | int | NULL | 限速 |
+| chunk_size_bytes | int | NOT NULL DEFAULT 8388608 | 分块 |
+| retry_count | int | NOT NULL DEFAULT 3 | 重试次数 |
+| retry_interval_seconds | int | NOT NULL DEFAULT 1800 | 重试间隔 |
+| retention_policy_id | UUID | NULL FK | 保留策略 |
+| config_version | bigint | NOT NULL DEFAULT 1 | 配置版本 |
+| recognizer_config | json/jsonb | NOT NULL | 识别规则 |
+| alert_config | json/jsonb | NULL | 告警规则 |
+| last_scan_at | timestamptz | NULL | 最近扫描 |
+| last_precheck_status | varchar(32) | NULL | 最近预检状态 |
+| last_success_at | timestamptz | NULL | 最近入库 |
+| created_at | timestamptz | NOT NULL | 创建 |
+| updated_at | timestamptz | NOT NULL | 更新 |
+| row_version | bigint | NOT NULL DEFAULT 1 | 乐观锁 |
+
+索引：
+
+- `(client_id, enabled)`；
+- `(task_mode, enabled)`；
+- `last_success_at`；
+- `application_name`。
+
+`recognizer_config` 示例：
+
+```json
+{
+  "includePatterns": ["*.bak"],
+  "excludePatterns": ["*.tmp", "*.partial"],
+  "recursive": false,
+  "sortBy": "lastModified",
+  "requiredFiles": [],
+  "batchRegex": null,
+  "businessUnitDepth": 1,
+  "expectedBusinessUnits": []
+}
+```
+
+### 6.16 业务单元表 `business_units`
+
+适用于账套、数据库、部门等独立对象。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 业务单元 ID |
+| task_id | UUID FK | 任务 |
+| external_key | varchar(255) | 原始目录名/账套号 |
+| display_name | varchar(255) | 显示名称 |
+| source_relative_path | varchar(2048) | 相对路径 |
+| expected | boolean | 是否预期存在 |
+| ignored | boolean | 是否忽略 |
+| enabled | boolean | 是否启用 |
+| last_discovered_at | timestamptz | 最近发现 |
+| last_success_at | timestamptz | 最近入库 |
+| created_at | timestamptz | 创建 |
+| updated_at | timestamptz | 更新 |
+
+唯一索引：
+
+```text
+(task_id, external_key)
+```
+
+### 6.17 候选备份集表 `candidate_backup_sets`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 候选 ID |
+| client_id | UUID FK | 客户端 |
+| task_id | UUID FK | 任务 |
+| business_unit_id | UUID NULL FK | 业务单元 |
+| candidate_key | varchar(512) | 客户端生成的候选键 |
+| source_root | varchar(2048) | 源根路径 |
+| backup_business_time | timestamptz NULL | 业务备份时间 |
+| discovered_at | timestamptz | 发现时间 |
+| prechecked_at | timestamptz NULL | 预检时间 |
+| precheck_status | varchar(32) | 预检状态 |
+| total_files | int | 文件数 |
+| total_bytes | bigint | 总容量 |
+| manifest_hash | varchar(64) NULL | 清单哈希 |
+| quick_fingerprint | varchar(128) NULL | 快速指纹 |
+| failure_code | varchar(64) NULL | 失败码 |
+| failure_message | varchar(2000) NULL | 失败信息 |
+| expires_at | timestamptz NULL | 候选有效期 |
+| superseded_by_id | UUID NULL | 被新候选替代 |
+| created_at | timestamptz | 创建 |
+| updated_at | timestamptz | 更新 |
+
+索引：
+
+- `(task_id, discovered_at DESC)`；
+- `(task_id, business_unit_id, backup_business_time DESC)`；
+- `precheck_status`；
+- `candidate_key`。
+
+### 6.18 候选文件表 `candidate_files`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 文件 ID |
+| candidate_backup_set_id | UUID FK | 候选 |
+| relative_path | varchar(4096) | 相对路径 |
+| file_name | varchar(1024) | 文件名 |
+| size_bytes | bigint | 大小 |
+| last_modified_at | timestamptz | 修改时间 |
+| sha256 | varchar(64) NULL | SHA-256 |
+| quick_hash | varchar(64) NULL | 快速哈希 |
+| is_required | boolean | 是否必需 |
+| sort_order | int | 排序 |
+
+唯一索引：
+
+```text
+(candidate_backup_set_id, relative_path)
+```
+
+### 6.19 指令表 `commands`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 指令 ID |
+| client_id | UUID FK | 客户端 |
+| task_id | UUID NULL FK | 任务 |
+| candidate_backup_set_id | UUID NULL FK | 候选 |
+| command_type | varchar(32) | 类型 |
+| status | varchar(32) | 状态 |
+| priority | int | 优先级 |
+| payload | json/jsonb | 参数 |
+| nonce | varchar(128) UNIQUE | 防重放 |
+| signature | text | 服务端签名 |
+| created_by | UUID NULL | 创建人 |
+| created_at | timestamptz | 创建时间 |
+| expires_at | timestamptz | 过期时间 |
+| claimed_at | timestamptz NULL | 领取时间 |
+| started_at | timestamptz NULL | 开始 |
+| completed_at | timestamptz NULL | 完成 |
+| result_code | varchar(64) NULL | 结果码 |
+| result_message | varchar(2000) NULL | 结果信息 |
+| result_payload | json/jsonb NULL | 扩展结果 |
+| idempotency_key | varchar(128) UNIQUE | 幂等键 |
+
+索引：
+
+- `(client_id, status, priority, created_at)`；
+- `expires_at`；
+- `command_type`。
+
+### 6.20 上传批次表 `upload_batches`
+
+管理员一次批量下发形成一个批次。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 批次 ID |
+| name | varchar(255) | 名称 |
+| created_by | UUID | 创建人 |
+| max_concurrent_clients | int | 并发 |
+| max_concurrent_per_client | int | 单客户端并发 |
+| bandwidth_limit_kbps | int NULL | 临时限速 |
+| status | varchar(32) | pending/running/completed/partial/failed/cancelled |
+| total_items | int | 总项 |
+| succeeded_items | int | 成功 |
+| failed_items | int | 失败 |
+| created_at | timestamptz | 创建 |
+| completed_at | timestamptz NULL | 完成 |
+
+### 6.21 上传会话表 `upload_sessions`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 会话 ID |
+| upload_batch_id | UUID NULL FK | 上传批次 |
+| client_id | UUID FK | 客户端 |
+| task_id | UUID FK | 任务 |
+| candidate_backup_set_id | UUID FK | 候选 |
+| status | varchar(32) | 上传状态 |
+| total_files | int | 文件数 |
+| total_bytes | bigint | 总容量 |
+| uploaded_bytes | bigint | 已上传 |
+| verified_bytes | bigint | 已校验 |
+| chunk_size_bytes | int | 分块大小 |
+| staging_path | varchar(2048) | 临时路径 |
+| started_at | timestamptz NULL | 开始 |
+| last_activity_at | timestamptz NULL | 最近活动 |
+| completed_at | timestamptz NULL | 接收完成 |
+| verified_at | timestamptz NULL | 校验完成 |
+| committed_at | timestamptz NULL | 入库 |
+| retry_count | int | 重试 |
+| error_code | varchar(64) NULL | 错误码 |
+| error_message | varchar(2000) NULL | 错误 |
+| idempotency_key | varchar(128) UNIQUE | 幂等键 |
+| created_at | timestamptz | 创建 |
+| updated_at | timestamptz | 更新 |
+
+索引：
+
+- `(client_id, status)`；
+- `(task_id, created_at DESC)`；
+- `candidate_backup_set_id`；
+- `last_activity_at`。
+
+### 6.22 上传文件表 `upload_files`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 上传文件 ID |
+| upload_session_id | UUID FK | 会话 |
+| candidate_file_id | UUID FK | 候选文件 |
+| relative_path | varchar(4096) | 相对路径 |
+| size_bytes | bigint | 大小 |
+| expected_sha256 | varchar(64) | 客户端哈希 |
+| server_sha256 | varchar(64) NULL | 服务端哈希 |
+| uploaded_bytes | bigint | 已上传 |
+| total_chunks | int | 总块数 |
+| uploaded_chunks | int | 已完成块 |
+| status | varchar(32) | pending/uploading/received/verified/failed |
+| temp_path | varchar(2048) | 临时路径 |
+| error_code | varchar(64) NULL | 错误 |
+
+唯一索引：
+
+```text
+(upload_session_id, relative_path)
+```
+
+### 6.23 上传分块表 `upload_chunks`
+
+高并发或超大文件时数据量较大，建议按会话分区或仅保存未完成会话。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 分块 ID |
+| upload_file_id | UUID FK | 文件 |
+| chunk_index | int | 块序号 |
+| offset_bytes | bigint | 偏移 |
+| size_bytes | int | 块大小 |
+| expected_hash | varchar(64) | 客户端块哈希 |
+| server_hash | varchar(64) NULL | 服务端块哈希 |
+| status | varchar(32) | pending/received/verified/failed |
+| received_at | timestamptz NULL | 收到时间 |
+
+唯一索引：
+
+```text
+(upload_file_id, chunk_index)
+```
+
+会话正式入库后，可只保留汇总并删除分块明细。
+
+### 6.24 正式备份集表 `backup_sets`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 备份版本 ID |
+| client_id | UUID FK | 客户端 |
+| task_id | UUID FK | 任务 |
+| business_unit_id | UUID NULL FK | 业务单元 |
+| source_candidate_id | UUID FK | 来源候选 |
+| upload_session_id | UUID FK | 上传会话 |
+| backup_set_code | varchar(255) UNIQUE | 可读编号 |
+| status | varchar(32) | 备份状态 |
+| backup_business_time | timestamptz NULL | 业务备份时间 |
+| discovered_at | timestamptz | 发现时间 |
+| uploaded_at | timestamptz | 上传完成 |
+| verified_at | timestamptz | 校验完成 |
+| repository_path | varchar(2048) | 正式路径 |
+| manifest_path | varchar(2048) | 清单路径 |
+| manifest_sha256 | varchar(64) | 清单哈希 |
+| total_files | int | 文件数 |
+| total_bytes | bigint | 总容量 |
+| locked | boolean | 是否锁定 |
+| retention_until | timestamptz NULL | 至少保留到 |
+| created_at | timestamptz | 创建 |
+
+索引：
+
+- `(task_id, business_unit_id, backup_business_time DESC)`；
+- `(client_id, created_at DESC)`；
+- `status`；
+- `retention_until`。
+
+### 6.25 正式备份文件表 `backup_files`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 文件 ID |
+| backup_set_id | UUID FK | 备份集 |
+| relative_path | varchar(4096) | 相对路径 |
+| file_name | varchar(1024) | 文件名 |
+| size_bytes | bigint | 大小 |
+| last_modified_at | timestamptz | 原修改时间 |
+| sha256 | varchar(64) | 哈希 |
+| repository_relative_path | varchar(4096) | 仓库相对路径 |
+| verification_status | varchar(32) | verified/failed |
+| created_at | timestamptz | 创建 |
+
+唯一索引：
+
+```text
+(backup_set_id, relative_path)
+```
+
+### 6.26 保留策略表 `retention_policies`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 策略 ID |
+| name | varchar(128) | 名称 |
+| keep_last_count | int | 保留最近数量 |
+| keep_weekly_count | int | 周版本 |
+| keep_monthly_count | int | 月版本 |
+| keep_yearly_count | int | 年版本 |
+| minimum_retention_days | int | 最短天数 |
+| recycle_bin_days | int | 回收区天数 |
+| config | json/jsonb | 扩展规则 |
+| created_at | timestamptz | 创建 |
+| updated_at | timestamptz | 更新 |
+
+### 6.27 保留锁表 `retention_locks`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 锁 ID |
+| backup_set_id | UUID FK | 备份集 |
+| reason | varchar(1000) | 原因 |
+| locked_by | UUID | 操作人 |
+| locked_at | timestamptz | 锁定时间 |
+| expires_at | timestamptz NULL | 可空，永久锁 |
+| active | boolean | 是否有效 |
+
+### 6.28 恢复请求表 `restore_requests`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 请求 ID |
+| backup_set_id | UUID FK | 备份集 |
+| requested_by | UUID | 申请人 |
+| purpose | varchar(1000) | 恢复用途 |
+| status | varchar(32) | requested/verifying/ready/downloading/completed/failed/expired |
+| requested_at | timestamptz | 申请时间 |
+| verified_at | timestamptz NULL | 下载前校验 |
+| download_token_hash | varchar(255) NULL | 下载令牌哈希 |
+| download_expires_at | timestamptz NULL | 过期时间 |
+| downloaded_bytes | bigint | 已下载 |
+| completed_at | timestamptz NULL | 完成 |
+| client_ip | varchar(64) NULL | 下载 IP |
+| error_message | varchar(2000) NULL | 错误 |
+
+### 6.29 告警表 `alerts`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | 告警 ID |
+| alert_key | varchar(255) | 去重键 |
+| level | varchar(32) | 等级 |
+| status | varchar(32) | 状态 |
+| category | varchar(64) | 分类 |
+| client_id | UUID NULL FK | 客户端 |
+| task_id | UUID NULL FK | 任务 |
+| business_unit_id | UUID NULL FK | 业务单元 |
+| backup_set_id | UUID NULL FK | 备份集 |
+| title | varchar(255) | 标题 |
+| message | varchar(4000) | 内容 |
+| first_occurred_at | timestamptz | 首次 |
+| last_occurred_at | timestamptz | 最近 |
+| occurrence_count | int | 次数 |
+| acknowledged_by | UUID NULL | 确认人 |
+| acknowledged_at | timestamptz NULL | 确认时间 |
+| recovered_at | timestamptz NULL | 恢复时间 |
+| closed_at | timestamptz NULL | 关闭时间 |
+| handling_note | varchar(4000) NULL | 处理说明 |
+| metadata | json/jsonb | 扩展 |
+
+活动告警唯一约束建议：
+
+```text
+(alert_key, status) WHERE status IN ('open','acknowledged','in_progress')
+```
+
+### 6.30 通知记录表 `notification_deliveries`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | ID |
+| alert_id | UUID NULL FK | 告警 |
+| channel | varchar(32) | email/wecom/dingtalk |
+| recipient | varchar(255) | 接收方 |
+| status | varchar(32) | pending/sent/failed |
+| attempt_count | int | 尝试次数 |
+| last_attempt_at | timestamptz NULL | 最近尝试 |
+| sent_at | timestamptz NULL | 发送时间 |
+| error_message | varchar(2000) NULL | 错误 |
+
+### 6.31 审计日志表 `audit_logs`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID PK | ID |
+| occurred_at | timestamptz | 时间 |
+| user_id | UUID NULL | 用户 |
+| username_snapshot | varchar(128) NULL | 用户名快照 |
+| client_ip | varchar(64) NULL | 来源 IP |
+| action | varchar(128) | 操作 |
+| resource_type | varchar(64) | 对象类型 |
+| resource_id | UUID NULL | 对象 ID |
+| request_id | varchar(128) | 请求跟踪 |
+| result | varchar(32) | success/failure |
+| before_data | json/jsonb NULL | 修改前摘要 |
+| after_data | json/jsonb NULL | 修改后摘要 |
+| error_code | varchar(64) NULL | 错误码 |
+| error_message | varchar(2000) NULL | 错误 |
+| user_agent | varchar(512) NULL | 浏览器 |
+| metadata | json/jsonb NULL | 扩展 |
+
+索引：
+
+- `(occurred_at DESC)`；
+- `(user_id, occurred_at DESC)`；
+- `(resource_type, resource_id)`；
+- `action`。
+
+审计日志不得通过普通 API 修改或删除。
+
+### 6.32 系统配置表 `system_settings`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| setting_key | varchar(128) PK | 配置键 |
+| setting_value | json/jsonb | 配置值 |
+| encrypted | boolean | 是否加密 |
+| updated_by | UUID | 更新人 |
+| updated_at | timestamptz | 更新时间 |
+| row_version | bigint | 乐观锁 |
+
+敏感配置必须应用层加密。
+
+---
+
+## 7. 数据库索引与分区建议
+
+### 7.1 高频查询索引
+
+必须重点优化：
+
+- 客户端在线状态；
+- 待领取指令；
+- 活跃上传会话；
+- 任务最近成功时间；
+- 某任务最近备份版本；
+- 未处理告警；
+- 备份记录筛选；
+- 审计日志时间范围。
+
+### 7.2 大表
+
+可能快速增长：
+
+- `client_heartbeats`
+- `audit_logs`
+- `upload_chunks`
+- `notification_deliveries`
+
+建议：
+
+- PostgreSQL 按月分区；
+- SQL Server 使用分区表或定期归档；
+- SQLite 试点阶段限制客户端数量和历史周期。
+
+### 7.3 数据保留
+
+| 数据 | 建议保留 |
+|---|---|
+| 原始心跳 | 30 天 |
+| 小时汇总监控 | 12 个月 |
+| 上传分块明细 | 入库后 7 天或立即汇总删除 |
+| 指令记录 | 2 年 |
+| 上传会话 | 2 年 |
+| 备份元数据 | 与备份文件一致 |
+| 告警 | 3 年 |
+| 审计日志 | 至少 3 年 |
+| 下载记录 | 至少 3 年 |
+
+---
+
+## 8. API 通用规范
+
+### 8.1 基础路径
+
+```text
+/api/v1
+```
+
+客户端接口：
+
+```text
+/api/v1/agent
+```
+
+管理接口：
+
+```text
+/api/v1/admin
+```
+
+下载接口：
+
+```text
+/api/v1/downloads
+```
+
+### 8.2 请求头
+
+管理接口：
+
+```http
+Authorization: Bearer <access_token>
+Content-Type: application/json
+X-Request-Id: <uuid>
+Idempotency-Key: <unique-key>
+```
+
+客户端接口：
+
+```http
+X-Client-Id: <uuid>
+X-Agent-Version: 1.0.0
+X-Request-Id: <uuid>
+Content-Type: application/json
+```
+
+客户端身份通过 TLS 客户端证书或等效设备凭据验证。
+
+### 8.3 通用响应格式
+
+成功：
+
+```json
+{
+  "success": true,
+  "requestId": "bda50834-5f37-46e7-b841-c2c5738d9b3f",
+  "data": {},
+  "message": null
+}
+```
+
+失败：
+
+```json
+{
+  "success": false,
+  "requestId": "bda50834-5f37-46e7-b841-c2c5738d9b3f",
+  "error": {
+    "code": "TASK_PATH_NOT_FOUND",
+    "message": "备份目录不存在",
+    "details": {
+      "taskId": "...",
+      "path": "D:\\Backup"
+    }
+  }
+}
+```
+
+### 8.4 分页
+
+请求：
+
+```text
+?page=1&pageSize=50&sort=createdAt:desc
+```
+
+响应：
+
+```json
+{
+  "items": [],
+  "page": 1,
+  "pageSize": 50,
+  "total": 0,
+  "totalPages": 0
+}
+```
+
+`pageSize` 最大 200。
+
+### 8.5 幂等
+
+以下接口必须支持 `Idempotency-Key`：
+
+- 创建批量上传；
+- 下发指令；
+- 创建上传会话；
+- 完成上传；
+- 创建恢复下载；
+- 客户端提交预检结果。
+
+同一幂等键重复请求，应返回原结果，不重复执行。
+
+---
+
+## 9. 认证接口
+
+### 9.1 管理员登录
+
+```http
+POST /api/v1/auth/login
+```
+
+请求：
+
+```json
+{
+  "username": "backupadmin",
+  "password": "******"
+}
+```
+
+响应：
+
+```json
+{
+  "accessToken": "...",
+  "refreshToken": "...",
+  "expiresIn": 3600,
+  "user": {
+    "id": "...",
+    "displayName": "备份管理员",
+    "permissions": ["tasks.read", "tasks.upload"]
+  }
+}
+```
+
+### 9.2 刷新令牌
+
+```http
+POST /api/v1/auth/refresh
+```
+
+### 9.3 退出
+
+```http
+POST /api/v1/auth/logout
+```
+
+服务端吊销刷新令牌。
+
+---
+
+## 10. 客户端注册接口
+
+### 10.1 提交注册
+
+```http
+POST /api/v1/agent/registrations
+```
+
+请求：
+
+```json
+{
+  "registrationToken": "一次性令牌",
+  "machineId": "machine-guid",
+  "hostname": "ERP-SERVER-01",
+  "displayName": "用友ERP服务器",
+  "osName": "Windows Server 2019",
+  "osVersion": "10.0.17763",
+  "architecture": "x64",
+  "agentVersion": "1.0.0",
+  "publicKey": "..."
+}
+```
+
+响应：
+
+```json
+{
+  "registrationId": "...",
+  "status": "pending_approval",
+  "pollAfterSeconds": 30
+}
+```
+
+### 10.2 查询注册结果
+
+```http
+GET /api/v1/agent/registrations/{registrationId}
+```
+
+成功后返回客户端 ID 和证书签发结果。
+
+---
+
+## 11. 心跳和配置接口
+
+### 11.1 心跳
+
+```http
+POST /api/v1/agent/heartbeat
+```
+
+请求：
+
+```json
+{
+  "clientTime": "2026-07-31T09:00:00Z",
+  "agentUptimeSeconds": 3600,
+  "systemUptimeSeconds": 864000,
+  "configVersion": 18,
+  "metrics": {
+    "cpuPercent": 12.5,
+    "memoryPercent": 63.2,
+    "memoryAvailableBytes": 8589934592,
+    "agentMemoryBytes": 73400320,
+    "networkSendBps": 1024,
+    "networkReceiveBps": 2048
+  },
+  "disks": [
+    {
+      "driveName": "D:",
+      "filesystem": "NTFS",
+      "totalBytes": 1099511627776,
+      "freeBytes": 549755813888,
+      "isSourceVolume": true
+    }
+  ],
+  "serviceStates": [
+    {
+      "serviceName": "MSSQLSERVER",
+      "actualState": "running",
+      "startType": "auto"
+    }
+  ],
+  "activeCommands": [],
+  "activeUploads": []
+}
+```
+
+响应：
+
+```json
+{
+  "serverTime": "2026-07-31T09:00:01Z",
+  "requiredConfigVersion": 19,
+  "commandsAvailable": true,
+  "heartbeatIntervalSeconds": 60
+}
+```
+
+### 11.2 获取配置
+
+```http
+GET /api/v1/agent/config?currentVersion=18
+```
+
+响应：
+
+```json
+{
+  "version": 19,
+  "issuedAt": "2026-07-31T08:30:00Z",
+  "signature": "...",
+  "tasks": [],
+  "monitoredServices": [],
+  "globalSettings": {
+    "heartbeatIntervalSeconds": 60,
+    "maxConcurrentUploads": 1
+  }
+}
+```
+
+---
+
+## 12. 指令接口
+
+### 12.1 领取指令
+
+```http
+POST /api/v1/agent/commands/claim
+```
+
+请求：
+
+```json
+{
+  "maxItems": 5,
+  "supportedCommandTypes": [
+    "precheck_task",
+    "upload_candidate",
+    "pause_upload",
+    "resume_upload",
+    "cancel_upload"
+  ]
+}
+```
+
+响应：
+
+```json
+{
+  "commands": [
+    {
+      "id": "...",
+      "type": "precheck_task",
+      "taskId": "...",
+      "candidateBackupSetId": null,
+      "payload": {},
+      "createdAt": "...",
+      "expiresAt": "...",
+      "nonce": "...",
+      "signature": "..."
+    }
+  ]
+}
+```
+
+### 12.2 上报指令开始
+
+```http
+POST /api/v1/agent/commands/{commandId}/started
+```
+
+### 12.3 上报指令进度
+
+```http
+POST /api/v1/agent/commands/{commandId}/progress
+```
+
+请求：
+
+```json
+{
+  "percent": 35.6,
+  "stage": "hashing",
+  "message": "正在计算第 5 个文件哈希"
+}
+```
+
+### 12.4 上报指令完成
+
+```http
+POST /api/v1/agent/commands/{commandId}/completed
+```
+
+请求：
+
+```json
+{
+  "success": true,
+  "resultCode": "OK",
+  "resultMessage": "预检完成",
+  "result": {}
+}
+```
+
+---
+
+## 13. 预检接口
+
+### 13.1 提交预检结果
+
+```http
+POST /api/v1/agent/tasks/{taskId}/precheck-results
+```
+
+请求：
+
+```json
+{
+  "commandId": "...",
+  "businessUnit": {
+    "externalKey": "001",
+    "displayName": "账套001",
+    "sourceRelativePath": "001"
+  },
+  "candidateKey": "ERP01-001-20260731-013000",
+  "sourceRoot": "D:\\UFBackup\\001\\20260731",
+  "backupBusinessTime": "2026-07-31T01:30:00+09:00",
+  "precheckStatus": "passed",
+  "totalFiles": 12,
+  "totalBytes": 18700000000,
+  "quickFingerprint": "...",
+  "manifestHash": "...",
+  "files": [
+    {
+      "relativePath": "backup001.bak",
+      "sizeBytes": 18000000000,
+      "lastModifiedAt": "2026-07-31T01:30:00+09:00",
+      "sha256": "...",
+      "isRequired": true
+    }
+  ]
+}
+```
+
+响应：
+
+```json
+{
+  "candidateBackupSetId": "...",
+  "accepted": true,
+  "nextAction": "wait_for_approval"
+}
+```
+
+### 13.2 查询任务测试结果
+
+```http
+POST /api/v1/admin/backup-tasks/{taskId}/test-recognition
+```
+
+接口创建预检指令，返回异步操作 ID。
+
+---
+
+## 14. 上传协议
+
+### 14.1 创建上传会话
+
+```http
+POST /api/v1/agent/upload-sessions
+```
+
+请求：
+
+```json
+{
+  "candidateBackupSetId": "...",
+  "commandId": "...",
+  "totalFiles": 12,
+  "totalBytes": 18700000000,
+  "chunkSizeBytes": 8388608,
+  "manifestHash": "...",
+  "idempotencyKey": "..."
+}
+```
+
+响应：
+
+```json
+{
+  "uploadSessionId": "...",
+  "status": "created",
+  "chunkSizeBytes": 8388608,
+  "expiresAt": "...",
+  "files": [
+    {
+      "uploadFileId": "...",
+      "relativePath": "backup001.bak",
+      "missingChunks": "all"
+    }
+  ]
+}
+```
+
+服务端在创建会话时检查：
+
+- 客户端身份；
+- 任务归属；
+- 候选是否有效；
+- 候选是否已入库；
+- 空间是否足够；
+- 并发是否允许；
+- 命令是否有效；
+- manifest 是否一致。
+
+### 14.2 查询缺失块
+
+```http
+GET /api/v1/agent/upload-sessions/{sessionId}/files/{fileId}/missing-chunks
+```
+
+响应：
+
+```json
+{
+  "missing": [0, 1, 5, 6],
+  "received": [2, 3, 4]
+}
+```
+
+文件块特别多时可返回范围：
+
+```json
+{
+  "missingRanges": [
+    {"start": 0, "end": 1},
+    {"start": 5, "end": 6}
+  ]
+}
+```
+
+### 14.3 上传分块
+
+```http
+PUT /api/v1/agent/upload-sessions/{sessionId}/files/{fileId}/chunks/{chunkIndex}
+```
+
+请求头：
+
+```http
+Content-Type: application/octet-stream
+Content-Length: 8388608
+X-Chunk-Offset: 0
+X-Chunk-SHA256: ...
+```
+
+响应：
+
+```json
+{
+  "received": true,
+  "chunkIndex": 0,
+  "serverHash": "..."
+}
+```
+
+服务端必须校验：
+
+- 会话归属；
+- 文件归属；
+- 块序号；
+- 偏移；
+- 长度；
+- 块哈希；
+- 会话状态；
+- 路径安全。
+
+### 14.4 完成单文件
+
+```http
+POST /api/v1/agent/upload-sessions/{sessionId}/files/{fileId}/complete
+```
+
+请求：
+
+```json
+{
+  "sizeBytes": 18000000000,
+  "sha256": "..."
+}
+```
+
+服务端确认临时文件并计算整体哈希。
+
+### 14.5 完成会话
+
+```http
+POST /api/v1/agent/upload-sessions/{sessionId}/complete
+```
+
+请求：
+
+```json
+{
+  "manifestHash": "...",
+  "totalFiles": 12,
+  "totalBytes": 18700000000
+}
+```
+
+响应：
+
+```json
+{
+  "status": "verifying",
+  "verificationOperationId": "..."
+}
+```
+
+### 14.6 查询会话
+
+```http
+GET /api/v1/agent/upload-sessions/{sessionId}
+```
+
+响应包含：
+
+- 会话状态；
+- 已上传字节；
+- 文件进度；
+- 错误；
+- 缺失块；
+- 是否可恢复。
+
+### 14.7 取消会话
+
+```http
+POST /api/v1/agent/upload-sessions/{sessionId}/cancel
+```
+
+取消后临时文件按策略保留一定时间。
+
+---
+
+## 15. 管理端客户端接口
+
+### 15.1 客户端列表
+
+```http
+GET /api/v1/admin/clients
+```
+
+筛选参数：
+
+- `status`
+- `groupId`
+- `keyword`
+- `agentVersion`
+- `hasAlert`
+- `lastHeartbeatBefore`
+
+### 15.2 客户端详情
+
+```http
+GET /api/v1/admin/clients/{clientId}
+```
+
+### 15.3 审批客户端
+
+```http
+POST /api/v1/admin/clients/{clientId}/approve
+```
+
+### 15.4 禁用客户端
+
+```http
+POST /api/v1/admin/clients/{clientId}/disable
+```
+
+### 15.5 注销客户端
+
+```http
+POST /api/v1/admin/clients/{clientId}/revoke
+```
+
+必须记录原因并吊销证书。
+
+### 15.6 刷新主机状态
+
+```http
+POST /api/v1/admin/clients/{clientId}/refresh-metrics
+```
+
+创建 `refresh_metrics` 指令。
+
+---
+
+## 16. 备份任务接口
+
+### 16.1 创建任务
+
+```http
+POST /api/v1/admin/backup-tasks
+```
+
+请求：
+
+```json
+{
+  "clientId": "...",
+  "name": "用友ERP账套备份",
+  "applicationName": "用友U8",
+  "sourcePath": "D:\\UFBackup",
+  "recognizerType": "subdirectory_units",
+  "taskMode": "approval_required",
+  "enabled": true,
+  "scheduleTimezone": "Asia/Tokyo",
+  "stabilityIntervalSeconds": 600,
+  "maxStabilityWaitSeconds": 7200,
+  "bandwidthLimitKbps": 51200,
+  "recognizerConfig": {
+    "recursive": true,
+    "businessUnitDepth": 1,
+    "excludeDirectories": ["Temp", "Old"],
+    "requiredFiles": []
+  }
+}
+```
+
+### 16.2 修改任务
+
+```http
+PUT /api/v1/admin/backup-tasks/{taskId}
+```
+
+请求必须携带 `rowVersion`。
+
+### 16.3 查询任务
+
+```http
+GET /api/v1/admin/backup-tasks/{taskId}
+```
+
+### 16.4 任务列表
+
+```http
+GET /api/v1/admin/backup-tasks
+```
+
+筛选：
+
+- 客户端；
+- 分组；
+- 模式；
+- 状态；
+- 应用；
+- 是否有告警；
+- 最近成功时间。
+
+### 16.5 暂停或恢复任务
+
+```http
+POST /api/v1/admin/backup-tasks/{taskId}/pause
+POST /api/v1/admin/backup-tasks/{taskId}/resume
+```
+
+### 16.6 下发预检
+
+```http
+POST /api/v1/admin/backup-tasks/{taskId}/precheck
+```
+
+### 16.7 下发上传
+
+```http
+POST /api/v1/admin/backup-tasks/{taskId}/upload
+```
+
+请求：
+
+```json
+{
+  "candidateBackupSetId": "...",
+  "force": false,
+  "bandwidthLimitKbps": null
+}
+```
+
+---
+
+## 17. 批量操作接口
+
+### 17.1 创建批量预检
+
+```http
+POST /api/v1/admin/operations/precheck-batches
+```
+
+请求：
+
+```json
+{
+  "scope": {
+    "clientGroupIds": ["..."],
+    "clientIds": [],
+    "taskIds": [],
+    "applicationNames": []
+  },
+  "onlyEnabled": true
+}
+```
+
+### 17.2 创建批量上传
+
+```http
+POST /api/v1/admin/operations/upload-batches
+```
+
+请求：
+
+```json
+{
+  "candidateBackupSetIds": ["...", "..."],
+  "maxConcurrentClients": 2,
+  "maxConcurrentPerClient": 1,
+  "temporaryBandwidthLimitKbps": 51200,
+  "skipBusyClients": true
+}
+```
+
+### 17.3 查询批次
+
+```http
+GET /api/v1/admin/operations/upload-batches/{batchId}
+```
+
+---
+
+## 18. 备份记录接口
+
+### 18.1 备份列表
+
+```http
+GET /api/v1/admin/backups
+```
+
+筛选：
+
+- `clientId`
+- `taskId`
+- `businessUnitId`
+- `applicationName`
+- `status`
+- `from`
+- `to`
+- `keyword`
+
+### 18.2 备份详情
+
+```http
+GET /api/v1/admin/backups/{backupSetId}
+```
+
+### 18.3 文件清单
+
+```http
+GET /api/v1/admin/backups/{backupSetId}/files
+```
+
+### 18.4 锁定备份
+
+```http
+POST /api/v1/admin/backups/{backupSetId}/lock
+```
+
+### 18.5 解锁备份
+
+```http
+POST /api/v1/admin/backups/{backupSetId}/unlock
+```
+
+### 18.6 重新校验
+
+```http
+POST /api/v1/admin/backups/{backupSetId}/verify
+```
+
+异步执行。
+
+---
+
+## 19. 恢复下载接口
+
+### 19.1 创建恢复请求
+
+```http
+POST /api/v1/admin/restore-requests
+```
+
+请求：
+
+```json
+{
+  "backupSetId": "...",
+  "purpose": "恢复到测试环境验证",
+  "selection": {
+    "type": "full"
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "restoreRequestId": "...",
+  "status": "verifying"
+}
+```
+
+### 19.2 查询恢复请求
+
+```http
+GET /api/v1/admin/restore-requests/{requestId}
+```
+
+### 19.3 下载
+
+```http
+GET /api/v1/downloads/{downloadToken}
+```
+
+要求：
+
+- 令牌短期有效；
+- 令牌只绑定一个恢复请求；
+- 支持 Range；
+- 记录下载 IP 和字节；
+- 下载前完成完整性校验。
+
+---
+
+## 20. 告警接口
+
+### 20.1 告警列表
+
+```http
+GET /api/v1/admin/alerts
+```
+
+筛选：
+
+- 等级；
+- 状态；
+- 分类；
+- 客户端；
+- 任务；
+- 日期。
+
+### 20.2 确认告警
+
+```http
+POST /api/v1/admin/alerts/{alertId}/acknowledge
+```
+
+### 20.3 更新处理状态
+
+```http
+POST /api/v1/admin/alerts/{alertId}/handle
+```
+
+请求：
+
+```json
+{
+  "status": "in_progress",
+  "note": "正在检查应用自动备份任务"
+}
+```
+
+### 20.4 关闭告警
+
+```http
+POST /api/v1/admin/alerts/{alertId}/close
+```
+
+---
+
+## 21. 审计接口
+
+### 21.1 查询审计日志
+
+```http
+GET /api/v1/admin/audit-logs
+```
+
+只有审计权限可用。
+
+支持：
+
+- 用户；
+- 操作；
+- 对象；
+- 结果；
+- 时间；
+- 请求 ID。
+
+审计日志无修改和删除接口。
+
+---
+
+## 22. 错误码
+
+### 22.1 通用
+
+| 错误码 | HTTP | 含义 |
+|---|---:|---|
+| INVALID_REQUEST | 400 | 请求不合法 |
+| UNAUTHORIZED | 401 | 未认证 |
+| FORBIDDEN | 403 | 无权限 |
+| NOT_FOUND | 404 | 资源不存在 |
+| CONFLICT | 409 | 状态冲突 |
+| VERSION_CONFLICT | 409 | 乐观锁冲突 |
+| RATE_LIMITED | 429 | 请求过多 |
+| INTERNAL_ERROR | 500 | 内部错误 |
+| SERVICE_UNAVAILABLE | 503 | 服务不可用 |
+
+### 22.2 客户端与安全
+
+| 错误码 | 含义 |
+|---|---|
+| CLIENT_NOT_REGISTERED | 客户端未注册 |
+| CLIENT_DISABLED | 客户端已禁用 |
+| CLIENT_CERTIFICATE_INVALID | 客户端证书无效 |
+| CLIENT_CERTIFICATE_EXPIRED | 客户端证书过期 |
+| COMMAND_EXPIRED | 指令过期 |
+| COMMAND_REPLAYED | 指令重复 |
+| COMMAND_SIGNATURE_INVALID | 指令签名错误 |
+| COMMAND_NOT_SUPPORTED | 客户端不支持该指令 |
+
+### 22.3 任务与预检
+
+| 错误码 | 含义 |
+|---|---|
+| TASK_NOT_ENABLED | 任务未启用 |
+| TASK_PATH_NOT_FOUND | 源路径不存在 |
+| TASK_ACCESS_DENIED | 无访问权限 |
+| NO_NEW_BACKUP | 没有新备份 |
+| FILE_STILL_CHANGING | 文件仍变化 |
+| REQUIRED_FILE_MISSING | 必需文件缺失 |
+| BACKUP_SIZE_ABNORMAL | 容量异常 |
+| CANDIDATE_EXPIRED | 候选已过期 |
+| CANDIDATE_CHANGED | 候选已变化 |
+| CANDIDATE_ALREADY_ARCHIVED | 已正式入库 |
+
+### 22.4 上传
+
+| 错误码 | 含义 |
+|---|---|
+| UPLOAD_NOT_PERMITTED | 未获得上传许可 |
+| UPLOAD_SESSION_EXPIRED | 会话过期 |
+| UPLOAD_SESSION_CONFLICT | 会话冲突 |
+| CHUNK_INVALID | 分块参数错误 |
+| CHUNK_HASH_MISMATCH | 分块哈希错误 |
+| FILE_HASH_MISMATCH | 文件哈希错误 |
+| MANIFEST_MISMATCH | 清单不一致 |
+| STORAGE_SPACE_LOW | 空间不足 |
+| STORAGE_UNAVAILABLE | 存储不可用 |
+| UPLOAD_CANCELLED | 上传已取消 |
+
+---
+
+## 23. 接口安全要求
+
+### 23.1 客户端认证
+
+推荐：
+
+- mTLS；
+- 每台客户端独立证书；
+- 证书与客户端 ID 绑定；
+- 证书吊销列表；
+- 证书定期轮换；
+- 客户端校验服务端证书。
+
+### 23.2 管理认证
+
+- Access Token 短期有效；
+- Refresh Token 可撤销；
+- 高风险操作要求二次确认；
+- 可选 MFA；
+- 登录失败锁定；
+- 管理页面限制管理网段。
+
+### 23.3 防重放
+
+客户端指令和关键请求包含：
+
+- 时间戳；
+- Nonce；
+- 请求 ID；
+- 幂等键；
+- 签名；
+- 有效期。
+
+### 23.4 路径安全
+
+- 客户端上传只使用相对路径；
+- 拒绝 `..`；
+- 拒绝绝对路径；
+- 拒绝 UNC；
+- 拒绝设备路径；
+- 服务端规范化后再次校验；
+- 正式路径完全由服务端生成。
+
+### 23.5 文件安全
+
+- 限制单文件最大值；
+- 限制文件数量；
+- 限制路径长度；
+- 限制会话总容量；
+- 临时目录与正式目录分开；
+- 校验通过前不可下载；
+- 正式文件默认只读。
+
+---
+
+## 24. 上传状态一致性
+
+服务端必须保证：
+
+1. 数据库会话状态和临时文件一致；
+2. 入库操作具备事务性；
+3. 数据库写入失败时不得暴露半成品正式目录；
+4. 正式目录成功创建后写入备份集记录；
+5. 服务重启后扫描未完成会话；
+6. 孤立临时目录进入隔离清理；
+7. 同一候选只能生成一个有效正式版本。
+
+建议入库流程：
+
+```text
+校验完成
+  → 创建仓库临时提交目录
+  → 写入 manifest
+  → 刷新文件缓存
+  → 原子重命名为正式目录
+  → 数据库事务写 backup_sets 与 backup_files
+  → 标记 upload_session=committed
+```
+
+若文件系统和数据库无法形成真正分布式事务，必须通过可恢复状态机保证最终一致。
+
+---
+
+## 25. 定时任务
+
+服务端后台任务：
+
+- 客户端离线判定；
+- 指令过期；
+- 上传会话超时；
+- 临时文件清理；
+- 保留策略计算；
+- 回收区物理删除；
+- 仓库一致性检查；
+- 数据库备份；
+- 告警通知；
+- 证书到期检查；
+- 监控数据汇总；
+- 审计归档。
+
+所有定时任务应支持：
+
+- 单实例锁；
+- 幂等；
+- 执行日志；
+- 失败重试；
+- 手动触发。
+
+第一版单服务端部署时可使用数据库锁或进程内锁。
+
+---
+
+## 26. 数据迁移与版本管理
+
+数据库使用迁移工具管理版本。
+
+要求：
+
+- 每次发布包含数据库迁移脚本；
+- 迁移前自动检查版本；
+- 迁移前备份数据库；
+- 不允许手工修改生产表；
+- 破坏性迁移必须提供回滚或恢复方案；
+- API 版本与数据库版本可查询。
+
+---
+
+## 27. 日志与追踪
+
+所有接口生成 `requestId`。
+
+日志应包含：
+
+- 时间；
+- 请求 ID；
+- 用户或客户端 ID；
+- API；
+- 状态码；
+- 耗时；
+- 错误码；
+- 目标资源；
+- 上传会话 ID；
+- 指令 ID。
+
+不得记录：
+
+- 明文密码；
+- 注册令牌；
+- 私钥；
+- 完整访问令牌；
+- 敏感文件内容。
+
+---
+
+## 28. 性能指标
+
+建议目标：
+
+- 100 个客户端心跳无压力；
+- 每分钟至少处理 500 次心跳；
+- 同时 2 至 5 个大文件上传；
+- 列表查询 95% 小于 2 秒；
+- 心跳接口 95% 小于 500ms；
+- 创建上传会话小于 2 秒；
+- 断点恢复查询小于 3 秒；
+- 支持单文件 1TB；
+- 支持单会话 100,000 个文件。
+
+大量文件清单提交应支持分页或压缩传输，避免单个 JSON 过大。
+
+---
+
+## 29. 数据库备份
+
+服务端数据库必须定期备份。
+
+建议：
+
+- 每日全备；
+- 重要变更前手动备份；
+- 数据库备份复制到正式仓库之外；
+- 定期恢复验证；
+- 数据库备份本身纳入离线副本。
+
+需要备份：
+
+- 数据库；
+- 服务端配置；
+- 证书和密钥；
+- 任务模板；
+- 通知配置；
+- 正式仓库。
+
+---
+
+## 30. 开发顺序建议
+
+第一批接口：
+
+1. 登录；
+2. 客户端注册；
+3. 心跳；
+4. 配置同步；
+5. 客户端管理；
+6. 任务管理；
+7. 指令领取与回报；
+8. 预检结果；
+9. 创建上传会话；
+10. 分块上传；
+11. 完成文件；
+12. 完成会话；
+13. 校验入库；
+14. 备份查询；
+15. 告警；
+16. 审计。
+
+第二批接口：
+
+- 恢复下载；
+- 保留策略；
+- 通知；
+- Agent 升级；
+- 深度校验；
+- 报表。
+
+---
+
+## 31. 数据库验收要求
+
+- 所有主外键正确；
+- 关键唯一约束有效；
+- 重复指令不会重复执行；
+- 同一候选不会重复正式入库；
+- 客户端注销后不能继续上传；
+- 并发修改任务产生版本冲突；
+- 审计日志不可普通修改；
+- 分块上传断点可恢复；
+- 入库失败不会留下可见半成品；
+- 删除备份前检查锁和保留策略；
+- 备份元数据与仓库文件可一致性校验。
+
+---
+
+## 32. 接口验收要求
+
+- 所有接口仅 HTTPS；
+- 无证书客户端不能调用 Agent API；
+- 无权限用户不能访问管理资源；
+- 分页、筛选、排序正常；
+- 幂等键生效；
+- 指令签名和有效期生效；
+- 目录穿越被拒绝；
+- 超大请求被限制；
+- 上传块哈希错误被拒绝；
+- 文件哈希错误不能入库；
+- Range 下载正常；
+- 接口错误返回统一错误码；
+- 全链路 requestId 可追踪；
+- 关键写操作生成审计日志。
+
+---
+
+## 33. 总结
+
+数据库和接口设计围绕以下核心原则展开：
+
+- 元数据关系化，原始文件文件化；
+- 客户端主动连接，服务端不反向控制主机；
+- 每台客户端独立身份；
+- 指令白名单、签名、防重放；
+- 预检、上传、校验、入库分别建模；
+- 分块上传支持断点续传；
+- 服务端不信任客户端哈希，必须重新校验；
+- 正式仓库路径由服务端生成；
+- 客户端不能覆盖或删除历史版本；
+- 备份文件脱离系统仍然可使用；
+- 数据库、文件系统和审计记录能够相互核对。

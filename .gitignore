@@ -1,0 +1,20 @@
+# ---- 构建产物 ----
+[Bb]in/
+[Oo]bj/
+publish/
+*.user
+*.suo
+.vs/
+
+# ---- 密钥与本机配置（禁止入库）----
+prod_keys.txt
+setup-env.ps1
+appsettings.*.local.json
+*.pfx
+*.p12
+*.key
+data/
+
+# ---- 运行时产物 ----
+logs/
+*.log
