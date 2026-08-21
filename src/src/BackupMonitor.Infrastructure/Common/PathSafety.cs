@@ -76,6 +76,33 @@ public static class PathSafety
         }
     }
 
+    /// <summary>
+    /// 判断一个已经成形的绝对路径是否位于基目录之内（基目录自身不算"之内"）。
+    /// 与 ResolveUnderBase 使用同一套包含判定，供两端已是绝对路径的场景使用——
+    /// 典型用途是删除前的围栏：待删目录取自数据库，必须确认它确实落在当前仓库根之下。
+    /// </summary>
+    public static bool IsUnderBase(string basePath, string fullPath)
+    {
+        if (string.IsNullOrWhiteSpace(basePath) || string.IsNullOrWhiteSpace(fullPath))
+            return false;
+
+        try
+        {
+            var resolvedBase = Path.GetFullPath(basePath);
+            var resolvedTarget = Path.GetFullPath(fullPath);
+
+            var prefix = resolvedBase.EndsWith(Path.DirectorySeparatorChar)
+                ? resolvedBase
+                : resolvedBase + Path.DirectorySeparatorChar;
+
+            return resolvedTarget.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>清理目录/文件名中的非法字符（服务端生成正式路径用）</summary>
     public static string SanitizePathComponent(string name)
     {

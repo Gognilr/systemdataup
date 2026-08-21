@@ -1,0 +1,126 @@
+/* js/views/alerts.js —— 告警列表（可排序/多选批量确认）/ 抽屉详情 / 处理动作 */
+import { api } from '../api.js';
+import { App, ACTIONS, LOADERS } from '../state.js';
+import {
+  $, esc, L, optsOf, status, fmtDT, relTime, prettyJson,
+  tableHtml, pagerHtml, skeleton, emptyState, hasFilter, batchBarHtml,
+  toast, errToast, formModal, openDrawer
+} from '../ui.js';
+import { shell, loading } from '../app.js';
+
+export async function vAlerts() {
+  App.state.alerts = App.state.alerts || { page: 1, pageSize: 20, level: '', status: '', totalCount: 0, selected: [], sortKey: 'lastOccurredAt', sortDesc: true };
+  const st = App.state.alerts;
+  $('#app').innerHTML = shell('alerts', '告警', `
+    <div class="toolbar">
+      <select id="f_level"><option value="">全部等级</option>${optsOf(L.alert_level).map(o => `<option value="${o.v}" ${st.level === o.v ? 'selected' : ''}>${o.t}</option>`).join('')}</select>
+      <select id="f_status"><option value="">全部状态</option>${optsOf(L.alert_status).map(o => `<option value="${o.v}" ${st.status === o.v ? 'selected' : ''}>${o.t}</option>`).join('')}</select>
+      <button class="primary" data-ui-action="loader" data-loader="alerts">查询</button>
+    </div>
+    <div id="alert-summary-chips" class="filter-chips" aria-label="告警摘要筛选"></div>
+    <div id="bb-alerts">${batchBarHtml('alerts')}</div>
+    <div id="vwrap">${loading()}</div>`);
+  $('#f_level').onchange = () => { st.level = $('#f_level').value; st.page = 1; LOADERS.alerts(); };
+  $('#f_status').onchange = () => { st.status = $('#f_status').value; st.page = 1; LOADERS.alerts(); };
+  api('/api/v1/admin/reports/alert-summary').then(summary => {
+    const root = $('#alert-summary-chips');
+    if (!root) return;
+    const byLevel = (summary.byLevel || []).map(item =>
+      `<button class="filter-chip ${st.level === item.value ? 'active' : ''}" data-ui-action="filter" data-filter-key="alerts" data-filter-field="level" data-filter-value="${esc(item.value)}">${esc(L.alert_level[item.value] || item.value)} <b>${esc(item.count)}</b></button>`).join('');
+    const byStatus = (summary.byStatus || []).map(item =>
+      `<button class="filter-chip ${st.status === item.value ? 'active' : ''}" data-ui-action="filter" data-filter-key="alerts" data-filter-field="status" data-filter-value="${esc(item.value)}">${esc(L.alert_status[item.value] || item.value)} <b>${esc(item.count)}</b></button>`).join('');
+    root.innerHTML = byLevel + byStatus;
+  }).catch(() => {});
+  await LOADERS.alerts();
+}
+
+LOADERS.alerts = async function () {
+  const st = App.state.alerts;
+  const wrap = $('#vwrap'); if (!wrap) return;
+  try {
+    const q = new URLSearchParams({ page: st.page, pageSize: st.pageSize, sortDescending: String(st.sortDesc !== false) });
+    if (st.level) q.set('level', st.level);
+    if (st.status) q.set('status', st.status);
+    const data = await api('/api/v1/admin/alerts?' + q);
+    st.totalCount = data.totalCount;
+    const filtered = hasFilter(st, ['level', 'status']);
+    // 「正常的空」是好消息，要说得像好消息（§6.5）
+    const empty = filtered
+      ? emptyState('filter', { key: 'alerts', title: '没有匹配当前筛选条件的告警' })
+      : emptyState('ok', { title: '没有告警', sub: '系统运行正常，暂无需要关注的异常' });
+    wrap.innerHTML = tableHtml([
+      { l: '等级', render: r => status('alert_level', r.level) },
+      { l: '状态', render: r => status('alert_status', r.status) },
+      { l: '标题', render: r => `<b>${esc(r.title)}</b><span class="sub">${esc((r.message || '').slice(0, 80))}</span>` },
+      { l: '类别', k: 'category' },
+      { l: '客户端 / 任务', render: r => `${esc(r.clientHostname || '—')}<span class="sub">${esc(r.taskName || '')}</span>` },
+      { l: '次数', num: true, k: 'occurrenceCount' },
+      { l: '最近发生', sort: true, k: 'lastOccurredAt', render: r => relTime(r.lastOccurredAt) },
+      { l: '操作', render: r => {
+        const b = [`<button class="small" data-ui-action="act" data-view="alerts" data-action="detail" data-id="${esc(r.id)}">详情</button>`];
+        if (r.status === 'open') b.push(`<button class="small primary" data-ui-action="act" data-view="alerts" data-action="ack" data-id="${esc(r.id)}">确认</button>`);
+        if (['open', 'acknowledged'].includes(r.status)) {
+          b.push(`<button class="small" data-ui-action="act" data-view="alerts" data-action="handle" data-id="${esc(r.id)}">处理</button>`);
+          b.push(`<button class="small" data-ui-action="act" data-view="alerts" data-action="close" data-id="${esc(r.id)}">关闭</button>`);
+        }
+        return b.join(' ');
+      } }
+    ], data.items, { empty, stateKey: 'alerts' }) + pagerHtml('alerts', st);
+    const bb = $('#bb-alerts');
+    if (bb) bb.outerHTML = `<div id="bb-alerts">${batchBarHtml('alerts')}</div>`;
+  } catch (e) { wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+};
+
+App.batchActs = App.batchActs || {};
+App.batchActs.alerts = [
+  { t: '批量确认', primary: true,
+    fn: async id => { await api(`/api/v1/admin/alerts/${id}/acknowledge`, { method: 'POST' }); } }
+];
+
+/* §6.3 告警详情抽屉 */
+export async function openAlertDrawer(id, viaNav = false) {
+  try {
+    const d = await api(`/api/v1/admin/alerts/${id}`);
+    openDrawer({
+      title: '告警详情',
+      wide: true,
+      onClose: () => { if (location.hash === '#/alerts/' + id) history.replaceState(null, '', '#/alerts'); },
+      bodyHtml: `
+    <div class="kv">
+      <div class="row"><div class="k">标题</div><div class="v"><b>${esc(d.title)}</b></div></div>
+      <div class="row"><div class="k">等级 / 状态</div><div class="v">${status('alert_level', d.level)} ${status('alert_status', d.status)}</div></div>
+      <div class="row"><div class="k">类别</div><div class="v">${esc(d.category || '—')}</div></div>
+      <div class="row"><div class="k">告警键</div><div class="v mono">${esc(d.alertKey)}</div></div>
+      <div class="row"><div class="k">客户端 / 任务</div><div class="v">${esc(d.clientHostname || '—')} / ${esc(d.taskName || '—')}</div></div>
+      <div class="row"><div class="k">首次 / 最近发生</div><div class="v">${fmtDT(d.firstOccurredAt)} / ${fmtDT(d.lastOccurredAt)}</div></div>
+      <div class="row"><div class="k">发生次数</div><div class="v">${esc(d.occurrenceCount)}</div></div>
+      <div class="row"><div class="k">确认</div><div class="v">${d.acknowledgedAt ? fmtDT(d.acknowledgedAt) + '（' + esc(d.acknowledgedByName || '') + '）' : '—'}</div></div>
+      <div class="row"><div class="k">恢复 / 关闭</div><div class="v">${fmtDT(d.recoveredAt)} / ${fmtDT(d.closedAt)}</div></div>
+      <div class="row"><div class="k">处理备注</div><div class="v">${esc(d.handlingNote || '—')}</div></div>
+    </div>
+    <h3>告警消息</h3><pre class="json">${esc(d.message || '—')}</pre>
+    ${d.metadata ? `<h3>元数据</h3><pre class="json">${esc(prettyJson(d.metadata))}</pre>` : ''}`
+    });
+    if (!viaNav) history.replaceState(null, '', '#/alerts/' + id);
+  } catch (e) { errToast(e); }
+}
+ACTIONS['alerts:detail'] = async id => openAlertDrawer(id);
+ACTIONS['alerts:ack'] = async id => {
+  await api(`/api/v1/admin/alerts/${id}/acknowledge`, { method: 'POST' });
+  toast('告警已确认', 'ok'); LOADERS.alerts();
+};
+ACTIONS['alerts:handle'] = async id => {
+  formModal('更新告警处理状态', [
+    { name: 'status', label: '目标状态', type: 'select', options: [{ v: 'in_progress', t: '处理中' }, { v: 'ignored', t: '忽略' }] },
+    { name: 'note', label: '处理备注', type: 'textarea' }
+  ], async v => {
+    await api(`/api/v1/admin/alerts/${id}/handle`, { method: 'POST', body: { status: v.status, note: v.note || null } });
+    toast('告警状态已更新', 'ok'); LOADERS.alerts();
+  }, '提交');
+};
+ACTIONS['alerts:close'] = async id => {
+  formModal('关闭告警', [{ name: 'note', label: '关闭说明', type: 'textarea' }], async v => {
+    await api(`/api/v1/admin/alerts/${id}/close`, { method: 'POST', body: { note: v.note || null } });
+    toast('告警已关闭', 'ok'); LOADERS.alerts();
+  }, '关闭');
+};

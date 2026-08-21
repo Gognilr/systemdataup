@@ -1,0 +1,78 @@
+/* =====================================================================
+   base.css —— 重置 / 排版 / 表单 / 按钮 / 布局 / 登录页
+   颜色与字号一律引用 tokens.css 令牌，不写字面值（UI-REDESIGN §4）。
+   ===================================================================== */
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:var(--t-body);font-family:var(--font-sans);background:var(--bg);color:var(--text)}
+b,strong{font-weight:600}
+a{color:var(--accent);text-decoration:none}
+h1{font:600 var(--t-xl)}
+h2{font:600 var(--t-xl);margin-bottom:var(--s-4)}
+h3{font:600 var(--t-lg);margin:var(--s-4) 0 var(--s-2)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ── 表单 ── */
+input,select,textarea{font:inherit;padding:var(--s-1) var(--s-2);border:1px solid var(--border-strong);border-radius:var(--r-md);background:var(--surface);color:var(--text);width:100%}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:0;border-color:var(--accent)}
+textarea{min-height:68px;resize:vertical}
+.frow{margin-bottom:var(--s-3)}
+.frow label{display:block;font:var(--t-body);color:var(--text-muted);margin-bottom:var(--s-1)}
+.frow .hint{font:var(--t-sm);color:var(--text-muted);margin-top:var(--s-1)}
+.frow input[type=checkbox]{width:auto;margin-right:var(--s-1)}
+.frow.inline{display:flex;align-items:center}
+
+/* ── 按钮 ── */
+button{font:inherit;padding:var(--s-1) var(--s-3);border-radius:var(--r-md);border:1px solid var(--border-strong);background:var(--surface);cursor:pointer;color:var(--text);transition:background var(--dur-fast) var(--ease),border-color var(--dur-fast) var(--ease)}
+button:hover{background:var(--surface-sunk)}
+button:disabled{opacity:.55;cursor:default}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+button.primary:hover{background:var(--accent-hover)}
+button.danger{color:var(--err-fg);border-color:var(--err-bd)}
+button.small{padding:var(--s-1) var(--s-2);font:var(--t-sm)}
+
+/* ── 布局骨架 ── */
+.layout{display:flex;min-height:100vh}
+.sidebar{width:56px;background:var(--sidebar);color:var(--ink-200);flex-shrink:0;display:flex;flex-direction:column;transition:width var(--dur-base) var(--ease);overflow:hidden}
+.sidebar:not(.is-collapsed){width:224px}
+.sidebar .logo{min-height:60px;padding:var(--s-4);display:flex;align-items:center;gap:var(--s-2);font:600 var(--t-lg);color:var(--ink-0);border-bottom:1px solid var(--sidebar-bd);white-space:nowrap}
+.sidebar .logo small{display:block;font-weight:400;font:var(--t-micro);color:var(--ink-400);margin-top:var(--s-1)}
+.sidebar .logo-mark{display:inline-flex;width:24px;height:28px;align-items:center;justify-content:center;flex-shrink:0;font:0/1 var(--t-sm);color:var(--ink-0)}
+.sidebar .logo-mark img{display:block;width:100%;height:100%;object-fit:contain}
+.sidebar.is-collapsed .logo-full{display:none}
+.sidebar.is-collapsed .nav-label{display:none}
+.sidebar nav{flex:1;padding:var(--s-2) 0;overflow-y:auto;overflow-x:hidden}
+.nav-group{margin-bottom:var(--s-2)}
+.nav-group-label{height:24px;padding:var(--s-1) var(--s-4);font:600 var(--t-micro);letter-spacing:.04em;color:var(--ink-400);white-space:nowrap}
+.sidebar.is-collapsed .nav-group-label{visibility:hidden}
+.sidebar nav a{display:flex;align-items:center;gap:var(--s-3);height:36px;padding:var(--s-1) var(--s-4);color:var(--ink-200);font:var(--t-body);transition:background var(--dur-fast) var(--ease);white-space:nowrap}
+.sidebar.is-collapsed nav a{justify-content:center;padding-left:var(--s-1);padding-right:var(--s-1)}
+.nav-icon{width:20px;display:inline-flex;justify-content:center;flex-shrink:0;font:var(--t-md)}
+.sidebar nav a:hover{background:var(--sidebar-hover);color:var(--ink-0)}
+.sidebar nav a.active{background:var(--accent);color:var(--accent-fg)}
+.sidebar .sidebar-toggle{margin:var(--s-2);width:calc(100% - var(--s-4));height:28px;padding:0;background:transparent;border-color:var(--sidebar-bd);color:var(--ink-300);font-size:18px}
+.sidebar .sidebar-toggle:hover{background:var(--sidebar-hover);color:var(--ink-0)}
+.sidebar .foot{display:flex;align-items:center;justify-content:center;gap:var(--s-1);padding:var(--s-3) var(--s-4);font:var(--t-micro);color:var(--ink-400);border-top:1px solid var(--sidebar-bd);white-space:nowrap}
+.sidebar:not(.is-collapsed) .foot .logo-mark{display:none}
+.main{flex:1;display:flex;flex-direction:column;min-width:0;height:100vh}
+.topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:var(--s-2) var(--s-6);display:flex;justify-content:space-between;align-items:center;flex-shrink:0}
+.topbar-title{display:flex;align-items:center;gap:var(--s-2);font-weight:600}
+.topbar-menu{display:none;padding:0 var(--s-1);border:0;background:transparent;font-size:16px}
+.topbar .who{color:var(--text-muted);font:var(--t-body)}
+.topbar .who b{color:var(--text)}
+.content{padding:var(--s-6);flex:1;overflow:auto;min-height:0}
+
+@media (max-width:720px){
+  .sidebar{position:fixed;inset:0 auto 0 0;z-index:30;box-shadow:var(--e-2)}
+  .sidebar:not(.is-collapsed){width:224px}
+  .main{margin-left:56px}
+  .topbar-menu{display:inline-flex}
+  .content{padding:var(--s-4)}
+  .topbar{padding-left:var(--s-3);padding-right:var(--s-3)}
+}
+
+/* ── 登录页：纯净背景（UI-REDESIGN §7.5，无装饰渐变） ── */
+.login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg)}
+.login-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--s-8);width:380px;max-width:92vw;box-shadow:var(--e-2)}
+.login-box h1{margin-bottom:var(--s-1)}
+.login-box .sub{color:var(--text-muted);font:var(--t-body);margin-bottom:var(--s-6)}
+.login-box .frow label{font-weight:600;color:var(--text)}

@@ -1,4 +1,3 @@
-using System.Text.Json;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
@@ -91,15 +90,8 @@ public class AgentConfigService : IAgentConfigService
             }
         };
 
-        // 配置签名（防篡改）
-        var canonical = JsonSerializer.Serialize(new
-        {
-            response.Version,
-            tasks = response.Tasks,
-            services = response.MonitoredServices,
-            global = response.GlobalSettings
-        });
-        response.Signature = _signer.SignConfig(response.Version, clientId, canonical);
+        // 配置签名（防篡改）；规范化逻辑与 Agent 共用，避免两端 JSON 漂移。
+        response.Signature = _signer.SignConfig(response, clientId);
 
         return response;
     }

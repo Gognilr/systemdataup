@@ -5,9 +5,8 @@ namespace BackupMonitor.Shared.Models.Agent;
 /// <summary>客户端提交注册请求（设计书 10.1）</summary>
 public class SubmitRegistrationRequest
 {
-    /// <summary>一次性注册令牌（明文，仅用于注册，不入库）</summary>
-    [Required]
-    public string RegistrationToken { get; set; } = null!;
+    /// <summary>一次性注册令牌（Secure 模式使用；LanSimple 自动登记时为空）</summary>
+    public string? RegistrationToken { get; set; }
 
     /// <summary>机器指纹（Agent 采集硬件/系统特征生成）</summary>
     [Required]
@@ -66,4 +65,14 @@ public class RegistrationResultResponse
 
     /// <summary>仍待审批时建议的轮询间隔（秒）</summary>
     public int? PollAfterSeconds { get; set; }
+}
+
+/// <summary>客户端证书续签结果；Agent 使用现有私钥安装新证书。</summary>
+public sealed class CertificateRenewalResponse
+{
+    public Guid ClientId { get; set; }
+    public string CertificatePem { get; set; } = null!;
+    public string CertificateThumbprint { get; set; } = null!;
+    public DateTime CertificateIssuedAt { get; set; }
+    public DateTime CertificateExpiresAt { get; set; }
 }

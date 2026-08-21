@@ -45,11 +45,16 @@ public class AlertingService : IAlertingService
     };
 
     private readonly AppDbContext _db;
+    private readonly IAgentNotificationService _agentNotifications;
     private readonly ILogger<AlertingService> _logger;
 
-    public AlertingService(AppDbContext db, ILogger<AlertingService> logger)
+    public AlertingService(
+        AppDbContext db,
+        IAgentNotificationService agentNotifications,
+        ILogger<AlertingService> logger)
     {
         _db = db;
+        _agentNotifications = agentNotifications;
         _logger = logger;
     }
 
@@ -68,6 +73,12 @@ public class AlertingService : IAlertingService
     {
         try
         {
+            var hasActiveAlert = await _db.Alerts
+                .AsNoTracking()
+                .AnyAsync(a => a.AlertKey == alertKey && ActiveStatuses.Contains(a.Status), ct);
+            if (!hasActiveAlert)
+                return;
+
             var now = DateTime.UtcNow;
 
             var existing = await _db.Alerts
@@ -107,6 +118,27 @@ public class AlertingService : IAlertingService
 
                 // 新告警按渠道配置落待发送通知记录（第二批补充设计；实际发送由发送器实现）
                 await CreateDeliveriesForAsync(alert, ct);
+
+                // Agent 只接收新告警，活动告警后续心跳仅更新次数，不重复弹窗。
+                if (clientId is not null)
+                {
+                    var severity = level switch
+                    {
+                        AlertLevel.Critical => "critical",
+                        AlertLevel.Warning => "warning",
+                        _ => "info"
+                    };
+                    await _agentNotifications.EnqueueAsync(
+                        clientId.Value,
+                        "alert",
+                        severity,
+                        title,
+                        message,
+                        $"alert:{alert.Id}:opened",
+                        alert.Id,
+                        backupSetId,
+                        ct);
+                }
             }
 
             await _db.SaveChangesAsync(ct);

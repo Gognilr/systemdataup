@@ -36,6 +36,6 @@
 | 文档 | 说明 |
 | --- | --- |
 | [DEV-PROMPTS.md](./DEV-PROMPTS.md) | 交接改造提示词（批次 1~8） |
-| [OPEN-ISSUES.md](./OPEN-ISSUES.md) | 遗留问题清单及修复方案 |
+| [OPEN-ISSUES-2026-08-07.md](./OPEN-ISSUES-2026-08-07.md) | 遗留问题清单及修复方案 |
 | [UI-REDESIGN.md](./UI-REDESIGN.md) | 管理控制台 UI 重设计方案（提示词 5~8 依据） |
 | BATCH1-REPORT.md 等 | 各批次改造报告 |

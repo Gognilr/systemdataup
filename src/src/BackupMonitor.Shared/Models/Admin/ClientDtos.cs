@@ -28,6 +28,12 @@ public class ClientListItemDto
     /// <summary>客户端状态（snake_case）</summary>
     public string Status { get; set; } = null!;
 
+    /// <summary>登记方式：lan_simple / secure。</summary>
+    public string EnrollmentMode { get; set; } = "secure";
+
+    public DateTime? CertificateExpiresAt { get; set; }
+    public int? CertificateRemainingDays { get; set; }
+
     public DateTime? LastHeartbeatAt { get; set; }
     public DateTime CreatedAt { get; set; }
     public int ActiveAlertCount { get; set; }
@@ -46,7 +52,6 @@ public class ClientDetailDto : ClientListItemDto
     public string? ApprovedByName { get; set; }
     public long LastConfigVersion { get; set; }
     public string? CertificateThumbprint { get; set; }
-    public DateTime? CertificateExpiresAt { get; set; }
     public int? TimeOffsetSeconds { get; set; }
     public string? Notes { get; set; }
     public DateTime UpdatedAt { get; set; }
@@ -54,7 +59,18 @@ public class ClientDetailDto : ClientListItemDto
 
     public List<ClientDiskDto> Disks { get; set; } = [];
     public List<ClientServiceDto> MonitoredServices { get; set; } = [];
+    public List<ClientUserSessionDto> UserSessions { get; set; } = [];
     public ClientMetricsDto? LastMetrics { get; set; }
+}
+
+/// <summary>最近自动登记客户端的待办摘要。</summary>
+public sealed class RecentAutoEnrollmentDto
+{
+    public Guid Id { get; set; }
+    public string Hostname { get; set; } = null!;
+    public string DisplayName { get; set; } = null!;
+    public DateTime CreatedAt { get; set; }
+    public DateTime? LastHeartbeatAt { get; set; }
 }
 
 /// <summary>客户端磁盘</summary>
@@ -90,10 +106,46 @@ public class ClientServiceDto
 public class ClientMetricsDto
 {
     public decimal? CpuPercent { get; set; }
+    public decimal? AgentCpuPercent { get; set; }
     public decimal? MemoryPercent { get; set; }
+    public long? MemoryTotalBytes { get; set; }
     public long? MemoryAvailableBytes { get; set; }
     public long? AgentMemoryBytes { get; set; }
+    public long? NetworkSendBps { get; set; }
+    public long? NetworkReceiveBps { get; set; }
+    public long? AgentUptimeSeconds { get; set; }
+    public long? SystemUptimeSeconds { get; set; }
     public DateTime? ReceivedAt { get; set; }
+}
+
+/// <summary>客户端资源指标历史点</summary>
+public class ClientMetricsPointDto : ClientMetricsDto
+{
+    public int? ActiveCommandCount { get; set; }
+    public int? ActiveUploadCount { get; set; }
+}
+
+/// <summary>客户端资源指标历史</summary>
+public class ClientMetricsHistoryDto
+{
+    public Guid ClientId { get; set; }
+    public DateTime From { get; set; }
+    public DateTime To { get; set; }
+    public List<ClientMetricsPointDto> Points { get; set; } = [];
+}
+
+/// <summary>客户端当前 Windows 用户会话</summary>
+public class ClientUserSessionDto
+{
+    public int SessionId { get; set; }
+    public string? Username { get; set; }
+    public string? Domain { get; set; }
+    public string State { get; set; } = null!;
+    public string? ClientName { get; set; }
+    public string? ClientAddress { get; set; }
+    public bool IsRemote { get; set; }
+    public DateTime? LogonAt { get; set; }
+    public DateTime SampledAt { get; set; }
 }
 
 /// <summary>禁用客户端请求（设计书 15.4）</summary>

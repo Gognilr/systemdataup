@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
@@ -23,7 +23,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\BackupMonitor.Api\BackupMonitor.Api.csproj" />
     <ProjectReference Include="..\..\src\BackupMonitor.Infrastructure\BackupMonitor.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\server\BackupMonitor.Server.Setup\BackupMonitor.Server.Setup.csproj" />
+    <ProjectReference Include="..\..\agent\BackupMonitor.Agent\BackupMonitor.Agent.csproj" />
   </ItemGroup>
 
 </Project>

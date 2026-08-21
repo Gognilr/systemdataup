@@ -14,11 +14,16 @@ public class AgentSystemController : ApiBaseController
 {
     private readonly IAgentHeartbeatService _heartbeatService;
     private readonly IAgentConfigService _configService;
+    private readonly IClientAdminService _clientService;
 
-    public AgentSystemController(IAgentHeartbeatService heartbeatService, IAgentConfigService configService)
+    public AgentSystemController(
+        IAgentHeartbeatService heartbeatService,
+        IAgentConfigService configService,
+        IClientAdminService clientService)
     {
         _heartbeatService = heartbeatService;
         _configService = configService;
+        _clientService = clientService;
     }
 
     /// <summary>心跳上报（11.1）</summary>
@@ -51,5 +56,13 @@ public class AgentSystemController : ApiBaseController
 
         var config = await _configService.GetConfigAsync(ClientIdentity, currentVersion, ct);
         return OkData(config);
+    }
+
+    /// <summary>客户端证书续签；旧证书在新证书生效后保留七天重叠期。</summary>
+    [HttpPost("certificate/renew")]
+    public async Task<ActionResult<ApiResponse<CertificateRenewalResponse>>> RenewCertificate(CancellationToken ct)
+    {
+        var result = await _clientService.RenewCertificateAsync(ClientIdentity, ct);
+        return OkData(result);
     }
 }

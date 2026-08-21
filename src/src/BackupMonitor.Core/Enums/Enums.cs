@@ -166,7 +166,8 @@ public enum CertificateStatus
 {
     Active,
     Revoked,
-    Expired
+    Expired,
+    Superseded
 }
 
 /// <summary>上传文件状态</summary>

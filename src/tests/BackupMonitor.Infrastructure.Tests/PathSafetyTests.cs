@@ -115,6 +115,34 @@ public class PathSafetyTests
         Assert.NotNull(PathSafety.ResolveUnderBase(basePath.ToLowerInvariant(), "f.txt"));
     }
 
+    // ---------- IsUnderBase：物理删除围栏的判定谓词 ----------
+    // RetentionCleanupWorker 在递归删除前用它确认目标确实落在仓库根之下。
+    // 判错的代价是删掉仓库之外的目录，因此边界必须逐条钉死。
+
+    [Theory]
+    [InlineData(@"E:\Repo", @"E:\Repo\host\task\2026-08-21_020000")]
+    [InlineData(@"E:\Repo\", @"E:\Repo\a")]                 // 基目录带尾随分隔符
+    [InlineData(@"e:\repo", @"E:\REPO\a\b")]                // Windows 大小写不敏感
+    public void IsUnderBase_基目录之内应通过(string basePath, string fullPath)
+        => Assert.True(PathSafety.IsUnderBase(basePath, fullPath));
+
+    [Theory]
+    [InlineData(@"E:\Repo", @"E:\Repo")]                    // 基目录自身不算"之内"
+    [InlineData(@"E:\Repo", @"E:\Repo2\a")]                 // 同前缀兄弟目录，经典误判点
+    [InlineData(@"E:\Repo", @"E:\RepoOld\a")]               // 同上
+    [InlineData(@"E:\Repo", @"C:\Program Files\PostgreSQL")]// 完全无关的路径
+    [InlineData(@"E:\Repo", @"E:\Repo\..\Windows")]         // 规范化后穿出基目录
+    [InlineData(@"E:\Repo", @"E:\")]                        // 盘符根
+    public void IsUnderBase_基目录之外必须拒绝(string basePath, string fullPath)
+        => Assert.False(PathSafety.IsUnderBase(basePath, fullPath));
+
+    [Theory]
+    [InlineData("", @"E:\Repo\a")]
+    [InlineData(@"E:\Repo", "")]
+    [InlineData("   ", @"E:\Repo\a")]
+    public void IsUnderBase_空输入一律拒绝(string basePath, string fullPath)
+        => Assert.False(PathSafety.IsUnderBase(basePath, fullPath));
+
     // ---------- SanitizePathComponent ----------
 
     [Theory]

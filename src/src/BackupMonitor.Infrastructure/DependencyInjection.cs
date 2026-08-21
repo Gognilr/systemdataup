@@ -21,10 +21,12 @@ public static class DependencyInjection
 
         // 系统配置缓存（内部按 scope 访问数据库）
         services.AddSingleton<SystemSettingsProvider>();
+        services.AddScoped<PartitionMaintenanceService>();
 
         // 请求级服务
         services.AddScoped<ICurrentContext, HttpContextCurrentContext>();
         services.AddScoped<IAuditRecorder, DbAuditRecorder>();
+        services.AddScoped<IAgentNotificationService, AgentNotificationService>();
         services.AddScoped<IAlertingService, AlertingService>();
         services.AddScoped<ICommandDispatcher, CommandService>();
         services.AddScoped<IAgentCommandService, CommandService>();
@@ -33,6 +35,7 @@ public static class DependencyInjection
 
         services.AddScoped<IAuthService, AuthService>();
         services.AddScoped<IAgentRegistrationService, AgentRegistrationService>();
+        services.AddScoped<LanEnrollmentService>();
         services.AddScoped<IAgentHeartbeatService, AgentHeartbeatService>();
         services.AddScoped<IAgentConfigService, AgentConfigService>();
         services.AddScoped<IAgentPrecheckService, AgentPrecheckService>();
@@ -41,6 +44,7 @@ public static class DependencyInjection
         services.AddScoped<IUploadSessionService, UploadSessionService>();
 
         services.AddScoped<IClientAdminService, ClientAdminService>();
+        services.AddScoped<IRegistrationTokenService, RegistrationTokenService>();
         services.AddScoped<IBackupTaskService, BackupTaskService>();
         services.AddScoped<IBatchOperationService, BatchOperationService>();
         services.AddScoped<IBackupSetService, BackupSetService>();
@@ -62,6 +66,7 @@ public static class DependencyInjection
         services.AddHostedService<UploadCommitWorker>();
         services.AddHostedService<NotificationDispatchWorker>();
         services.AddHostedService<RetentionCleanupWorker>();
+        services.AddHostedService<PartitionMaintenanceWorker>();
 
         return services;
     }

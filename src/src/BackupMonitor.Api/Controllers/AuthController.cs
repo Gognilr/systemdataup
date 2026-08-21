@@ -1,9 +1,11 @@
 using BackupMonitor.Infrastructure.Services;
+using BackupMonitor.Infrastructure.Security;
 using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models.Auth;
 using BackupMonitor.Shared.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
 
 namespace BackupMonitor.Api.Controllers;
 
@@ -11,11 +13,14 @@ namespace BackupMonitor.Api.Controllers;
 [Route("api/v1/auth")]
 public class AuthController : ApiBaseController
 {
+    private const string RefreshCookieName = "__Host-backupmonitor-refresh";
     private readonly IAuthService _authService;
+    private readonly JwtSettings _jwtSettings;
 
-    public AuthController(IAuthService authService)
+    public AuthController(IAuthService authService, JwtSettings jwtSettings)
     {
         _authService = authService;
+        _jwtSettings = jwtSettings;
     }
 
     /// <summary>登录（9.1）</summary>
@@ -26,26 +31,44 @@ public class AuthController : ApiBaseController
         var ip = HttpContext.Connection.RemoteIpAddress?.ToString();
         var userAgent = Request.Headers.UserAgent.ToString();
         var result = await _authService.LoginAsync(request, ip, userAgent, ct);
+        SetRefreshCookie(result.RefreshToken);
+        result.RefreshToken = string.Empty;
         return OkData(result);
     }
 
     /// <summary>刷新访问令牌（9.2，令牌轮换，旧令牌重用将吊销全部会话）</summary>
     [HttpPost("refresh")]
     [AllowAnonymous]
-    public async Task<ActionResult<ApiResponse<RefreshTokenResponse>>> Refresh([FromBody] RefreshTokenRequest request, CancellationToken ct)
+    public async Task<ActionResult<ApiResponse<RefreshTokenResponse>>> Refresh(
+        [FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow)] RefreshTokenRequest? request,
+        CancellationToken ct)
     {
         var ip = HttpContext.Connection.RemoteIpAddress?.ToString();
         var userAgent = Request.Headers.UserAgent.ToString();
-        var result = await _authService.RefreshAsync(request, ip, userAgent, ct);
+        var refreshToken = Request.Cookies[RefreshCookieName] ?? request?.RefreshToken;
+        if (string.IsNullOrWhiteSpace(refreshToken))
+            throw new BusinessException("UNAUTHORIZED", "刷新令牌缺失", 401);
+        var result = await _authService.RefreshAsync(new RefreshTokenRequest { RefreshToken = refreshToken }, ip, userAgent, ct);
+        SetRefreshCookie(result.RefreshToken);
+        result.RefreshToken = string.Empty;
         return OkData(result);
     }
 
     /// <summary>退出登录（9.3，吊销刷新令牌；请求体可选，OPEN-ISSUES #9）</summary>
     [HttpPost("logout")]
-    [Authorize(AuthenticationSchemes = "Bearer")]
-    public async Task<ActionResult<ApiResponse>> Logout([FromBody] RefreshTokenRequest? request, CancellationToken ct)
+    [AllowAnonymous]
+    public async Task<ActionResult<ApiResponse>> Logout(
+        [FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow)] RefreshTokenRequest? request,
+        CancellationToken ct)
     {
-        await _authService.LogoutAsync(request?.RefreshToken, ct);
+        await _authService.LogoutAsync(Request.Cookies[RefreshCookieName] ?? request?.RefreshToken, ct);
+        Response.Cookies.Delete(RefreshCookieName, new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.Strict,
+            Path = "/"
+        });
         return OkMessage("已退出登录");
     }
 
@@ -69,5 +92,18 @@ public class AuthController : ApiBaseController
             ?? throw new BusinessException("UNAUTHORIZED", "无法识别当前用户", 401);
         var result = await _authService.GetCurrentUserAsync(userId, ct);
         return OkData(result);
+    }
+
+    private void SetRefreshCookie(string refreshToken)
+    {
+        Response.Cookies.Append(RefreshCookieName, refreshToken, new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.Strict,
+            IsEssential = true,
+            Path = "/",
+            MaxAge = TimeSpan.FromDays(Math.Max(1, _jwtSettings.RefreshTokenTtlDays))
+        });
     }
 }

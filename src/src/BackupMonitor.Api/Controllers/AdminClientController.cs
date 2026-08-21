@@ -36,6 +36,29 @@ public class AdminClientController : ApiBaseController
         return OkData(result);
     }
 
+    /// <summary>最近自动登记客户端，供待办页追踪局域网免令牌登记。</summary>
+    [HttpGet("recent-auto-enrollments")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.read")]
+    public async Task<ActionResult<ApiResponse<IReadOnlyList<RecentAutoEnrollmentDto>>>> RecentAutomaticEnrollments(
+        [FromQuery] int days = 7, [FromQuery] int limit = 20, CancellationToken ct = default)
+    {
+        var result = await _clientService.GetRecentAutomaticEnrollmentsAsync(days, limit, ct);
+        return OkData(result);
+    }
+
+    /// <summary>客户端资源指标历史（默认最近 24 小时）</summary>
+    [HttpGet("{clientId:guid}/metrics")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.read")]
+    public async Task<ActionResult<ApiResponse<ClientMetricsHistoryDto>>> Metrics(
+        Guid clientId,
+        [FromQuery] int hours = 24,
+        [FromQuery] int limit = 1440,
+        CancellationToken ct = default)
+    {
+        var result = await _clientService.GetMetricsHistoryAsync(clientId, hours, limit, ct);
+        return OkData(result);
+    }
+
     /// <summary>审批通过并签发证书（15.3）</summary>
     [HttpPost("{clientId:guid}/approve")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.manage")]

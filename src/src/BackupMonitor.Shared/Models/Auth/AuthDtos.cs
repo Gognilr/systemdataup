@@ -36,6 +36,12 @@ public class CurrentUserDto
     public string? Email { get; set; }
     public List<string> Roles { get; set; } = [];
     public List<string> Permissions { get; set; } = [];
+
+    /// <summary>
+    /// 是否仍需完成强制改密（OPEN-ISSUES #2）。
+    /// 由 /auth/me 一并返回，让前端刷新后无需依赖 localStorage 也能还原改密拦截状态。
+    /// </summary>
+    public bool MustChangePassword { get; set; }
 }
 
 /// <summary>刷新令牌请求（设计书 9.2）</summary>

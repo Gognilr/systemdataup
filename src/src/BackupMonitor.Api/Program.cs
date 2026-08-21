@@ -1,11 +1,15 @@
 using System.Net;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
+using BackupMonitor.Api.Bootstrap;
+using BackupMonitor.Api.Discovery;
 using BackupMonitor.Api.Health;
 using BackupMonitor.Api.Middleware;
 using BackupMonitor.Api.Security;
 using BackupMonitor.Infrastructure;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Infrastructure.Security;
+using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Models;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
@@ -32,7 +36,34 @@ catch (IOException)
     // 无控制台可用
 }
 
+if (MigrationCommand.IsMigrationCommand(args))
+{
+    Environment.ExitCode = MigrationCommand.RunAsync(args).GetAwaiter().GetResult();
+    return;
+}
+
 var builder = WebApplication.CreateBuilder(args);
+
+// 服务端安装器写入的非机密 Turnkey 配置只描述数据目录、监听地址和部署模式；
+// 机密仍由 LocalServerBootstrap 从 ProgramData 密钥文件加载。
+builder.Configuration.AddJsonFile("appsettings.Turnkey.json", optional: true, reloadOnChange: false);
+
+// LAN Turnkey 安装器通过 BACKUPMONITOR_TURNKEY 启用本地引导；
+// Secure/开发部署未启用时不生成 ProgramData 文件，继续使用原有外部配置。
+var localBootstrap = LocalServerBootstrap.Initialize(builder.Configuration);
+if (localBootstrap.Enabled)
+    builder.Configuration.AddInMemoryCollection(localBootstrap.Values);
+
+var apiPort = builder.Configuration.GetValue("Server:ApiPort", 5080);
+X509Certificate2? turnkeyServerCertificate = null;
+if (localBootstrap.Enabled)
+{
+    var certificatePath = builder.Configuration["Security:ServerCertificate:CertPath"]
+        ?? throw new InvalidOperationException("LAN Turnkey 服务端证书路径未配置。");
+    var certificatePassword = builder.Configuration["Security:ServerCertificate:Password"]
+        ?? throw new InvalidOperationException("LAN Turnkey 服务端证书保护口令未配置。");
+    turnkeyServerCertificate = ServerCertificateFactory.LoadForKestrel(certificatePath, certificatePassword);
+}
 
 // Serilog
 builder.Host.UseSerilog((context, config) =>
@@ -48,6 +79,7 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 // Infrastructure 服务层
 builder.Services.AddInfrastructure(builder.Configuration);
 builder.Services.AddHttpContextAccessor();
+builder.Services.AddHostedService<LanDiscoveryHostedService>();
 
 // 健康检查（OPEN-ISSUES #6）：/health/db 改为只读自检。
 // 使用框架内置 AddHealthChecks + 自定义只读 DatabaseHealthCheck；
@@ -56,16 +88,48 @@ builder.Services.AddHttpContextAccessor();
 builder.Services.AddHealthChecks()
     .Add(new HealthCheckRegistration(
         "database",
-        sp => new DatabaseHealthCheck(sp.GetRequiredService<AppDbContext>()),
+        sp => new DatabaseHealthCheck(
+            sp.GetRequiredService<AppDbContext>(),
+            sp.GetRequiredService<PartitionMaintenanceService>()),
         failureStatus: HealthStatus.Unhealthy,
         tags: null));
 
-// Kestrel：若直接对外终结 HTTPS，则允许客户端证书（mTLS，设计书 23.1）。
-// 当前生产形态由 nginx 终结 TLS/mTLS，Kestrel 只监听回环 HTTP，此配置不生效但保留以支持直连部署。
+// Kestrel：Secure 形态只在本机回环 5080 提供 HTTP，由 nginx 终结 TLS/mTLS；
+// LAN Turnkey 形态由程序显式注册唯一的 HTTPS 端点，并使用启动时从
+// Security:ServerCertificate:* 加载的持久化密钥集证书（设计书 23.1）。
+// 不依赖 Kestrel:Endpoints 自动加载，避免 appsettings.Production 的旧 HTTP
+// 端点与 Turnkey HTTPS 端点合并后双重监听同一个端口。
 builder.WebHost.ConfigureKestrel(options =>
 {
+    // WebApplication.CreateBuilder may install a configuration loader for
+    // Kestrel:Endpoints. Turnkey owns the listener below, so discard that
+    // loader to prevent an old Production HTTP endpoint from being merged.
+    options.ConfigurationLoader = null;
     options.ConfigureHttpsDefaults(https =>
-        https.ClientCertificateMode = ClientCertificateMode.AllowCertificate);
+    {
+        https.ClientCertificateMode = ClientCertificateMode.AllowCertificate;
+
+        // 本系统的客户端身份信任源是 client_certificates 表的指纹查表
+        // （ClientCertificateAuthenticationHandler.AuthenticateByThumbprintAsync），
+        // 它校验指纹归属、证书状态、有效期和客户端状态；私钥持有由 TLS 握手本身证明。
+        // 签发用的 CA 由服务端自行生成、只存放在 ProgramData，从不安装进操作系统信任存储。
+        //
+        // 若保持 ClientCertificateValidation 为 null，Kestrel 的默认行为是
+        // 「SslPolicyErrors 非 None 即拒绝」——Agent 证书必然因根不受信而报
+        // RemoteCertificateChainErrors，结果是 TLS 握手阶段直接失败（连接重置），
+        // 连 401 都返回不了，Turnkey 形态下 Agent 根本连不上。
+        // 因此这里显式放行链校验，把身份判定交还给上面的指纹查表。
+        https.ClientCertificateValidation = static (_, _, _) => true;
+    });
+
+    if (turnkeyServerCertificate is not null)
+    {
+        options.ListenAnyIP(apiPort, listen => listen.UseHttps(turnkeyServerCertificate));
+    }
+    else
+    {
+        options.Listen(IPAddress.Loopback, apiPort);
+    }
 });
 
 // 反向代理（nginx 终结 TLS/mTLS）：还原真实客户端 IP 与协议。
@@ -217,6 +281,23 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
+app.Lifetime.ApplicationStarted.Register(() =>
+{
+    if (turnkeyServerCertificate is not null)
+    {
+        Log.Information(
+            "Turnkey HTTPS endpoint bound by Kestrel on any interface at port {ApiPort}; no automatic Kestrel endpoints are loaded.",
+            apiPort);
+    }
+    else
+    {
+        Log.Information("Secure HTTP endpoint bound by Kestrel on loopback at port {ApiPort}.", apiPort);
+    }
+});
+
+if (turnkeyServerCertificate is not null)
+    app.Lifetime.ApplicationStopped.Register(turnkeyServerCertificate.Dispose);
+
 // 中间件管道：
 //   对端记录 → 代理头还原 → RequestId → 请求日志 → 异常 → CORS → 认证 → 授权
 //
@@ -233,6 +314,7 @@ app.Use(async (context, next) =>
 app.UseForwardedHeaders();
 
 app.UseMiddleware<RequestIdMiddleware>();
+app.UseMiddleware<SecurityHeadersMiddleware>();
 app.UseSerilogRequestLogging();
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 
@@ -242,7 +324,8 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// TLS 由 nginx 终结，此处不做 HTTPS 重定向（Kestrel 只监听回环 HTTP）。
+// Secure 形态的 TLS 由 nginx 终结；Turnkey 形态的 Kestrel 端点本身就是 HTTPS，
+// 因此这里不做重定向，避免反向代理和本地 HTTPS 之间形成循环。
 app.UseCors("Management");
 
 // 内置单页管理控制台（wwwroot）：静态文件匿名可访问，业务接口仍走认证授权
@@ -250,6 +333,11 @@ app.UseDefaultFiles();
 app.UseStaticFiles();
 
 app.UseAuthentication();
+
+// 强制改密闸门必须位于认证之后（需要 JWT claim）、授权之前（未改密时不应触达任何业务端点）。
+// 静态文件在上面已经短路返回，不会经过这里。
+app.UseMiddleware<PasswordChangeRequiredMiddleware>();
+
 app.UseAuthorization();
 app.MapControllers();
 

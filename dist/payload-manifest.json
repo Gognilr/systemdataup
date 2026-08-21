@@ -1,0 +1,11 @@
+﻿{
+    "postgresql":  {
+                       "version":  "PostgreSQL 16.14",
+                       "archive":  "postgresql-16.14-1-windows-x64-binaries.zip",
+                       "source_url":  "https://get.enterprisedb.com/postgresql/postgresql-16.14-1-windows-x64-binaries.zip",
+                       "archive_sha256":  "98af1417ba6a8dc30543e560e5407833a3b9e7cc7ed20e73b2006f3aa2f04663",
+                       "initdb_sha256":  "2111500f1faa10211d330c2bfd88afedc00abe9caa134607c776453ff6f46f09",
+                       "pg_ctl_sha256":  "b6656121ef0a417ca4bd46dbe3ae50fd9ae077d8d6c06f92f9d498c224488c48"
+                   },
+    "runtime":  "win-x64"
+}

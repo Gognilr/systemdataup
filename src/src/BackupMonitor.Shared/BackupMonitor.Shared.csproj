@@ -7,4 +7,13 @@
     <RootNamespace>BackupMonitor.Shared</RootNamespace>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!--
+      SecureFileSystem is linked into the Windows-aware API and Agent projects.
+      Shared is also built for non-Windows targets where the BCL surface for
+      FileSystemSecurity is not available without an additional package.
+    -->
+    <Compile Remove="Security\SecureFileSystem.cs" />
+  </ItemGroup>
+
 </Project>

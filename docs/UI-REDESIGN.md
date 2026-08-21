@@ -415,7 +415,7 @@ X = 最近 14 天，Y = 备份任务，一格 = 当天入库状态。**行按异
 
 去掉 [L76](../src/src/BackupMonitor.Api/wwwroot/index.html:76) 的装饰渐变。纯净背景、居中卡片、无动画、自动聚焦用户名。错误信息就地显示在表单上方，不用 Toast（Toast 会飘走，登录失败需要持续可见）。
 
-配合 [OPEN-ISSUES #2](OPEN-ISSUES.md#2)：接入 `mustChangePassword` 后，首次登录强制跳转改密，改密前不放行任何路由。
+配合 [OPEN-ISSUES #2](OPEN-ISSUES-2026-08-07.md#2)：接入 `mustChangePassword` 后，首次登录强制跳转改密，改密前不放行任何路由。
 
 ---
 

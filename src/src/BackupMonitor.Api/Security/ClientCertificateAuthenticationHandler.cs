@@ -153,7 +153,10 @@ public class ClientCertificateAuthenticationHandler : AuthenticationHandler<Clie
         if (record is null)
             return AuthenticateResult.Fail("未知的客户端证书");
 
-        if (record.Status != CertificateStatus.Active)
+        var supersededOverlap = record.Status == CertificateStatus.Superseded
+            && record.RevokedAt is not null
+            && record.RevokedAt.Value.AddDays(7) > DateTime.UtcNow;
+        if (record.Status != CertificateStatus.Active && !supersededOverlap)
             return AuthenticateResult.Fail("客户端证书已吊销或已过期");
 
         if (record.ExpiresAt < DateTime.UtcNow)

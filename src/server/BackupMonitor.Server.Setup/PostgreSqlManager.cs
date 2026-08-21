@@ -1,0 +1,411 @@
+using System.Text;
+using System.Text.RegularExpressions;
+using System.ServiceProcess;
+using Microsoft.Win32;
+using BackupMonitor.Shared.Security;
+using Npgsql;
+
+namespace BackupMonitor.Server.Setup;
+
+internal sealed class PostgreSqlManager
+{
+    public const string ServiceName = "BackupMonitor.PostgreSQL";
+
+    public async Task InitializeAsync(
+        string postgresRoot,
+        string dataDirectory,
+        int port,
+        string postgresPassword,
+        string applicationPassword,
+        CancellationToken ct)
+    {
+        var bin = Path.Combine(postgresRoot, "bin");
+        var initdb = Path.Combine(bin, "initdb.exe");
+        var pgCtl = Path.Combine(bin, "pg_ctl.exe");
+        if (!File.Exists(initdb) || !File.Exists(pgCtl))
+            throw new FileNotFoundException(
+                $"服务端安装目录缺少 PostgreSQL Windows 运行时：{postgresRoot}");
+
+        // PostgreSQL launches restricted child processes on Windows. An
+        // Administrators-group ACE alone is therefore insufficient even when
+        // the installer itself is elevated: the restricted token needs the
+        // concrete installation-user SID. SYSTEM remains present for the
+        // registered Windows service.
+        SecureFileSystem.CreateDirectory(
+            dataDirectory,
+            enforceAcl: true,
+            includeCurrentUser: true);
+        var initialized = ReadClusterVersion(dataDirectory) is not null;
+        if (!initialized)
+        {
+            ArchiveIncompleteCluster(dataDirectory);
+            SecureFileSystem.CreateDirectory(
+                dataDirectory,
+                enforceAcl: true,
+                includeCurrentUser: true);
+            var passwordFile = Path.Combine(Path.GetTempPath(), $"BackupMonitor-pg-{Guid.NewGuid():N}.txt");
+            try
+            {
+                using (File.Create(passwordFile))
+                {
+                }
+                // initdb is a child process of the elevated installer. Grant the
+                // current token an explicit ACE in addition to SYSTEM and the
+                // Administrators group; relying on the Administrators group alone
+                // can leave the child token unable to read --pwfile under UAC.
+                SecureFileSystem.ApplyFileAcl(
+                    passwordFile,
+                    enforceAcl: true,
+                    includeCurrentUser: true);
+                await File.WriteAllTextAsync(passwordFile, postgresPassword + Environment.NewLine, Encoding.UTF8, ct);
+                await ProcessRunner.RunAsync(initdb,
+                    ["-D", dataDirectory, "-U", "postgres", "--pwfile", passwordFile,
+                     "--auth=scram-sha-256", "--encoding", "UTF8", "--locale", "C"],
+                    ct);
+            }
+            finally
+            {
+                TryDelete(passwordFile);
+            }
+        }
+
+        Configure(dataDirectory, port);
+        await EnsureServiceRegistrationAsync(pgCtl, dataDirectory, port, ct);
+
+        // A prior failed installer may have left PostgreSQL running directly
+        // from a temporary payload even though no service owns that process.
+        // Stop only that orphaned/manual instance, then start the persistent
+        // service so the process and its executable survive logoff/reboot.
+        if (await IsServerRunningAsync(pgCtl, dataDirectory, ct)
+            && !IsServiceRunning(ServiceName))
+        {
+            await ProcessRunner.RunAsync(pgCtl,
+                ["stop", "-D", dataDirectory, "-m", "fast", "-w"],
+                ct);
+        }
+
+        if (!IsServiceRunning(ServiceName))
+        {
+            await ProcessRunner.RunAsync(
+                Path.Combine(Environment.SystemDirectory, "sc.exe"),
+                ["start", ServiceName],
+                ct);
+        }
+
+        await WaitForConnectionAsync(port, postgresPassword, ct);
+        await EnsureDatabaseAndRoleAsync(port, postgresPassword, applicationPassword, ct);
+    }
+
+    private static void Configure(string dataDirectory, int port)
+    {
+        var postgresql = Path.Combine(dataDirectory, "postgresql.conf");
+        SetConfig(postgresql, "listen_addresses", "'127.0.0.1'");
+        SetConfig(postgresql, "port", port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        SetConfig(postgresql, "password_encryption", "'scram-sha-256'");
+
+        var hba = Path.Combine(dataDirectory, "pg_hba.conf");
+        File.WriteAllText(hba,
+            "# BackupMonitor private PostgreSQL instance\n"
+            + "local all all scram-sha-256\n"
+            + "host all all 127.0.0.1/32 scram-sha-256\n"
+            + "host all all ::1/128 scram-sha-256\n",
+            new UTF8Encoding(false));
+    }
+
+    private static void SetConfig(string path, string key, string value)
+    {
+        var lines = File.Exists(path) ? File.ReadAllLines(path).ToList() : [];
+        var pattern = new Regex($"^\\s*#?\\s*{Regex.Escape(key)}\\s*=", RegexOptions.CultureInvariant);
+        var index = lines.FindIndex(line => pattern.IsMatch(line));
+        var replacement = $"{key} = {value}";
+        if (index >= 0)
+            lines[index] = replacement;
+        else
+            lines.Add(replacement);
+        File.WriteAllLines(path, lines, new UTF8Encoding(false));
+    }
+
+    private static string? ReadClusterVersion(string dataDirectory)
+    {
+        var versionPath = Path.Combine(dataDirectory, "PG_VERSION");
+        try
+        {
+            using var stream = new FileStream(
+                versionPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream, Encoding.ASCII, detectEncodingFromByteOrderMarks: true);
+            var version = reader.ReadToEnd().Trim();
+            if (string.IsNullOrWhiteSpace(version))
+                throw new InvalidOperationException($"PostgreSQL 集群版本文件为空：{versionPath}");
+            return version;
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            throw new InvalidOperationException(
+                $"无法读取 PostgreSQL 集群版本文件：{versionPath}。安装器不会把权限错误误判为未初始化。",
+                ex);
+        }
+    }
+
+    private static void ArchiveIncompleteCluster(string dataDirectory)
+    {
+        string[] entries;
+        try
+        {
+            entries = Directory.GetFileSystemEntries(dataDirectory);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            throw new InvalidOperationException(
+                $"无法检查 PostgreSQL 数据目录：{dataDirectory}",
+                ex);
+        }
+
+        if (entries.Length == 0)
+            return;
+
+        var parent = Path.GetDirectoryName(dataDirectory)
+            ?? throw new InvalidOperationException($"PostgreSQL 数据目录没有父目录：{dataDirectory}");
+        var archive = Path.Combine(
+            parent,
+            $"data.incomplete-{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}");
+        Directory.Move(dataDirectory, archive);
+    }
+
+    private static async Task<bool> IsServerRunningAsync(
+        string pgCtl,
+        string dataDirectory,
+        CancellationToken ct)
+    {
+        var status = await ProcessRunner.RunAsync(
+            pgCtl,
+            ["status", "-D", dataDirectory],
+            ct,
+            throwOnError: false);
+        return status.ExitCode == 0;
+    }
+
+    private static bool IsAuthenticationFailure(PostgresException ex) =>
+        string.Equals(ex.SqlState, PostgresErrorCodes.InvalidPassword, StringComparison.Ordinal)
+        || string.Equals(ex.SqlState, PostgresErrorCodes.InvalidAuthorizationSpecification, StringComparison.Ordinal);
+
+    private static InvalidOperationException ExistingClusterPasswordMismatch(PostgresException ex) =>
+        new(
+            "现有 BackupMonitor PostgreSQL 集群正在运行，但 server-secrets.json 中的超级用户口令无法认证。安装器为保护已有数据不会重新执行 initdb；请使用同一安装实例的密钥包恢复口令。",
+            ex);
+
+    private static async Task OpenSuperuserConnectionAsync(
+        NpgsqlConnection connection,
+        CancellationToken ct)
+    {
+        try
+        {
+            await connection.OpenAsync(ct);
+        }
+        catch (PostgresException ex) when (IsAuthenticationFailure(ex))
+        {
+            throw ExistingClusterPasswordMismatch(ex);
+        }
+    }
+
+    private static async Task WaitForConnectionAsync(int port, string password, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                await using var connection = new NpgsqlConnection(BuildConnectionString(port, "postgres", password, "postgres"));
+                await OpenSuperuserConnectionAsync(connection, ct);
+                return;
+            }
+            catch (NpgsqlException) when (!ct.IsCancellationRequested)
+            {
+                await Task.Delay(250, ct);
+            }
+        }
+
+        throw new System.TimeoutException("BackupMonitor 专用 PostgreSQL 未能在 30 秒内就绪。");
+    }
+
+    private static async Task EnsureDatabaseAndRoleAsync(
+        int port,
+        string postgresPassword,
+        string applicationPassword,
+        CancellationToken ct)
+    {
+        await using var root = new NpgsqlConnection(BuildConnectionString(port, "postgres", postgresPassword, "postgres"));
+        await OpenSuperuserConnectionAsync(root, ct);
+
+        await using (var extension = new NpgsqlCommand("CREATE EXTENSION IF NOT EXISTS pgcrypto", root))
+            await extension.ExecuteNonQueryAsync(ct);
+
+        var rolePassword = await QuoteLiteralAsync(root, applicationPassword, ct);
+        await using (var role = new NpgsqlCommand(
+            $"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'backup_monitor_app') THEN CREATE ROLE backup_monitor_app LOGIN PASSWORD {rolePassword}; ELSE ALTER ROLE backup_monitor_app WITH LOGIN PASSWORD {rolePassword}; END IF; END $$;",
+            root))
+            await role.ExecuteNonQueryAsync(ct);
+
+        await using (var databaseExists = new NpgsqlCommand(
+            "SELECT 1 FROM pg_database WHERE datname = 'backup_monitor'", root))
+        {
+            if (await databaseExists.ExecuteScalarAsync(ct) is null)
+            {
+                await using var create = new NpgsqlCommand(
+                    "CREATE DATABASE backup_monitor OWNER backup_monitor_app", root);
+                await create.ExecuteNonQueryAsync(ct);
+            }
+        }
+
+        await using var database = new NpgsqlConnection(BuildConnectionString(port, "backup_monitor_app", applicationPassword, "backup_monitor"));
+        await database.OpenAsync(ct);
+        await using var schema = new NpgsqlCommand("CREATE EXTENSION IF NOT EXISTS pgcrypto", database);
+        await schema.ExecuteNonQueryAsync(ct);
+
+        await using var revoke = new NpgsqlCommand(
+            "REVOKE ALL ON DATABASE backup_monitor FROM PUBLIC; GRANT CONNECT ON DATABASE backup_monitor TO backup_monitor_app",
+            root);
+        await revoke.ExecuteNonQueryAsync(ct);
+    }
+
+    private static async Task<string> QuoteLiteralAsync(NpgsqlConnection connection, string value, CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand("SELECT quote_literal(@value)", connection);
+        command.Parameters.AddWithValue("value", value);
+        return (string)(await command.ExecuteScalarAsync(ct)
+            ?? throw new InvalidOperationException("PostgreSQL 无法生成安全的角色口令字面量。"));
+    }
+
+    private static async Task EnsureServiceRegistrationAsync(
+        string pgCtl,
+        string dataDirectory,
+        int port,
+        CancellationToken ct)
+    {
+        if (ServiceExists(ServiceName) && !ServiceRegistrationMatches(pgCtl))
+        {
+            await ProcessRunner.RunAsync(
+                Path.Combine(Environment.SystemDirectory, "sc.exe"),
+                ["stop", ServiceName],
+                ct,
+                throwOnError: false);
+            await WaitForServiceStoppedAsync(ct);
+            await ProcessRunner.RunAsync(
+                pgCtl,
+                ["unregister", "-N", ServiceName],
+                ct);
+            await WaitForServiceDeletedAsync(ct);
+        }
+
+        if (!ServiceExists(ServiceName))
+        {
+            await ProcessRunner.RunAsync(pgCtl,
+                ["register", "-N", ServiceName, "-D", dataDirectory, "-S", "auto",
+                 "-w", "-o", $"-p {port} -h 127.0.0.1"],
+                ct);
+        }
+    }
+
+    private static bool ServiceRegistrationMatches(string pgCtl)
+    {
+        using var key = Registry.LocalMachine.OpenSubKey(
+            $@"SYSTEM\CurrentControlSet\Services\{ServiceName}");
+        var imagePath = key?.GetValue("ImagePath") as string;
+        if (string.IsNullOrWhiteSpace(imagePath))
+            return false;
+
+        return imagePath.Contains(
+            Path.GetFullPath(pgCtl),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsServiceRunning(string name)
+    {
+        try
+        {
+            using var service = new ServiceController(name);
+            return service.Status is ServiceControllerStatus.Running
+                or ServiceControllerStatus.StartPending;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task WaitForServiceStoppedAsync(CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (!ServiceExists(ServiceName) || !IsServiceRunning(ServiceName))
+                return;
+            await Task.Delay(250, ct);
+        }
+
+        throw new System.TimeoutException($"Windows 服务 {ServiceName} 未能在 30 秒内停止。");
+    }
+
+    private static async Task WaitForServiceDeletedAsync(CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (!ServiceExists(ServiceName))
+                return;
+            await Task.Delay(200, ct);
+        }
+
+        throw new System.TimeoutException($"Windows 服务 {ServiceName} 未能在 15 秒内删除旧注册。");
+    }
+
+    internal static bool ServiceExists(string name)
+    {
+        try
+        {
+            using var service = new ServiceController(name);
+            _ = service.Status;
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static string BuildConnectionString(int port, string user, string password, string database) =>
+        new NpgsqlConnectionStringBuilder
+        {
+            Host = "127.0.0.1",
+            Port = port,
+            Username = user,
+            Password = password,
+            Database = database,
+            Timeout = 10,
+            CommandTimeout = 120,
+            Pooling = false
+        }.ConnectionString;
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+            // 安装失败时不覆盖主异常；临时文件由系统清理。
+        }
+    }
+}

@@ -45,6 +45,8 @@ public class AppDbContext : DbContext
     public DbSet<ClientDisk> ClientDisks => Set<ClientDisk>();
     public DbSet<MonitoredServiceDefinition> MonitoredServiceDefinitions => Set<MonitoredServiceDefinition>();
     public DbSet<ClientServiceState> ClientServiceStates => Set<ClientServiceState>();
+    public DbSet<ClientUserSession> ClientUserSessions => Set<ClientUserSession>();
+    public DbSet<AgentNotification> AgentNotifications => Set<AgentNotification>();
 
     #endregion
 

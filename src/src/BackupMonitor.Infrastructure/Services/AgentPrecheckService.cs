@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Security.Cryptography;
 using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -46,6 +48,22 @@ public class AgentPrecheckService : IAgentPrecheckService
             throw new BusinessException("FORBIDDEN", "任务不属于当前客户端", 403);
 
         var status = MapPrecheckStatus(request.PrecheckStatus);
+        var failureCode = request.FailureCode;
+        var failureMessage = request.FailureMessage;
+
+        // Agent 通过 mTLS 证明了客户端身份，但预检字段仍然是客户端输入。
+        // 服务端必须重新校验“通过”结果的完整性和任务级 requiredFiles，
+        // 否则伪造一个 passed 就会触发自动上传。
+        if (status == PrecheckStatus.Passed)
+        {
+            var validationError = ValidatePassedResult(task.RecognizerConfig, request);
+            if (validationError is not null)
+            {
+                status = PrecheckStatus.RequiredFileMissing;
+                failureCode = "SERVER_PRECHECK_VALIDATION_FAILED";
+                failureMessage = validationError;
+            }
+        }
 
         // 幂等：同一预检指令重复上报返回原结果
         if (request.CommandId is not null)
@@ -142,8 +160,8 @@ public class AgentPrecheckService : IAgentPrecheckService
         candidate.TotalBytes = request.TotalBytes;
         candidate.ManifestHash = request.ManifestHash;
         candidate.QuickFingerprint = request.QuickFingerprint;
-        candidate.FailureCode = request.FailureCode;
-        candidate.FailureMessage = request.FailureMessage;
+        candidate.FailureCode = failureCode;
+        candidate.FailureMessage = failureMessage;
         candidate.UpdatedAt = now;
 
         // 文件清单全量替换
@@ -205,7 +223,7 @@ public class AgentPrecheckService : IAgentPrecheckService
                 status == PrecheckStatus.Failed ? AlertLevel.Warning : AlertLevel.Notice,
                 "precheck_failed",
                 $"任务 {task.Name} 预检未通过：{EnumMapping.ToSnakeCase(status)}",
-                request.FailureMessage,
+                failureMessage,
                 clientId: clientId,
                 taskId: task.Id,
                 businessUnitId: candidate.BusinessUnitId,
@@ -262,4 +280,83 @@ public class AgentPrecheckService : IAgentPrecheckService
 
     private static PrecheckStatus MapPrecheckStatus(string value) =>
         EnumMapping.ParseSnakeCase<PrecheckStatus>(value, "precheckStatus");
+
+    private static string? ValidatePassedResult(string recognizerConfig, SubmitPrecheckResultRequest request)
+    {
+        var files = request.Files;
+        if (files is null || files.Count == 0)
+            return "预检通过结果必须包含文件清单";
+        if (request.TotalFiles is null || request.TotalFiles.Value != files.Count)
+            return "TotalFiles 与文件清单数量不一致";
+        if (request.TotalBytes is null || request.TotalBytes.Value != files.Sum(f => f.SizeBytes))
+            return "TotalBytes 与文件清单大小不一致";
+        if (!IsSha256(request.ManifestHash))
+            return "预检通过结果必须包含 64 位 ManifestHash";
+        if (files.Any(file => file.SizeBytes < 0
+                              || !PathSafety.IsValidRelativePath(file.RelativePath)
+                              || !IsSha256(file.Sha256)))
+            return "文件清单包含非法路径、大小或 SHA-256";
+        if (files.GroupBy(file => file.RelativePath.Replace('\\', '/'), StringComparer.OrdinalIgnoreCase)
+            .Any(group => group.Count() > 1))
+            return "文件清单包含重复相对路径";
+
+        var manifest = string.Join('\n', files
+            .Select(file => new
+            {
+                RelativePath = file.RelativePath.Replace('\\', '/'),
+                file.SizeBytes,
+                file.LastModifiedAt,
+                Sha256 = file.Sha256!.ToLowerInvariant()
+            })
+            .OrderBy(file => file.RelativePath, StringComparer.OrdinalIgnoreCase)
+            .Select(file => $"{file.RelativePath}|{file.SizeBytes}|{file.LastModifiedAt.Ticks}|{file.Sha256}"));
+        var actualManifest = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(manifest))).ToLowerInvariant();
+        if (!string.Equals(actualManifest, request.ManifestHash, StringComparison.OrdinalIgnoreCase))
+            return "ManifestHash 与文件清单不一致";
+
+        var required = ReadRequiredPatterns(recognizerConfig);
+        var relativePaths = files.Select(file => file.RelativePath.Replace('\\', '/')).ToList();
+        var missing = required.FirstOrDefault(pattern =>
+            !relativePaths.Any(path => GlobMatch(path, pattern) || GlobMatch(Path.GetFileName(path), pattern)));
+        return missing is null ? null : $"缺少 requiredFiles 文件：{missing}";
+    }
+
+    private static List<string> ReadRequiredPatterns(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return [];
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            return new[] { "requiredFiles", "requiredPatterns", "required" }
+                .SelectMany(property =>
+                    root.TryGetProperty(property, out var value)
+                        ? value.ValueKind == JsonValueKind.String
+                            ? string.IsNullOrWhiteSpace(value.GetString()) ? [] : [value.GetString()!]
+                            : value.ValueKind == JsonValueKind.Array
+                                ? value.EnumerateArray().Where(item => item.ValueKind == JsonValueKind.String)
+                                    .Select(item => item.GetString()!)
+                                    .Where(item => !string.IsNullOrWhiteSpace(item))
+                                : []
+                        : [])
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static bool IsSha256(string? value) =>
+        !string.IsNullOrWhiteSpace(value)
+        && Regex.IsMatch(value, "^[0-9a-fA-F]{64}$", RegexOptions.CultureInvariant);
+
+    private static bool GlobMatch(string value, string pattern)
+    {
+        var regex = "^" + Regex.Escape(pattern.Trim()).Replace(@"\*", ".*").Replace(@"\?", ".") + "$";
+        return Regex.IsMatch(value.Replace('\\', '/'), regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
 }

@@ -5,6 +5,7 @@ using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Infrastructure.Services;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -26,22 +27,50 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
     private readonly PostgresDatabaseFixture _fixture;
     private ServiceProvider _services = null!;
 
+    /// <summary>
+    /// 本测试实例的仓库根。物理删除围栏要求待删目录位于当前仓库根之内，
+    /// 因此每个用例都把 system_settings.repository_path 指到这里，
+    /// 并让 MakeRepositoryDirectory 在其下建目录。
+    /// </summary>
+    private string _repositoryRoot = null!;
+
     public RetentionCleanupWorkerTests(PostgresDatabaseFixture fixture) => _fixture = fixture;
 
-    public Task InitializeAsync()
+    public async Task InitializeAsync()
     {
+        _repositoryRoot = Path.Combine(Path.GetTempPath(), "bm-ret-test", Guid.NewGuid().ToString("N"), "repo");
+        Directory.CreateDirectory(_repositoryRoot);
+
         var sc = new ServiceCollection();
         sc.AddLogging();
         sc.AddDbContext<AppDbContext>(o => o.UseNpgsql(_fixture.ConnectionString));
+        sc.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
         sc.AddSingleton<ICurrentContext, NullCurrentContext>();
         sc.AddScoped<IAuditRecorder, DbAuditRecorder>();
+        sc.AddScoped<IAgentNotificationService, AgentNotificationService>();
         sc.AddScoped<IAlertingService, AlertingService>();
         sc.AddScoped<IScheduledLockService, ScheduledLockService>();
+        sc.AddScoped<IUploadStorage, UploadStorage>();
         sc.AddSingleton(sp => new SystemSettingsProvider(
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetRequiredService<ILogger<SystemSettingsProvider>>()));
         _services = sc.BuildServiceProvider();
-        return Task.CompletedTask;
+
+        // 必须先于 worker 首轮执行写入：SystemSettingsProvider 缓存 60 秒，
+        // 而每个用例都会新建一次 ServiceProvider，缓存此时还是空的。
+        await SetRepositoryRootSettingAsync(_repositoryRoot);
+    }
+
+    /// <summary>把 system_settings.repository_path 指向本用例的临时仓库根</summary>
+    private async Task SetRepositoryRootSettingAsync(string root)
+    {
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await db.Database.ExecuteSqlInterpolatedAsync($"""
+            UPDATE system_settings
+            SET setting_value = to_jsonb({root}::text)
+            WHERE setting_key = 'repository_path'
+            """);
     }
 
     public async Task DisposeAsync() => await _services.DisposeAsync();
@@ -285,6 +314,78 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
         }
     }
 
+    // ---------- 用例四：物理删除的仓库根围栏 ----------
+
+    /// <summary>
+    /// repository_path 指向仓库根之外时（迁移出错、手工改库、仓库重配都可能造成），
+    /// 即便备份集已到期且未被锁定，也必须拒绝递归删除：目录保持存在、状态停在 recycle_bin，
+    /// 且不得写出 retention.delete 成功审计。同一轮内围栏之内的备份集应照常被删除，
+    /// 以证明拒绝来自围栏本身，而不是这一轮压根没跑。
+    /// </summary>
+    [Fact]
+    public async Task 物理删除_仓库根之外的路径必须拒绝()
+    {
+        var now = DateTime.UtcNow;
+        Guid idInside, idOutside;
+        var insideDir = MakeRepositoryDirectory();
+        var outsideDir = MakeOutsideRepositoryDirectory();
+
+        try
+        {
+            await using (var scope = _services.CreateAsyncScope())
+            {
+                var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                var policy = new RetentionPolicy
+                {
+                    Id = Guid.NewGuid(),
+                    Name = $"it3-fence-{Guid.NewGuid():N}",
+                    KeepLastCount = 1,
+                    MinimumRetentionDays = 30,
+                    RecycleBinDays = 7,
+                    CreatedAt = now,
+                    UpdatedAt = now
+                };
+                (var clientId, var taskId) = await SeedClientAndTaskAsync(db, policy, now);
+
+                idInside = await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-60), now,
+                    status: BackupSetStatus.RecycleBin, retentionUntil: now.AddHours(-1), repositoryPath: insideDir);
+                idOutside = await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-60), now,
+                    status: BackupSetStatus.RecycleBin, retentionUntil: now.AddHours(-1), repositoryPath: outsideDir);
+                await db.SaveChangesAsync();
+            }
+
+            // 以围栏之内的那个被删除作为"本轮确实执行过"的信号
+            await RunWorkerUntilAsync(async () =>
+            {
+                await using var scope = _services.CreateAsyncScope();
+                var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                return await db.BackupSets.AsNoTracking()
+                    .AnyAsync(s => s.Id == idInside && s.Status == BackupSetStatus.Deleted);
+            });
+
+            await using (var scope = _services.CreateAsyncScope())
+            {
+                var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+                Assert.Equal(BackupSetStatus.Deleted, await StatusAsync(db, idInside));
+                Assert.False(Directory.Exists(insideDir), "围栏之内的到期目录应被物理删除");
+
+                Assert.Equal(BackupSetStatus.RecycleBin, await StatusAsync(db, idOutside));
+                Assert.True(Directory.Exists(outsideDir), "仓库根之外的目录绝不允许被删除");
+                Assert.True(File.Exists(Path.Combine(outsideDir, "data.bin")), "越界目录的内容必须原样保留");
+
+                Assert.False(await db.AuditLogs.AsNoTracking()
+                    .AnyAsync(a => a.Action == "retention.delete" && a.ResourceId == idOutside),
+                    "被围栏拒绝的备份集不得写出删除成功审计");
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(outsideDir))
+                Directory.Delete(outsideDir, recursive: true);
+        }
+    }
+
     // ---------- 基础设施 ----------
 
     /// <summary>启动真实 worker：首轮立即执行；轮询断言直至成立或超时，随后停止</summary>
@@ -316,12 +417,21 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
     private static async Task<BackupSetStatus> StatusAsync(AppDbContext db, Guid id)
         => (await db.BackupSets.AsNoTracking().SingleAsync(s => s.Id == id)).Status;
 
-    /// <summary>创建满足"至少两级目录"守卫的临时仓库目录并放入文件</summary>
-    private static string MakeRepositoryDirectory()
+    /// <summary>在本用例的仓库根之下创建备份集目录（同时满足"至少两级"守卫与仓库根围栏）</summary>
+    private string MakeRepositoryDirectory()
     {
-        var dir = Path.Combine(Path.GetTempPath(), "bm-ret-test", Guid.NewGuid().ToString("N"), "repo");
+        var dir = Path.Combine(_repositoryRoot, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         File.WriteAllText(Path.Combine(dir, "data.bin"), "retention-test");
+        return dir;
+    }
+
+    /// <summary>在仓库根之外创建目录，用于验证物理删除围栏会拒绝越界路径</summary>
+    private static string MakeOutsideRepositoryDirectory()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "bm-ret-outside", Guid.NewGuid().ToString("N"), "stray");
+        Directory.CreateDirectory(dir);
+        File.WriteAllText(Path.Combine(dir, "data.bin"), "must-not-be-deleted");
         return dir;
     }
 

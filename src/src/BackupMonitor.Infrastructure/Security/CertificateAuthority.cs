@@ -43,9 +43,18 @@ public class CertificateAuthority
             throw new BusinessException("INVALID_REQUEST", "客户端公钥不是合法的 Base64 编码", 400);
         }
 
-        var notBefore = DateTimeOffset.UtcNow.AddDays(-1);
+        // 客户端证书的有效期必须落在 CA 有效期内。原先固定回拨一天，
+        // 在本地 CA 刚生成时会早于 CA.NotBefore，导致 .NET 拒绝签发。
+        var now = DateTimeOffset.UtcNow;
+        var issuerNotBefore = new DateTimeOffset(ca.NotBefore.ToUniversalTime());
+        var issuerNotAfter = new DateTimeOffset(ca.NotAfter.ToUniversalTime());
+        var notBefore = issuerNotBefore > now.AddMinutes(-5) ? issuerNotBefore : now.AddMinutes(-5);
         var validityDays = _configuration.GetValue("Security:ClientCa:ClientCertValidityDays", 365);
-        var notAfter = DateTimeOffset.UtcNow.AddDays(validityDays);
+        var notAfter = now.AddDays(validityDays);
+        if (notAfter > issuerNotAfter)
+            notAfter = issuerNotAfter;
+        if (notAfter <= notBefore)
+            throw new BusinessException("SERVICE_UNAVAILABLE", "客户端证书 CA 的有效期不足，无法签发客户端证书", 503);
         var serial = CreateRandomSerial();
         var dn = new X500DistinguishedName($"CN={clientId}, O=BackupMonitor, OU={SanitizeDn(hostname)}");
 

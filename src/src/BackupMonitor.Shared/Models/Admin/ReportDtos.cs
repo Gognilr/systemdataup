@@ -55,7 +55,48 @@ public class AlertSummaryReportDto
     public List<EnumCountDto> ByStatus { get; set; } = [];
 }
 
-/// <summary>任务执行汇总报表</summary>
+/// <summary>任务在某一天的值守状态</summary>
+public class TaskDailyStatusDto
+{
+    /// <summary>success / failed / in_progress / no_schedule</summary>
+    public string Status { get; set; } = null!;
+
+    public DateTime Date { get; set; }
+
+    public int BackupSetCount { get; set; }
+
+    public long BackupBytes { get; set; }
+}
+
+/// <summary>值守台的任务行（最近 14 天）</summary>
+public class TaskMatrixRowDto
+{
+    public Guid TaskId { get; set; }
+
+    public string TaskName { get; set; } = null!;
+
+    public string ClientHostname { get; set; } = null!;
+
+    public bool Enabled { get; set; }
+
+    public string ImportanceLevel { get; set; } = null!;
+
+    public List<TaskDailyStatusDto> Days { get; set; } = [];
+}
+
+/// <summary>仓库容量快照</summary>
+public class RepositoryCapacityDto
+{
+    /// <summary>数据库中已入库备份数据量</summary>
+    public long RepositoryBytes { get; set; }
+
+    public long DiskFreeBytes { get; set; }
+
+    public long DiskTotalBytes { get; set; }
+
+    public DateTime? EstimatedFullAt { get; set; }
+}
+
 public class TaskSummaryReportDto
 {
     public int TotalTasks { get; set; }
@@ -71,4 +112,12 @@ public class TaskSummaryReportDto
 
     /// <summary>最近一次成功入库（available）时间</summary>
     public DateTime? LastSuccessfulUploadAt { get; set; }
+
+    /// <summary>矩阵列日期，按升序排列，默认最近 14 天</summary>
+    public List<DateTime> Dates { get; set; } = [];
+
+    /// <summary>按异常优先排列的任务 × 日期状态矩阵</summary>
+    public List<TaskMatrixRowDto> Matrix { get; set; } = [];
+
+    public RepositoryCapacityDto Capacity { get; set; } = new();
 }

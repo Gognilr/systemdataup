@@ -20,6 +20,9 @@ public class HeartbeatRequest
 
     public List<HeartbeatServiceStateDto>? ServiceStates { get; set; }
 
+    /// <summary>当前 Windows 登录会话</summary>
+    public List<HeartbeatUserSessionDto>? UserSessions { get; set; }
+
     /// <summary>Agent 侧活动指令 ID 列表</summary>
     public List<Guid>? ActiveCommands { get; set; }
 
@@ -31,7 +34,9 @@ public class HeartbeatRequest
 public class HeartbeatMetricsDto
 {
     public decimal? CpuPercent { get; set; }
+    public decimal? AgentCpuPercent { get; set; }
     public decimal? MemoryPercent { get; set; }
+    public long? MemoryTotalBytes { get; set; }
     public long? MemoryAvailableBytes { get; set; }
     public long? AgentMemoryBytes { get; set; }
     public long? NetworkSendBps { get; set; }
@@ -64,6 +69,19 @@ public class HeartbeatServiceStateDto
     public string? StartType { get; set; }
 }
 
+/// <summary>心跳中的 Windows 用户会话</summary>
+public class HeartbeatUserSessionDto
+{
+    public int SessionId { get; set; }
+    public string? Username { get; set; }
+    public string? Domain { get; set; }
+    public string State { get; set; } = null!;
+    public string? ClientName { get; set; }
+    public string? ClientAddress { get; set; }
+    public bool IsRemote { get; set; }
+    public DateTime? LogonAt { get; set; }
+}
+
 /// <summary>心跳响应（设计书 11.1）</summary>
 public class HeartbeatResponse
 {
@@ -78,4 +96,21 @@ public class HeartbeatResponse
 
     /// <summary>心跳间隔（秒）</summary>
     public int HeartbeatIntervalSeconds { get; set; } = 60;
+
+    /// <summary>证书剩余有效期小于等于 30 天时提示 Agent 续签。</summary>
+    public bool CertificateRenewalRequired { get; set; }
+
+    /// <summary>Agent 托盘只显示的消息，不包含敏感凭据。</summary>
+    public List<AgentNotificationDto> Notifications { get; set; } = [];
+}
+
+/// <summary>Agent 托盘消息。</summary>
+public class AgentNotificationDto
+{
+    public Guid Id { get; set; }
+    public string Kind { get; set; } = null!;
+    public string Severity { get; set; } = "info";
+    public string Title { get; set; } = null!;
+    public string? Message { get; set; }
+    public DateTime CreatedAt { get; set; }
 }

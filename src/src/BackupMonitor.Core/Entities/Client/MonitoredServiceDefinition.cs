@@ -22,6 +22,13 @@ public class MonitoredServiceDefinition
 
     public bool Enabled { get; set; } = true;
 
+    /// <summary>最近一次上报的当前状态快照；历史表只记录状态发生变化的时刻。</summary>
+    public ServiceActualState? CurrentActualState { get; set; }
+
+    public ServiceStartType? CurrentStartType { get; set; }
+
+    public DateTime? CurrentSampledAt { get; set; }
+
     // 导航属性
     public Client Client { get; set; } = null!;
     public ICollection<ClientServiceState> ServiceStates { get; set; } = [];

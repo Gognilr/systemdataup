@@ -45,8 +45,19 @@ public class AgentUpgradeService : IAgentUpgradeService
             throw new ValidationFailedException("clientIds 至少需要一台客户端");
         if (string.IsNullOrWhiteSpace(request.TargetVersion))
             throw new ValidationFailedException("targetVersion 必填");
-        if (string.IsNullOrWhiteSpace(request.PackagePath))
-            throw new ValidationFailedException("packagePath 必填");
+        if (string.IsNullOrWhiteSpace(request.PackageUrl))
+            throw new ValidationFailedException("packageUrl 必填");
+        if (!Uri.TryCreate(request.PackageUrl.Trim(), UriKind.Absolute, out var packageUri)
+            || (!string.Equals(packageUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(packageUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+        {
+            throw new ValidationFailedException("packageUrl 必须是 HTTP 或 HTTPS 地址");
+        }
+        if (string.IsNullOrWhiteSpace(request.PackageSha256)
+            || !System.Text.RegularExpressions.Regex.IsMatch(request.PackageSha256, "^[0-9a-fA-F]{64}$"))
+        {
+            throw new ValidationFailedException("packageSha256 必须为 64 位十六进制");
+        }
 
         var response = new UpgradeAgentResponseDto();
         var userId = _context.UserId;
@@ -81,8 +92,8 @@ public class AgentUpgradeService : IAgentUpgradeService
                 var payload = new
                 {
                     targetVersion = request.TargetVersion.Trim(),
-                    packagePath = request.PackagePath.Trim(),
-                    packageSha256 = request.PackageSha256?.ToLowerInvariant(),
+                    packageUrl = packageUri.ToString(),
+                    sha256 = request.PackageSha256.ToLowerInvariant(),
                     note = request.Note
                 };
 
@@ -120,7 +131,7 @@ public class AgentUpgradeService : IAgentUpgradeService
                 response.Dispatched,
                 response.Failed,
                 request.TargetVersion,
-                request.PackagePath
+                request.PackageUrl
             }), ct: ct);
 
         _logger.LogInformation("Agent 升级下发完成：成功 {Dispatched}，失败 {Failed}，目标版本 {Version}",

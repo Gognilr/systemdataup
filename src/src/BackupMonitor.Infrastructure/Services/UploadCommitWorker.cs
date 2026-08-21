@@ -61,10 +61,11 @@ public class UploadCommitWorker : BackgroundService
                 await using var scope = _scopeFactory.CreateAsyncScope();
                 var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
                 var alerting = scope.ServiceProvider.GetRequiredService<IAlertingService>();
+                var agentNotifications = scope.ServiceProvider.GetRequiredService<IAgentNotificationService>();
                 var storage = scope.ServiceProvider.GetRequiredService<IUploadStorage>();
 
                 if (item.Kind == WorkKind.CommitSession)
-                    await CommitSessionAsync(db, alerting, storage, item.Id, stoppingToken);
+                    await CommitSessionAsync(db, alerting, agentNotifications, storage, item.Id, stoppingToken);
                 else if (item.Kind == WorkKind.ReverifyBackupSet)
                     await ReverifyBackupSetAsync(db, alerting, item.Id, stoppingToken);
                 else
@@ -117,7 +118,13 @@ public class UploadCommitWorker : BackgroundService
         }
     }
 
-    private async Task CommitSessionAsync(AppDbContext db, IAlertingService alerting, IUploadStorage storage, Guid sessionId, CancellationToken ct)
+    private async Task CommitSessionAsync(
+        AppDbContext db,
+        IAlertingService alerting,
+        IAgentNotificationService agentNotifications,
+        IUploadStorage storage,
+        Guid sessionId,
+        CancellationToken ct)
     {
         var session = await db.UploadSessions
             .Include(s => s.Files).ThenInclude(f => f.CandidateFile)
@@ -178,6 +185,7 @@ public class UploadCommitWorker : BackgroundService
             var uploadedAt = session.CompletedAt ?? DateTime.UtcNow;
 
             await using var dbScope = await db.Database.BeginTransactionAsync(ct);
+            var committed = false;
             try
             {
                 // 备份集记录先行创建以获得编码（状态 verifying，原子重命名成功后置 available）
@@ -232,13 +240,14 @@ public class UploadCommitWorker : BackgroundService
                 // 原子重命名为正式目录
                 Directory.Move(commitTemp, finalPath);
 
+                var finalManifestPath = Path.Combine(finalPath, "manifest.json");
                 var manifestHash = Convert.ToHexString(
-                    System.Security.Cryptography.SHA256.HashData(await File.ReadAllBytesAsync(manifestPath, ct))).ToLowerInvariant();
+                    System.Security.Cryptography.SHA256.HashData(await File.ReadAllBytesAsync(finalManifestPath, ct))).ToLowerInvariant();
 
                 backupSet.Status = BackupSetStatus.Available;
                 backupSet.VerifiedAt = DateTime.UtcNow;
                 backupSet.RepositoryPath = finalPath;
-                backupSet.ManifestPath = Path.Combine(finalPath, "manifest.json");
+                backupSet.ManifestPath = finalManifestPath;
                 backupSet.ManifestSha256 = manifestHash;
 
                 foreach (var file in session.Files)
@@ -266,9 +275,50 @@ public class UploadCommitWorker : BackgroundService
 
                 await db.SaveChangesAsync(ct);
                 await dbScope.CommitAsync(ct);
+                committed = true;
 
-                await storage.CleanupSessionAsync(session.Id, ct);
-                await alerting.RecoverAsync($"task:{task.Id}:upload_failed", ct);
+                // ── 以下全部是提交之后的收尾动作：备份集已落库、正式目录已就位。
+                // 任何一步都不得把异常抛给下面的 catch —— 那里会回滚事务并删除正式目录，
+                // 等于把一次已经成功的备份毁掉。因此逐个兜住，失败只记录。
+                try
+                {
+                    await storage.CleanupSessionAsync(session.Id, ct);
+                }
+                catch (Exception cleanupEx)
+                {
+                    _logger.LogWarning(
+                        cleanupEx, "暂存目录清理失败 session={SessionId}（备份已入库，不影响结果）", session.Id);
+                }
+
+                try
+                {
+                    await alerting.RecoverAsync($"task:{task.Id}:upload_failed", ct);
+                }
+                catch (Exception recoverEx)
+                {
+                    _logger.LogWarning(
+                        recoverEx, "上传失败告警恢复失败 task={TaskId}（备份已入库，不影响结果）", task.Id);
+                }
+
+                // 备份已完成入库后向对应客户端排队一条一次性托盘提示。
+                try
+                {
+                    await agentNotifications.EnqueueAsync(
+                        client.Id,
+                        "backup_completed",
+                        "info",
+                        "备份完成",
+                        $"任务 {task.Name}：备份集 {backupSet.BackupSetCode}，{backupSet.TotalFiles} 个文件，{backupSet.TotalBytes} 字节",
+                        $"backup_set:{backupSet.Id}:completed",
+                        backupSetId: backupSet.Id,
+                        ct: ct);
+                    await db.SaveChangesAsync(ct);
+                }
+                catch (Exception notificationEx)
+                {
+                    // 提示队列异常不能回滚已经成功的备份。
+                    _logger.LogWarning(notificationEx, "备份完成提示入队失败 backupSet={BackupSetId}", backupSet.Id);
+                }
 
                 _logger.LogInformation(
                     "会话 {SessionId} 入库成功 backupSet={Code} path={Path}",
@@ -276,6 +326,13 @@ public class UploadCommitWorker : BackgroundService
             }
             catch
             {
+                // 提交之后本不该再走到这里（收尾动作已各自兜住异常）。万一走到了，
+                // 绝不能回滚或删目录：事务已提交、正式目录已就位，那样做就是销毁一次成功的备份。
+                // 之所以留这道闸，是因为原先的写法只靠「对已提交事务调 RollbackAsync 会先抛异常」
+                // 这个实现细节侥幸躲开删除，换个 EF/Npgsql 版本就可能真的删下去。
+                if (committed)
+                    throw;
+
                 await dbScope.RollbackAsync(ct);
 
                 // 数据库写入失败不得暴露半成品正式目录（设计书 24.3）

@@ -24,7 +24,11 @@ public class ClientHeartbeat
 
     public decimal? CpuPercent { get; set; }
 
+    public decimal? AgentCpuPercent { get; set; }
+
     public decimal? MemoryPercent { get; set; }
+
+    public long? MemoryTotalBytes { get; set; }
 
     public long? MemoryAvailableBytes { get; set; }
 

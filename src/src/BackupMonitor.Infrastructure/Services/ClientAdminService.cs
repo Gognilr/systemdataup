@@ -6,6 +6,7 @@ using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Infrastructure.Security;
 using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models;
+using BackupMonitor.Shared.Models.Agent;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -17,6 +18,10 @@ public interface IClientAdminService
 {
     Task<PagedResult<ClientListItemDto>> GetListAsync(ClientQuery query, CancellationToken ct = default);
     Task<ClientDetailDto> GetDetailAsync(Guid clientId, CancellationToken ct = default);
+    Task<IReadOnlyList<RecentAutoEnrollmentDto>> GetRecentAutomaticEnrollmentsAsync(
+        int days = 7, int limit = 20, CancellationToken ct = default);
+    Task<CertificateRenewalResponse> RenewCertificateAsync(Guid clientId, CancellationToken ct = default);
+    Task<ClientMetricsHistoryDto> GetMetricsHistoryAsync(Guid clientId, int hours = 24, int limit = 1440, CancellationToken ct = default);
     Task<ApproveClientResponseDto> ApproveAsync(Guid clientId, CancellationToken ct = default);
     Task RejectAsync(Guid clientId, string? reason, CancellationToken ct = default);
     Task DisableAsync(Guid clientId, DisableClientRequest request, CancellationToken ct = default);
@@ -108,6 +113,8 @@ public class ClientAdminService : IClientAdminService
                 c.OsName,
                 c.AgentVersion,
                 c.Status,
+                c.EnrollmentMode,
+                c.CertificateExpiresAt,
                 c.LastHeartbeatAt,
                 c.CreatedAt
             })
@@ -138,6 +145,11 @@ public class ClientAdminService : IClientAdminService
             OsName = r.OsName,
             AgentVersion = r.AgentVersion,
             Status = EnumMapping.ToSnakeCase(r.Status),
+            EnrollmentMode = r.EnrollmentMode,
+            CertificateExpiresAt = r.CertificateExpiresAt,
+            CertificateRemainingDays = r.CertificateExpiresAt is null
+                ? null
+                : Math.Max(0, (int)Math.Ceiling((r.CertificateExpiresAt.Value - DateTime.UtcNow).TotalDays)),
             LastHeartbeatAt = r.LastHeartbeatAt,
             CreatedAt = r.CreatedAt,
             ActiveAlertCount = alertCounts.FirstOrDefault(a => a.ClientId == r.Id)?.Count ?? 0,
@@ -169,26 +181,11 @@ public class ClientAdminService : IClientAdminService
             .OrderBy(d => d.ServiceName)
             .ToListAsync(ct);
 
-        // 每个监控服务取最近一次采样状态
-        var latestSamples = await _db.ClientServiceStates.AsNoTracking()
+        var userSessions = await _db.ClientUserSessions.AsNoTracking()
             .Where(s => s.ClientId == clientId)
-            .GroupBy(s => s.DefinitionId)
-            .Select(g => new { DefinitionId = g.Key, SampledAt = g.Max(s => s.SampledAt) })
+            .OrderBy(s => s.Username)
+            .ThenBy(s => s.SessionId)
             .ToListAsync(ct);
-
-        var sampledAtLookup = latestSamples.ToDictionary(l => l.DefinitionId, l => l.SampledAt);
-        var sampleTimestamps = sampledAtLookup.Values.ToList();
-        var definitionIds = sampledAtLookup.Keys.ToList();
-
-        var latestStates = await _db.ClientServiceStates.AsNoTracking()
-            .Where(s => s.ClientId == clientId
-                        && definitionIds.Contains(s.DefinitionId)
-                        && sampleTimestamps.Contains(s.SampledAt))
-            .ToListAsync(ct);
-
-        var stateLookup = latestStates
-            .GroupBy(s => s.DefinitionId)
-            .ToDictionary(g => g.Key, g => g.OrderByDescending(s => s.SampledAt).First());
 
         var lastHeartbeat = await _db.ClientHeartbeats.AsNoTracking()
             .Where(h => h.ClientId == clientId)
@@ -196,9 +193,15 @@ public class ClientAdminService : IClientAdminService
             .Select(h => new ClientMetricsDto
             {
                 CpuPercent = h.CpuPercent,
+                AgentCpuPercent = h.AgentCpuPercent,
                 MemoryPercent = h.MemoryPercent,
+                MemoryTotalBytes = h.MemoryTotalBytes,
                 MemoryAvailableBytes = h.MemoryAvailableBytes,
                 AgentMemoryBytes = h.AgentMemoryBytes,
+                NetworkSendBps = h.NetworkSendBps,
+                NetworkReceiveBps = h.NetworkReceiveBps,
+                AgentUptimeSeconds = h.AgentUptimeSeconds,
+                SystemUptimeSeconds = h.SystemUptimeSeconds,
                 ReceivedAt = h.ReceivedAt
             })
             .FirstOrDefaultAsync(ct);
@@ -213,6 +216,7 @@ public class ClientAdminService : IClientAdminService
             OsName = client.OsName,
             AgentVersion = client.AgentVersion,
             Status = EnumMapping.ToSnakeCase(client.Status),
+            EnrollmentMode = client.EnrollmentMode,
             LastHeartbeatAt = client.LastHeartbeatAt,
             CreatedAt = client.CreatedAt,
             ActiveAlertCount = activeAlertCount,
@@ -228,6 +232,9 @@ public class ClientAdminService : IClientAdminService
             LastConfigVersion = client.LastConfigVersion,
             CertificateThumbprint = client.CertificateThumbprint,
             CertificateExpiresAt = client.CertificateExpiresAt,
+            CertificateRemainingDays = client.CertificateExpiresAt is null
+                ? null
+                : Math.Max(0, (int)Math.Ceiling((client.CertificateExpiresAt.Value - DateTime.UtcNow).TotalDays)),
             TimeOffsetSeconds = client.TimeOffsetSeconds,
             Notes = client.Notes,
             UpdatedAt = client.UpdatedAt,
@@ -249,14 +256,94 @@ public class ClientAdminService : IClientAdminService
                 ServiceName = d.ServiceName,
                 DisplayName = d.DisplayName,
                 ExpectedState = EnumMapping.ToSnakeCase(d.ExpectedState),
-                ActualState = stateLookup.TryGetValue(d.Id, out var s)
-                    ? EnumMapping.ToSnakeCase(s.ActualState) : null,
-                LastSampledAt = s?.SampledAt,
+                ActualState = d.CurrentActualState is not null
+                    ? EnumMapping.ToSnakeCase(d.CurrentActualState.Value) : null,
+                LastSampledAt = d.CurrentSampledAt,
                 AlertOnMismatch = d.AlertOnMismatch,
                 Enabled = d.Enabled
             }).ToList(),
 
+            UserSessions = userSessions.Select(s => new ClientUserSessionDto
+            {
+                SessionId = s.SessionId,
+                Username = s.Username,
+                Domain = s.Domain,
+                State = s.State,
+                ClientName = s.ClientName,
+                ClientAddress = s.ClientAddress,
+                IsRemote = s.IsRemote,
+                LogonAt = s.LogonAt,
+                SampledAt = s.SampledAt
+            }).ToList(),
+
             LastMetrics = lastHeartbeat
+        };
+    }
+
+    public async Task<IReadOnlyList<RecentAutoEnrollmentDto>> GetRecentAutomaticEnrollmentsAsync(
+        int days = 7, int limit = 20, CancellationToken ct = default)
+    {
+        days = Math.Clamp(days, 1, 30);
+        limit = Math.Clamp(limit, 1, 50);
+        var from = DateTime.UtcNow.AddDays(-days);
+        return await _db.Clients.AsNoTracking()
+            .Where(c => c.EnrollmentMode == "lan_simple" && c.CreatedAt >= from)
+            .OrderByDescending(c => c.CreatedAt)
+            .Take(limit)
+            .Select(c => new RecentAutoEnrollmentDto
+            {
+                Id = c.Id,
+                Hostname = c.Hostname,
+                DisplayName = c.DisplayName,
+                CreatedAt = c.CreatedAt,
+                LastHeartbeatAt = c.LastHeartbeatAt
+            })
+            .ToListAsync(ct);
+    }
+
+    public async Task<ClientMetricsHistoryDto> GetMetricsHistoryAsync(
+        Guid clientId,
+        int hours = 24,
+        int limit = 1440,
+        CancellationToken ct = default)
+    {
+        if (!await _db.Clients.AsNoTracking().AnyAsync(c => c.Id == clientId, ct))
+            throw new NotFoundException("客户端", clientId);
+
+        hours = Math.Clamp(hours, 1, 168);
+        limit = Math.Clamp(limit, 1, 2000);
+        var to = DateTime.UtcNow;
+        var from = to.AddHours(-hours);
+
+        var points = await _db.ClientHeartbeats.AsNoTracking()
+            .Where(h => h.ClientId == clientId && h.ReceivedAt >= from && h.ReceivedAt <= to)
+            .OrderByDescending(h => h.ReceivedAt)
+            .Take(limit)
+            .Select(h => new ClientMetricsPointDto
+            {
+                ReceivedAt = h.ReceivedAt,
+                CpuPercent = h.CpuPercent,
+                AgentCpuPercent = h.AgentCpuPercent,
+                MemoryPercent = h.MemoryPercent,
+                MemoryTotalBytes = h.MemoryTotalBytes,
+                MemoryAvailableBytes = h.MemoryAvailableBytes,
+                AgentMemoryBytes = h.AgentMemoryBytes,
+                NetworkSendBps = h.NetworkSendBps,
+                NetworkReceiveBps = h.NetworkReceiveBps,
+                AgentUptimeSeconds = h.AgentUptimeSeconds,
+                SystemUptimeSeconds = h.SystemUptimeSeconds,
+                ActiveCommandCount = h.ActiveCommandCount,
+                ActiveUploadCount = h.ActiveUploadCount
+            })
+            .ToListAsync(ct);
+
+        points.Reverse();
+        return new ClientMetricsHistoryDto
+        {
+            ClientId = clientId,
+            From = from,
+            To = to,
+            Points = points
         };
     }
 
@@ -317,6 +404,79 @@ public class ClientAdminService : IClientAdminService
         return new ApproveClientResponseDto
         {
             ClientId = client.Id,
+            CertificateThumbprint = issued.Thumbprint,
+            CertificateIssuedAt = issued.IssuedAt,
+            CertificateExpiresAt = issued.ExpiresAt
+        };
+    }
+
+    public async Task<CertificateRenewalResponse> RenewCertificateAsync(
+        Guid clientId,
+        CancellationToken ct = default)
+    {
+        var client = await _db.Clients
+            .Include(c => c.Certificates)
+            .FirstOrDefaultAsync(c => c.Id == clientId, ct)
+            ?? throw new NotFoundException("客户端", clientId);
+
+        if (client.Status is ClientStatus.Disabled or ClientStatus.Revoked)
+            throw new BusinessException("CLIENT_DISABLED", "客户端已禁用或已注销，不能续签证书", 403);
+        if (string.IsNullOrWhiteSpace(client.PublicKey))
+            throw new BusinessException("INVALID_REQUEST", "客户端没有可用于续签的公钥", 409);
+
+        var now = DateTime.UtcNow;
+        var active = client.Certificates
+            .Where(c => c.Status == CertificateStatus.Active)
+            .OrderByDescending(c => c.ExpiresAt)
+            .FirstOrDefault();
+        if (active is not null && active.ExpiresAt > now.AddDays(30))
+            throw new BusinessException("CERTIFICATE_RENEWAL_NOT_DUE", "客户端证书尚未进入 30 天续签窗口", 409);
+
+        var issued = await _certificateAuthority.IssueClientCertificateAsync(
+            client.Id,
+            client.Hostname,
+            client.PublicKey);
+
+        foreach (var certificate in client.Certificates.Where(c => c.Status == CertificateStatus.Active))
+        {
+            certificate.Status = CertificateStatus.Superseded;
+            certificate.RevokedAt = now;
+            certificate.RevokeReason = "已由新证书替代，保留七天重叠期";
+        }
+
+        _db.ClientCertificates.Add(new ClientCertificate
+        {
+            Id = Guid.NewGuid(),
+            ClientId = client.Id,
+            Thumbprint = issued.Thumbprint,
+            SerialNumber = issued.SerialNumber,
+            IssuedAt = issued.IssuedAt,
+            ExpiresAt = issued.ExpiresAt,
+            Status = CertificateStatus.Active,
+            CertificatePem = issued.CertificatePem
+        });
+        client.CertificateThumbprint = issued.Thumbprint;
+        client.CertificateExpiresAt = issued.ExpiresAt;
+        client.Status = ClientStatus.Online;
+
+        await _db.SaveChangesAsync(ct);
+        await _audit.RecordAsync(
+            "client.certificate.renew",
+            AuditResult.Success,
+            "client",
+            client.Id,
+            afterData: JsonSerializer.Serialize(new
+            {
+                certificateThumbprint = issued.Thumbprint,
+                certificateExpiresAt = issued.ExpiresAt,
+                overlapDays = 7
+            }),
+            ct: ct);
+
+        return new CertificateRenewalResponse
+        {
+            ClientId = client.Id,
+            CertificatePem = issued.CertificatePem,
             CertificateThumbprint = issued.Thumbprint,
             CertificateIssuedAt = issued.IssuedAt,
             CertificateExpiresAt = issued.ExpiresAt

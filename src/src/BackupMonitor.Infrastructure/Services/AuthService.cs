@@ -136,7 +136,8 @@ public class AuthService : IAuthService
                 DisplayName = user.DisplayName,
                 Email = user.Email,
                 Roles = roles,
-                Permissions = permissions
+                Permissions = permissions,
+                MustChangePassword = user.MustChangePassword
             }
         };
     }
@@ -285,7 +286,8 @@ public class AuthService : IAuthService
             DisplayName = user.DisplayName,
             Email = user.Email,
             Roles = roles,
-            Permissions = permissions
+            Permissions = permissions,
+            MustChangePassword = user.MustChangePassword
         };
     }
 

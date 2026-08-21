@@ -180,14 +180,23 @@ CI 最小可用形态：
 name: ci
 on: [push, pull_request]
 jobs:
-  build-test:
+  server-build-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with: { dotnet-version: '8.0.x' }
-      - run: dotnet build src/BackupMonitor.sln -c Release --nologo
-      - run: dotnet test  src/BackupMonitor.sln -c Release --nologo --no-build
+      - run: dotnet build src/src/BackupMonitor.Api/BackupMonitor.Api.csproj -c Release --nologo
+      - run: dotnet test src/tests/BackupMonitor.Infrastructure.Tests/BackupMonitor.Infrastructure.Tests.csproj -c Release --nologo
+
+  windows-agent-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: '8.0.x' }
+      - run: dotnet build src/agent/BackupMonitor.Agent/BackupMonitor.Agent.csproj -c Release --nologo
+      - run: dotnet build src/agent/BackupMonitor.Agent.Tray/BackupMonitor.Agent.Tray.csproj -c Release --nologo
 ```
 
 顺带一提：本轮改动因为本机没有 .NET SDK 而**未经编译验证**，CI 的第一个价值就是堵上这个口子。

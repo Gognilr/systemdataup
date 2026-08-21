@@ -49,6 +49,13 @@ public static class JwtClaimTypes
     public const string Role = "role";
     public const string Permission = "permission";
 
+    /// <summary>
+    /// 未完成首次强制改密的标记（OPEN-ISSUES #2）。
+    /// 只在 users.must_change_password 为 true 时写入，值恒为 "true"；
+    /// 由 PasswordChangeRequiredMiddleware 在服务端强制执行。
+    /// </summary>
+    public const string MustChangePassword = "must_change_password";
+
     /// <summary>客户端证书认证方案写入的客户端 ID claim</summary>
     public const string ClientId = "client_id";
 
@@ -81,6 +88,12 @@ public class JwtTokenService
             new(JwtClaimTypes.Username, user.Username),
             new(JwtClaimTypes.DisplayName, user.DisplayName)
         };
+
+        // 强制改密状态必须随令牌下发，否则服务端无从判断（OPEN-ISSUES #2）。
+        // 改密成功后 users.must_change_password 置 false，下一次签发的令牌自然不再带此 claim；
+        // 同时 ChangePasswordAsync 会吊销全部刷新令牌，旧令牌最迟在自然过期后失效。
+        if (user.MustChangePassword)
+            claims.Add(new Claim(JwtClaimTypes.MustChangePassword, "true"));
 
         foreach (var role in roles.Distinct())
             claims.Add(new Claim(JwtClaimTypes.Role, role));

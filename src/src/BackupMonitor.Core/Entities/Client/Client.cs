@@ -35,6 +35,9 @@ public class Client : IHasRowVersion
 
     public ClientStatus Status { get; set; } = ClientStatus.PendingApproval;
 
+    /// <summary>登记方式：lan_simple / secure。</summary>
+    public string EnrollmentMode { get; set; } = "secure";
+
     public DateTime? ApprovedAt { get; set; }
 
     /// <summary>审批人</summary>

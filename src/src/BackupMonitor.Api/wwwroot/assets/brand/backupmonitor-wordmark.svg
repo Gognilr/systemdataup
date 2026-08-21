@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 128" role="img" aria-labelledby="title desc">
+  <title id="title">BackupMonitor</title>
+  <desc id="desc">BackupMonitor data protection and endpoint health brand.</desc>
+  <g transform="translate(0 4) scale(.94)">
+    <path d="M64 7 111 27v32c0 31-18 51-47 62C35 110 17 90 17 59V27L64 7Z" fill="#0d2d52"/>
+    <path d="M64 18 99 33v26c0 24-13 40-35 50-22-10-35-26-35-50V33l35-15Z" fill="#f5fbff"/>
+    <path d="M36 45c0-4 4-7 8-7h34c4 0 8 3 8 7s-4 7-8 7H44c-4 0-8-3-8-7Zm0 13c0-4 4-7 8-7h34c4 0 8 3 8 7s-4 7-8 7H44c-4 0-8-3-8-7Zm0 13c0-4 4-7 8-7h34c4 0 8 3 8 7s-4 7-8 7H44c-4 0-8-3-8-7Z" fill="#24a7df"/>
+    <circle cx="88" cy="86" r="21" fill="#fff" stroke="#16a05a" stroke-width="6"/>
+    <path d="m76 86 7 7 7-16 5 11h8" fill="none" stroke="#16a05a" stroke-linecap="round" stroke-linejoin="round" stroke-width="4"/>
+  </g>
+  <text x="132" y="61" fill="#0d2d52" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="35" font-weight="700" letter-spacing=".5">BackupMonitor</text>
+  <text x="135" y="89" fill="#54708e" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="15" letter-spacing="2">DATA PROTECTION · ENDPOINT HEALTH</text>
+</svg>

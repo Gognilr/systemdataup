@@ -13,14 +13,16 @@ public class UpgradeAgentRequestDto
     [MaxLength(32, ErrorMessage = "targetVersion 不能超过 32 字符")]
     public string TargetVersion { get; set; } = null!;
 
-    /// <summary>升级包路径（Agent 可访问的局域网共享路径或服务端下发地址）</summary>
-    [Required(ErrorMessage = "packagePath 必填")]
-    [MaxLength(2048, ErrorMessage = "packagePath 不能超过 2048 字符")]
-    public string PackagePath { get; set; } = null!;
+    /// <summary>升级包 HTTP(S) 地址；生产环境必须使用 HTTPS。</summary>
+    [Required(ErrorMessage = "packageUrl 必填")]
+    [Url(ErrorMessage = "packageUrl 必须是有效的 HTTP(S) 地址")]
+    [MaxLength(2048, ErrorMessage = "packageUrl 不能超过 2048 字符")]
+    public string PackageUrl { get; set; } = null!;
 
-    /// <summary>升级包 SHA-256（64 位十六进制），供 Agent 校验</summary>
+    /// <summary>升级包 SHA-256（64 位十六进制），Agent 强制校验</summary>
+    [Required(ErrorMessage = "packageSha256 必填")]
     [RegularExpression("^[0-9a-fA-F]{64}$", ErrorMessage = "packageSha256 必须为 64 位十六进制")]
-    public string? PackageSha256 { get; set; }
+    public string PackageSha256 { get; set; } = null!;
 
     [MaxLength(500, ErrorMessage = "note 不能超过 500 字符")]
     public string? Note { get; set; }

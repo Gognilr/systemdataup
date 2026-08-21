@@ -87,6 +87,7 @@ public class ClientConfiguration : IEntityTypeConfiguration<Client>
         builder.Property(e => e.AgentVersion).HasColumnName("agent_version").HasMaxLength(64);
         builder.Property(e => e.IpAddresses).HasColumnName("ip_addresses").HasColumnType("jsonb");
         builder.Property(e => e.Status).HasColumnName("status");
+        builder.Property(e => e.EnrollmentMode).HasColumnName("enrollment_mode").HasMaxLength(16).HasDefaultValue("secure");
         builder.Property(e => e.ApprovedAt).HasColumnName("approved_at");
         builder.Property(e => e.ApprovedBy).HasColumnName("approved_by");
         builder.Property(e => e.LastHeartbeatAt).HasColumnName("last_heartbeat_at");
@@ -162,7 +163,9 @@ public class ClientHeartbeatConfiguration : IEntityTypeConfiguration<ClientHeart
         builder.Property(e => e.AgentUptimeSeconds).HasColumnName("agent_uptime_seconds");
         builder.Property(e => e.SystemUptimeSeconds).HasColumnName("system_uptime_seconds");
         builder.Property(e => e.CpuPercent).HasColumnName("cpu_percent").HasColumnType("numeric(5,2)");
+        builder.Property(e => e.AgentCpuPercent).HasColumnName("agent_cpu_percent").HasColumnType("numeric(5,2)");
         builder.Property(e => e.MemoryPercent).HasColumnName("memory_percent").HasColumnType("numeric(5,2)");
+        builder.Property(e => e.MemoryTotalBytes).HasColumnName("memory_total_bytes");
         builder.Property(e => e.MemoryAvailableBytes).HasColumnName("memory_available_bytes");
         builder.Property(e => e.AgentMemoryBytes).HasColumnName("agent_memory_bytes");
         builder.Property(e => e.NetworkSendBps).HasColumnName("network_send_bps");
@@ -223,6 +226,9 @@ public class MonitoredServiceDefinitionConfiguration : IEntityTypeConfiguration<
         builder.Property(e => e.ExpectedState).HasColumnName("expected_state");
         builder.Property(e => e.AlertOnMismatch).HasColumnName("alert_on_mismatch").HasDefaultValue(true);
         builder.Property(e => e.Enabled).HasColumnName("enabled").HasDefaultValue(true);
+        builder.Property(e => e.CurrentActualState).HasColumnName("current_actual_state");
+        builder.Property(e => e.CurrentStartType).HasColumnName("current_start_type");
+        builder.Property(e => e.CurrentSampledAt).HasColumnName("current_sampled_at");
 
         builder.HasIndex(e => e.ClientId).HasDatabaseName("idx_monitored_service_definitions_client");
 
@@ -259,5 +265,79 @@ public class ClientServiceStateConfiguration : IEntityTypeConfiguration<ClientSe
             .WithMany()
             .HasForeignKey(e => e.ClientId)
             .OnDelete(DeleteBehavior.Cascade);
+    }
+}
+
+public class ClientUserSessionConfiguration : IEntityTypeConfiguration<ClientUserSession>
+{
+    public void Configure(EntityTypeBuilder<ClientUserSession> builder)
+    {
+        builder.ToTable("client_user_sessions");
+
+        builder.HasKey(e => e.Id);
+        builder.Property(e => e.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+        builder.Property(e => e.ClientId).HasColumnName("client_id");
+        builder.Property(e => e.SessionId).HasColumnName("session_id");
+        builder.Property(e => e.Username).HasColumnName("username").HasMaxLength(255);
+        builder.Property(e => e.Domain).HasColumnName("domain_name").HasMaxLength(255);
+        builder.Property(e => e.State).HasColumnName("state").HasMaxLength(32).IsRequired();
+        builder.Property(e => e.ClientName).HasColumnName("client_name").HasMaxLength(255);
+        builder.Property(e => e.ClientAddress).HasColumnName("client_address").HasMaxLength(128);
+        builder.Property(e => e.IsRemote).HasColumnName("is_remote").HasDefaultValue(false);
+        builder.Property(e => e.LogonAt).HasColumnName("logon_at");
+        builder.Property(e => e.SampledAt).HasColumnName("sampled_at").HasDefaultValueSql("now()");
+
+        builder.HasIndex(e => new { e.ClientId, e.SessionId })
+            .IsUnique().HasDatabaseName("uq_client_user_sessions_client_session");
+        builder.HasIndex(e => new { e.ClientId, e.SampledAt })
+            .IsDescending(false, true).HasDatabaseName("idx_client_user_sessions_client_sampled");
+
+        builder.HasOne(e => e.Client)
+            .WithMany()
+            .HasForeignKey(e => e.ClientId)
+            .OnDelete(DeleteBehavior.Cascade);
+    }
+}
+
+public class AgentNotificationConfiguration : IEntityTypeConfiguration<AgentNotification>
+{
+    public void Configure(EntityTypeBuilder<AgentNotification> builder)
+    {
+        builder.ToTable("agent_notifications");
+
+        builder.HasKey(e => e.Id);
+        builder.Property(e => e.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+        builder.Property(e => e.ClientId).HasColumnName("client_id").IsRequired();
+        builder.Property(e => e.Kind).HasColumnName("kind").HasMaxLength(32).IsRequired();
+        builder.Property(e => e.Severity).HasColumnName("severity").HasMaxLength(16).IsRequired();
+        builder.Property(e => e.Title).HasColumnName("title").HasMaxLength(255).IsRequired();
+        builder.Property(e => e.Message).HasColumnName("message").HasMaxLength(2000);
+        builder.Property(e => e.DedupeKey).HasColumnName("dedupe_key").HasMaxLength(255).IsRequired();
+        builder.Property(e => e.AlertId).HasColumnName("alert_id");
+        builder.Property(e => e.BackupSetId).HasColumnName("backup_set_id");
+        builder.Property(e => e.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("now()");
+        builder.Property(e => e.ExpiresAt).HasColumnName("expires_at");
+        builder.Property(e => e.DeliveredAt).HasColumnName("delivered_at");
+
+        builder.HasIndex(e => new { e.ClientId, e.DedupeKey })
+            .IsUnique().HasDatabaseName("uq_agent_notifications_client_dedupe");
+        builder.HasIndex(e => new { e.ClientId, e.CreatedAt })
+            .IsDescending(false, true).HasDatabaseName("idx_agent_notifications_client_created");
+        builder.HasIndex(e => e.ExpiresAt).HasDatabaseName("idx_agent_notifications_expires");
+        builder.HasIndex(e => new { e.ClientId, e.DeliveredAt, e.CreatedAt })
+            .HasDatabaseName("idx_agent_notifications_client_delivery");
+
+        builder.HasOne(e => e.Client)
+            .WithMany()
+            .HasForeignKey(e => e.ClientId)
+            .OnDelete(DeleteBehavior.Cascade);
+        builder.HasOne<BackupMonitor.Core.Entities.Alert.Alert>()
+            .WithMany()
+            .HasForeignKey(e => e.AlertId)
+            .OnDelete(DeleteBehavior.SetNull);
+        builder.HasOne<BackupMonitor.Core.Entities.Backup.BackupSet>()
+            .WithMany()
+            .HasForeignKey(e => e.BackupSetId)
+            .OnDelete(DeleteBehavior.SetNull);
     }
 }

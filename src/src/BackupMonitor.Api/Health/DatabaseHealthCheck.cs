@@ -1,4 +1,5 @@
 using BackupMonitor.Infrastructure.Data;
+using BackupMonitor.Infrastructure.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 
@@ -12,8 +13,13 @@ namespace BackupMonitor.Api.Health;
 public sealed class DatabaseHealthCheck : IHealthCheck
 {
     private readonly AppDbContext _db;
+    private readonly PartitionMaintenanceService _partitions;
 
-    public DatabaseHealthCheck(AppDbContext db) => _db = db;
+    public DatabaseHealthCheck(AppDbContext db, PartitionMaintenanceService partitions)
+    {
+        _db = db;
+        _partitions = partitions;
+    }
 
     public async Task<HealthCheckResult> CheckHealthAsync(
         HealthCheckContext context, CancellationToken cancellationToken = default)
@@ -26,6 +32,17 @@ public sealed class DatabaseHealthCheck : IHealthCheck
 
             var settingsCount = await _db.SystemSettings.AsNoTracking().CountAsync(cancellationToken);
             var roleCount = await _db.Roles.AsNoTracking().CountAsync(cancellationToken);
+            var missing = await _partitions.GetMissingPartitionsAsync(
+                _db,
+                DateTime.UtcNow,
+                horizonDays: 30,
+                cancellationToken);
+
+            if (missing.Count > 0)
+            {
+                return HealthCheckResult.Degraded(
+                    $"数据库连接正常，但未来 30 天缺少分区：{string.Join(", ", missing)}；{version}");
+            }
 
             return HealthCheckResult.Healthy(
                 $"连接正常；system_settings={settingsCount}，roles={roleCount}；{version}");

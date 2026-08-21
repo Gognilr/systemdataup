@@ -13,6 +13,7 @@
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.11" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.11" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="8.0.11" />
+    <PackageReference Include="Npgsql" Version="8.0.6" />
     <PackageReference Include="Serilog.AspNetCore" Version="8.0.3" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.9.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
@@ -22,6 +23,10 @@
     <ProjectReference Include="..\BackupMonitor.Core\BackupMonitor.Core.csproj" />
     <ProjectReference Include="..\BackupMonitor.Infrastructure\BackupMonitor.Infrastructure.csproj" />
     <ProjectReference Include="..\BackupMonitor.Shared\BackupMonitor.Shared.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\BackupMonitor.Shared\Security\SecureFileSystem.cs" Link="Security\SecureFileSystem.cs" />
   </ItemGroup>
 
 </Project>

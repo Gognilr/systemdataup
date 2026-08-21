@@ -36,6 +36,8 @@ public class RetentionCleanupWorker : BackgroundService
     /// <summary>ready 且从未签发令牌的恢复请求最长等待天数 system_settings 键：
     /// 验证通过后迟迟不签发令牌视为放弃，超期置 expired，避免僵尸请求无限堆积</summary>
     public const string ReadyExpireKey = "restore_ready_expire_days";
+    public const string ServiceStateRetentionKey = "telemetry_service_state_retention_days";
+    public const string HeartbeatRetentionKey = "telemetry_heartbeat_retention_days";
 
     /// <summary>锁 TTL：须大于单轮最坏耗时（批量目录物理删除），防止执行中被抢占重复执行</summary>
     private static readonly TimeSpan LockTtl = TimeSpan.FromMinutes(15);
@@ -110,16 +112,53 @@ public class RetentionCleanupWorker : BackgroundService
         // 阶段零：清扫过期恢复请求（先于保护集计算，被清扫的请求立即释放其对备份集的保护）
         var graceHours = Math.Max(1, await settings.GetIntAsync(RestoreGraceKey, 24, ct));
         var readyExpireDays = Math.Max(1, await settings.GetIntAsync(ReadyExpireKey, 7, ct));
+        var serviceStateRetentionDays = Math.Max(1, await settings.GetIntAsync(ServiceStateRetentionKey, 7, ct));
         var expiredRequests = await ExpireStaleRestoreRequestsAsync(db, audit, now, TimeSpan.FromHours(graceHours), readyExpireDays, ct);
 
         var restoreProtectedIds = await GetRestoreProtectedSetIdsAsync(db, ct);
 
-        var deleted = await PurgeExpiredRecycleBinAsync(db, audit, alerting, now, restoreProtectedIds, ct);
-        var recycled = await ApplyGfsRetentionAsync(db, audit, now, restoreProtectedIds, ct);
+        // 物理删除围栏的基准。刻意复用 IUploadStorage 的解析逻辑（system_settings → 配置 → 默认路径），
+        // 保证"允许删除的范围"与"实际写入的范围"同源，不会各自漂移。
+        var storage = scope.ServiceProvider.GetRequiredService<IUploadStorage>();
+        var repositoryRoot = await storage.GetRepositoryRootAsync(ct);
 
-        if (deleted > 0 || recycled > 0 || expiredRequests > 0)
-            _logger.LogInformation("保留策略清理完成：恢复请求过期 {Expired}，移入回收站 {Recycled}，物理删除 {Deleted}",
-                expiredRequests, recycled, deleted);
+        var deleted = await PurgeExpiredRecycleBinAsync(db, audit, alerting, now, restoreProtectedIds, repositoryRoot, ct);
+        var recycled = await ApplyGfsRetentionAsync(db, audit, now, restoreProtectedIds, ct);
+        var telemetry = await CleanupTelemetryAsync(db, now, serviceStateRetentionDays, ct);
+
+        if (deleted > 0 || recycled > 0 || expiredRequests > 0 || telemetry > 0)
+            _logger.LogInformation("保留策略清理完成：恢复请求过期 {Expired}，移入回收站 {Recycled}，物理删除 {Deleted}，遥测删除 {Telemetry}",
+                expiredRequests, recycled, deleted, telemetry);
+    }
+
+    /// <summary>删除高频遥测，服务状态按 5000 行分批，避免长事务锁住整张表。</summary>
+    private static async Task<int> CleanupTelemetryAsync(
+        AppDbContext db,
+        DateTime now,
+        int serviceStateRetentionDays,
+        CancellationToken ct)
+    {
+        var cutoff = now.AddDays(-serviceStateRetentionDays);
+        var deletedServiceStates = 0;
+        while (true)
+        {
+            var deleted = await db.Database.ExecuteSqlInterpolatedAsync($"""
+                DELETE FROM client_service_states
+                WHERE ctid IN (
+                    SELECT ctid
+                    FROM client_service_states
+                    WHERE sampled_at < {cutoff}
+                    LIMIT 5000)
+                """, ct);
+            deletedServiceStates += deleted;
+            if (deleted < 5000)
+                break;
+        }
+
+        var deletedNotifications = await db.AgentNotifications
+            .Where(n => n.ExpiresAt < now)
+            .ExecuteDeleteAsync(ct);
+        return deletedServiceStates + deletedNotifications;
     }
 
     /// <summary>
@@ -219,6 +258,7 @@ public class RetentionCleanupWorker : BackgroundService
         IAlertingService alerting,
         DateTime now,
         HashSet<Guid> restoreProtectedIds,
+        string repositoryRoot,
         CancellationToken ct)
     {
         var expired = await db.BackupSets
@@ -245,7 +285,7 @@ public class RetentionCleanupWorker : BackgroundService
 
             try
             {
-                DeleteRepositoryDirectory(set);
+                DeleteRepositoryDirectory(set, repositoryRoot);
                 set.Status = BackupSetStatus.Deleted;
                 await db.SaveChangesAsync(ct);
 
@@ -399,7 +439,7 @@ public class RetentionCleanupWorker : BackgroundService
         set.Locked || set.RetentionLocks.Any(l => l.Active && (l.ExpiresAt == null || l.ExpiresAt > now));
 
     /// <summary>物理删除仓库目录（带路径安全守卫）</summary>
-    private void DeleteRepositoryDirectory(BackupSet set)
+    private void DeleteRepositoryDirectory(BackupSet set, string repositoryRoot)
     {
         if (string.IsNullOrWhiteSpace(set.RepositoryPath))
         {
@@ -418,6 +458,18 @@ public class RetentionCleanupWorker : BackgroundService
         var segments = relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
         if (segments.Length < 2)
             throw new InvalidOperationException($"仓库路径层级过浅，拒绝删除：{full}");
+
+        // 围栏（最关键的一道）：待删目录必须落在当前仓库根之内。
+        // backup_sets.repository_path 是数据库列，迁移出错、手工改库、仓库路径重配或上游拼接
+        // bug 都可能让它指向任意目录，而这里执行的是递归删除——上面的"至少两级"守卫拦不住
+        // C:\Program Files\PostgreSQL 这类路径。入库侧（UploadCommitWorker）本来就用
+        // PathSafety.ResolveUnderBase 做了基目录约束，销毁侧必须对称。
+        //
+        // 仓库根被改过之后，历史备份集会落在围栏之外并因此无法物理删除：这是刻意选择的
+        // 失败方向——拒绝并告警，交由人工确认，绝不猜测性地删除。
+        if (!PathSafety.IsUnderBase(repositoryRoot, full))
+            throw new InvalidOperationException(
+                $"仓库目录不在当前仓库根 {Path.GetFullPath(repositoryRoot)} 之内，拒绝删除：{full}");
 
         if (Directory.Exists(full))
             Directory.Delete(full, recursive: true);

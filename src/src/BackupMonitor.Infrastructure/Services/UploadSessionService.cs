@@ -64,7 +64,15 @@ public class UploadSessionService : IUploadSessionService
                 .Include(s => s.Files)
                 .FirstOrDefaultAsync(s => s.IdempotencyKey == request.IdempotencyKey && s.ClientId == clientId, ct);
             if (existing is not null)
-                return BuildCreateResponse(existing, resumed: true);
+            {
+                if (existing.Status is not (UploadStatus.Failed or UploadStatus.Cancelled or UploadStatus.Expired))
+                    return BuildCreateResponse(existing, resumed: true);
+
+                // 失败会话保留作审计，但释放幂等键，让同一候选可以创建全新的重试会话。
+                existing.IdempotencyKey = null;
+                existing.UpdatedAt = DateTime.UtcNow;
+                await _db.SaveChangesAsync(ct);
+            }
         }
 
         var candidate = await _db.Set<Core.Entities.Backup.CandidateBackupSet>()

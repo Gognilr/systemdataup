@@ -1,55 +1,78 @@
 @echo off
+setlocal EnableExtensions
 chcp 65001 >nul
-if "%PGPASSWORD%"=="" (
-  echo ERROR: PGPASSWORD is not set.
-  echo   set PGPASSWORD=^<postgres password^>  ^&^&  dbinit.bat
-  exit /b 1
-)
-if "%ADMIN_PW%"=="" (
-  echo ERROR: ADMIN_PW is not set (initial admin password, injected into V005).
-  echo   set ADMIN_PW=^<admin password, at least 12 chars^>  ^&^&  dbinit.bat
-  exit /b 1
-)
+
+if not defined PGPASSWORD goto :missing_pgpassword
+if not defined ADMIN_PW goto :missing_admin_password
+
+if not defined PGHOST set "PGHOST=localhost"
+if not defined PGPORT set "PGPORT=5432"
+if not defined PGUSER set "PGUSER=postgres"
+if not defined PGDATABASE set "PGDATABASE=backup_monitor"
 set "PGCLIENTENCODING=UTF8"
-set "PSQL=C:\Program Files\PostgreSQL\18\bin\psql.exe"
 
-echo === [1/7] Create database backup_monitor ===
-"%PSQL%" -U postgres -h localhost -tc "SELECT 1 FROM pg_database WHERE datname='backup_monitor'" | findstr "1" >nul
-if not errorlevel 1 (
-  echo Database already exists, skip creation.
-) else (
-  "%PSQL%" -U postgres -h localhost -c "CREATE DATABASE backup_monitor ENCODING 'UTF8' TEMPLATE template0;"
-  if errorlevel 1 goto :fail
-)
+if defined PSQL goto :psql_ready
+for %%V in (18 17 16 15 14) do if not defined PSQL if exist "C:\Program Files\PostgreSQL\%%V\bin\psql.exe" set "PSQL=C:\Program Files\PostgreSQL\%%V\bin\psql.exe"
+if not defined PSQL goto :missing_psql
 
-echo === [2/7] Run V001__initial_schema.sql ===
-"%PSQL%" -U postgres -h localhost -d backup_monitor -v ON_ERROR_STOP=1 -f "%~dp0src\database\V001__initial_schema.sql"
+:psql_ready
+echo === Create database %PGDATABASE% if needed ===
+"%PSQL%" -U "%PGUSER%" -h "%PGHOST%" -p "%PGPORT%" -d postgres -Atc "SELECT 1 FROM pg_database WHERE datname='%PGDATABASE%'" | findstr /x "1" >nul
+if not errorlevel 1 goto :database_ready
+"%PSQL%" -U "%PGUSER%" -h "%PGHOST%" -p "%PGPORT%" -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE %PGDATABASE% ENCODING 'UTF8' TEMPLATE template0;"
 if errorlevel 1 goto :fail
 
-echo === [3/7] Run V002__refresh_tokens_and_batch_idempotency.sql ===
-"%PSQL%" -U postgres -h localhost -d backup_monitor -v ON_ERROR_STOP=1 -f "%~dp0src\database\V002__refresh_tokens_and_batch_idempotency.sql"
+:database_ready
+set "BACKUPMONITOR_MIGRATION_DIRECTORY=%~dp0src\database"
+set "BACKUPMONITOR_MIGRATION_LOG=%TEMP%\BackupMonitor-migration.log"
+
+echo === Apply V001-V010 through MigrationRunner ===
+if defined BACKUPMONITOR_MIGRATION_RUNNER goto :run_external_runner
+where dotnet >nul 2>nul
+if errorlevel 1 goto :missing_dotnet
+dotnet run --project "%~dp0src\src\BackupMonitor.Api\BackupMonitor.Api.csproj" --configuration Release -- --migrate --migration-directory "%BACKUPMONITOR_MIGRATION_DIRECTORY%"
+goto :migration_finished
+
+:run_external_runner
+"%BACKUPMONITOR_MIGRATION_RUNNER%" --migrate --migration-directory "%BACKUPMONITOR_MIGRATION_DIRECTORY%"
+
+:migration_finished
 if errorlevel 1 goto :fail
 
-echo === [4/7] Run V003__scheduled_locks.sql ===
-"%PSQL%" -U postgres -h localhost -d backup_monitor -v ON_ERROR_STOP=1 -f "%~dp0src\database\V003__scheduled_locks.sql"
-if errorlevel 1 goto :fail
+echo === Verify admin account and all migrations ===
+"%PSQL%" -U "%PGUSER%" -h "%PGHOST%" -p "%PGPORT%" -d "%PGDATABASE%" -Atc "SELECT count(*) FROM users WHERE username='admin' AND status='active'" | findstr /x "1" >nul
+if errorlevel 1 goto :verify_admin_failed
+"%PSQL%" -U "%PGUSER%" -h "%PGHOST%" -p "%PGPORT%" -d "%PGDATABASE%" -Atc "SELECT count(DISTINCT left(version,4)) FROM schema_migrations WHERE left(version,4) IN ('V001','V002','V003','V004','V005','V006','V007','V008','V009','V010')" | findstr /x "10" >nul
+if errorlevel 1 goto :verify_migrations_failed
 
-echo === [5/7] Run V004__idempotency_keys.sql ===
-"%PSQL%" -U postgres -h localhost -d backup_monitor -v ON_ERROR_STOP=1 -f "%~dp0src\database\V004__idempotency_keys.sql"
-if errorlevel 1 goto :fail
-
-echo === [6/7] Run V005__admin_password_bootstrap.sql (admin password injected via ADMIN_PW) ===
-"%PSQL%" -U postgres -h localhost -d backup_monitor -v ON_ERROR_STOP=1 -v admin_pw="%ADMIN_PW%" -f "%~dp0src\database\V005__admin_password_bootstrap.sql"
-if errorlevel 1 goto :fail
-
-echo === [7/7] Verify ===
-"%PSQL%" -U postgres -h localhost -d backup_monitor -c "SELECT count(*) AS table_count FROM pg_tables WHERE schemaname='public';"
-"%PSQL%" -U postgres -h localhost -d backup_monitor -c "SELECT 'client_groups' AS seed_table, count(*) AS rows FROM client_groups UNION ALL SELECT 'roles', count(*) FROM roles UNION ALL SELECT 'system_settings', count(*) FROM system_settings UNION ALL SELECT 'task_templates', count(*) FROM backup_task_templates ORDER BY 1;"
-"%PSQL%" -U postgres -h localhost -d backup_monitor -c "SELECT username, status, must_change_password FROM users WHERE username='admin';"
-
-echo === DONE ===
+echo.
+echo DONE: database initialized and V001-V010 applied.
 exit /b 0
 
+:missing_pgpassword
+echo ERROR: set PGPASSWORD to the PostgreSQL superuser password before running dbinit.bat.
+exit /b 1
+
+:missing_admin_password
+echo ERROR: set ADMIN_PW to the initial BackupMonitor admin password before running dbinit.bat.
+exit /b 1
+
+:missing_psql
+echo ERROR: PostgreSQL psql.exe was not found. Set PSQL to its full path.
+exit /b 1
+
+:missing_dotnet
+echo ERROR: dotnet.exe was not found. Install the .NET 8 SDK or set BACKUPMONITOR_MIGRATION_RUNNER.
+exit /b 1
+
+:verify_admin_failed
+echo ERROR: the active admin account was not found after migration.
+goto :fail
+
+:verify_migrations_failed
+echo ERROR: V001-V010 were not all recorded in schema_migrations.
+goto :fail
+
 :fail
-echo === FAILED (see errors above) ===
+echo ERROR: database initialization failed. See %BACKUPMONITOR_MIGRATION_LOG% for migration details.
 exit /b 1

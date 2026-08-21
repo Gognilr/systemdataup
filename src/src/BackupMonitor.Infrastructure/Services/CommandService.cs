@@ -78,7 +78,31 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
             var existing = await _db.Commands
                 .FirstOrDefaultAsync(c => c.IdempotencyKey == idempotencyKey, ct);
             if (existing is not null)
+            {
+                var uploadAcceptedButCommitFailed = existing.Status == CommandStatus.Succeeded
+                    && existing.CommandType is CommandType.UploadCandidate or CommandType.UploadLatest
+                    && existing.CandidateBackupSetId is not null
+                    && await _db.UploadSessions.AnyAsync(s =>
+                        s.CandidateBackupSetId == existing.CandidateBackupSetId
+                        && s.Status == UploadStatus.Failed, ct);
+
+                if (existing.Status is CommandStatus.Failed or CommandStatus.Cancelled or CommandStatus.Expired or CommandStatus.Rejected
+                    || uploadAcceptedButCommitFailed)
+                {
+                    existing.Status = CommandStatus.Pending;
+                    existing.ClaimedAt = null;
+                    existing.StartedAt = null;
+                    existing.CompletedAt = null;
+                    existing.ResultCode = null;
+                    existing.ResultMessage = null;
+                    existing.ResultPayload = null;
+                    existing.ExpiresAt = DateTime.UtcNow.Add(ttl ?? DefaultTtl);
+                    existing.Nonce = TokenHasher.GenerateToken(16);
+                    existing.Signature = _signer.SignCommand(existing);
+                    await _db.SaveChangesAsync(ct);
+                }
                 return existing;
+            }
         }
 
         var command = new Command
@@ -167,7 +191,8 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
                 CreatedAt = c.CreatedAt,
                 ExpiresAt = c.ExpiresAt,
                 Nonce = c.Nonce,
-                Signature = c.Signature ?? _signer.SignCommand(c)
+                // 每次下发都用当前签名算法重签，兼容从旧 HMAC 迁移到 RSA 的存量指令。
+                Signature = _signer.SignCommand(c)
             }).ToList()
         };
     }
