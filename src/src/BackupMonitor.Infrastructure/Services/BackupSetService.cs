@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Threading.Channels;
 using BackupMonitor.Core.Entities.Retention;
+using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
@@ -26,6 +27,22 @@ public interface IBackupSetService
 /// <summary>备份查询实现（列表/详情/文件/锁定/解锁/重校验）</summary>
 public class BackupSetService : IBackupSetService
 {
+
+    // ── 列表排序白名单（审查 P1-3）。备份集按大小/时间排序是排障最常用的两种视角。
+    private static readonly Dictionary<string, Func<IQueryable<BackupSet>, bool, IQueryable<BackupSet>>> BackupSetSorts =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["backupSetCode"] = SortWhitelist.By<BackupSet, string>(s => s.BackupSetCode),
+            ["status"] = SortWhitelist.By<BackupSet, BackupSetStatus>(s => s.Status),
+            ["totalBytes"] = SortWhitelist.By<BackupSet, long>(s => s.TotalBytes),
+            ["totalFiles"] = SortWhitelist.By<BackupSet, int>(s => s.TotalFiles),
+            ["backupBusinessTime"] = SortWhitelist.By<BackupSet, DateTime?>(s => s.BackupBusinessTime),
+            ["uploadedAt"] = SortWhitelist.By<BackupSet, DateTime?>(s => s.UploadedAt),
+            ["retentionUntil"] = SortWhitelist.By<BackupSet, DateTime?>(s => s.RetentionUntil)
+        };
+
+    private static readonly Func<IQueryable<BackupSet>, bool, IQueryable<BackupSet>> BackupSetSortFallback =
+        SortWhitelist.By<BackupSet, DateTime?>(s => s.UploadedAt);
     private readonly AppDbContext _db;
     private readonly Channel<WorkItem> _workChannel;
     private readonly ICurrentContext _context;
@@ -77,7 +94,7 @@ public class BackupSetService : IBackupSetService
         var totalCount = await sets.LongCountAsync(ct);
 
         var rows = await sets
-            .OrderByDescending(s => s.UploadedAt)
+            .ApplySort(query.SortBy, query.SortDescending, BackupSetSorts, BackupSetSortFallback)
             .Skip((query.Page - 1) * query.PageSize)
             .Take(query.PageSize)
             .Select(s => new

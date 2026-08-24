@@ -38,7 +38,9 @@ LOADERS.todo = async function () {
     ['failed', 'failure', 'error'].includes(String(t.lastPrecheckStatus || '').toLowerCase()) ||
     (t.lastScanAt && ageHours(t.lastScanAt) > 24 && ageHours(t.lastSuccessAt) > 72)
   ));
-  const count = clients.length + failedTasks.length + restores.length + alerts.length;
+  // P2-12：recentAutoEnrollments 会被渲染进列表，却没算进计数，
+  // 于是顶部横幅显示「没有待处理事项」，下方却列着若干条。
+  const count = clients.length + failedTasks.length + restores.length + alerts.length + recentAutoEnrollments.length;
   const checkedAt = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
   const parts = [];
     if (clients.length) parts.push(todoItem('○', 'wait', `${clients.length} 台客户端等待审批`, '注册请求已经进入管理端，审批后才会签发 mTLS 证书。', '去审批', { kind: 'navigate', hash: '#/clients' }));

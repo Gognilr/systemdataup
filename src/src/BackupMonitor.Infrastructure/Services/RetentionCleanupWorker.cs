@@ -100,6 +100,9 @@ public class RetentionCleanupWorker : BackgroundService
     }
 
     /// <summary>一轮清理：先清扫过期恢复请求，再算恢复保护集，最后清回收站、做 GFS 保留计算</summary>
+    /// <summary>单任务单轮回收比例熔断阈值（百分比），默认 50。</summary>
+    public const string RecycleBreakerPercentKey = "retention_recycle_breaker_percent";
+
     private async Task RunPassAsync(IServiceScope scope, CancellationToken ct)
     {
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -123,7 +126,7 @@ public class RetentionCleanupWorker : BackgroundService
         var repositoryRoot = await storage.GetRepositoryRootAsync(ct);
 
         var deleted = await PurgeExpiredRecycleBinAsync(db, audit, alerting, now, restoreProtectedIds, repositoryRoot, ct);
-        var recycled = await ApplyGfsRetentionAsync(db, audit, now, restoreProtectedIds, ct);
+        var recycled = await ApplyGfsRetentionAsync(db, audit, alerting, settings, now, restoreProtectedIds, ct);
         var telemetry = await CleanupTelemetryAsync(db, now, serviceStateRetentionDays, ct);
 
         if (deleted > 0 || recycled > 0 || expiredRequests > 0 || telemetry > 0)
@@ -316,10 +319,16 @@ public class RetentionCleanupWorker : BackgroundService
     private async Task<int> ApplyGfsRetentionAsync(
         AppDbContext db,
         IAuditRecorder audit,
+        IAlertingService alerting,
+        SystemSettingsProvider settings,
         DateTime now,
         HashSet<Guid> restoreProtectedIds,
         CancellationToken ct)
     {
+        // 审查 P1-2 熔断：单个任务在一轮内回收的比例超过阈值时，判定为策略配置异常而非正常轮换，
+        // 暂停该任务本轮回收并升级为严重告警。设错策略的典型后果就是「某任务全部备份集一次性进回收站」，
+        // 这道闸把它挡在回收站之前——回收站还能捞回来，但没有理由让它先发生。
+        var breakerPercent = Math.Clamp(await settings.GetIntAsync(RecycleBreakerPercentKey, 50, ct), 1, 100);
         var tasks = await db.BackupTasks
             .Include(t => t.RetentionPolicy)
             .Where(t => t.RetentionPolicyId != null)
@@ -345,6 +354,7 @@ public class RetentionCleanupWorker : BackgroundService
             var keepIds = MarkGfsRetained(sets, policy);
             var minCutoff = now.AddDays(-policy.MinimumRetentionDays);
 
+            var candidates = new List<BackupSet>();
             foreach (var set in sets)
             {
                 if (keepIds.Contains(set.Id))
@@ -362,6 +372,37 @@ public class RetentionCleanupWorker : BackgroundService
                     continue;
                 }
 
+                candidates.Add(set);
+            }
+
+            if (candidates.Count == 0)
+                continue;
+
+            // 熔断判定：本轮回收比例达到阈值即整体暂停该任务，不做部分回收——
+            // 部分回收同样会删掉数据，且会让下一轮继续蚕食。
+            var percent = candidates.Count * 100 / sets.Count;
+            if (percent >= breakerPercent)
+            {
+                _logger.LogError(
+                    "保留清理熔断：任务 {Task} 本轮拟回收 {N}/{Total}（{Percent}%），达到阈值 {Threshold}%，已暂停该任务回收",
+                    task.Name, candidates.Count, sets.Count, percent, breakerPercent);
+
+                await alerting.RaiseAsync(
+                    $"task:{task.Id}:retention_breaker",
+                    AlertLevel.Critical,
+                    "retention_breaker_tripped",
+                    $"保留清理熔断（任务 {task.Name}）",
+                    $"策略 {policy.Name} 本轮拟将 {candidates.Count}/{sets.Count} 个备份集（{percent}%）移入回收站，" +
+                    $"达到熔断阈值 {breakerPercent}%。已暂停该任务的本轮回收，请核对保留规则是否配置正确。",
+                    taskId: task.Id,
+                    ct: ct);
+                continue;
+            }
+
+            await alerting.RecoverAsync($"task:{task.Id}:retention_breaker", ct);
+
+            foreach (var set in candidates)
+            {
                 set.Status = BackupSetStatus.RecycleBin;
                 set.RetentionUntil = now.AddDays(policy.RecycleBinDays);
                 await db.SaveChangesAsync(ct);

@@ -6,6 +6,7 @@ using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Exceptions;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -227,15 +228,25 @@ public class UploadCommitWorker : BackgroundService
                             path = f.RelativePath,
                             size = f.SizeBytes,
                             lastModified = f.CandidateFile?.LastModifiedAt ?? DateTime.UtcNow,
-                            sha256 = f.ExpectedSha256
+                            // P2-8：与 BackupFile.Sha256 同源——服务端实测值优先，
+                            // 恢复前校验用的就是这个值，清单必须和它一致
+                            sha256 = f.ServerSha256 ?? f.ExpectedSha256
                         })
                         .ToList()
                 };
                 var manifestJson = JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true });
+                // 审查 P1-6：清单是恢复时的权威依据，必须先于目录改名真正落盘。
+                // 原先以 FileAccess.Read 打开再 Flush(flushToDisk:true) 是空操作——
+                // 对只读流刷盘一个字节都不会同步，断电后可能出现"正式目录已存在、清单为空"。
                 var manifestPath = Path.Combine(commitTemp, "manifest.json");
-                await File.WriteAllTextAsync(manifestPath, manifestJson, ct);
-                await using (var mf = new FileStream(manifestPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                var manifestBytes = System.Text.Encoding.UTF8.GetBytes(manifestJson);
+                await using (var mf = new FileStream(
+                    manifestPath, FileMode.Create, FileAccess.Write, FileShare.None,
+                    bufferSize: 4096, FileOptions.WriteThrough))
+                {
+                    await mf.WriteAsync(manifestBytes, ct);
                     mf.Flush(flushToDisk: true);
+                }
 
                 // 原子重命名为正式目录
                 Directory.Move(commitTemp, finalPath);
@@ -259,7 +270,8 @@ public class UploadCommitWorker : BackgroundService
                         RelativePath = file.RelativePath,
                         FileName = Path.GetFileName(file.RelativePath.Replace('/', Path.DirectorySeparatorChar)),
                         SizeBytes = file.SizeBytes,
-                        LastModifiedAt = DateTime.UtcNow,
+                        // P2-9：源文件修改时间是备份的实质元数据，不能用入库时刻顶替
+                        LastModifiedAt = file.CandidateFile?.LastModifiedAt ?? DateTime.UtcNow,
                         Sha256 = file.ServerSha256 ?? file.ExpectedSha256,
                         RepositoryRelativePath = file.RelativePath,
                         VerificationStatus = VerificationStatus.Verified
@@ -517,19 +529,35 @@ public class UploadCommitWorker : BackgroundService
     }
 
     /// <summary>生成备份集编码 BS-yyyy-NNNN（唯一约束冲突时重试）</summary>
+    /// <summary>
+    /// 生成备份集编码 BS-yyyy-NNNN（审查 P2-7）。
+    ///
+    /// 序号取自数据库序列 backup_set_code_seq（V011）：单调递增、不随删除回落，
+    /// 并发下由数据库保证唯一。原先的 COUNT(*)+1 会在保留策略删除历史备份集后
+    /// 让计数回落，使新备份集复用已注销的编码，破坏 manifest/审计/告警的可追溯性。
+    /// </summary>
     private static async Task<string> GenerateBackupSetCodeAsync(AppDbContext db, CancellationToken ct)
     {
         var year = DateTime.UtcNow.Year;
-        var prefix = $"BS-{year}-";
 
-        for (var attempt = 0; attempt < 5; attempt++)
+        await using var command = db.Database.GetDbConnection().CreateCommand();
+        command.CommandText = "SELECT nextval('backup_set_code_seq')";
+
+        var shouldClose = command.Connection!.State != System.Data.ConnectionState.Open;
+        if (shouldClose)
+            await command.Connection.OpenAsync(ct);
+        else
+            command.Transaction = db.Database.CurrentTransaction?.GetDbTransaction();
+
+        try
         {
-            var count = await db.BackupSets.CountAsync(b => b.BackupSetCode.StartsWith(prefix), ct);
-            var code = $"{prefix}{count + 1 + attempt:0000}";
-            if (!await db.BackupSets.AnyAsync(b => b.BackupSetCode == code, ct))
-                return code;
+            var next = Convert.ToInt64(await command.ExecuteScalarAsync(ct));
+            return $"BS-{year}-{next:0000}";
         }
-
-        return $"{prefix}{Guid.NewGuid().ToString("N")[..8]}";
+        finally
+        {
+            if (shouldClose)
+                await command.Connection.CloseAsync();
+        }
     }
 }

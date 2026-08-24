@@ -73,12 +73,11 @@ public class AlertingService : IAlertingService
     {
         try
         {
-            var hasActiveAlert = await _db.Alerts
-                .AsNoTracking()
-                .AnyAsync(a => a.AlertKey == alertKey && ActiveStatuses.Contains(a.Status), ct);
-            if (!hasActiveAlert)
-                return;
-
+            // 这里原本有一道前置守卫：查不到同键的活动告警就直接 return。
+            // 判断方向写反了——「不存在活动告警」恰恰是需要新建告警的情形，
+            // 结果是下面创建新告警的 else 分支成为死代码，全系统任何 RaiseAsync 都不产生告警：
+            // 入库失败、保留删除失败、回收熔断……监控的输出端整体失效。
+            // 该守卫与下面的 existing 查询本就重复，直接去掉，由 existing 是否为 null 决定新建还是累加。
             var now = DateTime.UtcNow;
 
             var existing = await _db.Alerts

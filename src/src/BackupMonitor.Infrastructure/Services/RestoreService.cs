@@ -31,7 +31,7 @@ public interface IRestoreService
     Task<RestoreDownloadContext> BeginDownloadAsync(string token, string? clientIp, CancellationToken ct = default);
 
     /// <summary>下载结束后记账（字节数与完成状态）</summary>
-    Task FinishDownloadAsync(Guid requestId, long bytesTransferred, bool completed, CancellationToken ct = default);
+    Task FinishDownloadAsync(Guid requestId, long bytesTransferred, bool wholeSetDelivered, string? deliveredRelativePath = null, CancellationToken ct = default);
 }
 
 /// <summary>恢复下载可下载的文件条目</summary>
@@ -297,7 +297,7 @@ public class RestoreService : IRestoreService
                 .ToList());
     }
 
-    public async Task FinishDownloadAsync(Guid requestId, long bytesTransferred, bool completed, CancellationToken ct = default)
+    public async Task FinishDownloadAsync(Guid requestId, long bytesTransferred, bool wholeSetDelivered, string? deliveredRelativePath = null, CancellationToken ct = default)
     {
         var entity = await _db.RestoreRequests.FirstOrDefaultAsync(r => r.Id == requestId, ct);
         if (entity is null)
@@ -307,12 +307,27 @@ public class RestoreService : IRestoreService
         // 或并发请求已将状态推进到终态时，迟到的记账直接跳过，避免污染字节统计或复活终态。
         if (entity.Status is not RestoreRequestStatus.Downloading)
         {
-            _logger.LogWarning("恢复请求 {RequestId} 状态为 {Status}，跳过迟到的下载记账（{Bytes} 字节，completed={Completed}）",
-                requestId, EnumMapping.ToSnakeCase(entity.Status), bytesTransferred, completed);
+            _logger.LogWarning("恢复请求 {RequestId} 状态为 {Status}，跳过迟到的下载记账（{Bytes} 字节，wholeSet={WholeSet}）",
+                requestId, EnumMapping.ToSnakeCase(entity.Status), bytesTransferred, wholeSetDelivered);
             return;
         }
 
         entity.DownloadedBytes += bytesTransferred;
+
+        // 审查 P1-7：整个恢复请求是否完成，按「已交付文件集合是否覆盖备份集全部文件」判定。
+        // 整包 ZIP 一次交付全部文件，直接置完成；单文件下载只累加集合，
+        // 集齐了才算完成——原先取走一个文件就把整个请求标记为 Completed。
+        var completed = wholeSetDelivered;
+        if (!completed && !string.IsNullOrWhiteSpace(deliveredRelativePath))
+        {
+            var delivered = ParseDeliveredPaths(entity.DeliveredPaths);
+            delivered.Add(deliveredRelativePath);
+            entity.DeliveredPaths = JsonSerializer.Serialize(delivered.OrderBy(x => x, StringComparer.OrdinalIgnoreCase));
+
+            var totalFiles = await _db.BackupFiles.CountAsync(f => f.BackupSetId == entity.BackupSetId, ct);
+            completed = totalFiles > 0 && delivered.Count >= totalFiles;
+        }
+
         if (completed)
         {
             entity.Status = RestoreRequestStatus.Completed;
@@ -322,7 +337,31 @@ public class RestoreService : IRestoreService
         await _db.SaveChangesAsync(ct);
 
         await _audit.RecordAsync("restore.download", AuditResult.Success, "restore_request", requestId,
-            afterData: JsonSerializer.Serialize(new { bytes = bytesTransferred, completed }), ct: ct);
+            afterData: JsonSerializer.Serialize(new
+            {
+                bytes = bytesTransferred,
+                file = deliveredRelativePath,
+                completed
+            }), ct: ct);
+    }
+
+    /// <summary>解析已交付路径集合；列内容异常时按空集处理（宁可不判完成，也不误判）。</summary>
+    private static HashSet<string> ParseDeliveredPaths(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            var items = JsonSerializer.Deserialize<List<string>>(json);
+            return items is null
+                ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(items, StringComparer.OrdinalIgnoreCase);
+        }
+        catch (JsonException)
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
     }
 
     private static RestoreRequestDto Map(RestoreRequest r) => new()

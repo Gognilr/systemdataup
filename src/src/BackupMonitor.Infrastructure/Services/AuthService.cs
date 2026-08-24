@@ -68,8 +68,10 @@ public class AuthService : IAuthService
 
         var now = DateTime.UtcNow;
 
-        if (user.Status == UserStatus.Disabled)
-            throw new BusinessException("FORBIDDEN", "账号已停用，请联系系统管理员", 403);
+        // 审查 P2-1：停用检查曾排在密码校验之前，且返回专有文案「账号已停用」，
+        // 与上面「统一错误信息，不暴露用户是否存在」的意图自相矛盾——
+        // 未认证攻击者据此即可枚举出哪些用户名真实存在。
+        // 状态校验统一放到密码校验通过之后（见下方 user.Status != Active 分支）。
 
         if (user.LockedUntil is not null && user.LockedUntil > now)
         {
@@ -118,6 +120,7 @@ public class AuthService : IAuthService
         var (roles, permissions) = await LoadRoleAndPermissionCodesAsync(user.Id, ct);
 
         var accessToken = _jwt.CreateAccessToken(user, roles, permissions);
+        var refreshTokenTtlDays = await _settings.GetIntAsync("refresh_token_ttl_days", _jwt.RefreshTokenTtlDays, ct);
         var refreshToken = await CreateRefreshTokenAsync(user, clientIp, userAgent, ct);
 
         await _db.SaveChangesAsync(ct);
@@ -128,6 +131,7 @@ public class AuthService : IAuthService
             AccessToken = accessToken,
             RefreshToken = refreshToken,
             ExpiresIn = _jwt.AccessTokenTtlSeconds,
+            RefreshTokenTtlDays = refreshTokenTtlDays,
             MustChangePassword = user.MustChangePassword,
             User = new CurrentUserDto
             {
@@ -171,6 +175,7 @@ public class AuthService : IAuthService
         var user = await _db.Users.FirstAsync(u => u.Id == stored.UserId, ct);
 
         // 轮换：旧令牌标记吊销，签发新令牌
+        var refreshTokenTtlDays = await _settings.GetIntAsync("refresh_token_ttl_days", _jwt.RefreshTokenTtlDays, ct);
         var newToken = await CreateRefreshTokenAsync(user, clientIp, userAgent, ct);
         stored.RevokedAt = now;
         stored.RevokeReason = "rotated";
@@ -184,7 +189,8 @@ public class AuthService : IAuthService
         {
             AccessToken = _jwt.CreateAccessToken(user, roles, permissions),
             RefreshToken = newToken,
-            ExpiresIn = _jwt.AccessTokenTtlSeconds
+            ExpiresIn = _jwt.AccessTokenTtlSeconds,
+            RefreshTokenTtlDays = refreshTokenTtlDays
         };
     }
 
@@ -228,13 +234,13 @@ public class AuthService : IAuthService
         }
 
         // 2. 强度校验放在服务端（OPEN-ISSUES #2），不能只依赖前端
-        var strengthError = ValidatePasswordStrength(request.NewPassword, user.Username);
+        var strengthError = PasswordPolicy.Validate(request.NewPassword, user.Username);
         if (strengthError is not null)
             throw new BusinessException("INVALID_REQUEST", strengthError, 400);
 
         // 3. 更新口令（bcrypt 成本 12，与 V001/V005 的 gen_salt('bf',12) 一致）
         var now = DateTime.UtcNow;
-        user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(request.NewPassword, workFactor: 12);
+        user.PasswordHash = PasswordPolicy.Hash(request.NewPassword);
         user.PasswordChangedAt = now;
         user.MustChangePassword = false;
         await _db.SaveChangesAsync(ct);
@@ -246,29 +252,6 @@ public class AuthService : IAuthService
         await _audit.RecordAsync("auth.change_password", AuditResult.Success, "user", user.Id, ct: ct);
         _logger.LogInformation("用户 {Username} 口令修改成功，已吊销其全部刷新令牌", user.Username);
     }
-
-    /// <summary>口令强度校验：长度 ≥ 12、不等于用户名、不属于常见弱口令。返回错误信息，null 表示通过</summary>
-    private static string? ValidatePasswordStrength(string newPassword, string username)
-    {
-        if (string.IsNullOrEmpty(newPassword) || newPassword.Length < 12)
-            return "新口令长度不得少于 12 位";
-
-        if (string.Equals(newPassword, username, StringComparison.OrdinalIgnoreCase))
-            return "新口令不能与用户名相同";
-
-        if (CommonWeakPasswords.Contains(newPassword.ToLowerInvariant()))
-            return "新口令属于常见弱口令，请更换";
-
-        return null;
-    }
-
-    /// <summary>常见弱口令表（长度 ≥ 12 的条目仍可能被弱口令字典收录，兜底拦截）</summary>
-    private static readonly HashSet<string> CommonWeakPasswords = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "password123456", "123456789012", "abcdefghijkl", "qwertyuiop12",
-        "admin@2026!!!!", "administrator1", "changeme1234", "welcome12345",
-        "aa123456789012", "111111111111", "000000000000"
-    };
 
     public async Task<CurrentUserDto> GetCurrentUserAsync(Guid userId, CancellationToken ct = default)
     {

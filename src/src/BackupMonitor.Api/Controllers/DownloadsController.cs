@@ -95,7 +95,9 @@ public class DownloadsController : ApiBaseController
         }
         finally
         {
-            await _restoreService.FinishDownloadAsync(context.RequestId, counting.BytesWritten, completed, CancellationToken.None);
+            // 整包 ZIP 一次交付全部文件，completed 即代表整个请求完成
+            await _restoreService.FinishDownloadAsync(
+                context.RequestId, counting.BytesWritten, completed, deliveredRelativePath: null, CancellationToken.None);
         }
     }
 
@@ -159,7 +161,7 @@ public class DownloadsController : ApiBaseController
             Response.Headers.ContentRange = $"bytes {start}-{end}/{fileLength}";
 
         long copied = 0;
-        var completed = false;
+        var fileFullyDelivered = false;
         try
         {
             await using var fileStream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
@@ -177,8 +179,10 @@ public class DownloadsController : ApiBaseController
                 remaining -= read;
             }
 
-            // 完整交付整个文件才算完成（含从 0 开始的 Range 全量请求）
-            completed = start == 0 && copied == fileLength;
+            // 审查 P1-7：这里只能断言「本文件是否完整交付」（含从 0 开始的 Range 全量请求）。
+            // 整个恢复请求是否完成，由 RestoreService 按已交付文件集合判定——
+            // 原先直接把它当作整个请求的完成标志，取走一个文件就 Completed。
+            fileFullyDelivered = start == 0 && copied == fileLength;
         }
         catch (OperationCanceledException)
         {
@@ -187,10 +191,18 @@ public class DownloadsController : ApiBaseController
         catch (Exception ex)
         {
             _logger.LogError(ex, "恢复下载失败 request={RequestId} file={File}", context.RequestId, file.RelativePath);
+            // 审查 P1-7：与 ZIP 分支对齐——尚未开始写出时重抛，让统一异常中间件
+            // 返回标准 JSON 错误。原先这里吞掉异常，客户端会拿到一个空 200。
+            if (!Response.HasStarted)
+                throw;
         }
         finally
         {
-            await _restoreService.FinishDownloadAsync(context.RequestId, copied, completed, CancellationToken.None);
+            await _restoreService.FinishDownloadAsync(
+                context.RequestId, copied,
+                wholeSetDelivered: false,
+                deliveredRelativePath: fileFullyDelivered ? file.RelativePath : null,
+                CancellationToken.None);
         }
     }
 

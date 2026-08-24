@@ -9,7 +9,7 @@ import {
 import { shell, loading } from '../app.js';
 
 export async function vTasks() {
-  App.state.tasks = App.state.tasks || { page: 1, pageSize: 20, mode: '', totalCount: 0, selected: [] };
+  App.state.tasks = App.state.tasks || { page: 1, pageSize: 20, mode: '', totalCount: 0, selected: [] , sortKey: 'createdAt', sortDesc: true};
   const st = App.state.tasks;
   $('#app').innerHTML = shell('tasks', '备份任务', `
     <div class="toolbar">
@@ -29,6 +29,7 @@ LOADERS.tasks = async function () {
   const wrap = $('#vwrap'); if (!wrap) return;
   try {
     const q = new URLSearchParams({ page: st.page, pageSize: st.pageSize });
+    if (st.sortKey) { q.set('sortBy', st.sortKey); q.set('sortDescending', String(st.sortDesc !== false)); }
     if (st.mode) q.set('taskMode', st.mode);
     const data = await api('/api/v1/admin/backup-tasks?' + q);
     st.totalCount = data.totalCount;
@@ -36,15 +37,15 @@ LOADERS.tasks = async function () {
       ? emptyState('first', { glyph: '⧉', title: '还没有备份任务', sub: '创建任务后，Agent 将按计划扫描并采集备份产物', actHtml: '<button class="primary" data-ui-action="act" data-view="tasks" data-action="create">＋ 新建任务</button>' })
       : emptyState('filter', { key: 'tasks', title: `没有匹配「${L.task_mode[st.mode] || ''}」的任务` });
     wrap.innerHTML = tableHtml([
-      { l: '任务名', render: r => `<b>${esc(r.name)}</b><span class="sub">${esc(r.applicationName)}</span>` },
+      { l: '任务名', k: 'name', sort: true, render: r => `<b>${esc(r.name)}</b><span class="sub">${esc(r.applicationName)}</span>` },
       { l: '客户端', k: 'clientHostname' },
       { l: '源路径', render: r => `<span class="mono" style="font-size:12px">${esc(r.sourcePath)}</span>` },
       { l: '识别器', render: r => esc(L.recognizer[r.recognizerType] || r.recognizerType) },
-      { l: '模式', render: r => status('task_mode', r.taskMode) },
-      { l: '启用', render: r => r.enabled ? '是' : '否' },
+      { l: '模式', k: 'taskMode', sort: true, render: r => status('task_mode', r.taskMode) },
+      { l: '启用', k: 'enabled', sort: true, render: r => r.enabled ? '是' : '否' },
       { l: '重要级', render: r => esc(L.importance[r.importanceLevel] || r.importanceLevel) },
       { l: '最近预检', render: r => r.lastPrecheckStatus ? status('result', r.lastPrecheckStatus) : '—' },
-      { l: '最近成功', render: r => relTime(r.lastSuccessAt) },
+      { l: '最近成功', k: 'lastSuccessAt', sort: true, render: r => relTime(r.lastSuccessAt) },
       { l: '操作', render: r => {
         const b = [`<button class="small" data-ui-action="act" data-view="tasks" data-action="detail" data-id="${esc(r.id)}">详情</button>`,
           `<button class="small" data-ui-action="act" data-view="tasks" data-action="edit" data-id="${esc(r.id)}">编辑</button>`];

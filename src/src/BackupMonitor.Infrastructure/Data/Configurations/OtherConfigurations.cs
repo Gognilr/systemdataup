@@ -25,6 +25,7 @@ public class RestoreRequestConfiguration : IEntityTypeConfiguration<RestoreReque
         builder.Property(e => e.DownloadTokenHash).HasColumnName("download_token_hash").HasMaxLength(255);
         builder.Property(e => e.DownloadExpiresAt).HasColumnName("download_expires_at");
         builder.Property(e => e.DownloadedBytes).HasColumnName("downloaded_bytes").HasDefaultValue(0L);
+        builder.Property(e => e.DeliveredPaths).HasColumnName("delivered_paths").HasColumnType("jsonb");
         builder.Property(e => e.CompletedAt).HasColumnName("completed_at");
         builder.Property(e => e.ClientIp).HasColumnName("client_ip").HasMaxLength(64);
         builder.Property(e => e.ErrorMessage).HasColumnName("error_message").HasMaxLength(2000);

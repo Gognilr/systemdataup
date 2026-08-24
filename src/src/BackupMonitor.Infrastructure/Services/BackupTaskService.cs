@@ -30,6 +30,22 @@ public interface IBackupTaskService
 /// <summary>备份任务服务实现（CRUD 乐观锁 + 暂停/恢复 + 指令下发 + 识别测试）</summary>
 public class BackupTaskService : IBackupTaskService
 {
+
+    // ── 列表排序白名单（审查 P1-3）
+    private static readonly Dictionary<string, Func<IQueryable<BackupTask>, bool, IQueryable<BackupTask>>> TaskSorts =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["name"] = SortWhitelist.By<BackupTask, string>(t => t.Name),
+            ["applicationName"] = SortWhitelist.By<BackupTask, string?>(t => t.ApplicationName),
+            ["taskMode"] = SortWhitelist.By<BackupTask, TaskMode>(t => t.TaskMode),
+            ["enabled"] = SortWhitelist.By<BackupTask, bool>(t => t.Enabled),
+            ["lastSuccessAt"] = SortWhitelist.By<BackupTask, DateTime?>(t => t.LastSuccessAt),
+            ["lastScanAt"] = SortWhitelist.By<BackupTask, DateTime?>(t => t.LastScanAt),
+            ["createdAt"] = SortWhitelist.By<BackupTask, DateTime>(t => t.CreatedAt)
+        };
+
+    private static readonly Func<IQueryable<BackupTask>, bool, IQueryable<BackupTask>> TaskSortFallback =
+        SortWhitelist.By<BackupTask, DateTime>(t => t.CreatedAt);
     private const int MinChunkSize = 4 * 1024 * 1024;   // 4MB（设计书 7.2）
     private const int MaxChunkSize = 32 * 1024 * 1024;  // 32MB
 
@@ -228,7 +244,7 @@ public class BackupTaskService : IBackupTaskService
         var totalCount = await tasks.LongCountAsync(ct);
 
         var rows = await tasks
-            .OrderByDescending(t => t.CreatedAt)
+            .ApplySort(query.SortBy, query.SortDescending, TaskSorts, TaskSortFallback)
             .Skip((query.Page - 1) * query.PageSize)
             .Take(query.PageSize)
             .Select(t => new

@@ -1,3 +1,4 @@
+using BackupMonitor.Core.Entities.Alert;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
@@ -22,6 +23,22 @@ public interface IAlertService
 /// <summary>告警服务实现（列表/详情/确认/处理/关闭）</summary>
 public class AlertService : IAlertService
 {
+
+    // ── 列表排序白名单（审查 P1-3）
+    private static readonly Dictionary<string, Func<IQueryable<Alert>, bool, IQueryable<Alert>>> AlertSorts =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["level"] = SortWhitelist.By<Alert, AlertLevel>(a => a.Level),
+            ["status"] = SortWhitelist.By<Alert, AlertStatus>(a => a.Status),
+            ["category"] = SortWhitelist.By<Alert, string?>(a => a.Category),
+            ["title"] = SortWhitelist.By<Alert, string>(a => a.Title),
+            ["occurrenceCount"] = SortWhitelist.By<Alert, int>(a => a.OccurrenceCount),
+            ["firstOccurredAt"] = SortWhitelist.By<Alert, DateTime>(a => a.FirstOccurredAt),
+            ["lastOccurredAt"] = SortWhitelist.By<Alert, DateTime>(a => a.LastOccurredAt)
+        };
+
+    private static readonly Func<IQueryable<Alert>, bool, IQueryable<Alert>> AlertSortFallback =
+        SortWhitelist.By<Alert, DateTime>(a => a.LastOccurredAt);
     private readonly AppDbContext _db;
     private readonly ICurrentContext _context;
     private readonly IAuditRecorder _audit;
@@ -81,7 +98,7 @@ public class AlertService : IAlertService
         var totalCount = await alerts.LongCountAsync(ct);
 
         var rows = await alerts
-            .OrderByDescending(a => a.LastOccurredAt)
+            .ApplySort(query.SortBy, query.SortDescending, AlertSorts, AlertSortFallback)
             .Skip((query.Page - 1) * query.PageSize)
             .Take(query.PageSize)
             .Select(a => new

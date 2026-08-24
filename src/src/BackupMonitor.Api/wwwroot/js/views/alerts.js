@@ -26,9 +26,9 @@ export async function vAlerts() {
     const root = $('#alert-summary-chips');
     if (!root) return;
     const byLevel = (summary.byLevel || []).map(item =>
-      `<button class="filter-chip ${st.level === item.value ? 'active' : ''}" data-ui-action="filter" data-filter-key="alerts" data-filter-field="level" data-filter-value="${esc(item.value)}">${esc(L.alert_level[item.value] || item.value)} <b>${esc(item.count)}</b></button>`).join('');
+      `<button class="filter-chip ${st.level === item.value ? 'active' : ''}" data-ui-action="filter" data-filter-key="alerts" data-filter-field="level" data-filter-value="${esc(item.value)}">${esc(L.alert_level[item.value] || item.value)} <strong>${esc(item.count)}</strong></button>`).join('');
     const byStatus = (summary.byStatus || []).map(item =>
-      `<button class="filter-chip ${st.status === item.value ? 'active' : ''}" data-ui-action="filter" data-filter-key="alerts" data-filter-field="status" data-filter-value="${esc(item.value)}">${esc(L.alert_status[item.value] || item.value)} <b>${esc(item.count)}</b></button>`).join('');
+      `<button class="filter-chip ${st.status === item.value ? 'active' : ''}" data-ui-action="filter" data-filter-key="alerts" data-filter-field="status" data-filter-value="${esc(item.value)}">${esc(L.alert_status[item.value] || item.value)} <strong>${esc(item.count)}</strong></button>`).join('');
     root.innerHTML = byLevel + byStatus;
   }).catch(() => {});
   await LOADERS.alerts();
@@ -39,6 +39,7 @@ LOADERS.alerts = async function () {
   const wrap = $('#vwrap'); if (!wrap) return;
   try {
     const q = new URLSearchParams({ page: st.page, pageSize: st.pageSize, sortDescending: String(st.sortDesc !== false) });
+    if (st.sortKey) q.set('sortBy', st.sortKey);
     if (st.level) q.set('level', st.level);
     if (st.status) q.set('status', st.status);
     const data = await api('/api/v1/admin/alerts?' + q);

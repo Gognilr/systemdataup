@@ -35,8 +35,15 @@ public class RetentionPolicyDto
     public int BoundTaskCount { get; set; }
 }
 
-/// <summary>创建/更新保留策略请求</summary>
-public class RetentionPolicyUpsertDto
+/// <summary>
+/// 创建/更新保留策略请求。
+///
+/// 审查 P1-2：四个 Keep*Count 全可空、两个天数下限为 0 时，
+/// 「四项留空 + 两个 0」是一份能通过全部 [Range] 校验的合法策略，
+/// 其效果是 GFS 保留集为空 → 该任务全部备份集进回收站 → 保留 0 天 → 下一轮全部物理删除。
+/// 因此下限提到 1，并用 IValidatableObject 加「至少一条保留规则」的跨字段校验。
+/// </summary>
+public class RetentionPolicyUpsertDto : IValidatableObject
 {
     [Required(ErrorMessage = "name 必填")]
     [MaxLength(128, ErrorMessage = "name 不能超过 128 字符")]
@@ -54,9 +61,29 @@ public class RetentionPolicyUpsertDto
     [Range(1, int.MaxValue, ErrorMessage = "keepYearlyCount 必须大于 0")]
     public int? KeepYearlyCount { get; set; }
 
-    [Range(0, 36500, ErrorMessage = "minimumRetentionDays 超出范围")]
+    /// <summary>最短保留天数。下限 1——0 意味着备份集一入库即可被清理。</summary>
+    [Range(1, 36500, ErrorMessage = "minimumRetentionDays 必须在 1~36500 之间")]
     public int MinimumRetentionDays { get; set; } = 30;
 
-    [Range(0, 3650, ErrorMessage = "recycleBinDays 超出范围")]
+    /// <summary>回收区保留天数。下限 1——0 意味着进回收站的下一轮就物理删除，等于没有回收站。</summary>
+    [Range(1, 3650, ErrorMessage = "recycleBinDays 必须在 1~3650 之间")]
     public int RecycleBinDays { get; set; } = 30;
+
+    /// <summary>跨字段校验：至少要有一条 Keep*Count 规则，否则 GFS 保留集恒为空。</summary>
+    public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        if (KeepLastCount is null or <= 0 &&
+            KeepWeeklyCount is null or <= 0 &&
+            KeepMonthlyCount is null or <= 0 &&
+            KeepYearlyCount is null or <= 0)
+        {
+            yield return new ValidationResult(
+                "至少需要设置一条保留规则（keepLastCount / keepWeeklyCount / keepMonthlyCount / keepYearlyCount 之一），" +
+                "否则该策略下的备份集会在保留期满后被全部清除",
+                [
+                    nameof(KeepLastCount), nameof(KeepWeeklyCount),
+                    nameof(KeepMonthlyCount), nameof(KeepYearlyCount)
+                ]);
+        }
+    }
 }

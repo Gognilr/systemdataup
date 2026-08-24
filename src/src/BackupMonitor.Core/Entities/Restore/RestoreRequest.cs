@@ -30,6 +30,9 @@ public class RestoreRequest
 
     public long DownloadedBytes { get; set; }
 
+    /// <summary>已完整交付的文件相对路径（jsonb 数组，V012；审查 P1-7 完成判定依据）</summary>
+    public string DeliveredPaths { get; set; } = "[]";
+
     public DateTime? CompletedAt { get; set; }
 
     /// <summary>下载方 IP</summary>

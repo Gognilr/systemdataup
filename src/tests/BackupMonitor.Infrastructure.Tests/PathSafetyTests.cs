@@ -162,4 +162,45 @@ public class PathSafetyTests
         var result = PathSafety.SanitizePathComponent(new string('a', 150));
         Assert.Equal(100, result.Length);
     }
+
+    // ---------- Windows 保留设备名（审查 P2-6） ----------
+
+    /// <summary>
+    /// CON / NUL / COM1~9 / LPT1~9 在任何目录下都不能作为文件名，带扩展名同样保留
+    /// （NUL.txt 依旧指向空设备）。写入会「静默成功」而内容丢失，必须在入口拒绝。
+    /// </summary>
+    [Theory]
+    [InlineData("NUL")]
+    [InlineData("nul")]
+    [InlineData("CON")]
+    [InlineData("PRN")]
+    [InlineData("AUX")]
+    [InlineData("COM1")]
+    [InlineData("LPT9")]
+    [InlineData("NUL.txt")]
+    [InlineData("con.bak")]
+    [InlineData("data/NUL")]
+    [InlineData("data/COM3/file.dat")]
+    public void IsValidRelativePath_拒绝Windows保留设备名(string path)
+        => Assert.False(PathSafety.IsValidRelativePath(path));
+
+    /// <summary>形近但不保留的名字不得误杀。</summary>
+    [Theory]
+    [InlineData("CONFIG")]
+    [InlineData("console.log")]
+    [InlineData("COM10")]
+    [InlineData("LPT0")]
+    [InlineData("nullable.json")]
+    [InlineData("data/AUXILIARY/x.dat")]
+    public void IsValidRelativePath_形近名不误杀(string path)
+        => Assert.True(PathSafety.IsValidRelativePath(path));
+
+    /// <summary>服务端生成路径时，撞上保留名要改写而不是原样使用。</summary>
+    [Theory]
+    [InlineData("NUL", "_NUL")]
+    [InlineData("con", "_con")]
+    [InlineData("COM1", "_COM1")]
+    [InlineData("CONFIG", "CONFIG")]
+    public void SanitizePathComponent_保留设备名改写(string input, string expected)
+        => Assert.Equal(expected, PathSafety.SanitizePathComponent(input));
 }

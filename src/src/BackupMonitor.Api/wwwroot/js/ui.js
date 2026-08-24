@@ -117,13 +117,34 @@ export function openModal(title, bodyHtml, opts = {}) {
   });
   return ov;
 }
-export function closeModal() { const o = $('#overlay'); if (o) o.remove(); }
+export function closeModal() {
+  const o = $('#overlay');
+  if (!o) return;
+  // 先派发再移除：confirmModal 等待方靠这个事件把 Promise 落定为「取消」（P2-11）
+  o.dispatchEvent(new CustomEvent('bm:dismiss'));
+  o.remove();
+}
 
 export function confirmModal(msg) {
   return new Promise(resolve => {
     const ov = openModal('请确认', `<p style="line-height:1.7">${esc(msg)}</p>`, { okText: '确定' });
-    ov.querySelector('[data-ok]').addEventListener('click', () => { closeModal(); resolve(true); });
-    ov.addEventListener('click', ev => { if (ev.target === ov || ev.target.closest('[data-close]')) setTimeout(() => resolve(false), 0); });
+    let settled = false;
+    const settle = value => {
+      if (settled) return;
+      settled = true;
+      ov.removeEventListener('bm:dismiss', onDismiss);
+      resolve(value);
+    };
+    // P2-11：原先只在点遮罩/关闭按钮时 resolve(false)，而全局 Esc 处理器走的是 closeModal()，
+    // 于是按 Esc 关掉弹窗后 Promise 永不落定——所有 `if (!await confirmModal(...)) return;`
+    // 的调用方会静默永久挂起，用户既得不到结果也没有任何提示。
+    // closeModal 现在会派发 bm:dismiss，任何关闭途径都能让它落定为「取消」。
+    const onDismiss = () => settle(false);
+    ov.addEventListener('bm:dismiss', onDismiss);
+    ov.querySelector('[data-ok]').addEventListener('click', () => { settle(true); closeModal(); });
+    ov.addEventListener('click', ev => {
+      if (ev.target === ov || ev.target.closest('[data-close]')) setTimeout(() => settle(false), 0);
+    });
   });
 }
 

@@ -10,7 +10,7 @@ import { shell, loading } from '../app.js';
 import { renderClientRuntimeDetail } from './client-runtime.js';
 
 export async function vClients() {
-  App.state.clients = App.state.clients || { page: 1, pageSize: 20, status: '', keyword: '', totalCount: 0, selected: [] };
+  App.state.clients = App.state.clients || { page: 1, pageSize: 20, status: '', keyword: '', totalCount: 0, selected: [] , sortKey: 'createdAt', sortDesc: true};
   const st = App.state.clients;
   $('#app').innerHTML = shell('clients', '客户端管理', `
     <div class="toolbar">
@@ -68,9 +68,9 @@ async function loadDeploymentStatus() {
     const dbOk = d.databaseStatus === 'healthy';
     const autoText = d.automaticEnrollment ? '局域网自动登记已启用' : 'Secure 模式：需要注册令牌';
     const openButton = d.automaticEnrollment
-      ? `<button class="button" id="open-enrollment-window">开放登记 30 分钟</button><span class="text-muted">当前窗口：${esc(d.enrollmentOpenUntilUtc || '已关闭')}</span>`
+      ? `<button class="button" id="open-enrollment-window">开放登记 30 分钟</button><span class="text-muted">当前窗口：${d.enrollmentOpenUntilUtc ? fmtDT(d.enrollmentOpenUntilUtc) : '已关闭'}</span>`
       : '';
-    wrap.innerHTML = `<div class="dashboard-section-head"><h2>部署状态</h2><small>${esc(d.checkedAtUtc || '')}</small></div>
+    wrap.innerHTML = `<div class="dashboard-section-head"><h2>部署状态</h2><small>${d.checkedAtUtc ? fmtDT(d.checkedAtUtc) : ''}</small></div>
       <div class="deployment-status-grid">
         <div><span>服务器地址</span><strong class="mono">${esc(d.serverAddress)}</strong></div>
         <div><span>服务状态</span><strong class="status status--ok">运行中</strong></div>
@@ -100,6 +100,7 @@ LOADERS.clients = async function () {
   const wrap = $('#vwrap'); if (!wrap) return;
   try {
     const q = new URLSearchParams({ page: st.page, pageSize: st.pageSize });
+    if (st.sortKey) { q.set('sortBy', st.sortKey); q.set('sortDescending', String(st.sortDesc !== false)); }
     if (st.status) q.set('status', st.status);
     if (st.keyword) q.set('keyword', st.keyword);
     const data = await api('/api/v1/admin/clients?' + q);
@@ -107,15 +108,15 @@ LOADERS.clients = async function () {
     const filtered = hasFilter(st, ['status', 'keyword']);
     const empty = !filtered
       ? emptyState('first', { glyph: '⌗', title: '还没有客户端', sub: '从上方下载客户端安装程序并完成安装后，客户端会自动出现在这里' })
-      : emptyState('filter', { key: 'clients', title: `没有匹配「${esc(st.keyword || L.client_status[st.status] || '')}」的客户端` });
+      : emptyState('filter', { key: 'clients', title: `没有匹配「${st.keyword || L.client_status[st.status] || ''}」的客户端` });
     wrap.innerHTML = tableHtml([
-      { l: '主机名', render: r => `<a href="#/clients/${esc(r.id)}"><b>${esc(r.hostname)}</b></a><span class="sub">${esc(r.displayName)}</span>` },
+      { l: '主机名', k: 'hostname', sort: true, render: r => `<a href="#/clients/${esc(r.id)}"><b>${esc(r.hostname)}</b></a><span class="sub">${esc(r.displayName)}</span>` },
       { l: '分组', k: 'clientGroupName' },
       { l: '系统', render: r => esc(r.osName || '—') },
-      { l: 'Agent', k: 'agentVersion' },
-      { l: '状态', render: r => status('client_status', r.status) },
+      { l: 'Agent', k: 'agentVersion', sort: true },
+      { l: '状态', k: 'status', sort: true, render: r => status('client_status', r.status) },
       { l: '证书剩余', render: r => r.certificateRemainingDays == null ? '—' : `${esc(r.certificateRemainingDays)} 天` },
-      { l: '最近心跳', render: r => relTime(r.lastHeartbeatAt) },
+      { l: '最近心跳', k: 'lastHeartbeatAt', sort: true, render: r => relTime(r.lastHeartbeatAt) },
       { l: '告警', num: true, render: r => r.activeAlertCount ? `<span class="status status--err pill">${esc(r.activeAlertCount)}</span>` : '0' },
       { l: '任务数', num: true, k: 'taskCount' },
       { l: '操作', render: r => {

@@ -8,6 +8,26 @@ public static class PathSafety
 {
     private const int MaxPathLength = 2048;
 
+    /// <summary>
+    /// Windows 保留设备名（审查 P2-6）。这些名字在任何目录下都不能作为文件名使用，
+    /// 带扩展名同样保留（NUL.txt 依旧指向空设备）。写入会「静默成功」而内容丢失，
+    /// 因此必须在入口拒绝，而不是等写盘时才发现。
+    /// </summary>
+    private static readonly HashSet<string> WindowsReservedNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    };
+
+    /// <summary>判断一个路径段是否命中 Windows 保留设备名（忽略扩展名）</summary>
+    private static bool IsReservedDeviceName(string segment)
+    {
+        var dot = segment.IndexOf('.');
+        var stem = dot >= 0 ? segment[..dot] : segment;
+        return WindowsReservedNames.Contains(stem);
+    }
+
     /// <summary>校验客户端提交的相对路径，非法时返回 false</summary>
     public static bool IsValidRelativePath(string? relativePath)
     {
@@ -43,6 +63,8 @@ public static class PathSafety
             if (segment.EndsWith(' ') || segment.EndsWith('.'))
                 return false;
             if (segment.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                return false;
+            if (IsReservedDeviceName(segment))
                 return false;
         }
 
@@ -114,6 +136,10 @@ public static class PathSafety
         var cleaned = sb.ToString().Replace("..", "_").Trim().TrimEnd('.');
         if (string.IsNullOrWhiteSpace(cleaned))
             cleaned = "unnamed";
+        // 服务端生成的目录名同样不能撞上保留设备名（审查 P2-6）：
+        // 主机名或任务名恰好叫 CON/NUL 时，Directory.CreateDirectory 会失败或行为异常。
+        if (IsReservedDeviceName(cleaned))
+            cleaned = "_" + cleaned;
         return cleaned.Length > 100 ? cleaned[..100] : cleaned;
     }
 }

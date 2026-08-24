@@ -5,6 +5,7 @@ using BackupMonitor.Shared.Models.Auth;
 using BackupMonitor.Shared.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 
 namespace BackupMonitor.Api.Controllers;
@@ -14,6 +15,10 @@ namespace BackupMonitor.Api.Controllers;
 public class AuthController : ApiBaseController
 {
     private const string RefreshCookieName = "__Host-backupmonitor-refresh";
+
+    /// <summary>凭据类端点的 IP 级限速策略名（审查 P2-2），策略本体在 Program.cs 注册。</summary>
+    public const string RateLimitPolicy = "auth-ip";
+
     private readonly IAuthService _authService;
     private readonly JwtSettings _jwtSettings;
 
@@ -26,18 +31,20 @@ public class AuthController : ApiBaseController
     /// <summary>登录（9.1）</summary>
     [HttpPost("login")]
     [AllowAnonymous]
+    [EnableRateLimiting(RateLimitPolicy)]
     public async Task<ActionResult<ApiResponse<LoginResponse>>> Login([FromBody] LoginRequest request, CancellationToken ct)
     {
         var ip = HttpContext.Connection.RemoteIpAddress?.ToString();
         var userAgent = Request.Headers.UserAgent.ToString();
         var result = await _authService.LoginAsync(request, ip, userAgent, ct);
-        SetRefreshCookie(result.RefreshToken);
+        SetRefreshCookie(result.RefreshToken, result.RefreshTokenTtlDays);
         result.RefreshToken = string.Empty;
         return OkData(result);
     }
 
     /// <summary>刷新访问令牌（9.2，令牌轮换，旧令牌重用将吊销全部会话）</summary>
     [HttpPost("refresh")]
+    [EnableRateLimiting(RateLimitPolicy)]
     [AllowAnonymous]
     public async Task<ActionResult<ApiResponse<RefreshTokenResponse>>> Refresh(
         [FromBody(EmptyBodyBehavior = EmptyBodyBehavior.Allow)] RefreshTokenRequest? request,
@@ -49,7 +56,7 @@ public class AuthController : ApiBaseController
         if (string.IsNullOrWhiteSpace(refreshToken))
             throw new BusinessException("UNAUTHORIZED", "刷新令牌缺失", 401);
         var result = await _authService.RefreshAsync(new RefreshTokenRequest { RefreshToken = refreshToken }, ip, userAgent, ct);
-        SetRefreshCookie(result.RefreshToken);
+        SetRefreshCookie(result.RefreshToken, result.RefreshTokenTtlDays);
         result.RefreshToken = string.Empty;
         return OkData(result);
     }
@@ -94,7 +101,11 @@ public class AuthController : ApiBaseController
         return OkData(result);
     }
 
-    private void SetRefreshCookie(string refreshToken)
+    /// <summary>
+    /// 写刷新令牌 Cookie。ttlDays 必须来自签发方（审查 P2-4）——
+    /// 它和写进 refresh_tokens.expires_at 的是同一个来源，不能各自去读配置。
+    /// </summary>
+    private void SetRefreshCookie(string refreshToken, int ttlDays)
     {
         Response.Cookies.Append(RefreshCookieName, refreshToken, new CookieOptions
         {
@@ -103,7 +114,7 @@ public class AuthController : ApiBaseController
             SameSite = SameSiteMode.Strict,
             IsEssential = true,
             Path = "/",
-            MaxAge = TimeSpan.FromDays(Math.Max(1, _jwtSettings.RefreshTokenTtlDays))
+            MaxAge = TimeSpan.FromDays(Math.Max(1, ttlDays > 0 ? ttlDays : _jwtSettings.RefreshTokenTtlDays))
         });
     }
 }

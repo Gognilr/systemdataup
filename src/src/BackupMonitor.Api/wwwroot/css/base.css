@@ -22,13 +22,18 @@ textarea{min-height:68px;resize:vertical}
 .frow.inline{display:flex;align-items:center}
 
 /* ── 按钮 ── */
-button{font:inherit;padding:var(--s-1) var(--s-3);border-radius:var(--r-md);border:1px solid var(--border-strong);background:var(--surface);cursor:pointer;color:var(--text);transition:background var(--dur-fast) var(--ease),border-color var(--dur-fast) var(--ease)}
-button:hover{background:var(--surface-sunk)}
-button:disabled{opacity:.55;cursor:default}
-button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
-button.primary:hover{background:var(--accent-hover)}
-button.danger{color:var(--err-fg);border-color:var(--err-bd)}
-button.small{padding:var(--s-1) var(--s-2);font:var(--t-sm)}
+/* 审查 P1-4：按钮样式此前只以 button.xxx 这种元素限定选择器定义，
+   而 <a class="button"> / <a class="primary button"> 两个类都吃不到——
+   「下载客户端安装程序」这个一键交付入口因此渲染成一行普通链接文字，
+   视觉权重比紧邻的真 <button>「高级设置」还弱。
+   这里把选择器与元素解耦：button 与 .button 共用同一套外观。 */
+button,.button{display:inline-flex;align-items:center;justify-content:center;gap:var(--s-1);font:inherit;padding:var(--s-1) var(--s-3);border-radius:var(--r-md);border:1px solid var(--border-strong);background:var(--surface);cursor:pointer;color:var(--text);text-decoration:none;transition:background var(--dur-fast) var(--ease),border-color var(--dur-fast) var(--ease)}
+button:hover,.button:hover{background:var(--surface-sunk)}
+button:disabled,.button[aria-disabled="true"]{opacity:.55;cursor:default}
+button.primary,.button.primary,a.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+button.primary:hover,.button.primary:hover,a.primary:hover{background:var(--accent-hover)}
+button.danger,.button.danger{color:var(--err-fg);border-color:var(--err-bd)}
+button.small,.button.small{padding:var(--s-1) var(--s-2);font:var(--t-sm)}
 
 /* ── 布局骨架 ── */
 .layout{display:flex;min-height:100vh}

@@ -148,6 +148,23 @@ public class UploadSessionService : IUploadSessionService
             UpdatedAt = now
         };
 
+        // 审查 P1-1：expected_sha256 是服务端唯一的权威完整性基准（来自预检清单）。
+        // 缺失时下游无从比对，只能退化为「相信上传方自己声明的哈希」——那等于没有校验。
+        // 因此在建会话阶段就拒绝，而不是放行到入库后才发现无从验证。
+        var missingHash = candidate.Files
+            .Where(f => string.IsNullOrWhiteSpace(f.Sha256))
+            .Select(f => f.RelativePath)
+            .Take(5)
+            .ToList();
+        if (missingHash.Count > 0)
+        {
+            throw new BusinessException(
+                "INVALID_REQUEST",
+                $"候选文件缺少预检哈希，无法建立上传会话：{string.Join("、", missingHash)}"
+                + (candidate.Files.Count(f => string.IsNullOrWhiteSpace(f.Sha256)) > missingHash.Count ? " 等" : ""),
+                400);
+        }
+
         // 由候选文件生成上传文件计划
         foreach (var cf in candidate.Files.OrderBy(f => f.SortOrder))
         {
@@ -158,7 +175,7 @@ public class UploadSessionService : IUploadSessionService
                 CandidateFileId = cf.Id,
                 RelativePath = cf.RelativePath,
                 SizeBytes = cf.SizeBytes,
-                ExpectedSha256 = cf.Sha256 ?? string.Empty,
+                ExpectedSha256 = cf.Sha256!,
                 TotalChunks = (int)Math.Ceiling(cf.SizeBytes / (double)request.ChunkSizeBytes),
                 Status = UploadFileStatus.Pending
             });
@@ -225,6 +242,20 @@ public class UploadSessionService : IUploadSessionService
             throw new BusinessException("CHUNK_INVALID", "缺少 X-Chunk-SHA256", 400);
 
         var (serverHash, chunkBytes) = await _storage.WriteChunkAsync(sessionId, file.Id, chunkIndex, offset, data, ct);
+
+        // 审查 P1-1：块长度必须与块序号推出的期望值一致。
+        // 原先只校验偏移与哈希，不校验长度——非末块传一个短块即可在暂存文件里留下空洞，
+        // 而空洞位置的字节是 0，块自身的哈希仍然自洽，只有整文件哈希才会发现。
+        // 在这里拦住可以让错误停在出问题的那一块，而不是整份传完再报。
+        var isLastChunk = chunkIndex == file.TotalChunks - 1;
+        var expectedChunkBytes = isLastChunk ? file.SizeBytes - offset : session.ChunkSizeBytes;
+        if (chunkBytes != expectedChunkBytes)
+        {
+            await MarkFileFailedAsync(file, "CHUNK_INVALID", ct);
+            throw new BusinessException(
+                "CHUNK_INVALID",
+                $"块长度错误（块 {chunkIndex}：期望 {expectedChunkBytes} 字节，实际 {chunkBytes} 字节）", 400);
+        }
 
         if (!string.Equals(serverHash, expectedHash, StringComparison.OrdinalIgnoreCase))
         {
@@ -302,8 +333,18 @@ public class UploadSessionService : IUploadSessionService
         var serverSha = await _storage.ComputeFileHashAsync(sessionId, file.Id, ct);
         var now = DateTime.UtcNow;
 
-        if (!string.IsNullOrWhiteSpace(request.Sha256)
-            && !string.Equals(serverSha, request.Sha256, StringComparison.OrdinalIgnoreCase))
+        // 审查 P1-1：完整性判定以预检清单的 expected_sha256 为准（权威基准，服务端持有）。
+        // 客户端在完成时声明的 request.Sha256 只作附加交叉验证——它由上传方单方面给出，
+        // 原先「不传就整段跳过」等于把完整性开关交到了被验证方手里。
+        var mismatchReason =
+            !string.Equals(serverSha, file.ExpectedSha256, StringComparison.OrdinalIgnoreCase)
+                ? $"实测哈希与预检期望值不一致（期望 {file.ExpectedSha256}，实测 {serverSha}）"
+            : !string.IsNullOrWhiteSpace(request.Sha256)
+              && !string.Equals(serverSha, request.Sha256, StringComparison.OrdinalIgnoreCase)
+                ? $"客户端声明哈希与实测不一致（声明 {request.Sha256}，实测 {serverSha}）"
+            : null;
+
+        if (mismatchReason is not null)
         {
             file.Status = UploadFileStatus.Failed;
             file.ErrorCode = "FILE_HASH_MISMATCH";
@@ -311,8 +352,10 @@ public class UploadSessionService : IUploadSessionService
             session.UpdatedAt = now;
             await _db.SaveChangesAsync(ct);
             await _audit.RecordAsync("upload.file.complete", AuditResult.Failure, "upload_session", session.Id,
-                errorCode: "FILE_HASH_MISMATCH", errorMessage: $"文件哈希错误 {file.RelativePath}", ct: ct);
-            throw new BusinessException("FILE_HASH_MISMATCH", $"文件哈希错误（{file.RelativePath}）", 409);
+                errorCode: "FILE_HASH_MISMATCH",
+                errorMessage: $"文件哈希错误 {file.RelativePath}：{mismatchReason}", ct: ct);
+            throw new BusinessException(
+                "FILE_HASH_MISMATCH", $"文件哈希错误（{file.RelativePath}）：{mismatchReason}", 409);
         }
 
         file.Status = UploadFileStatus.Verified;

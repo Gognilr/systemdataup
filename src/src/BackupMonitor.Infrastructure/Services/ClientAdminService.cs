@@ -32,6 +32,21 @@ public interface IClientAdminService
 /// <summary>客户端管理实现（列表/详情/审批签发证书/拒绝/禁用/注销/刷新主机状态）</summary>
 public class ClientAdminService : IClientAdminService
 {
+
+    // ── 列表排序白名单（审查 P1-3）。键名与前端表头 data-sort-column 一致（camelCase）。
+    private static readonly Dictionary<string, Func<IQueryable<Client>, bool, IQueryable<Client>>> ClientSorts =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["hostname"] = SortWhitelist.By<Client, string>(c => c.Hostname),
+            ["displayName"] = SortWhitelist.By<Client, string>(c => c.DisplayName),
+            ["status"] = SortWhitelist.By<Client, ClientStatus>(c => c.Status),
+            ["agentVersion"] = SortWhitelist.By<Client, string?>(c => c.AgentVersion),
+            ["lastHeartbeatAt"] = SortWhitelist.By<Client, DateTime?>(c => c.LastHeartbeatAt),
+            ["createdAt"] = SortWhitelist.By<Client, DateTime>(c => c.CreatedAt)
+        };
+
+    private static readonly Func<IQueryable<Client>, bool, IQueryable<Client>> ClientSortFallback =
+        SortWhitelist.By<Client, DateTime>(c => c.CreatedAt);
     private static readonly AlertStatus[] ActiveAlertStatuses =
         [AlertStatus.Open, AlertStatus.Acknowledged, AlertStatus.InProgress];
 
@@ -100,7 +115,7 @@ public class ClientAdminService : IClientAdminService
         var totalCount = await clients.LongCountAsync(ct);
 
         var rows = await clients
-            .OrderByDescending(c => c.CreatedAt)
+            .ApplySort(query.SortBy, query.SortDescending, ClientSorts, ClientSortFallback)
             .Skip((query.Page - 1) * query.PageSize)
             .Take(query.PageSize)
             .Select(c => new

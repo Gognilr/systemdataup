@@ -25,6 +25,14 @@ public class LoginResponse
 
     /// <summary>是否必须立即修改口令（初始管理员首次登录为 true，OPEN-ISSUES #2）</summary>
     public bool MustChangePassword { get; set; }
+
+    /// <summary>
+    /// 本次签发的刷新令牌实际有效天数（审查 P2-4）。
+    /// Cookie 的 MaxAge 必须取这个值——它和写进 refresh_tokens.expires_at 的是同一个来源
+    /// （system_settings.refresh_token_ttl_days，缺省回落到配置）。原先 Cookie 取配置、
+    /// 令牌取数据库设置，两者不一致时用户要么提前掉线，要么揣着一张早已失效的 Cookie。
+    /// </summary>
+    public int RefreshTokenTtlDays { get; set; }
 }
 
 /// <summary>当前登录用户信息</summary>
@@ -57,6 +65,9 @@ public class RefreshTokenResponse
     public string AccessToken { get; set; } = null!;
     public string RefreshToken { get; set; } = null!;
     public int ExpiresIn { get; set; }
+
+    /// <summary>本次签发的刷新令牌实际有效天数，Cookie MaxAge 取此值（审查 P2-4）</summary>
+    public int RefreshTokenTtlDays { get; set; }
 }
 
 /// <summary>修改口令请求（OPEN-ISSUES #2，需 Bearer 登录态）</summary>

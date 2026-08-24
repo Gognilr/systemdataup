@@ -108,8 +108,12 @@ public class UploadStorage : IUploadStorage
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "无法获取暂存盘剩余空间 root={Root}", root);
-            return long.MaxValue;
+            // 审查 P1-8：这是安全相关判断，必须 fail-closed。
+            // 原先返回 long.MaxValue 会让 CreateSessionAsync 的空间预检恒定通过，
+            // 上传照常开始、直到写盘才崩；而同一方法在「驱动器未就绪」时返回 0，
+            // 两条失败路径给出的答案完全相反。统一为 0，由调用方以 STORAGE_SPACE_LOW 明确拒绝。
+            _logger.LogWarning(ex, "无法获取暂存盘剩余空间 root={Root}，按 0 处理以拒绝新会话", root);
+            return 0;
         }
     }
 
@@ -119,9 +123,16 @@ public class UploadStorage : IUploadStorage
         var dir = await EnsureSessionDirectoryAsync(sessionId, ct);
         var path = Path.Combine(dir, $"{uploadFileId:N}.part");
 
+        // 审查 P2-10：断点续传协议本就允许同一文件的多个分块并行上传，
+        // 原先以 FileShare.Read 打开，第二个并发写入直接抛 IOException；
+        // 且 useAsync:false 配合 WriteAsync 会阻塞线程池线程。
+        // 各分块写入区间由 offset 严格划分且互不重叠，允许并发写是安全的。
+        //
+        // 审查 P1-6：分块被应答为「已接收」时必须真正落盘，否则断电后
+        // 客户端认为已传完、服务端却少了数据——WriteThrough 绕过系统写缓存。
         await using var fileStream = new FileStream(
-            path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read,
-            bufferSize: 81920, useAsync: false);
+            path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite,
+            bufferSize: 81920, FileOptions.Asynchronous | FileOptions.WriteThrough);
         fileStream.Seek(offset, SeekOrigin.Begin);
 
         using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);

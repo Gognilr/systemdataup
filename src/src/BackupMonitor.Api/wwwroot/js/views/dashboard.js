@@ -85,7 +85,7 @@ function renderTrend(dailyUploads) {
     const y = 64 - ((Number(item.count) || 0) / max) * 56;
     return `${x},${y}`;
   }).join(' ');
-  return `<svg class="trend-svg" viewBox="0 0 100 70" role="img" aria-label="最近 14 天入库量趋势"><line x1="0" y1="64" x2="100" y2="64"></line><polyline points="${points}"></polyline></svg>
+  return `<svg class="trend-svg" viewBox="0 0 100 70" preserveAspectRatio="none" role="img" aria-label="最近 14 天入库量趋势"><line x1="0" y1="64" x2="100" y2="64"></line><polyline points="${points}"></polyline></svg>
     <div class="matrix-legend"><span>最近 ${esc(data.length)} 天</span><span>最高 ${esc(max)} 个备份集 / 日</span></div>`;
 }
 

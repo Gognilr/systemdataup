@@ -13,7 +13,7 @@
 
   /* ── 语义：只用于状态偏离 ── */
   --ok-fg:#0f7a4a;   --ok-bg:#e6f4ec;   --ok-bd:#a8d9be;
-  --warn-fg:#96590a; --warn-bg:#fcf1df; --warn-bd:#ebc98a;
+  --warn-fg:#8a5109; --warn-bg:#fcf1df; --warn-bd:#ebc98a;
   --err-fg:#b3261e;  --err-bg:#fcebea;  --err-bd:#f0b4b0;
   --info-fg:#0b5fa5; --info-bg:#e6f0fa; --info-bd:#a9cceb;
 

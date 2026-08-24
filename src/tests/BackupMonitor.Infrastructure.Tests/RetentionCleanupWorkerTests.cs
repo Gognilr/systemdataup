@@ -61,6 +61,16 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
         await SetRepositoryRootSettingAsync(_repositoryRoot);
     }
 
+    /// <summary>设置回收熔断阈值（百分比）。100 表示实际关闭熔断。</summary>
+    private async Task SetRecycleBreakerPercentAsync(int percent)
+    {
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await db.Database.ExecuteSqlRawAsync(
+            "UPDATE system_settings SET setting_value = to_jsonb({0}::int) WHERE setting_key = {1}",
+            percent, RetentionCleanupWorker.RecycleBreakerPercentKey);
+    }
+
     /// <summary>把 system_settings.repository_path 指向本用例的临时仓库根</summary>
     private async Task SetRepositoryRootSettingAsync(string root)
     {
@@ -156,6 +166,11 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
     [Fact]
     public async Task 保留锁与字段锁阻止回收()
     {
+        // 本用例 5 个备份集里有 3 个可回收（60%），会触发默认 50% 的回收熔断（P1-2）。
+        // 这里测的是锁，不是熔断，因此显式关闭熔断以隔离被测对象；
+        // 熔断本身由「回收比例超阈值触发熔断」单独覆盖。
+        await SetRecycleBreakerPercentAsync(100);
+
         var now = DateTime.UtcNow;
         Guid idActiveLock, idExpiredLock, idInactiveLock, idFieldLocked, idPlain;
 
@@ -311,6 +326,76 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
 
             Assert.True(await db.AuditLogs.AsNoTracking()
                 .AnyAsync(a => a.Action == "retention.delete" && a.ResourceId == idPurge));
+        }
+    }
+
+    // ---------- 用例三之二：回收熔断（审查 P1-2） ----------
+
+    /// <summary>
+    /// 一份「四项 Keep*Count 全空 + MinimumRetentionDays=1」的策略会让某任务全部备份集
+    /// 一次性进回收站——这正是 P1-2 描述的灾难场景。熔断阈值 50% 时该任务本轮回收必须
+    /// 整体暂停（不做部分回收），备份集全部保持 available，并写出严重告警。
+    /// </summary>
+    [Fact]
+    public async Task 回收比例超阈值触发熔断()
+    {
+        await SetRecycleBreakerPercentAsync(50);
+
+        var now = DateTime.UtcNow;
+        Guid taskId;
+        var setIds = new List<Guid>();
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var policy = new RetentionPolicy
+            {
+                Id = Guid.NewGuid(),
+                Name = $"it3-breaker-{Guid.NewGuid():N}",
+                KeepLastCount = null,
+                KeepWeeklyCount = null,
+                KeepMonthlyCount = null,
+                KeepYearlyCount = null,
+                MinimumRetentionDays = 1,
+                RecycleBinDays = 7,
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+            (var clientId, taskId) = await SeedClientAndTaskAsync(db, policy, now);
+
+            // 4 个全部超期且无 GFS 保留名额 → 拟回收 100%，远超 50% 阈值
+            for (var i = 0; i < 4; i++)
+                setIds.Add(await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-3), now));
+
+            await db.SaveChangesAsync();
+        }
+
+        // 熔断的可观测结果是「告警出现」；用它作为本轮确实跑过的信号
+        await RunWorkerUntilAsync(async () =>
+        {
+            await using var scope = _services.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            return await db.Alerts.AsNoTracking()
+                .AnyAsync(a => a.Category == "retention_breaker_tripped" && a.TaskId == taskId);
+        });
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            foreach (var id in setIds)
+            {
+                Assert.Equal(BackupSetStatus.Available, await StatusAsync(db, id));
+            }
+
+            var alert = await db.Alerts.AsNoTracking()
+                .FirstAsync(a => a.Category == "retention_breaker_tripped" && a.TaskId == taskId);
+            Assert.Equal(AlertLevel.Critical, alert.Level);
+
+            Assert.False(
+                await db.AuditLogs.AsNoTracking()
+                    .AnyAsync(a => a.Action == "retention.recycle" && setIds.Contains(a.ResourceId!.Value)),
+                "熔断后不得写出任何回收审计——不做部分回收");
         }
     }
 

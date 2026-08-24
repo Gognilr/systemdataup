@@ -1,7 +1,10 @@
 using System.Net;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.RateLimiting;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using BackupMonitor.Api.Bootstrap;
+using BackupMonitor.Api.Controllers;
 using BackupMonitor.Api.Discovery;
 using BackupMonitor.Api.Health;
 using BackupMonitor.Api.Middleware;
@@ -262,6 +265,35 @@ builder.Services.AddAuthorization(options =>
 var allowedOrigins = builder.Configuration
     .GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
 
+// 审查 P2-2：此前只有「按账号」的失败锁定，没有任何 IP 维度限速。
+// 后果有两面：① 分布式撞库可以每账号 5 次以内横扫全部用户名而不触发任何阈值；
+// ② 攻击者可以主动打满某个管理员的失败次数，把人锁在系统外造成拒绝服务。
+// 账号锁定拦不住这两种，因为它们都不依赖「同一账号连续失败」。
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    // 按对端 IP 分区。取 RemoteIpAddress——UseForwardedHeaders 已在更早的中间件里
+    // 用 KnownProxies 白名单还原过真实客户端 IP，未配置代理时它就是 TCP 直连对端。
+    options.AddPolicy(AuthController.RateLimitPolicy, context =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
+
+    options.OnRejected = async (context, ct) =>
+    {
+        context.HttpContext.Response.ContentType = "application/json; charset=utf-8";
+        await context.HttpContext.Response.WriteAsync(
+            """{"success":false,"error":{"code":"TOO_MANY_REQUESTS","message":"请求过于频繁，请稍后重试"}}""",
+            ct);
+    };
+});
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("Management", policy =>
@@ -315,7 +347,25 @@ app.UseForwardedHeaders();
 
 app.UseMiddleware<RequestIdMiddleware>();
 app.UseMiddleware<SecurityHeadersMiddleware>();
-app.UseSerilogRequestLogging();
+// 审查 P2-3：恢复下载令牌出现在 URL 路径中（/api/v1/downloads/{token}），
+// 会被请求日志原文记录——有日志读取权限的人可在 TTL 内重放，直接取走整个备份集。
+// 协议形态（路径携带令牌）是为了让浏览器用普通 <a> 直接下载，改成请求头需要一整套
+// 一次性会话交换，属于独立的接口变更；这里先切断「令牌落进日志」这条实际泄露路径。
+app.UseSerilogRequestLogging(options =>
+{
+    options.GetLevel = (httpContext, elapsed, ex) =>
+        ex is not null ? Serilog.Events.LogEventLevel.Error
+        : httpContext.Response.StatusCode >= 500 ? Serilog.Events.LogEventLevel.Error
+        : Serilog.Events.LogEventLevel.Information;
+
+    options.EnrichDiagnosticContext = (diagnosticContext, httpContext) =>
+    {
+        var path = httpContext.Request.Path.Value ?? string.Empty;
+        // 下载端点的路径段就是令牌本身，打码后再入日志
+        if (path.StartsWith("/api/v1/downloads/", StringComparison.OrdinalIgnoreCase))
+            diagnosticContext.Set("RequestPath", "/api/v1/downloads/***");
+    };
+});
 app.UseMiddleware<ExceptionHandlingMiddleware>();
 
 if (app.Environment.IsDevelopment())
@@ -332,6 +382,7 @@ app.UseCors("Management");
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
+app.UseRateLimiter();
 app.UseAuthentication();
 
 // 强制改密闸门必须位于认证之后（需要 JWT claim）、授权之前（未改密时不应触达任何业务端点）。

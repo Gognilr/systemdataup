@@ -9,7 +9,7 @@ import {
 import { shell, loading } from '../app.js';
 
 export async function vBackups() {
-  App.state.backups = App.state.backups || { page: 1, pageSize: 20, status: '', keyword: '', totalCount: 0 };
+  App.state.backups = App.state.backups || { page: 1, pageSize: 20, status: '', keyword: '', totalCount: 0 , sortKey: 'uploadedAt', sortDesc: true};
   const st = App.state.backups;
   $('#app').innerHTML = shell('backups', '备份集', `
     <div class="toolbar">
@@ -34,22 +34,23 @@ LOADERS.backups = async function () {
   const wrap = $('#vwrap'); if (!wrap) return;
   try {
     const q = new URLSearchParams({ page: st.page, pageSize: st.pageSize });
+    if (st.sortKey) { q.set('sortBy', st.sortKey); q.set('sortDescending', String(st.sortDesc !== false)); }
     if (st.status) q.set('status', st.status);
     if (st.keyword) q.set('keyword', st.keyword);
     const data = await api('/api/v1/admin/backups?' + q);
     st.totalCount = data.totalCount;
     const empty = !hasFilter(st, ['status', 'keyword'])
       ? emptyState('first', { glyph: '❏', title: '暂无备份集', sub: '备份任务成功入库后，备份集会出现在这里' })
-      : emptyState('filter', { key: 'backups', title: `没有匹配「${esc(st.keyword || L.backup_set_status[st.status] || '')}」的备份集` });
+      : emptyState('filter', { key: 'backups', title: `没有匹配「${st.keyword || L.backup_set_status[st.status] || ''}」的备份集` });
     wrap.innerHTML = tableHtml([
-      { l: '备份集编号', render: r => `<a href="#/backups/${esc(r.id)}"><b class="mono">${esc(r.backupSetCode)}</b></a>` },
+      { l: '备份集编号', k: 'backupSetCode', sort: true, render: r => `<a href="#/backups/${esc(r.id)}"><b class="mono">${esc(r.backupSetCode)}</b></a>` },
       { l: '客户端 / 任务', render: r => `${esc(r.clientHostname)}<span class="sub">${esc(r.taskName)}</span>` },
       { l: '应用', k: 'applicationName' },
-      { l: '状态', render: r => status('backup_set_status', r.status) },
-      { l: '业务时间', render: r => relTime(r.backupBusinessTime) },
-      { l: '大小', num: true, render: r => `${esc(r.totalFiles)} 个文件 / ${fmtBytes(r.totalBytes)}` },
+      { l: '状态', k: 'status', sort: true, render: r => status('backup_set_status', r.status) },
+      { l: '业务时间', k: 'backupBusinessTime', sort: true, render: r => relTime(r.backupBusinessTime) },
+      { l: '大小', k: 'totalBytes', sort: true, num: true, render: r => `${esc(r.totalFiles)} 个文件 / ${fmtBytes(r.totalBytes)}` },
       { l: '锁定', render: r => r.locked ? '<span class="status status--wait pill">已锁定</span>' : '—' },
-      { l: '保留至', render: r => relTime(r.retentionUntil) },
+      { l: '保留至', k: 'retentionUntil', sort: true, render: r => relTime(r.retentionUntil) },
       { l: '操作', render: r => {
         const b = [];
         if (r.status === 'available') {

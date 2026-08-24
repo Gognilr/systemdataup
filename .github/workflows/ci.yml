@@ -22,3 +22,42 @@ jobs:
         with: { dotnet-version: '8.0.x' }
       - run: dotnet build src/agent/BackupMonitor.Agent/BackupMonitor.Agent.csproj -c Release --nologo
       - run: dotnet build src/agent/BackupMonitor.Agent.Tray/BackupMonitor.Agent.Tray.csproj -c Release --nologo
+      # 审查 §06：两个双击 EXE 是整个「局域网一键交付」故事的载体，此前不在 CI 里，
+      # 任何一个编译中断都不会被发现。
+      - run: dotnet build src/agent/BackupMonitor.Agent.Setup/BackupMonitor.Agent.Setup.csproj -c Release --nologo
+      - run: dotnet build src/server/BackupMonitor.Server.Setup/BackupMonitor.Server.Setup.csproj -c Release --nologo
+
+  # 审查 §06：CI 此前完全不检查前端（2,945 行 JS/CSS）。
+  # P1-4 那种「CSS 里根本不存在的类」用一个最简单的引用检查就能拦住。
+  frontend-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - name: ES 模块语法检查
+        working-directory: src/src/BackupMonitor.Api/wwwroot
+        run: |
+          set -e
+          for f in js/*.js js/views/*.js; do
+            node --check "$f"
+          done
+
+      - name: CSS 类引用检查（HTML/JS 里用到的类必须在 CSS 中定义）
+        working-directory: src/src/BackupMonitor.Api/wwwroot
+        run: |
+          set -e
+          # 收集 CSS 里定义过的类名
+          cat css/*.css | grep -oE '\.[a-zA-Z][a-zA-Z0-9_-]*' | sed 's/^\.//' | sort -u > /tmp/defined.txt
+          # 收集 JS/HTML 模板里 class="..." 用到的类名（跳过含 ${} 插值的动态片段）
+          grep -rhoE 'class="[^"$]*"' index.html js/ \
+            | sed -E 's/class="([^"]*)"/\1/' | tr ' ' '\n' \
+            | grep -vE '^$' | sort -u > /tmp/used.txt
+          missing=$(comm -23 /tmp/used.txt /tmp/defined.txt || true)
+          if [ -n "$missing" ]; then
+            echo "以下 class 在 CSS 中没有定义："
+            echo "$missing"
+            exit 1
+          fi
+          echo "CSS 类引用检查通过"

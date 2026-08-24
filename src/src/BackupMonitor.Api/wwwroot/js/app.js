@@ -37,12 +37,15 @@ export const NAV_GROUPS = [
   ] },
   { key: 'manage', label: '管理', items: [
     ['retention', '保留策略', '◫'], ['notifications', '通知', '✉'],
-    ['upgrades', 'Agent 升级', '↑'], ['job-history', '作业历史', '▤'], ['audit', '审计日志', '≡']
+    ['upgrades', 'Agent 升级', '↑'], ['job-history', '作业历史', '◷'], ['audit', '审计日志', '≡']
   ] }
 ];
 const NAV_ITEMS = NAV_GROUPS.flatMap(g => g.items.map(([key, label, icon]) => ({ key, label, icon, group: g.label })));
 
-function sidebarIsExpanded() { return store.get('sidebar') === 'expanded'; }
+// 界面评估：默认折叠是首次使用的硬伤——新管理员第一次登录只看到一竖排抽象几何符号，
+// 且折叠态下分组标签是 visibility:hidden，留下几段无法解释的空隙。改为默认展开，
+// 只有用户显式折叠过（存了 'collapsed'）才折叠。
+function sidebarIsExpanded() { return store.get('sidebar') !== 'collapsed'; }
 function sidebarClass() { return sidebarIsExpanded() ? '' : ' is-collapsed'; }
 
 export function shell(active, title, body) {
@@ -249,6 +252,7 @@ let commandEl = null;
 let commandItems = [];
 let commandIndex = 0;
 let commandSearchSerial = 0;
+let commandSearchTimer = null;
 
 function ensureCommandPalette() {
   if (commandEl) return commandEl;
@@ -266,7 +270,13 @@ function ensureCommandPalette() {
     const button = e.target.closest('[data-command-index]');
     if (button) executeCommand(Number(button.dataset.commandIndex));
   });
-  commandEl.querySelector('#commandInput').addEventListener('input', e => renderCommands(e.target.value.trim()));
+  // P1-5：每次按键都并发拉三个接口，机群规模上去后是明显的性能问题。
+  // 200ms 防抖：连续输入只在停顿后发一次请求；已有的 commandSearchSerial 负责丢弃过期响应。
+  commandEl.querySelector('#commandInput').addEventListener('input', e => {
+    const value = e.target.value.trim();
+    clearTimeout(commandSearchTimer);
+    commandSearchTimer = setTimeout(() => renderCommands(value), 200);
+  });
   return commandEl;
 }
 function closeCommandPalette() {
@@ -275,21 +285,25 @@ function closeCommandPalette() {
   commandSearchSerial++;
 }
 async function searchCommandRecords(q) {
-  const needle = q.toLocaleLowerCase();
   const read = path => api(path).then(x => x || { items: [] }).catch(() => ({ items: [] }));
   const [clients, tasks, backups] = await Promise.all([
-    read(`/api/v1/admin/clients?page=1&pageSize=200&keyword=${encodeURIComponent(q)}`),
-    read(`/api/v1/admin/backup-tasks?page=1&pageSize=200&applicationName=${encodeURIComponent(q)}`),
-    read(`/api/v1/admin/backups?page=1&pageSize=200&applicationName=${encodeURIComponent(q)}`)
+    // P1-5：任务与备份集此前误用 applicationName——它只匹配「应用名」字段，
+    // 于是按任务名搜不到任务、按备份集编号搜不到备份集。keyword 才是全字段检索参数：
+    // BackupTaskService 的 keyword 同时匹配 Name 与 ApplicationName，
+    // BackupSetService 的 keyword 匹配 BackupSetCode。
+    // pageSize 由 200 降到 20——服务端已按 keyword 过滤，不需要再拉大量数据到前端二次筛。
+    read(`/api/v1/admin/clients?page=1&pageSize=20&keyword=${encodeURIComponent(q)}`),
+    read(`/api/v1/admin/backup-tasks?page=1&pageSize=20&keyword=${encodeURIComponent(q)}`),
+    read(`/api/v1/admin/backups?page=1&pageSize=20&keyword=${encodeURIComponent(q)}`)
   ]);
   const items = [];
-  for (const c of clients.items || []) if ([c.hostname, c.displayName, c.id].some(v => String(v || '').toLocaleLowerCase().includes(needle))) {
+  for (const c of clients.items || []) {
     items.push({ kind: '搜索', title: c.hostname, hint: `客户端 · ${c.displayName || c.id}`, run: () => { location.hash = '#/clients/' + c.id; } });
   }
-  for (const t of tasks.items || []) if ([t.name, t.applicationName, t.clientHostname, t.id].some(v => String(v || '').toLocaleLowerCase().includes(needle))) {
+  for (const t of tasks.items || []) {
     items.push({ kind: '搜索', title: t.name, hint: `备份任务 · ${t.clientHostname || ''}`, run: () => { location.hash = '#/tasks/' + t.id; } });
   }
-  for (const b of backups.items || []) if ([b.backupSetCode, b.taskName, b.clientHostname, b.id].some(v => String(v || '').toLocaleLowerCase().includes(needle))) {
+  for (const b of backups.items || []) {
     items.push({ kind: '搜索', title: b.backupSetCode, hint: `备份集 · ${b.taskName || b.clientHostname || ''}`, run: () => { location.hash = '#/backups/' + b.id; } });
   }
   return items.slice(0, 12);
