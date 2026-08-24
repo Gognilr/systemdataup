@@ -1,4 +1,4 @@
-using System.Net.Http;
+﻿using System.Net.Http;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -83,6 +83,33 @@ internal sealed class ServerMaintenance
             });
         await RestartServicesAsync(ct);
         return fingerprint;
+    }
+
+    /// <summary>
+    /// 读取当前服务端 TLS 证书指纹，供操作员带外核对——客户端安装器会显示同一个值，
+    /// 由人比对两边是否一致，这是识破中间人的唯一手段（自签名证书没有公共 CA 背书）。
+    ///
+    /// 复用现有证书，不会重新签发：Initialize 在证书已存在时只读取，不生成新的。
+    /// </summary>
+    public string GetServerCertificateFingerprint(string installDirectory, string dataDirectory)
+    {
+        var configPath = Path.Combine(installDirectory, "appsettings.Turnkey.json");
+        var configuration = new ConfigurationBuilder()
+            .AddJsonFile(configPath, optional: false, reloadOnChange: false)
+            .Build();
+        var bootstrap = LocalServerBootstrap.Initialize(
+            configuration,
+            new LocalServerBootstrapOptions
+            {
+                Enabled = true,
+                DataDirectory = dataDirectory,
+                SecretsPath = Path.Combine(dataDirectory, "server-secrets.json"),
+                DiscoveryEnabled = configuration.GetValue("LanMode:DiscoveryEnabled", true),
+                DiscoveryPort = configuration.GetValue("LanMode:DiscoveryPort", 45808)
+            });
+
+        return bootstrap.Values["Security:ServerCertificate:Fingerprint"]
+            ?? throw new InvalidOperationException("未能读取服务端 TLS 证书指纹，请检查服务端证书配置。");
     }
 
     public string RepairPermissions(string dataDirectory)

@@ -139,7 +139,7 @@ $rsa = [Security.Cryptography.RSA]::Create(3072)
 $rsa.Dispose()
 ```
 
-数据库初始化使用仓库根目录 `dbinit.bat`：新库执行 V001~V007；已存在的库跳过 V001~V005 基线，只执行可重复的 V006/V007 增量，避免把初始化脚本误当成升级脚本重复执行。
+数据库初始化使用仓库根目录 `dbinit.bat`：迁移由 `MigrationRunner` 按 `schema_migrations` 记录逐个补齐（当前 V001~V014），已执行过的版本自动跳过，重复运行安全。
 
 ## 2. 证书
 

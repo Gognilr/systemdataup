@@ -21,6 +21,11 @@ textarea{min-height:68px;resize:vertical}
 .frow input[type=checkbox]{width:auto;margin-right:var(--s-1)}
 .frow.inline{display:flex;align-items:center}
 
+/* 表单里的「高级选项」折叠区：默认收起，只留一行摘要。 */
+.fadv{margin:var(--s-3) 0 var(--s-2);border-top:1px solid var(--border);padding-top:var(--s-3)}
+.fadv>summary{cursor:pointer;font:var(--t-body);color:var(--text-muted);user-select:none;margin-bottom:var(--s-3)}
+.fadv>summary:hover{color:var(--text)}
+
 /* ── 按钮 ── */
 /* 审查 P1-4：按钮样式此前只以 button.xxx 这种元素限定选择器定义，
    而 <a class="button"> / <a class="primary button"> 两个类都吃不到——

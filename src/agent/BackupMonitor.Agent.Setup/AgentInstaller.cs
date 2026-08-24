@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
@@ -48,7 +48,8 @@ internal sealed class AgentInstaller
     public async Task<AgentBootstrap> GetBootstrapAsync(string serverUrl, CancellationToken ct)
     {
         var baseUrl = NormalizeServerUrl(serverUrl);
-        using var client = CreateHttpClient();
+        string? presentedFingerprint = null;
+        using var client = CreateHttpClient(onServerCertificate: value => presentedFingerprint = value);
         using var response = await client.GetAsync(new Uri(new Uri(baseUrl + "/"), "api/v1/agent/bootstrap"), ct);
         var body = await response.Content.ReadAsStringAsync(ct);
         if (!response.IsSuccessStatusCode)
@@ -82,6 +83,23 @@ internal sealed class AgentInstaller
             && string.IsNullOrWhiteSpace(certificateFingerprint))
             throw new InvalidOperationException("服务端没有提供 TLS 证书指纹，请检查 Turnkey 服务端证书配置。");
 
+        // 把要固定的指纹和实际通话的那张证书绑死。两者不一致说明响应体里的指纹
+        // 不是这条连接对端的证书——继续下去会把客户端配置成固定一张它从未验证过的证书。
+        if (!string.IsNullOrWhiteSpace(certificateFingerprint)
+            && presentedFingerprint is not null
+            && !string.Equals(
+                NormalizeFingerprint(certificateFingerprint),
+                presentedFingerprint,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "服务端返回的 TLS 证书指纹与本次连接实际出示的证书不一致，已中止安装。"
+                + Environment.NewLine
+                + $"响应体：{NormalizeFingerprint(certificateFingerprint)}"
+                + Environment.NewLine
+                + $"实际连接：{presentedFingerprint}");
+        }
+
         ValidatePublicKey(publicKey);
         return new AgentBootstrap(
             publicKey,
@@ -96,12 +114,22 @@ internal sealed class AgentInstaller
         string serverUrl,
         string displayName,
         string registrationToken,
+        string? expectedServerFingerprint,
+        Func<string, Task<bool>> confirmServerFingerprintAsync,
         IProgress<InstallProgress> progress,
         CancellationToken ct)
     {
         var baseUrl = NormalizeServerUrl(serverUrl);
         progress.Report(new InstallProgress("正在读取服务端安装配置…", 5));
         var bootstrap = await GetBootstrapAsync(baseUrl, ct);
+
+        // 带外核对必须挡在下载之前：这一步之后的每一个字节都来自这条连接，
+        // 包括 Agent 程序包本身。等装完再问就没有意义了。
+        progress.Report(new InstallProgress("等待核对服务端证书指纹…", 8));
+        await VerifyServerFingerprintAsync(
+            bootstrap.ServerCertificateFingerprint,
+            expectedServerFingerprint,
+            confirmServerFingerprintAsync);
         if (!bootstrap.AutomaticEnrollment && string.IsNullOrWhiteSpace(registrationToken))
             throw new InvalidOperationException("当前服务端是 Secure 模式，请在“高级选项”中填写注册令牌。");
         var packageUri = ResolvePackageUri(baseUrl, bootstrap.AgentPackagePath);
@@ -112,7 +140,8 @@ internal sealed class AgentInstaller
         {
             var packagePath = Path.Combine(tempRoot, "BackupMonitor.Agent.zip");
             progress.Report(new InstallProgress("正在下载客户端组件…", 10));
-            await DownloadPackageAsync(packageUri, packagePath, progress, ct);
+            await DownloadPackageAsync(
+                packageUri, packagePath, bootstrap.ServerCertificateFingerprint, progress, ct);
 
             var payloadRoot = Path.Combine(tempRoot, "payload");
             progress.Report(new InstallProgress("正在解压客户端组件…", 62));
@@ -184,10 +213,101 @@ internal sealed class AgentInstaller
         }, ct);
     }
 
-    private static HttpClient CreateHttpClient() => new()
+    /// <summary>
+    /// 一键交付的服务端用的是安装时自签的证书，客户端机器不可能预先信任它，
+    /// 默认证书校验一定失败——而 /api/v1/agent/bootstrap 的用途恰恰就是把证书指纹
+    /// 发给客户端做后续固定校验。所以引导那一次请求按设计只能是首次信任（TOFU）：
+    /// 跳过链校验，但记下对端实际出示的证书指纹，回来和响应体里的指纹对账。
+    ///
+    /// <paramref name="pinnedFingerprint"/> 有值时改为严格固定校验，只认这一张证书，
+    /// 与运行期 AgentApiClient 的判定口径一致。引导之后的所有请求都走这条路径。
+    /// </summary>
+    private static HttpClient CreateHttpClient(
+        string? pinnedFingerprint = null,
+        Action<string>? onServerCertificate = null)
     {
-        Timeout = TimeSpan.FromMinutes(30)
-    };
+        var handler = new HttpClientHandler();
+
+        if (!string.IsNullOrWhiteSpace(pinnedFingerprint))
+        {
+            var expected = NormalizeFingerprint(pinnedFingerprint);
+            handler.ServerCertificateCustomValidationCallback = (_, certificate, _, _) =>
+                certificate is not null
+                && string.Equals(
+                    NormalizeFingerprint(Convert.ToHexString(certificate.GetCertHash(HashAlgorithmName.SHA256))),
+                    expected,
+                    StringComparison.OrdinalIgnoreCase);
+        }
+        else if (onServerCertificate is not null)
+        {
+            handler.ServerCertificateCustomValidationCallback = (_, certificate, _, _) =>
+            {
+                if (certificate is null)
+                    return false;
+                onServerCertificate(
+                    NormalizeFingerprint(Convert.ToHexString(certificate.GetCertHash(HashAlgorithmName.SHA256))));
+                return true;
+            };
+        }
+
+        return new HttpClient(handler, disposeHandler: true)
+        {
+            Timeout = TimeSpan.FromMinutes(30)
+        };
+    }
+
+    /// <summary>
+    /// 带外核对服务端 TLS 指纹。
+    ///
+    /// 自签名证书没有公共 CA 背书，GetBootstrapAsync 里那道「响应体指纹 == 实际出示证书」
+    /// 的对账只能发现服务端自身配置错乱：中间人出示自己的证书、响应体里填自己的指纹，
+    /// 两者一样自洽。要识破它，只能由人拿服务端安装器上显示的值来比。
+    ///
+    /// 填了期望值就精确比对，不再打扰操作员——这条路既省事又比人眼更严格，
+    /// 批量装机时粘贴同一个值即可。留空才回落到人工确认。
+    /// </summary>
+    private static async Task VerifyServerFingerprintAsync(
+        string? actualFingerprint,
+        string? expectedFingerprint,
+        Func<string, Task<bool>> confirmAsync)
+    {
+        var actual = CertificateFingerprint.Normalize(actualFingerprint);
+        if (actual.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "服务端没有提供 TLS 证书指纹，无法完成带外核对，已中止安装。");
+        }
+
+        if (!string.IsNullOrWhiteSpace(expectedFingerprint))
+        {
+            if (!CertificateFingerprint.Matches(expectedFingerprint, actual))
+            {
+                throw new InvalidOperationException(
+                    "服务端 TLS 证书指纹与你填写的期望值不一致，已中止安装。"
+                    + Environment.NewLine + Environment.NewLine
+                    + "你填写的：" + Environment.NewLine
+                    + CertificateFingerprint.ToDisplayBlock(expectedFingerprint)
+                    + Environment.NewLine + Environment.NewLine
+                    + "实际连到的：" + Environment.NewLine
+                    + CertificateFingerprint.ToDisplayBlock(actual)
+                    + Environment.NewLine + Environment.NewLine
+                    + "这说明连接对端不是你预期的那台服务端。请勿继续，联系管理员核实。");
+            }
+
+            return;
+        }
+
+        if (!await confirmAsync(actual))
+        {
+            throw new InvalidOperationException(
+                "未确认服务端证书指纹，已取消安装。"
+                + Environment.NewLine
+                + "请在服务端安装器上点「查看服务端指纹」取得正确取值后重试。");
+        }
+    }
+
+    private static string NormalizeFingerprint(string value) =>
+        value.Replace(":", string.Empty, StringComparison.Ordinal).Trim().ToLowerInvariant();
 
     private static string NormalizeServerUrl(string value)
     {
@@ -207,10 +327,12 @@ internal sealed class AgentInstaller
     private static async Task DownloadPackageAsync(
         Uri packageUri,
         string packagePath,
+        string? serverCertificateFingerprint,
         IProgress<InstallProgress> progress,
         CancellationToken ct)
     {
-        using var client = CreateHttpClient();
+        // 引导已经拿到指纹，从这一步起一律严格固定校验，不再放行任何其他证书。
+        using var client = CreateHttpClient(serverCertificateFingerprint);
         using var response = await client.GetAsync(packageUri, HttpCompletionOption.ResponseHeadersRead, ct);
         if (!response.IsSuccessStatusCode)
             throw new InvalidOperationException($"客户端组件下载失败，服务端返回 HTTP {(int)response.StatusCode}。");

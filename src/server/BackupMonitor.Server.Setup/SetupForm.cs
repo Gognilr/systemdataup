@@ -1,4 +1,6 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
+
+using BackupMonitor.Shared.Security;
 
 namespace BackupMonitor.Server.Setup;
 
@@ -14,6 +16,7 @@ internal sealed class SetupForm : Form
     private readonly Button _restartServices = new();
     private readonly Button _openWeb = new();
     private readonly Button _diagnostics = new();
+    private readonly Button _showFingerprint = new();
     private readonly Button _reissueServerCertificate = new();
     private readonly Button _repairPermissions = new();
     private readonly Button _exportKeyPackage = new();
@@ -119,6 +122,7 @@ internal sealed class SetupForm : Form
         _restartServices.Text = "重启服务";
         _openWeb.Text = "打开管理网页";
         _diagnostics.Text = "运行诊断";
+        _showFingerprint.Text = "查看服务端指纹";
         _reissueServerCertificate.Text = "重新签发服务端证书";
         _uninstall.Text = "卸载";
         _repairPermissions.Text = "修复文件权限";
@@ -128,6 +132,7 @@ internal sealed class SetupForm : Form
         {
             _resetPassword,
             _restartServices,
+            _showFingerprint,
             _reissueServerCertificate,
             _repairPermissions,
             _exportKeyPackage,
@@ -144,6 +149,7 @@ internal sealed class SetupForm : Form
         _restartServices.Click += async (_, _) => await RestartServicesAsync();
         _openWeb.Click += (_, _) => OpenWeb();
         _diagnostics.Click += async (_, _) => await ShowDiagnosticsAsync();
+        _showFingerprint.Click += (_, _) => ShowServerFingerprint();
         _reissueServerCertificate.Click += async (_, _) => await ReissueServerCertificateAsync();
         _repairPermissions.Click += async (_, _) => await RepairPermissionsAsync();
         _exportKeyPackage.Click += async (_, _) => await ExportKeyPackageAsync();
@@ -226,6 +232,11 @@ internal sealed class SetupForm : Form
         try
         {
             await _installer.InstallAsync(request, progress, CancellationToken.None);
+
+            // 装完立刻把指纹亮出来：装客户端的人马上就要用它，
+            // 不该还得回来自己找一个按钮。这里也顺手复制到剪贴板。
+            ShowServerFingerprint();
+
             MessageBox.Show(this, "BackupMonitor Server 安装完成，管理网页即将打开。", "安装完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
             Close();
         }
@@ -455,6 +466,59 @@ internal sealed class SetupForm : Form
         finally
         {
             SetBusy(false);
+        }
+    }
+
+    /// <summary>
+    /// 显示服务端 TLS 证书指纹，供操作员带外交给装客户端的人。
+    ///
+    /// 客户端安装器会显示同一个值并要求确认——两边比对一致才能证明客户端连的是这台
+    /// 服务端。局域网里用的是自签名证书，没有公共 CA 背书，这一步是识破中间人的唯一手段：
+    /// 中间人能让「响应体里的指纹」和「实际出示的证书」互相自洽，骗不过的只有这个带外取值。
+    ///
+    /// 顺手复制到剪贴板：把它粘进工单交给装机的人，比让对方照着屏幕抄 64 个字符可靠得多，
+    /// 对方在客户端安装器的「高级选项」里粘贴后即为精确比对，连人工核对都省了。
+    /// </summary>
+    private void ShowServerFingerprint()
+    {
+        if (!ServerInstaller.IsInstalled())
+            return;
+
+        try
+        {
+            var fingerprint = _maintenance.GetServerCertificateFingerprint(_installDirectory, _dataDirectory);
+            var normalized = CertificateFingerprint.Normalize(fingerprint);
+
+            var copied = false;
+            try
+            {
+                Clipboard.SetText(normalized);
+                copied = true;
+            }
+            catch
+            {
+                // 剪贴板被别的进程占用时不影响查看，下面照常显示。
+            }
+
+            _status.Text = "服务端 TLS 指纹：" + normalized;
+            MessageBox.Show(
+                this,
+                "服务端 TLS 证书指纹："
+                + Environment.NewLine + Environment.NewLine
+                + CertificateFingerprint.ToDisplayBlock(normalized)
+                + Environment.NewLine + Environment.NewLine
+                + "安装客户端时，客户端安装器会显示同一个值并要求核对。"
+                + Environment.NewLine
+                + "把这个值填进客户端安装器的「高级选项 → 服务端证书指纹」即为精确比对。"
+                + Environment.NewLine
+                + (copied ? "（已复制到剪贴板）" : "（剪贴板不可用，请手工记录）"),
+                "服务端证书指纹",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "读取指纹失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 

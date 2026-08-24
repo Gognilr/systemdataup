@@ -1,4 +1,4 @@
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
@@ -23,57 +23,126 @@ public sealed class AgentApiException : Exception
     }
 }
 
-public sealed class AgentApiClient
+public sealed class AgentApiClient : IDisposable
 {
     private readonly AgentOptions _options;
     private readonly AgentStateStore _stateStore;
-    private readonly HttpClientHandler _handler;
-    private readonly HttpClient _http;
     private readonly JsonSerializerOptions _json = new(JsonSerializerDefaults.Web) { PropertyNameCaseInsensitive = true };
+
+    /// <summary>保护 _http / _clientCertificate 的整体替换；请求侧只做一次快照读。</summary>
+    private readonly object _clientSync = new();
+    private HttpClient _http;
+    private X509Certificate2? _clientCertificate;
 
     public AgentApiClient(IOptions<AgentOptions> options, AgentStateStore stateStore)
     {
         _options = options.Value;
         _stateStore = stateStore;
-        _handler = new HttpClientHandler();
+        _http = null!;
+        RebuildClient(stateStore.LoadCertificate());
+    }
+
+    /// <summary>
+    /// 首次注册获批后挂载客户端证书。
+    ///
+    /// 必须重建 HttpClient，不能只往 ClientCertificates 集合里加一张证书：
+    /// 客户端证书是在 TLS 握手阶段协商的，握手完成后连接的身份就固定了。
+    /// 注册阶段的请求（提交申请、轮询审批结果）是匿名端点，那条连接握手时
+    /// Agent 手上还没有证书，于是以「不出示证书」建立并进入连接池。
+    /// 之后即便把证书塞进 handler，心跳复用的仍是那条无证书的连接，
+    /// 服务端 Connection.ClientCertificate 始终为 null，mTLS 端点一律 401；
+    /// 而失败重试间隔（10 秒）短于连接池空闲回收时间（默认 60 秒），
+    /// 这条连接永远不会被淘汰——Agent 就此永久卡死，注册成功却一次心跳都上报不了。
+    /// </summary>
+    public void AttachCertificate(X509Certificate2 certificate)
+    {
+        lock (_clientSync)
+        {
+            if (string.Equals(_clientCertificate?.Thumbprint, certificate.Thumbprint, StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+
+        RebuildClient(certificate);
+    }
+
+    /// <summary>证书续签后换用新证书。同样必须重建连接池，理由见 AttachCertificate。</summary>
+    public void ReplaceCertificate(X509Certificate2 certificate) => RebuildClient(certificate);
+
+    /// <summary>
+    /// 丢弃当前连接池，下一次请求重新握手，证书不变。
+    /// 用于 401 之后的自愈：任何让连接身份与本地证书脱节的情况，
+    /// 重新握手都能纠正，代价只是一次 TLS 握手。
+    /// </summary>
+    public void RecycleConnections()
+    {
+        X509Certificate2? certificate;
+        lock (_clientSync)
+        {
+            certificate = _clientCertificate;
+        }
+
+        RebuildClient(certificate);
+    }
+
+    private void RebuildClient(X509Certificate2? certificate)
+    {
+        var handler = new HttpClientHandler();
         if (_options.AllowInsecureTls)
         {
             // 仅供本地开发联调；生产配置默认关闭。生产配置绝不能启用此分支。
-            _handler.ServerCertificateCustomValidationCallback = static (_, _, _, _) => true;
+            handler.ServerCertificateCustomValidationCallback = static (_, _, _, _) => true;
         }
         else if (!string.IsNullOrWhiteSpace(_options.ServerCertificateFingerprint))
         {
             var expectedFingerprint = NormalizeFingerprint(_options.ServerCertificateFingerprint);
-            _handler.ServerCertificateCustomValidationCallback = (_, certificate, _, _) =>
-                certificate is not null
+            handler.ServerCertificateCustomValidationCallback = (_, serverCertificate, _, _) =>
+                serverCertificate is not null
                 && string.Equals(
-                    NormalizeFingerprint(Convert.ToHexString(certificate.GetCertHash(HashAlgorithmName.SHA256))),
+                    NormalizeFingerprint(Convert.ToHexString(serverCertificate.GetCertHash(HashAlgorithmName.SHA256))),
                     expectedFingerprint,
                     StringComparison.OrdinalIgnoreCase);
         }
 
-        _http = new HttpClient(_handler)
+        if (certificate is not null)
+            handler.ClientCertificates.Add(certificate);
+
+        var http = new HttpClient(handler)
         {
             BaseAddress = new Uri(_options.ServerUrl.TrimEnd('/') + "/", UriKind.Absolute),
             Timeout = TimeSpan.FromMinutes(10)
         };
 
-        var certificate = stateStore.LoadCertificate();
-        if (certificate is not null)
-            _handler.ClientCertificates.Add(certificate);
+        HttpClient? previous;
+        lock (_clientSync)
+        {
+            previous = _http;
+            _http = http;
+            _clientCertificate = certificate;
+        }
+
+        // 释放旧实例才会真正关闭池中的连接。Agent 的请求全部由单一工作循环顺序发出，
+        // 证书变更时不会有请求在途。
+        previous?.Dispose();
     }
 
-    public void AttachCertificate(X509Certificate2 certificate)
+    private HttpClient CurrentClient()
     {
-        if (!_handler.ClientCertificates.Cast<X509Certificate2>().Any(c =>
-                string.Equals(c.Thumbprint, certificate.Thumbprint, StringComparison.OrdinalIgnoreCase)))
-            _handler.ClientCertificates.Add(certificate);
+        lock (_clientSync)
+        {
+            return _http;
+        }
     }
 
-    public void ReplaceCertificate(X509Certificate2 certificate)
+    public void Dispose()
     {
-        _handler.ClientCertificates.Clear();
-        _handler.ClientCertificates.Add(certificate);
+        HttpClient? http;
+        lock (_clientSync)
+        {
+            http = _http;
+            _http = null!;
+        }
+
+        http?.Dispose();
     }
 
     public Task<SubmitRegistrationResponse> SubmitRegistrationAsync(SubmitRegistrationRequest request, CancellationToken ct) =>
@@ -133,7 +202,7 @@ public sealed class AgentApiClient
     public async Task<byte[]> DownloadBytesAsync(string url, CancellationToken ct)
     {
         using var request = CreateRequest(HttpMethod.Get, url);
-        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+        using var response = await CurrentClient().SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadAsByteArrayAsync(ct);
     }
@@ -178,7 +247,7 @@ public sealed class AgentApiClient
 
     private async Task<T> SendRequestAsync<T>(HttpRequestMessage request, CancellationToken ct)
     {
-        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+        using var response = await CurrentClient().SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
         var payload = await response.Content.ReadAsStringAsync(ct);
         ApiResponse<T>? envelope = null;
         try

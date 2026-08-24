@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -7,6 +7,7 @@ using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Models.Agent;
+using BackupMonitor.Shared.Scheduling;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
@@ -598,7 +599,7 @@ public class BackupTaskService : IBackupTaskService
         task.Enabled = enabled;
         task.Priority = Math.Clamp(priority, 1, 1000);
         task.ImportanceLevel = importance;
-        task.ScanSchedule = string.IsNullOrWhiteSpace(scanSchedule) ? null : scanSchedule.Trim();
+        task.ScanSchedule = NormalizeScanSchedule(scanSchedule);
         task.UploadWindowStart = ParseTimeOfDay(uploadWindowStart, nameof(uploadWindowStart));
         task.UploadWindowEnd = ParseTimeOfDay(uploadWindowEnd, nameof(uploadWindowEnd));
         task.ScheduleTimezone = string.IsNullOrWhiteSpace(scheduleTimezone) ? "Asia/Shanghai" : scheduleTimezone.Trim();
@@ -615,6 +616,24 @@ public class BackupTaskService : IBackupTaskService
         task.RetentionPolicyId = retentionPolicyId;
         task.RecognizerConfig = string.IsNullOrWhiteSpace(recognizerConfig) ? "{}" : recognizerConfig;
         task.AlertConfig = string.IsNullOrWhiteSpace(alertConfig) ? null : alertConfig;
+    }
+
+    /// <summary>
+    /// 校验并归一化扫描计划。cron 由 Agent 本地解析执行，写错了没有任何即时反馈——
+    /// 只会表现为「到点没有扫描」，而界面上看不出错在哪一段。因此保存时就用
+    /// Agent 使用的同一份解析器挡下来，把错误落在填表的人面前。
+    /// </summary>
+    private static string? NormalizeScanSchedule(string? scanSchedule)
+    {
+        if (string.IsNullOrWhiteSpace(scanSchedule))
+            return null;
+
+        var trimmed = scanSchedule.Trim();
+        var error = CronExpression.Validate(trimmed);
+        if (error is not null)
+            throw new BusinessException("INVALID_REQUEST", $"扫描计划不是合法的 cron 表达式：{error}", 400);
+
+        return trimmed;
     }
 
     private static TimeSpan? ParseTimeOfDay(string? value, string fieldName)

@@ -26,7 +26,7 @@ if errorlevel 1 goto :fail
 set "BACKUPMONITOR_MIGRATION_DIRECTORY=%~dp0src\database"
 set "BACKUPMONITOR_MIGRATION_LOG=%TEMP%\BackupMonitor-migration.log"
 
-echo === Apply V001-V010 through MigrationRunner ===
+echo === Apply V001-V014 through MigrationRunner ===
 if defined BACKUPMONITOR_MIGRATION_RUNNER goto :run_external_runner
 where dotnet >nul 2>nul
 if errorlevel 1 goto :missing_dotnet
@@ -42,11 +42,11 @@ if errorlevel 1 goto :fail
 echo === Verify admin account and all migrations ===
 "%PSQL%" -U "%PGUSER%" -h "%PGHOST%" -p "%PGPORT%" -d "%PGDATABASE%" -Atc "SELECT count(*) FROM users WHERE username='admin' AND status='active'" | findstr /x "1" >nul
 if errorlevel 1 goto :verify_admin_failed
-"%PSQL%" -U "%PGUSER%" -h "%PGHOST%" -p "%PGPORT%" -d "%PGDATABASE%" -Atc "SELECT count(DISTINCT left(version,4)) FROM schema_migrations WHERE left(version,4) IN ('V001','V002','V003','V004','V005','V006','V007','V008','V009','V010')" | findstr /x "10" >nul
+"%PSQL%" -U "%PGUSER%" -h "%PGHOST%" -p "%PGPORT%" -d "%PGDATABASE%" -Atc "SELECT count(DISTINCT left(version,4)) FROM schema_migrations WHERE left(version,4) IN ('V001','V002','V003','V004','V005','V006','V007','V008','V009','V010','V011','V012','V013','V014')" | findstr /x "14" >nul
 if errorlevel 1 goto :verify_migrations_failed
 
 echo.
-echo DONE: database initialized and V001-V010 applied.
+echo DONE: database initialized and V001-V014 applied.
 exit /b 0
 
 :missing_pgpassword
@@ -70,7 +70,7 @@ echo ERROR: the active admin account was not found after migration.
 goto :fail
 
 :verify_migrations_failed
-echo ERROR: V001-V010 were not all recorded in schema_migrations.
+echo ERROR: V001-V014 were not all recorded in schema_migrations.
 goto :fail
 
 :fail

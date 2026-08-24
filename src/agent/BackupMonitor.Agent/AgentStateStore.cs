@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -22,6 +22,27 @@ public sealed class AgentState
     public Dictionary<string, LocalCandidateState> Candidates { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<Guid> SeenNotificationIds { get; set; } = [];
     public List<string> SeenCommandNonces { get; set; } = [];
+
+    /// <summary>按任务 ID 记录扫描计划的排期状态；键为 taskId 的字符串形式。</summary>
+    public Dictionary<string, ScheduledScanState> ScheduledScans { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// 单个任务的扫描计划排期。存的是「下一次该在什么时候跑」而不是「上一次什么时候跑的」：
+/// Agent 重启后要能直接判断是否到点，不必反推。
+/// </summary>
+public sealed class ScheduledScanState
+{
+    /// <summary>排期依据的 cron 原文；与下发配置不一致时重新排期。</summary>
+    public string Cron { get; set; } = string.Empty;
+
+    /// <summary>排期依据的时区 ID；同上。</summary>
+    public string? TimeZone { get; set; }
+
+    public DateTime NextDueAtUtc { get; set; }
+
+    public DateTime? LastRunAtUtc { get; set; }
 }
 
 public sealed class LocalCandidateState

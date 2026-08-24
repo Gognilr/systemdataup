@@ -78,22 +78,34 @@ async function taskFormFields(initial) {
   const policyOpts = [{ v: '', t: '（不绑定）' }].concat((policies || []).map(p => ({ v: p.id, t: p.name })));
   const v = initial || {};
   const fields = [];
-  if (!initial) fields.push({ name: 'clientId', label: '客户端', type: 'select', options: clientOpts, value: v.clientId, required: true });
+  // 建任务只有四件事必须由人决定：哪台机器、叫什么、备份的是什么应用、备份文件落在哪个目录。
+  // 其余十项全部有可用默认值，收进「高级选项」——铺开十四个输入框会把「必须填什么」淹掉。
+  if (!initial) {
+    fields.push({
+      name: 'clientId', label: '客户端', type: 'select', options: clientOpts, value: v.clientId, required: true,
+      hint: clientOpts.length ? '任务在哪台机器上执行' : '暂无已登记的客户端——请先在客户端机器上安装 Agent 并完成审批'
+    });
+  }
   fields.push(
-    { name: 'name', label: '任务名称', type: 'text', value: v.name, required: true },
+    { name: 'name', label: '任务名称', type: 'text', value: v.name, required: true, placeholder: '如 财务库每日全备' },
     { name: 'applicationName', label: '应用名称', type: 'text', value: v.applicationName, required: true, placeholder: '如 SQLServer / Oracle / FileSet' },
-    { name: 'sourcePath', label: '源路径', type: 'text', value: v.sourcePath, required: true, placeholder: '客户端上的备份输出路径' },
+    { name: 'sourcePath', label: '源路径', type: 'text', value: v.sourcePath, required: true,
+      placeholder: 'D:\\backup\\finance', hint: '客户端机器上的路径，不是服务端上的路径' },
     { name: 'recognizerType', label: '识别器类型', type: 'select', value: v.recognizerType || 'latest_directory', required: true,
-      options: optsOf(L.recognizer) },
-    { name: 'taskMode', label: '任务模式', type: 'select', value: v.taskMode || 'approval_required', options: optsOf(L.task_mode).filter(o => o.v !== 'paused') },
-    { name: 'importanceLevel', label: '重要级', type: 'select', value: v.importanceLevel || 'normal', options: optsOf(L.importance) },
-    { name: 'enabled', label: '状态', labelText: '启用该任务', type: 'checkbox', value: v.enabled !== false },
-    { name: 'priority', label: '优先级', type: 'number', value: v.priority ?? 100, hint: '数值小的优先' },
-    { name: 'scanSchedule', label: '扫描计划（cron，可选）', type: 'text', value: v.scanSchedule || '', placeholder: '如 0 2 * * *' },
-    { name: 'uploadWindowStart', label: '上传窗口开始', type: 'text', value: v.uploadWindowStart || '', placeholder: 'HH:mm:ss，可选' },
-    { name: 'uploadWindowEnd', label: '上传窗口结束', type: 'text', value: v.uploadWindowEnd || '', placeholder: 'HH:mm:ss，可选' },
-    { name: 'retentionPolicyId', label: '保留策略', type: 'select', value: v.retentionPolicyId || '', options: policyOpts },
-    { name: 'recognizerConfig', label: '识别规则配置（JSON）', type: 'textarea', value: v.recognizerConfig || '{}' }
+      options: optsOf(L.recognizer), hint: '源路径下如何认出「一份备份」' },
+    { name: 'taskMode', label: '任务模式', type: 'select', value: v.taskMode || 'approval_required',
+      options: optsOf(L.task_mode).filter(o => o.v !== 'paused'),
+      hint: '需审批：扫到的备份要人工确认后才入库；自动：扫到即入库' },
+    { name: 'importanceLevel', label: '重要级', type: 'select', value: v.importanceLevel || 'normal', options: optsOf(L.importance), advanced: true },
+    { name: 'enabled', label: '状态', labelText: '启用该任务', type: 'checkbox', value: v.enabled !== false, advanced: true },
+    { name: 'priority', label: '优先级', type: 'number', value: v.priority ?? 100, hint: '数值小的优先', advanced: true },
+    { name: 'scanSchedule', label: '扫描计划（cron，可选）', type: 'text', value: v.scanSchedule || '', placeholder: '0 2 * * *', advanced: true,
+      hint: '五段式：分 时 日 月 周，按客户端所在时区触发。留空则只能手动点预检' },
+    { name: 'uploadWindowStart', label: '上传窗口开始', type: 'text', value: v.uploadWindowStart || '', placeholder: 'HH:mm:ss，可选', advanced: true },
+    { name: 'uploadWindowEnd', label: '上传窗口结束', type: 'text', value: v.uploadWindowEnd || '', placeholder: 'HH:mm:ss，可选', advanced: true },
+    { name: 'retentionPolicyId', label: '保留策略', type: 'select', value: v.retentionPolicyId || '', options: policyOpts, advanced: true },
+    { name: 'recognizerConfig', label: '识别规则配置（JSON）', type: 'textarea', value: v.recognizerConfig || '{}', advanced: true,
+      hint: '留空或 {} 表示用识别器默认规则' }
   );
   return fields;
 }

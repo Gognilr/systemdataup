@@ -269,21 +269,39 @@ public sealed class BackupScanner
 
     private static bool IsAllowed(FileInfo file, string root, Rules rules)
     {
-        if ((file.Attributes & FileAttributes.Hidden) != 0)
-            return false;
-        if (file.Name.StartsWith('~') || file.Name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)
-            || file.Name.EndsWith(".partial", StringComparison.OrdinalIgnoreCase)
-            || file.Name.EndsWith(".bak", StringComparison.OrdinalIgnoreCase))
-            return false;
-
         var relative = Path.GetRelativePath(root, file.FullName).Replace('\\', '/');
+
+        // 显式排除永远优先。
         if (rules.Excludes.Any(pattern => MatchesPath(relative, pattern) || GlobMatch(file.FullName, pattern)))
             return false;
+
         if (rules.BatchRegex is not null
             && !RegexMatches(relative, rules.BatchRegex)
             && !RegexMatches(Path.GetFileName(root), rules.BatchRegex))
             return false;
-        return rules.Includes.Count == 0 || rules.Includes.Any(pattern => MatchesPath(relative, pattern) || GlobMatch(file.FullName, pattern));
+
+        var matchesInclude = rules.Includes.Any(pattern => MatchesPath(relative, pattern) || GlobMatch(file.FullName, pattern));
+        if (rules.Includes.Count > 0 && !matchesInclude)
+            return false;
+
+        // 被 includePatterns 或 requiredFiles 点名的文件跳过下面的启发式判断：
+        // 管理员已经明确说了要这个文件，系统没有资格替他判断那是不是半成品。
+        if (matchesInclude || rules.Required.Any(pattern => MatchesPath(relative, pattern)))
+            return true;
+
+        // 启发式：正在写入或明显是半成品的文件不该被当成一份备份。
+        //
+        // 注意 .bak 不在此列。它曾经在，但那是把通用桌面经验（config.ini.bak 是编辑器留下的副本）
+        // 搬进了备份领域——SQL Server 的 BACKUP DATABASE 默认产出的就是 .bak，
+        // 在一个备份监控系统里把 .bak 当垃圾滤掉，等于对最常见的备份格式集体失明，
+        // 而且失明得毫无提示：界面上只会显示「未发现符合识别规则的备份文件」。
+        // 真要排除随手留下的 .bak，用 excludePatterns 明确写出来。
+        if ((file.Attributes & FileAttributes.Hidden) != 0)
+            return false;
+
+        return !file.Name.StartsWith('~')
+               && !file.Name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)
+               && !file.Name.EndsWith(".partial", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool MatchesPath(string relative, string pattern) =>

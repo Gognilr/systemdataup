@@ -1,4 +1,4 @@
-using System.IO.Compression;
+﻿using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Runtime.InteropServices;
@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using BackupMonitor.Shared.Models.Agent;
+using BackupMonitor.Shared.Scheduling;
 using Microsoft.Extensions.Options;
 
 namespace BackupMonitor.Agent;
@@ -83,6 +84,8 @@ public sealed class AgentWorker : BackgroundService
                 if (heartbeat.CommandsAvailable || _activeCommands.Count == 0)
                     await ClaimAndExecuteCommandsAsync(stoppingToken);
 
+                await RunScheduledScansAsync(config, stoppingToken);
+
                 var heartbeatDelay = heartbeat.HeartbeatIntervalSeconds > 0
                     ? heartbeat.HeartbeatIntervalSeconds
                     : _options.HeartbeatIntervalSeconds;
@@ -96,6 +99,14 @@ public sealed class AgentWorker : BackgroundService
             {
                 _logger.LogWarning("Agent API 调用失败 status={Status} code={Code}: {Message}", ex.StatusCode, ex.ErrorCode, ex.Message);
                 _stateStore.Update(s => s.LastError = ex.Message);
+
+                // mTLS 形态下 401 意味着服务端没有收到（或不认）本次连接出示的客户端证书。
+                // 本地明明装着证书却被拒，最可能的原因是连接的 TLS 身份与本地证书脱节——
+                // 证书是握手时协商的，池中的旧连接不会因为本地换了证书而改变身份。
+                // 重新握手即可自愈；代价是每 10 秒一次 TLS 握手，可以忽略。
+                if (ex.StatusCode == 401 && _stateStore.Snapshot().CertificateThumbprint is not null)
+                    _api.RecycleConnections();
+
                 await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
             }
             catch (Exception ex)
@@ -384,7 +395,11 @@ public sealed class AgentWorker : BackgroundService
         return CommandResult.FromSuccess("PRECHECK_SUBMITTED", $"已提交 {count} 个预检结果");
     }
 
-    private async Task<int> SubmitScanResultsAsync(AgentTaskConfigDto task, Guid commandId, CancellationToken ct)
+    /// <summary>
+    /// 扫描并上报预检结果。commandId 为 null 表示这次扫描不是由服务端指令触发的
+    /// （本地扫描计划自行触发），服务端据此跳过指令幂等与结果回填。
+    /// </summary>
+    private async Task<int> SubmitScanResultsAsync(AgentTaskConfigDto task, Guid? commandId, CancellationToken ct)
     {
         var scans = await _scanner.ScanAsync(task, ct);
         foreach (var scan in scans)
@@ -591,6 +606,134 @@ public sealed class AgentWorker : BackgroundService
         catch
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// 按任务自带的 cron 在本地触发扫描。
+    ///
+    /// 调度做在 Agent 侧而不是服务端：cron 已经随签名配置下发了，Agent 自己算下一次触发
+    /// 不需要服务端调度器和分布式锁；服务端短暂离线也不会让当天的扫描整个丢掉。
+    /// 触发的动作与手动预检完全一致（扫描 + 上报预检结果），只是不带指令 ID。
+    ///
+    /// 排期状态持久化在 state.json 里，Agent 重启不会丢；反过来，重启也不会
+    /// 立刻重跑一遍——只有确实越过了触发时刻才会执行。
+    /// </summary>
+    private async Task RunScheduledScansAsync(AgentConfigResponse? config, CancellationToken ct)
+    {
+        if (config is null)
+            return;
+
+        // 「暂停」只改 TaskMode、不动 Enabled，所以这里必须显式排除 paused——
+        // 否则点了暂停之后定时扫描照跑，暂停这个按钮就等于失效了。
+        // 手动预检不受影响：那是操作员的明确指令。
+        var scheduled = config.Tasks
+            .Where(t => t.Enabled
+                        && !string.Equals(t.TaskMode, "paused", StringComparison.OrdinalIgnoreCase)
+                        && !string.IsNullOrWhiteSpace(t.ScanSchedule))
+            .ToList();
+
+        // 任务被删除、停用或取消了定时之后，排期记录要跟着清掉，否则状态文件只增不减。
+        var live = new HashSet<string>(scheduled.Select(t => t.TaskId.ToString()), StringComparer.OrdinalIgnoreCase);
+        _stateStore.Update(state =>
+        {
+            foreach (var stale in state.ScheduledScans.Keys.Where(key => !live.Contains(key)).ToList())
+                state.ScheduledScans.Remove(stale);
+        });
+
+        foreach (var task in scheduled)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (!CronExpression.TryParse(task.ScanSchedule, out var cron, out var parseError) || cron is null)
+            {
+                // 服务端保存时已经校验过，走到这里说明是旧数据或被绕过；跳过该任务而不是整轮中断。
+                _logger.LogWarning(
+                    "任务 {Task} 的扫描计划无法解析，本次跳过：{Error}（cron={Cron}）",
+                    task.Name, parseError, task.ScanSchedule);
+                continue;
+            }
+
+            var timeZone = ResolveScheduleTimeZone(task.ScheduleTimezone);
+            var key = task.TaskId.ToString();
+            var now = DateTime.UtcNow;
+            var entry = _stateStore.Snapshot().ScheduledScans.GetValueOrDefault(key);
+
+            // 首次见到这个任务，或者 cron / 时区被改过：从此刻起重新排期，不补跑历史。
+            if (entry is null
+                || !string.Equals(entry.Cron, task.ScanSchedule, StringComparison.Ordinal)
+                || !string.Equals(entry.TimeZone, timeZone.Id, StringComparison.Ordinal))
+            {
+                var first = cron.GetNextOccurrence(now, timeZone);
+                SaveScheduleEntry(key, task.ScanSchedule!, timeZone.Id, first, lastRunAtUtc: entry?.LastRunAtUtc);
+                _logger.LogInformation(
+                    "任务 {Task} 的扫描计划已排期 cron={Cron} tz={TimeZone} next={Next:O}",
+                    task.Name, task.ScanSchedule, timeZone.Id, first);
+                continue;
+            }
+
+            if (entry.NextDueAtUtc > now)
+                continue;
+
+            // 先写回下一次排期再执行：扫描可能耗时很久，中途崩溃不该在重启后重复触发同一次计划。
+            var following = cron.GetNextOccurrence(now, timeZone);
+            SaveScheduleEntry(key, task.ScanSchedule!, timeZone.Id, following, lastRunAtUtc: now);
+
+            _logger.LogInformation(
+                "按扫描计划触发预检 task={Task} cron={Cron} next={Next:O}", task.Name, task.ScanSchedule, following);
+            try
+            {
+                var submitted = await SubmitScanResultsAsync(task, commandId: null, ct);
+                _logger.LogInformation("计划扫描完成 task={Task} 已提交 {Count} 个预检结果", task.Name, submitted);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // 一个任务失败不影响其余任务，也不该把整个工作循环打回重试。
+                _logger.LogError(ex, "计划扫描失败 task={Task}", task.Name);
+                _stateStore.Update(state => state.LastError = ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 写回排期。nextDueAtUtc 为 null 表示这个表达式描述的时刻永不出现
+    /// （例如 2 月 30 日），记成 MaxValue，免得每一轮都重算一次并刷日志。
+    /// </summary>
+    private void SaveScheduleEntry(string key, string cron, string timeZoneId, DateTime? nextDueAtUtc, DateTime? lastRunAtUtc)
+    {
+        if (nextDueAtUtc is null)
+            _logger.LogWarning("扫描计划 {Cron} 在未来四年内没有触发时刻，已停用该任务的定时扫描", cron);
+
+        _stateStore.Update(state => state.ScheduledScans[key] = new ScheduledScanState
+        {
+            Cron = cron,
+            TimeZone = timeZoneId,
+            NextDueAtUtc = nextDueAtUtc ?? DateTime.MaxValue,
+            LastRunAtUtc = lastRunAtUtc
+        });
+    }
+
+    /// <summary>
+    /// 解析任务时区。服务端存的是 IANA ID（默认 Asia/Shanghai），
+    /// .NET 在 Windows 上也能识别；识别不了就退回本机时区，不能因此不扫描。
+    /// </summary>
+    private TimeZoneInfo ResolveScheduleTimeZone(string? timeZoneId)
+    {
+        if (string.IsNullOrWhiteSpace(timeZoneId))
+            return TimeZoneInfo.Local;
+
+        try
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById(timeZoneId);
+        }
+        catch (Exception ex) when (ex is TimeZoneNotFoundException or InvalidTimeZoneException)
+        {
+            _logger.LogWarning("无法识别时区 {TimeZone}，扫描计划按本机时区执行", timeZoneId);
+            return TimeZoneInfo.Local;
         }
     }
 

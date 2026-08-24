@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)] [string] $ServerUrl,
     [Parameter(Mandatory = $true)] [string] $RegistrationToken,
@@ -22,9 +22,11 @@ $packageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
 
-Get-ChildItem -LiteralPath $packageRoot -File | Where-Object {
+# 递归拷贝：自包含发布除了根目录的运行时 DLL，还带本地化资源子目录（cs/de/ja/zh-Hans...）。
+# 只拷根目录文件会把它们全部丢掉。
+Get-ChildItem -LiteralPath $packageRoot -Force | Where-Object {
     $_.Name -notin @('install-agent.ps1', 'uninstall-agent.ps1')
-} | Copy-Item -Destination $InstallDir -Force
+} | Copy-Item -Destination $InstallDir -Recurse -Force
 
 $settingsPath = Join-Path $InstallDir 'appsettings.json'
 $settings = if (Test-Path -LiteralPath $settingsPath) {

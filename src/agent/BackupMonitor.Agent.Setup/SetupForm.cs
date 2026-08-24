@@ -1,4 +1,6 @@
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
+
+using BackupMonitor.Shared.Security;
 
 namespace BackupMonitor.Agent.Setup;
 
@@ -7,6 +9,7 @@ internal sealed class SetupForm : Form
     private readonly TextBox _serverUrl = new();
     private readonly TextBox _displayName = new();
     private readonly TextBox _registrationToken = new();
+    private readonly TextBox _expectedFingerprint = new();
     private readonly ComboBox _discoveredServers = new();
     private readonly Button _rescan = new();
     private readonly Button _advancedToggle = new();
@@ -98,8 +101,34 @@ internal sealed class SetupForm : Form
         discoveryRow.Controls.Add(_advancedToggle);
         root.Controls.Add(discoveryRow, 0, 4);
 
-        _advancedPanel = CreateField("注册令牌（Secure 高级模式）", _registrationToken, "LAN 自动登记模式无需填写；仅在 Secure 模式下使用。\n");
+        var advanced = new TableLayoutPanel
+        {
+            ColumnCount = 1,
+            RowCount = 2,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0)
+        };
+        advanced.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        advanced.Controls.Add(
+            CreateField(
+                "注册令牌（Secure 高级模式）",
+                _registrationToken,
+                "LAN 自动登记模式无需填写；仅在 Secure 模式下使用。" + Environment.NewLine),
+            0,
+            0);
         _registrationToken.UseSystemPasswordChar = true;
+        advanced.Controls.Add(
+            CreateField(
+                "服务端证书指纹（可选，批量装机建议填写）",
+                _expectedFingerprint,
+                "在服务端安装器上点「查看服务端指纹」取得。填了就精确比对，装机时不再打扰你；"
+                + Environment.NewLine
+                + "留空则安装过程中会把指纹显示出来，由你与服务端屏幕逐段核对后确认。"),
+            0,
+            1);
+        _advancedPanel = advanced;
         _advancedPanel.Visible = false;
         root.Controls.Add(_advancedPanel, 0, 5);
 
@@ -270,6 +299,34 @@ internal sealed class SetupForm : Form
         }
     }
 
+    /// <summary>
+    /// 带外核对关卡：把本次连接实际使用的服务端证书指纹亮给操作员，由人来判断
+    /// 对面是不是真服务端。自签名证书没有公共 CA 背书，这个判断计算机做不了——
+    /// 中间人可以让「响应体里的指纹」和「实际出示的证书」自洽。
+    ///
+    /// 默认按钮设为「否」：这种确认框最大的风险是被顺手点掉。
+    /// </summary>
+    private Task<bool> ConfirmServerFingerprintAsync(string fingerprint)
+    {
+        var choice = MessageBox.Show(
+            this,
+            "请与服务端安装器上「查看服务端指纹」显示的值逐段核对："
+            + Environment.NewLine + Environment.NewLine
+            + CertificateFingerprint.ToDisplayBlock(fingerprint)
+            + Environment.NewLine + Environment.NewLine
+            + "完全一致才点「是」。"
+            + Environment.NewLine
+            + "不一致说明这条连接可能已被他人接管，请点「否」并联系管理员。"
+            + Environment.NewLine + Environment.NewLine
+            + "提示：在「高级选项」里预先填入指纹，可免去每台机器的人工核对。",
+            "核对服务端证书指纹",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+
+        return Task.FromResult(choice == DialogResult.Yes);
+    }
+
     private async Task InstallAsync()
     {
         if (!TryReadInputs(out var serverUrl, out var displayName, out var registrationToken))
@@ -279,7 +336,14 @@ internal sealed class SetupForm : Form
         SetBusy(true, "正在准备安装…");
         try
         {
-            await _installer.InstallAsync(serverUrl, displayName, registrationToken, progress, CancellationToken.None);
+            await _installer.InstallAsync(
+                serverUrl,
+                displayName,
+                registrationToken,
+                _expectedFingerprint.Text,
+                ConfirmServerFingerprintAsync,
+                progress,
+                CancellationToken.None);
             SetStatus("安装完成，正在自动登记并上线。", Color.DarkGreen, 100);
             MessageBox.Show(
                 this,
@@ -369,6 +433,7 @@ internal sealed class SetupForm : Form
         _serverUrl.Enabled = !busy;
         _displayName.Enabled = !busy;
         _registrationToken.Enabled = !busy && _advancedPanel.Visible;
+        _expectedFingerprint.Enabled = !busy && _advancedPanel.Visible;
         _discoveredServers.Enabled = !busy;
         _rescan.Enabled = !busy;
         _advancedToggle.Enabled = !busy;

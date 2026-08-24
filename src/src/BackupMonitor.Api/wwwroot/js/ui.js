@@ -148,9 +148,12 @@ export function confirmModal(msg) {
   });
 }
 
-/* 通用表单弹窗：fields=[{name,label,type,value,options,required,placeholder,hint}] */
+/* 通用表单弹窗：fields=[{name,label,type,value,options,required,placeholder,hint,advanced}]
+   advanced:true 的字段收进「高级选项」折叠区。这类字段都带可用默认值，
+   平时不该出现在视野里——一次性铺开十几个输入框会让「必须填什么」这件事消失，
+   使用者只能逐个猜。取值逻辑不受影响：折叠区里的控件同样在 DOM 中。 */
 export function formModal(title, fields, onSubmit, okText = '保存') {
-  const html = fields.map(f => {
+  const renderField = f => {
     let input;
     const v = f.value != null ? f.value : '';
     if (f.type === 'select') {
@@ -164,7 +167,13 @@ export function formModal(title, fields, onSubmit, okText = '保存') {
       input = `<input type="${f.type || 'text'}" name="${f.name}" value="${esc(v)}" placeholder="${esc(f.placeholder || '')}" ${f.type === 'number' ? 'step="any"' : ''}>`;
     }
     return `<div class="frow"><label>${esc(f.label)}${f.required ? ' *' : ''}</label>${input}${f.hint ? `<div class="hint">${esc(f.hint)}</div>` : ''}</div>`;
-  }).join('');
+  };
+  const basic = fields.filter(f => !f.advanced);
+  const advanced = fields.filter(f => f.advanced);
+  const html = basic.map(renderField).join('')
+    + (advanced.length
+      ? `<details class="fadv"><summary>高级选项（${advanced.length} 项，均有默认值）</summary>${advanced.map(renderField).join('')}</details>`
+      : '');
   const ov = openModal(title, html, { okText });
   ov.querySelector('[data-ok]').addEventListener('click', async () => {
     const vals = {};
@@ -173,6 +182,9 @@ export function formModal(title, fields, onSubmit, okText = '保存') {
       if (f.type === 'checkbox') { vals[f.name] = el.checked; }
       else { vals[f.name] = el.value.trim(); }
       if (f.required && (vals[f.name] === '' || vals[f.name] == null)) {
+        // 字段可能收在折叠区里；不展开的话提示指向一个看不见的输入框。
+        el.closest('details')?.setAttribute('open', '');
+        el.focus();
         toast(`「${f.label}」为必填项`, 'err'); return;
       }
     }

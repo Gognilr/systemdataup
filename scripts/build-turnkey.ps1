@@ -25,27 +25,14 @@ function Assert-WorkspaceTarget {
 }
 
 function Reset-GeneratedDirectory {
-    param(
-        [Parameter(Mandatory = $true)][string] $Path,
-        # 允许清空失败的子目录名（仅限纯临时解压区）。外部工具（编辑器、文件监视器、
-        # 杀毒扫描）随时可能压住上一轮解压出来的文件；这类残留不会进入安装包，
-        # 不该让整个构建停摆。喂进安装包的子目录一律不在此列，残留必须硬失败，
-        # 否则陈旧文件会被 publish/copy 合并进产物。
-        [string[]] $ScratchChildren = @()
-    )
+    param([Parameter(Mandatory = $true)][string] $Path)
 
     Assert-WorkspaceTarget $Path
     if (Test-Path -LiteralPath $Path) {
         # Keep the generated directory root. Windows may hold a handle to the
         # root while still allowing its generated children to be replaced.
         Get-ChildItem -LiteralPath $Path -Force | ForEach-Object {
-            $isScratch = $ScratchChildren -contains $_.Name
-            try {
-                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
-            } catch {
-                if (-not $isScratch) { throw }
-                Write-Warning "临时目录 $($_.Name) 未能完全清空（有进程占用），沿用残留继续：$($_.Exception.Message)"
-            }
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force
         }
     } else {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
@@ -90,7 +77,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $srcRoot 'database\V001__initial_sch
     throw 'Database migration root is missing V001__initial_schema.sql.'
 }
 
-Reset-GeneratedDirectory $stageRoot -ScratchChildren @('postgresql-extract')
+Reset-GeneratedDirectory $stageRoot
 Reset-GeneratedDirectory $distRoot
 Assert-WorkspaceTarget $setupPayloadRoot
 New-Item -ItemType Directory -Path $setupPayloadRoot -Force | Out-Null
@@ -147,8 +134,18 @@ if (-not (Test-Path -LiteralPath $agentExe) -or -not (Test-Path -LiteralPath $tr
 
 $clientPackageStage = Join-Path $stageRoot 'client-package'
 New-Item -ItemType Directory -Path $clientPackageStage -Force | Out-Null
-Copy-Item -LiteralPath $agentExe -Destination (Join-Path $clientPackageStage 'BackupMonitor.Agent.exe') -Force
-Copy-Item -LiteralPath $trayExe -Destination (Join-Path $clientPackageStage 'BackupMonitor.Agent.Tray.exe') -Force
+# 客户端 ZIP 必须是一份能直接跑起来的自包含发布。只放两个 apphost exe 的话，
+# 运行时、hostfxr 和 BackupMonitor.Agent.dll 全都不在包里，解压出来根本起不来；
+# install-agent.ps1 也是按「把包根目录整体拷进安装目录」来写的。
+# 排除 .pdb：调试符号对运行没用，只是让下载体积翻倍。
+foreach ($publishDir in @($agentPublish, $trayPublish)) {
+    Get-ChildItem -LiteralPath $publishDir -Force |
+        Where-Object { $_.Extension -ne '.pdb' } |
+        Copy-Item -Destination $clientPackageStage -Recurse -Force
+}
+if (-not (Test-Path -LiteralPath (Join-Path $clientPackageStage 'BackupMonitor.Agent.dll'))) {
+    throw 'Client package is missing BackupMonitor.Agent.dll; the self-contained publish was not staged.'
+}
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\appsettings.json') -Destination (Join-Path $clientPackageStage 'appsettings.json') -Force
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\install-agent.ps1') -Destination (Join-Path $clientPackageStage 'install-agent.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\uninstall-agent.ps1') -Destination (Join-Path $clientPackageStage 'uninstall-agent.ps1') -Force
@@ -204,6 +201,35 @@ Copy-Item -LiteralPath $agentSetup -Destination (Join-Path $distRoot 'BackupMoni
 # 只有这个脚本能在双击 exe 之前把问题指出来。
 Copy-Item -LiteralPath (Join-Path $repoRoot 'deploy\Check-Prerequisites.ps1') -Destination (Join-Path $distRoot 'Check-Prerequisites.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'deploy\Install-UcrtPrerequisites.ps1') -Destination (Join-Path $distRoot 'Install-UcrtPrerequisites.ps1') -Force
+
+# ---- 前置运行库 ----------------------------------------------------------
+# 内置 PostgreSQL 是 MSVC 编译的，直接导入 vcruntime140.dll / vcruntime140_1.dll /
+# msvcp140.dll。这三个任何 Windows 版本都不自带，缺了安装能装完但数据库服务起不来，
+# 而且报的是另一个 DLL 缺失，很容易被当成新问题。所以必须与安装包同行。
+#
+# 这里不做 SHA-256 锁定：aka.ms/vs/17/release 是「当前版本」指针，按设计会随微软更新
+# 而变，钉死哈希只会让构建在某天突然失败。改为校验 Authenticode 签名有效且签发者是
+# 微软——对移动目标而言这才是有意义的完整性判据。
+$prerequisiteRoot = Join-Path $distRoot 'prerequisites'
+New-Item -ItemType Directory -Path $prerequisiteRoot -Force | Out-Null
+$vcRedistCache = Join-Path $PayloadCacheRoot 'vc_redist.x64.exe'
+if (-not (Test-Path -LiteralPath $vcRedistCache)) {
+    Write-Host 'Downloading VC++ 2015-2022 x64 redistributable'
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile $vcRedistCache -UseBasicParsing
+}
+$vcSignature = Get-AuthenticodeSignature -LiteralPath $vcRedistCache
+if ($vcSignature.Status -ne 'Valid') {
+    throw "vc_redist.x64.exe Authenticode signature is not valid: $($vcSignature.Status)"
+}
+if ($vcSignature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+    throw "vc_redist.x64.exe is not signed by Microsoft: $($vcSignature.SignerCertificate.Subject)"
+}
+Copy-Item -LiteralPath $vcRedistCache -Destination (Join-Path $prerequisiteRoot 'vc_redist.x64.exe') -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'deploy\PREREQUISITES.md') -Destination (Join-Path $prerequisiteRoot 'README.md') -Force
+$vcVersion = (Get-Item -LiteralPath $vcRedistCache).VersionInfo.ProductVersion
+"{0}  vc_redist.x64.exe  ({1})" -f (Get-FileHash -LiteralPath $vcRedistCache -Algorithm SHA256).Hash.ToLowerInvariant(), $vcVersion |
+    Set-Content -LiteralPath (Join-Path $prerequisiteRoot 'SHA256SUMS.txt') -Encoding ASCII
 
 $sumLines = foreach ($name in @('BackupMonitor.Server.Setup.exe', 'BackupMonitor.Agent.Setup.exe')) {
     $file = Join-Path $distRoot $name

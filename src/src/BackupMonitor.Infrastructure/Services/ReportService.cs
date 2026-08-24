@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Enums;
+﻿using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Models.Admin;
@@ -307,9 +307,12 @@ public class ReportService : IReportService
 
     private async Task<(long FreeBytes, long TotalBytes)> GetDiskCapacityAsync(CancellationToken ct)
     {
-        var repositoryRoot = await _storage.GetRepositoryRootAsync(ct);
         try
         {
+            // 仓库根解析本身也要纳入保护：它会对配置的路径执行 CreateDirectory，
+            // 路径指向不存在的盘符或没有写权限时直接抛异常。容量统计只是概览页上
+            // 的一个数字，不该让整个只读报表接口 500——取不到就报 0，页面照常渲染。
+            var repositoryRoot = await _storage.GetRepositoryRootAsync(ct);
             var root = Path.GetPathRoot(Path.GetFullPath(repositoryRoot));
             if (string.IsNullOrWhiteSpace(root))
                 return (0, 0);

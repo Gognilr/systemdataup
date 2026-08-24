@@ -1,4 +1,4 @@
-using System.IO.Compression;
+﻿using System.IO.Compression;
 using System.Reflection;
 using System.Security.Principal;
 using System.Text.Json;
@@ -51,6 +51,16 @@ internal sealed class ServerInstaller
 
             Directory.CreateDirectory(request.InstallDirectory);
             Directory.CreateDirectory(request.DataDirectory);
+            // 覆盖安装时上一次装的服务往往还在跑，Windows 会锁住已加载的
+            // BackupMonitor.Api.dll，下面的复制必定撞共享冲突。PostgreSQL 运行时靠
+            // 「已完整就跳过复制」绕开了同一问题，但 API 目录每次都必须真的覆盖，
+            // 只能先把服务停下来。
+            if (apiServiceExisted)
+            {
+                progress.Report(new ServerInstallProgress("正在停止已有的服务端服务…", 10));
+                await StopApiServiceAsync(ct);
+            }
+
             progress.Report(new ServerInstallProgress("正在复制服务端和 PostgreSQL 运行时…", 15));
             var postgresRuntime = Path.Combine(request.InstallDirectory, "PostgreSQL");
             // Payload extraction and recursive copying can process thousands of
@@ -120,6 +130,9 @@ internal sealed class ServerInstaller
                 request.AdminPassword,
                 new Progress<string>(message => progress.Report(new ServerInstallProgress(message, 55))),
                 ct);
+
+            progress.Report(new ServerInstallProgress("正在设置仓库与暂存目录…", 65));
+            await ConfigureStoragePathsAsync(applicationConnection, request.DataDirectory, ct);
 
             progress.Report(new ServerInstallProgress("正在注册 Windows 服务和防火墙规则…", 70));
             await RegisterApiServiceAsync(request.InstallDirectory, ct);
@@ -222,6 +235,55 @@ internal sealed class ServerInstaller
             throw new InvalidOperationException("服务端 payload 缺少数据库迁移 V001。");
         if (!Directory.Exists(Path.Combine(root, "postgresql", "bin")))
             throw new InvalidOperationException("服务端 payload 缺少 PostgreSQL Windows 运行时目录。");
+    }
+
+    /// <summary>
+    /// 把仓库与暂存目录落到本次安装选定的数据目录下。
+    ///
+    /// 一键安装已经问过数据目录，就该由它给出权威取值。不这么做的话，取值会落到
+    /// V001 的种子上——那是开发机的 E:\BackupRepository / D:\BackupStaging，
+    /// 目标机上多半没有这两个盘，运行期解析仓库根就会抛异常。
+    ///
+    /// 只在取值仍是「未配置」或仍等于旧种子时才写：管理员显式配置过的路径不能覆盖。
+    /// </summary>
+    private static async Task ConfigureStoragePathsAsync(
+        string connectionString,
+        string dataDirectory,
+        CancellationToken ct)
+    {
+        var repository = Path.Combine(dataDirectory, "repository");
+        var staging = Path.Combine(dataDirectory, "staging");
+        Directory.CreateDirectory(repository);
+        Directory.CreateDirectory(staging);
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(ct);
+
+        await SetStoragePathAsync(connection, "repository_path", @"E:\BackupRepository", repository, ct);
+        await SetStoragePathAsync(connection, "staging_path", @"D:\BackupStaging", staging, ct);
+    }
+
+    private static async Task SetStoragePathAsync(
+        NpgsqlConnection connection,
+        string key,
+        string seededValue,
+        string newValue,
+        CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            """
+            UPDATE system_settings
+               SET setting_value = to_jsonb(@value::text),
+                   updated_at    = now(),
+                   row_version   = row_version + 1
+             WHERE setting_key = @key
+               AND (setting_value = 'null'::jsonb OR setting_value #>> '{}' = @seeded)
+            """,
+            connection);
+        command.Parameters.AddWithValue("key", key);
+        command.Parameters.AddWithValue("value", newValue);
+        command.Parameters.AddWithValue("seeded", seededValue);
+        await command.ExecuteNonQueryAsync(ct);
     }
 
     private static void WriteTurnkeyConfiguration(ServerInstallRequest request)
@@ -372,6 +434,42 @@ internal sealed class ServerInstaller
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// 停止 API 服务并等到它真正退出。sc.exe stop 只是把停止请求投递给 SCM 就返回，
+    /// 立刻去覆盖文件仍会撞上尚未退出的进程，因此必须轮询到 Stopped 为止。
+    /// </summary>
+    private static async Task StopApiServiceAsync(CancellationToken ct)
+    {
+        await ProcessRunner.RunAsync(
+            Path.Combine(Environment.SystemDirectory, "sc.exe"),
+            ["stop", ServiceName],
+            ct,
+            throwOnError: false);
+
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                using var service = new System.ServiceProcess.ServiceController(ServiceName);
+                service.Refresh();
+                if (service.Status == System.ServiceProcess.ServiceControllerStatus.Stopped)
+                    return;
+            }
+            catch (InvalidOperationException)
+            {
+                // 服务已不存在，无需再等。
+                return;
+            }
+
+            await Task.Delay(500, ct);
+        }
+
+        throw new System.TimeoutException(
+            $"Windows 服务 {ServiceName} 未能在 30 秒内停止，无法覆盖安装目录中正在使用的文件。"
+            + "请手动停止该服务（sc stop " + ServiceName + "）后重试。");
     }
 
     private static async Task TryDeleteApiServiceAsync(CancellationToken ct)
