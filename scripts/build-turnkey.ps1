@@ -25,14 +25,27 @@ function Assert-WorkspaceTarget {
 }
 
 function Reset-GeneratedDirectory {
-    param([Parameter(Mandatory = $true)][string] $Path)
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        # 允许清空失败的子目录名（仅限纯临时解压区）。外部工具（编辑器、文件监视器、
+        # 杀毒扫描）随时可能压住上一轮解压出来的文件；这类残留不会进入安装包，
+        # 不该让整个构建停摆。喂进安装包的子目录一律不在此列，残留必须硬失败，
+        # 否则陈旧文件会被 publish/copy 合并进产物。
+        [string[]] $ScratchChildren = @()
+    )
 
     Assert-WorkspaceTarget $Path
     if (Test-Path -LiteralPath $Path) {
         # Keep the generated directory root. Windows may hold a handle to the
         # root while still allowing its generated children to be replaced.
         Get-ChildItem -LiteralPath $Path -Force | ForEach-Object {
-            Remove-Item -LiteralPath $_.FullName -Recurse -Force
+            $isScratch = $ScratchChildren -contains $_.Name
+            try {
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+            } catch {
+                if (-not $isScratch) { throw }
+                Write-Warning "临时目录 $($_.Name) 未能完全清空（有进程占用），沿用残留继续：$($_.Exception.Message)"
+            }
         }
     } else {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
@@ -77,7 +90,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $srcRoot 'database\V001__initial_sch
     throw 'Database migration root is missing V001__initial_schema.sql.'
 }
 
-Reset-GeneratedDirectory $stageRoot
+Reset-GeneratedDirectory $stageRoot -ScratchChildren @('postgresql-extract')
 Reset-GeneratedDirectory $distRoot
 Assert-WorkspaceTarget $setupPayloadRoot
 New-Item -ItemType Directory -Path $setupPayloadRoot -Force | Out-Null

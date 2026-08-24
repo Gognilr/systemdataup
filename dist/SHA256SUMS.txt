@@ -1,2 +1,0 @@
-7ab23ce2b29b0d8531063f2f1dfd08d5bd4d711e259ac7b25b581d4060592e63  BackupMonitor.Server.Setup.exe
-d52b9dacbbfb2b7e4727b16f1fb713b2826bfae406e7f9f194bbb94acb9d04ff  BackupMonitor.Agent.Setup.exe
