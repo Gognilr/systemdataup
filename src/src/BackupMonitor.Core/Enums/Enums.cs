@@ -35,9 +35,6 @@ public enum RecognizerType
 public enum PrecheckStatus
 {
     NotScanned,
-    Scanning,
-    CandidateFound,
-    WaitingStable,
     Passed,
     NoNewBackup,
     StillChanging,
@@ -75,7 +72,19 @@ public enum CommandType
     Rehash,
     SyncConfig,
     RefreshMetrics,
-    UpgradeAgent
+    UpgradeAgent,
+
+    /// <summary>
+    /// 浏览客户端目录，返回一棵只含元数据的目录树。
+    /// 建任务向导用它让管理员"指着"备份目录，而不是"描述"它。
+    /// </summary>
+    BrowsePath,
+
+    /// <summary>
+    /// 列出客户端上安装的 Windows 服务。
+    /// 配关键服务监控时从真实列表里挑，而不是凭记忆敲 MSSQL$SQLEXPRESS 这种名字。
+    /// </summary>
+    ListServices
 }
 
 /// <summary>上传会话状态</summary>
@@ -102,7 +111,6 @@ public enum BackupSetStatus
     Available,
     VerificationFailed,
     Quarantined,
-    RetentionPending,
     RecycleBin,
     Deleted
 }

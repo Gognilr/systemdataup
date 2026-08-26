@@ -49,6 +49,15 @@ public class Client : IHasRowVersion
     /// <summary>最后一次配置版本号（用于增量配置下发）</summary>
     public long LastConfigVersion { get; set; }
 
+    /// <summary>
+    /// 客户端级配置修订号。监控服务定义的增删改会推进它。
+    ///
+    /// 必须与任务版本一起参与 requiredConfigVersion 的计算：配置下发里包含监控服务，
+    /// 但它们的变更不会改动任何任务的 config_version，只看任务版本的话，
+    /// 新加的监控服务永远到不了客户端，而且一声不响。
+    /// </summary>
+    public long ConfigRevision { get; set; }
+
     /// <summary>当前证书指纹</summary>
     public string? CertificateThumbprint { get; set; }
 

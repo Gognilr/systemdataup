@@ -5,6 +5,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.ServiceProcess;
 using System.Text.Json;
 using BackupMonitor.Api.Bootstrap;
+using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Shared.Security;
 using Microsoft.Extensions.Configuration;
 using Npgsql;
@@ -36,10 +37,14 @@ internal sealed class ServerMaintenance
         string newPassword,
         CancellationToken ct)
     {
-        if (newPassword.Length < 12)
-            throw new InvalidOperationException("管理员密码至少需要 12 个字符。");
+        // 走与自助改密同一套 PasswordPolicy。原来这里只判长度 ≥ 12，"aaaaaaaaaaaa"、
+        // "123456789012" 这类口令在 Web 端会被拒、在安装器里却能设进去——而 PasswordPolicy
+        // 的注释本身就写着「两端必须共用同一套规则」。
+        var strengthError = PasswordPolicy.Validate(newPassword, "admin");
+        if (strengthError is not null)
+            throw new InvalidOperationException(strengthError);
 
-        var hash = BCrypt.Net.BCrypt.HashPassword(newPassword, workFactor: 12);
+        var hash = PasswordPolicy.Hash(newPassword);
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(ct);
         await using var transaction = await connection.BeginTransactionAsync(ct);
@@ -289,16 +294,54 @@ internal sealed class ServerMaintenance
 
     public async Task RestartServicesAsync(CancellationToken ct)
     {
+        await StopServicesAsync(ct);
+        await StartServicesAsync(ct);
+    }
+
+    /// <summary>
+    /// 停止服务端。顺序是先 API 后 PostgreSQL——反过来会让 API 在数据库消失后
+    /// 继续跑一段时间，日志里刷一片连接失败，看起来像是出了故障。
+    ///
+    /// 每一步都等到真的 Stopped 再进行下一步：sc stop 只是把停止控制码投递给服务，
+    /// 立刻返回，此时进程往往还活着。这条教训是从「卸载时 icudt67.dll 被占用」来的。
+    /// </summary>
+    public async Task StopServicesAsync(CancellationToken ct)
+    {
         var sc = Path.Combine(Environment.SystemDirectory, "sc.exe");
         await ProcessRunner.RunAsync(sc, ["stop", ServerServiceName], ct, throwOnError: false);
         await WaitForServiceStatusAsync(ServerServiceName, ServiceControllerStatus.Stopped, ct, required: false);
         await ProcessRunner.RunAsync(sc, ["stop", PostgreSqlServiceName], ct, throwOnError: false);
         await WaitForServiceStatusAsync(PostgreSqlServiceName, ServiceControllerStatus.Stopped, ct, required: false);
+    }
+
+    /// <summary>启动服务端。顺序与停止相反：数据库先起来，API 才有得连。</summary>
+    public async Task StartServicesAsync(CancellationToken ct)
+    {
+        var sc = Path.Combine(Environment.SystemDirectory, "sc.exe");
         await ProcessRunner.RunAsync(sc, ["start", PostgreSqlServiceName], ct);
         await WaitForServiceStatusAsync(PostgreSqlServiceName, ServiceControllerStatus.Running, ct);
         await ProcessRunner.RunAsync(sc, ["start", ServerServiceName], ct);
         await WaitForServiceStatusAsync(ServerServiceName, ServiceControllerStatus.Running, ct);
     }
+
+    /// <summary>
+    /// 两个服务的当前状态，给维护界面显示。
+    /// 有了它，「停止服务」和「启动服务」两个按钮才不是让人盲按——
+    /// 人需要先知道现在是什么状态，才知道该按哪个。
+    /// </summary>
+    public (string Server, string Postgres) GetServiceStatuses() =>
+        (TranslateStatus(GetServiceStatus(ServerServiceName)),
+         TranslateStatus(GetServiceStatus(PostgreSqlServiceName)));
+
+    private static string TranslateStatus(string status) => status switch
+    {
+        "Running" => "运行中",
+        "Stopped" => "已停止",
+        "StartPending" => "正在启动",
+        "StopPending" => "正在停止",
+        "Paused" => "已暂停",
+        _ => status
+    };
 
     public async Task<string> GetDiagnosticsAsync(
         string installDirectory,
@@ -370,8 +413,24 @@ internal sealed class ServerMaintenance
         var sc = Path.Combine(Environment.SystemDirectory, "sc.exe");
         await ProcessRunner.RunAsync(sc, ["stop", ServerServiceName], ct, throwOnError: false);
         await ProcessRunner.RunAsync(sc, ["stop", PostgreSqlServiceName], ct, throwOnError: false);
+        // sc stop 只是把 STOP 控制码投递给服务就立刻返回，PostgreSQL 还要做关机 checkpoint，
+        // 期间 postgres.exe 仍然占着 bin 目录里的 icudt*.dll 等文件。不等它真正停下就删目录，
+        // 必然报 "Access to the path 'icudt67.dll' is denied."
+        await WaitForServiceStatusAsync(ServerServiceName, ServiceControllerStatus.Stopped, ct, required: false);
+        await WaitForServiceStatusAsync(PostgreSqlServiceName, ServiceControllerStatus.Stopped, ct, required: false);
+
+        // 集群未必由服务托管：安装中途失败、或上一次卸载只删了服务没杀进程，都会留下一个没有
+        // 服务归属的 postmaster。它会一直占着 PGDATA 和端口活到下次重启，而下一次安装看到
+        // PG_VERSION 存在就跳过 initdb，直接沿用这个旧集群——于是「重装完还是昨天的数据」。
+        // 所以删服务之前，先照着 PGDATA 直接把 postmaster 停掉。
+        await StopPostgresClusterDirectlyAsync(installDirectory, postgresDataDirectory, ct);
+
         await ProcessRunner.RunAsync(sc, ["delete", ServerServiceName], ct, throwOnError: false);
         await ProcessRunner.RunAsync(sc, ["delete", PostgreSqlServiceName], ct, throwOnError: false);
+
+        // 服务停了之后仍可能残留从安装目录启动的子进程（postgres 的后台进程、托盘等），
+        // 给它们几秒自行退出的时间，再强杀，最后才删目录。
+        await WaitForProcessesToExitAsync(installDirectory, ct);
 
         var netsh = Path.Combine(
             Environment.GetEnvironmentVariable("SystemRoot") ?? Environment.GetFolderPath(Environment.SpecialFolder.Windows),
@@ -386,12 +445,155 @@ internal sealed class ServerMaintenance
             ct,
             throwOnError: false);
 
-        if (Directory.Exists(installDirectory))
-            Directory.Delete(installDirectory, recursive: true);
-        if (removeData && Directory.Exists(dataDirectory))
-            Directory.Delete(dataDirectory, recursive: true);
-        if (removeData && Directory.Exists(postgresDataDirectory))
-            Directory.Delete(postgresDataDirectory, recursive: true);
+        // 每个目录独立删除、各自收集错误：安装目录删不掉时若直接抛出，数据库目录就永远留在盘上，
+        // 重装后被原样沿用。数据的清除比安装目录的清除更要紧，不能被前者的失败带走。
+        var failures = new List<Exception>();
+        await TryDeleteAsync(installDirectory);
+        if (removeData)
+        {
+            await TryDeleteAsync(dataDirectory);
+            await TryDeleteAsync(postgresDataDirectory);
+        }
+
+        if (failures.Count > 0)
+            throw new AggregateException(
+                "卸载未能删除全部目录，残留内容会在下次安装时被沿用，请重启计算机后再次运行卸载。",
+                failures);
+
+        async Task TryDeleteAsync(string directory)
+        {
+            try
+            {
+                await DeleteDirectoryWithRetryAsync(directory, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                failures.Add(ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 用安装目录里的 pg_ctl 直接停掉 PGDATA 上的集群，不依赖 Windows 服务是否还在。
+    /// 用 immediate 模式：卸载紧接着就要删掉整个数据目录，没必要为一个即将消失的集群等
+    /// checkpoint 写完。
+    /// </summary>
+    private static async Task StopPostgresClusterDirectlyAsync(
+        string installDirectory,
+        string postgresDataDirectory,
+        CancellationToken ct)
+    {
+        var pgCtl = Path.Combine(installDirectory, "PostgreSQL", "bin", "pg_ctl.exe");
+        if (!File.Exists(pgCtl))
+            return;
+
+        // 实际 PGDATA 是 <postgresDataDirectory>\data，老版本直接用父目录，两个都试一遍。
+        string[] candidates = [Path.Combine(postgresDataDirectory, "data"), postgresDataDirectory];
+        foreach (var candidate in candidates)
+        {
+            if (!File.Exists(Path.Combine(candidate, "postmaster.pid")))
+                continue;
+
+            await ProcessRunner.RunAsync(
+                pgCtl,
+                ["stop", "-D", candidate, "-m", "immediate", "-w", "-t", "30"],
+                ct,
+                throwOnError: false);
+        }
+    }
+
+    /// <summary>
+    /// 等待所有可执行文件位于 <paramref name="directory"/> 下的进程退出，超时后强制结束。
+    /// </summary>
+    private static async Task WaitForProcessesToExitAsync(string directory, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(20);
+        while (true)
+        {
+            var running = GetProcessesUnder(directory);
+            if (running.Count == 0)
+                return;
+
+            if (DateTime.UtcNow >= deadline)
+            {
+                foreach (var process in running)
+                {
+                    try
+                    {
+                        process.Kill(entireProcessTree: true);
+                        process.WaitForExit(5000);
+                    }
+                    catch
+                    {
+                        // 进程可能刚好自己退出了，或者没有权限；后面删目录的重试会给出准确报错。
+                    }
+                    finally
+                    {
+                        process.Dispose();
+                    }
+                }
+
+                return;
+            }
+
+            foreach (var process in running)
+                process.Dispose();
+
+            await Task.Delay(500, ct);
+        }
+    }
+
+    private static List<System.Diagnostics.Process> GetProcessesUnder(string directory)
+    {
+        var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var matches = new List<System.Diagnostics.Process>();
+        foreach (var process in System.Diagnostics.Process.GetProcesses())
+        {
+            string? path = null;
+            try
+            {
+                path = process.MainModule?.FileName;
+            }
+            catch
+            {
+                // 系统进程和其他会话的进程读不到主模块，直接跳过。
+            }
+
+            if (path is not null && path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                matches.Add(process);
+            else
+                process.Dispose();
+        }
+
+        return matches;
+    }
+
+    /// <summary>
+    /// 带重试的目录删除：文件句柄的释放是异步的，服务刚停时删除仍可能撞上 ACCESS_DENIED。
+    /// 全部重试用尽后抛出可读的错误，告诉操作员是哪个文件被占用。
+    /// </summary>
+    private static async Task DeleteDirectoryWithRetryAsync(string directory, CancellationToken ct)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            if (!Directory.Exists(directory))
+                return;
+
+            try
+            {
+                Directory.Delete(directory, recursive: true);
+                return;
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+            {
+                if (attempt >= 9)
+                    throw new IOException(
+                        $"删除 {directory} 失败：{ex.Message}。该文件仍被其他进程占用，请重启计算机后再次运行卸载。",
+                        ex);
+
+                await Task.Delay(1000, ct);
+            }
+        }
     }
 
     private sealed record KeyPackageFile(string EntryName, string Path);

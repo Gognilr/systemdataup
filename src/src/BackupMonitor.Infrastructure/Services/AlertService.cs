@@ -1,3 +1,4 @@
+using System.Text.Json;
 using BackupMonitor.Core.Entities.Alert;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -18,6 +19,15 @@ public interface IAlertService
     Task AcknowledgeAsync(Guid alertId, CancellationToken ct = default);
     Task HandleAsync(Guid alertId, HandleAlertRequest request, CancellationToken ct = default);
     Task CloseAsync(Guid alertId, CloseAlertRequest request, CancellationToken ct = default);
+
+    /// <summary>指派告警（功能说明书 8.18）</summary>
+    Task AssignAsync(Guid alertId, AssignAlertRequest request, CancellationToken ct = default);
+
+    /// <summary>创建临时静默（默认按客户端范围，见 SilenceAlertRequest）</summary>
+    Task<AlertSilenceDto> SilenceAsync(Guid alertId, SilenceAlertRequest request, CancellationToken ct = default);
+
+    /// <summary>提前解除一条静默</summary>
+    Task RemoveSilenceAsync(Guid silenceId, CancellationToken ct = default);
 }
 
 /// <summary>告警服务实现（列表/详情/确认/处理/关闭）</summary>
@@ -87,6 +97,8 @@ public class AlertService : IAlertService
             alerts = alerts.Where(a => a.ClientId == query.ClientId);
         if (query.TaskId is not null)
             alerts = alerts.Where(a => a.TaskId == query.TaskId);
+        if (query.AssignedTo is not null)
+            alerts = alerts.Where(a => a.AssignedTo == query.AssignedTo);
         if (query.From is not null)
             alerts = alerts.Where(a => a.LastOccurredAt >= query.From);
         if (query.To is not null)
@@ -97,6 +109,7 @@ public class AlertService : IAlertService
 
         var totalCount = await alerts.LongCountAsync(ct);
 
+        var now = DateTime.UtcNow;
         var rows = await alerts
             .ApplySort(query.SortBy, query.SortDescending, AlertSorts, AlertSortFallback)
             .Skip((query.Page - 1) * query.PageSize)
@@ -117,7 +130,11 @@ public class AlertService : IAlertService
                 a.FirstOccurredAt,
                 a.LastOccurredAt,
                 a.OccurrenceCount,
-                a.AcknowledgedAt
+                a.AcknowledgedAt,
+                a.AssignedTo,
+                AssignedToName = a.AssignedToUser != null ? a.AssignedToUser.DisplayName : null,
+                a.AssignedAt,
+                IsSilenced = _db.AlertSilences.Any(s => s.Until > now && EF.Functions.Like(a.AlertKey, s.AlertKeyPattern))
             })
             .ToListAsync(ct);
 
@@ -137,7 +154,11 @@ public class AlertService : IAlertService
             FirstOccurredAt = a.FirstOccurredAt,
             LastOccurredAt = a.LastOccurredAt,
             OccurrenceCount = a.OccurrenceCount,
-            AcknowledgedAt = a.AcknowledgedAt
+            AcknowledgedAt = a.AcknowledgedAt,
+            AssignedTo = a.AssignedTo,
+            AssignedToName = a.AssignedToName,
+            AssignedAt = a.AssignedAt,
+            IsSilenced = a.IsSilenced
         }).ToList();
 
         return PagedResult<AlertListItemDto>.Create(items, totalCount, query.Page, query.PageSize);
@@ -150,8 +171,13 @@ public class AlertService : IAlertService
             .Include(a => a.Task)
             .Include(a => a.BusinessUnit)
             .Include(a => a.AcknowledgedByUser)
+            .Include(a => a.AssignedToUser)
             .FirstOrDefaultAsync(a => a.Id == alertId, ct)
             ?? throw new NotFoundException("告警", alertId);
+
+        var now = DateTime.UtcNow;
+        var isSilenced = await _db.AlertSilences
+            .AnyAsync(s => s.Until > now && EF.Functions.Like(alert.AlertKey, s.AlertKeyPattern), ct);
 
         return new AlertDetailDto
         {
@@ -170,6 +196,10 @@ public class AlertService : IAlertService
             LastOccurredAt = alert.LastOccurredAt,
             OccurrenceCount = alert.OccurrenceCount,
             AcknowledgedAt = alert.AcknowledgedAt,
+            AssignedTo = alert.AssignedTo,
+            AssignedToName = alert.AssignedToUser?.DisplayName,
+            AssignedAt = alert.AssignedAt,
+            IsSilenced = isSilenced,
 
             BusinessUnitId = alert.BusinessUnitId,
             BusinessUnitName = alert.BusinessUnit?.DisplayName,
@@ -250,5 +280,83 @@ public class AlertService : IAlertService
 
         await _db.SaveChangesAsync(ct);
         await _audit.RecordAsync("alert.close", AuditResult.Success, "alert", alert.Id, ct: ct);
+    }
+
+    /// <summary>指派告警（功能说明书 8.18）。AssignedTo 为 null 表示取消指派。</summary>
+    public async Task AssignAsync(Guid alertId, AssignAlertRequest request, CancellationToken ct = default)
+    {
+        var alert = await _db.Alerts.FirstOrDefaultAsync(a => a.Id == alertId, ct)
+            ?? throw new NotFoundException("告警", alertId);
+
+        if (request.AssignedTo is not null)
+        {
+            var userExists = await _db.Users.AsNoTracking().AnyAsync(u => u.Id == request.AssignedTo, ct);
+            if (!userExists)
+                throw new NotFoundException("用户", request.AssignedTo.Value);
+        }
+
+        alert.AssignedTo = request.AssignedTo;
+        alert.AssignedAt = request.AssignedTo is null ? null : DateTime.UtcNow;
+
+        await _db.SaveChangesAsync(ct);
+        await _audit.RecordAsync("alert.assign", AuditResult.Success, "alert", alert.Id,
+            afterData: $"{{\"assignedTo\":\"{request.AssignedTo}\"}}", ct: ct);
+    }
+
+    /// <summary>
+    /// 创建临时静默（设计书 8.18）：
+    /// 有客户端时按客户端范围静默（覆盖该客户端后续全部告警键，对应维护窗口场景）；
+    /// 没有客户端（如系统级告警）时退化为按这条告警自身的 alert_key 精确静默。
+    /// </summary>
+    public async Task<AlertSilenceDto> SilenceAsync(Guid alertId, SilenceAlertRequest request, CancellationToken ct = default)
+    {
+        var alert = await _db.Alerts.AsNoTracking().FirstOrDefaultAsync(a => a.Id == alertId, ct)
+            ?? throw new NotFoundException("告警", alertId);
+
+        var userId = _context.UserId
+            ?? throw new BusinessException("UNAUTHORIZED", "静默操作需要管理员身份", 401);
+
+        var pattern = alert.ClientId is not null
+            ? $"client:{alert.ClientId}:%"
+            : alert.TaskId is not null
+                ? $"task:{alert.TaskId}:%"
+                : alert.AlertKey;
+
+        var silence = new AlertSilence
+        {
+            Id = Guid.NewGuid(),
+            AlertKeyPattern = pattern,
+            Reason = string.IsNullOrWhiteSpace(request.Reason) ? "维护窗口" : request.Reason.Trim(),
+            Until = DateTime.UtcNow.AddHours(request.Hours),
+            CreatedBy = userId,
+            CreatedAt = DateTime.UtcNow
+        };
+        _db.AlertSilences.Add(silence);
+
+        await _db.SaveChangesAsync(ct);
+        await _audit.RecordAsync("alert.silence", AuditResult.Success, "alert", alert.Id,
+            afterData: JsonSerializer.Serialize(new { silence.Id, silence.AlertKeyPattern, silence.Until }), ct: ct);
+
+        return new AlertSilenceDto
+        {
+            Id = silence.Id,
+            AlertKeyPattern = silence.AlertKeyPattern,
+            Reason = silence.Reason,
+            Until = silence.Until,
+            CreatedBy = silence.CreatedBy,
+            CreatedAt = silence.CreatedAt
+        };
+    }
+
+    /// <summary>提前解除一条静默</summary>
+    public async Task RemoveSilenceAsync(Guid silenceId, CancellationToken ct = default)
+    {
+        var silence = await _db.AlertSilences.FirstOrDefaultAsync(s => s.Id == silenceId, ct)
+            ?? throw new NotFoundException("告警静默", silenceId);
+
+        _db.AlertSilences.Remove(silence);
+        await _db.SaveChangesAsync(ct);
+
+        await _audit.RecordAsync("alert.silence_remove", AuditResult.Success, "alert_silence", silence.Id, ct: ct);
     }
 }

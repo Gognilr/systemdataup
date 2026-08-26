@@ -31,13 +31,29 @@ public class AgentConfigService : IAgentConfigService
         _signer = signer;
     }
 
-    public async Task<long> GetRequiredVersionAsync(Guid clientId, CancellationToken ct = default)
+    public async Task<long> GetRequiredVersionAsync(Guid clientId, CancellationToken ct = default) =>
+        await ComputeVersionAsync(clientId, ct);
+
+    /// <summary>
+    /// 配置版本 = 任务版本最大值 与 客户端配置修订号 的较大者。
+    ///
+    /// 只看任务版本的话，监控服务定义的变更推不动版本号，Agent 就不会重新拉配置——
+    /// 新增的关键服务永远到不了客户端，且没有任何报错；客户端一个任务都没有时
+    /// 版本恒为 0，问题更彻底。两个数都是单调递增的，取 max 仍然单调。
+    /// </summary>
+    private async Task<long> ComputeVersionAsync(Guid clientId, CancellationToken ct)
     {
-        var max = await _db.BackupTasks
+        var taskVersion = await _db.BackupTasks
             .Where(t => t.ClientId == clientId)
             .Select(t => (long?)t.ConfigVersion)
-            .MaxAsync(ct);
-        return max ?? 0;
+            .MaxAsync(ct) ?? 0;
+
+        var revision = await _db.Clients
+            .Where(c => c.Id == clientId)
+            .Select(c => (long?)c.ConfigRevision)
+            .FirstOrDefaultAsync(ct) ?? 0;
+
+        return Math.Max(taskVersion, revision);
     }
 
     public async Task<AgentConfigResponse> GetConfigAsync(Guid clientId, long currentVersion, CancellationToken ct = default)
@@ -52,7 +68,9 @@ public class AgentConfigService : IAgentConfigService
             .OrderBy(d => d.ServiceName)
             .ToListAsync(ct);
 
-        var version = tasks.Count > 0 ? tasks.Max(t => t.ConfigVersion) : 0;
+        // 与 GetRequiredVersionAsync 必须用同一个算法：这里算小了，Agent 存下的版本
+        // 会永远低于心跳要求的版本，于是每一次心跳都触发一次全量配置拉取。
+        var version = await ComputeVersionAsync(clientId, ct);
 
         var response = new AgentConfigResponse
         {
@@ -73,6 +91,7 @@ public class AgentConfigService : IAgentConfigService
                 MaxStabilityWaitSeconds = t.MaxStabilityWaitSeconds,
                 BandwidthLimitKbps = t.BandwidthLimitKbps,
                 ChunkSizeBytes = t.ChunkSizeBytes,
+                RandomDelayMinutes = t.RandomDelayMinutes,
                 RecognizerConfig = t.RecognizerConfig,
                 ConfigVersion = t.ConfigVersion
             }).ToList(),

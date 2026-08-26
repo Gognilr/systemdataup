@@ -1,7 +1,8 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 namespace BackupMonitor.Api.Middleware;
 
@@ -39,6 +40,19 @@ public class ExceptionHandlingMiddleware
             await WriteErrorAsync(context, 409, "CONFLICT", "数据已被其他操作修改，请刷新后重试");
             return;
         }
+        catch (DbUpdateException ex) when (IsForeignKeyViolation(ex, out var constraint))
+        {
+            // 外键冲突是「这条记录还被别处引用着」，属于业务冲突而不是服务器故障。
+            // 兜底成 500 的话，界面只会显示「服务器内部错误，请稍后重试」——
+            // 而重试一万次也不会成功，使用者完全无从判断问题出在哪。
+            _logger.LogWarning(
+                ex, "外键约束阻止了操作 {Method} {Path} constraint={Constraint}",
+                context.Request.Method, context.Request.Path, constraint);
+            await WriteErrorAsync(
+                context, 409, "CONFLICT",
+                $"该记录仍被其他数据引用，无法删除或修改（约束 {constraint}）。请先处理关联数据。");
+            return;
+        }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             return; // 客户端主动断开
@@ -60,6 +74,25 @@ public class ExceptionHandlingMiddleware
                 : ("FORBIDDEN", "权限不足");
             await WriteErrorAsync(context, context.Response.StatusCode, code, message);
         }
+    }
+
+    /// <summary>
+    /// 判断异常链里是否有 PostgreSQL 外键冲突（SQLSTATE 23503），并取出约束名。
+    /// </summary>
+    private static bool IsForeignKeyViolation(Exception exception, out string constraint)
+    {
+        constraint = "unknown";
+        for (var current = exception.InnerException; current is not null; current = current.InnerException)
+        {
+            if (current is not PostgresException { SqlState: PostgresErrorCodes.ForeignKeyViolation } postgres)
+                continue;
+
+            if (!string.IsNullOrWhiteSpace(postgres.ConstraintName))
+                constraint = postgres.ConstraintName;
+            return true;
+        }
+
+        return false;
     }
 
     private static async Task WriteErrorAsync(HttpContext context, int statusCode, string errorCode, string message, object? details = null)

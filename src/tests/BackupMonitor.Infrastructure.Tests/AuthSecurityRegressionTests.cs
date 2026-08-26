@@ -14,7 +14,7 @@ namespace BackupMonitor.Infrastructure.Tests;
 
 /// <summary>
 /// 提示词 2（认证安全批次）回归测试：
-/// - V005 管理员引导：注入式口令可登录、must_change_password=true（OPEN-ISSUES #2）
+/// - V005 管理员引导：注入式口令可登录；V017 之后不再强制首次改密（口令是安装时人工设的）
 /// - 改密：旧口令校验失败不产生状态变更、成功后吊销全部刷新令牌并清除强制标志
 /// - 口令强度服务端校验（长度 ≥ 12、不等于用户名）
 /// - 不存在的用户登录走等成本 dummy 校验并返回统一错误（OPEN-ISSUES #7）
@@ -84,21 +84,26 @@ public class AuthSecurityRegressionTests
 
     // ---------- V005 引导 ----------
 
+    /// <summary>
+    /// 安装器设的管理员口令登录后可以直接用：口令是操作员在安装界面亲手输入的，
+    /// 并且过了与 Web 端改密同一套 PasswordPolicy，首次登录再逼一次改密没有收益。
+    /// V017 负责把 V005 打上的强制标志清掉。
+    /// </summary>
     [Fact]
-    public async Task V005_Admin_Bootstrap_Injects_Password_And_Forces_Change()
+    public async Task V005_Admin_Bootstrap_Injects_Password_Without_Forcing_Change()
     {
-        // 1. 数据库层：admin 存在且带强制改密标志
+        // 1. 数据库层：admin 存在且没有强制改密标志
         await using var conn = new NpgsqlConnection(_fixture.ConnectionString);
         await conn.OpenAsync();
         await using var cmd = new NpgsqlCommand(
             "SELECT must_change_password, status::text FROM users WHERE username='admin'", conn);
         await using var reader = await cmd.ExecuteReaderAsync();
         Assert.True(await reader.ReadAsync(), "V005 应当种入 admin 账户");
-        Assert.True(reader.GetBoolean(0));
+        Assert.False(reader.GetBoolean(0));
         Assert.Equal("active", reader.GetString(1));
         await reader.CloseAsync();
 
-        // 2. 服务层：注入的引导口令可以登录，且响应携带 mustChangePassword
+        // 2. 服务层：注入的引导口令可以登录，且不再要求改密
         await using var provider = BuildServices();
         await using var scope = provider.CreateAsyncScope();
         var auth = CreateAuthService(scope);
@@ -107,7 +112,7 @@ public class AuthSecurityRegressionTests
             new LoginRequest { Username = "admin", Password = PostgresDatabaseFixture.AdminBootstrapPassword },
             "127.0.0.1", "unit-test");
 
-        Assert.True(login.MustChangePassword);
+        Assert.False(login.MustChangePassword);
         Assert.False(string.IsNullOrEmpty(login.AccessToken));
         Assert.False(string.IsNullOrEmpty(login.RefreshToken));
     }
@@ -215,6 +220,39 @@ public class AuthSecurityRegressionTests
 
         Assert.Equal(400, ex.StatusCode);
         Assert.Equal(expectedMessage, ex.Message);
+    }
+
+    /// <summary>
+    /// 新口令与当前口令相同必须被拒绝，且不得清除强制改密标志。
+    ///
+    /// 这条不是形式主义：首次登录的强制改密如果接受「原样填回初始口令」，
+    /// must_change_password 会被清掉而口令仍是安装器设的那个，
+    /// 等于这道闸门自己给自己放行。
+    /// </summary>
+    [Fact]
+    public async Task ChangePassword_Rejects_NewPassword_Identical_To_Current()
+    {
+        await using var provider = BuildServices();
+        await using var scope = provider.CreateAsyncScope();
+        var auth = CreateAuthService(scope);
+        const string password = "Correct-Old-Pw-2026!";
+        var username = $"pw_same_{Guid.NewGuid():N}"[..20];
+        var userId = await CreateTestUserAsync(scope, username, password, mustChange: true);
+
+        var ex = await Assert.ThrowsAsync<BusinessException>(() =>
+            auth.ChangePasswordAsync(userId, new ChangePasswordRequest
+            {
+                OldPassword = password,
+                NewPassword = password
+            }));
+
+        Assert.Equal(400, ex.StatusCode);
+        Assert.Equal("新口令不能与当前口令相同", ex.Message);
+
+        // 强制改密标志必须原样保留——否则闸门已经被绕过了
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var user = await db.Users.AsNoTracking().FirstAsync(u => u.Id == userId);
+        Assert.True(user.MustChangePassword);
     }
 }
 

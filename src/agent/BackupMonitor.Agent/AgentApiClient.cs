@@ -182,9 +182,11 @@ public sealed class AgentApiClient : IDisposable
         SendAsync<MissingChunksResponse>(HttpMethod.Get, $"api/v1/agent/upload-sessions/{sessionId}/files/{fileId}/missing-chunks", null, ct);
 
     public async Task<UploadChunkResponse> UploadChunkAsync(
-        Guid sessionId, Guid fileId, int chunkIndex, long offset, byte[] bytes, string sha256, CancellationToken ct)
+        Guid sessionId, Guid fileId, int chunkIndex, long offset, ReadOnlyMemory<byte> bytes, string sha256, CancellationToken ct)
     {
-        using var content = new ByteArrayContent(bytes);
+        // ReadOnlyMemoryContent 直接包装调用方切好的 length 范围，不会多发 ArrayPool.Rent
+        // 可能超额分配出来的那部分垃圾字节，也不需要为了凑 byte[] 再拷贝一份。
+        using var content = new ReadOnlyMemoryContent(bytes);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
         using var request = CreateRequest(HttpMethod.Put, $"api/v1/agent/upload-sessions/{sessionId}/files/{fileId}/chunks/{chunkIndex}");
         request.Headers.Add("X-Chunk-Offset", offset.ToString(System.Globalization.CultureInfo.InvariantCulture));

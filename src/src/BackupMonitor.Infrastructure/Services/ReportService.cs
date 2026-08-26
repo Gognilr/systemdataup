@@ -14,6 +14,9 @@ public interface IReportService
     Task<BackupSummaryReportDto> GetBackupSummaryAsync(CancellationToken ct = default);
     Task<AlertSummaryReportDto> GetAlertSummaryAsync(CancellationToken ct = default);
     Task<TaskSummaryReportDto> GetTaskSummaryAsync(CancellationToken ct = default);
+
+    /// <summary>待办聚合（B5 中期方案）：计数不受分页影响，"哪些任务算有问题"的判定在服务端做</summary>
+    Task<TodoSummaryDto> GetTodoSummaryAsync(CancellationToken ct = default);
 }
 
 /// <summary>报表实现</summary>
@@ -302,6 +305,120 @@ public class ReportService : IReportService
                 DiskTotalBytes = diskTotalBytes,
                 EstimatedFullAt = estimatedFullAt
             }
+        };
+    }
+
+    /// <summary>
+    /// 待办聚合（B5 中期方案）：五类事项各自 CountAsync 得出总数（不受分页影响），
+    /// 明细只回前 20 条，前端"查看全部"跳去对应列表页并带上等价筛选条件。
+    /// "哪些任务算有问题"的判定与 BackupTaskService.GetListAsync(OnlyProblematic) 共用同一份规则。
+    /// </summary>
+    public async Task<TodoSummaryDto> GetTodoSummaryAsync(CancellationToken ct = default)
+    {
+        const int previewLimit = 20;
+        var now = DateTime.UtcNow;
+
+        var pendingClients = _db.Clients.AsNoTracking().Where(c => c.Status == ClientStatus.PendingApproval);
+        var pendingClientsCount = await pendingClients.CountAsync(ct);
+        var pendingClientsItems = await pendingClients
+            .OrderByDescending(c => c.CreatedAt)
+            .Take(previewLimit)
+            .Select(c => new TodoClientItemDto
+            {
+                Id = c.Id,
+                Hostname = c.Hostname,
+                DisplayName = c.DisplayName,
+                CreatedAt = c.CreatedAt
+            })
+            .ToListAsync(ct);
+
+        // 与 BackupTaskService.GetListAsync(OnlyProblematic=true) 同一份规则：
+        // 已启用且（最近预检非正常态 或 超过一天没扫描且超过三天没成功）。
+        var scanStaleCutoff = now.AddHours(-24);
+        var successStaleCutoff = now.AddDays(-3);
+        var problematicTasks = _db.BackupTasks.AsNoTracking().Where(t => t.Enabled && (
+            (t.LastPrecheckStatus != null && !BackupTaskService.OkPrecheckStatuses.Contains(t.LastPrecheckStatus.Value))
+            || (t.LastScanAt != null && t.LastScanAt < scanStaleCutoff
+                && (t.LastSuccessAt == null || t.LastSuccessAt < successStaleCutoff))));
+        var problematicTasksCount = await problematicTasks.CountAsync(ct);
+        var problematicTasksItems = await problematicTasks
+            .OrderByDescending(t => t.LastScanAt)
+            .Take(previewLimit)
+            .Select(t => new TodoTaskItemDto
+            {
+                Id = t.Id,
+                Name = t.Name,
+                ClientHostname = t.Client.Hostname,
+                LastPrecheckStatus = t.LastPrecheckStatus.HasValue ? EnumMapping.ToSnakeCase(t.LastPrecheckStatus.Value) : null,
+                LastScanAt = t.LastScanAt,
+                LastSuccessAt = t.LastSuccessAt
+            })
+            .ToListAsync(ct);
+
+        var readyRestores = _db.RestoreRequests.AsNoTracking().Where(r => r.Status == RestoreRequestStatus.Ready);
+        var readyRestoresCount = await readyRestores.CountAsync(ct);
+        var readyRestoresItems = await readyRestores
+            .OrderBy(r => r.RequestedAt)
+            .Take(previewLimit)
+            .Select(r => new TodoRestoreItemDto
+            {
+                Id = r.Id,
+                BackupSetCode = r.BackupSet.BackupSetCode,
+                RequestedByName = r.RequestedByUser.DisplayName,
+                RequestedAt = r.RequestedAt
+            })
+            .ToListAsync(ct);
+
+        var criticalAlerts = _db.Alerts.AsNoTracking()
+            .Where(a => a.Level == AlertLevel.Critical && a.Status == AlertStatus.Open);
+        var criticalAlertsCount = await criticalAlerts.CountAsync(ct);
+        var criticalAlertsItems = await criticalAlerts
+            .OrderByDescending(a => a.LastOccurredAt)
+            .Take(previewLimit)
+            .Select(a => new AlertListItemDto
+            {
+                Id = a.Id,
+                AlertKey = a.AlertKey,
+                Level = EnumMapping.ToSnakeCase(a.Level),
+                Status = EnumMapping.ToSnakeCase(a.Status),
+                Category = a.Category,
+                ClientId = a.ClientId,
+                ClientHostname = a.Client != null ? a.Client.Hostname : null,
+                TaskId = a.TaskId,
+                TaskName = a.Task != null ? a.Task.Name : null,
+                Title = a.Title,
+                Message = a.Message,
+                FirstOccurredAt = a.FirstOccurredAt,
+                LastOccurredAt = a.LastOccurredAt,
+                OccurrenceCount = a.OccurrenceCount,
+                AcknowledgedAt = a.AcknowledgedAt
+            })
+            .ToListAsync(ct);
+
+        var recentEnrollFrom = now.AddDays(-7);
+        var recentEnrollments = _db.Clients.AsNoTracking()
+            .Where(c => c.EnrollmentMode == "lan_simple" && c.CreatedAt >= recentEnrollFrom);
+        var recentEnrollmentsCount = await recentEnrollments.CountAsync(ct);
+        var recentEnrollmentsItems = await recentEnrollments
+            .OrderByDescending(c => c.CreatedAt)
+            .Take(previewLimit)
+            .Select(c => new RecentAutoEnrollmentDto
+            {
+                Id = c.Id,
+                Hostname = c.Hostname,
+                DisplayName = c.DisplayName,
+                CreatedAt = c.CreatedAt,
+                LastHeartbeatAt = c.LastHeartbeatAt
+            })
+            .ToListAsync(ct);
+
+        return new TodoSummaryDto
+        {
+            PendingApprovalClients = new TodoSectionDto<TodoClientItemDto> { Count = pendingClientsCount, Items = pendingClientsItems },
+            ProblematicTasks = new TodoSectionDto<TodoTaskItemDto> { Count = problematicTasksCount, Items = problematicTasksItems },
+            ReadyRestores = new TodoSectionDto<TodoRestoreItemDto> { Count = readyRestoresCount, Items = readyRestoresItems },
+            CriticalAlerts = new TodoSectionDto<AlertListItemDto> { Count = criticalAlertsCount, Items = criticalAlertsItems },
+            RecentAutoEnrollments = new TodoSectionDto<RecentAutoEnrollmentDto> { Count = recentEnrollmentsCount, Items = recentEnrollmentsItems }
         };
     }
 

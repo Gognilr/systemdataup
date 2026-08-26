@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
@@ -20,6 +20,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _statusItem;
     private readonly ToolStripMenuItem _refreshItem;
+    private readonly ToolStripMenuItem _startServiceItem;
+    private readonly ToolStripMenuItem _stopServiceItem;
     private readonly System.Windows.Forms.Timer _timer;
     private Icon? _currentIcon;
     private bool _refreshing;
@@ -37,12 +39,21 @@ internal sealed class TrayApplicationContext : ApplicationContext
         };
         _refreshItem = new ToolStripMenuItem("刷新状态", null, async (_, _) => await RefreshStatusAsync());
 
+        // 托盘此前只能"停止服务并退出"。停完之后托盘也没了，想再把服务起回来
+        // 只剩 services.msc 这一条路——而托盘的使用者恰恰是最不该被送去那里的人。
+        // 这两项按当前状态互斥显示：停着的时候只给"启动"，跑着的时候只给"停止"。
+        _startServiceItem = new ToolStripMenuItem("启动 Agent 服务", null, async (_, _) => await ToggleServiceAsync(start: true));
+        _stopServiceItem = new ToolStripMenuItem("停止 Agent 服务（托盘保留）", null, async (_, _) => await ToggleServiceAsync(start: false));
+
         var menu = new ContextMenuStrip();
         menu.Items.Add(new ToolStripMenuItem("BackupMonitor Agent") { Enabled = false });
         menu.Items.Add(_statusItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("打开服务端客户端页", null, (_, _) => OpenServerPage()));
         menu.Items.Add(_refreshItem);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(_startServiceItem);
+        menu.Items.Add(_stopServiceItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("正常退出并停止 Agent 服务", null, async (_, _) => await StopServiceAndExitAsync()));
         menu.Items.Add(new ToolStripMenuItem("退出托盘（服务继续运行）", null, (_, _) => ExitTrayOnly()));
@@ -90,6 +101,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _notifyIcon.Text = TruncateTooltip($"BackupMonitor Agent：{label}");
             ReplaceIcon(CreateStatusIcon(color));
             _refreshItem.Enabled = true;
+            UpdateServiceMenuItems(status);
         }
         catch (Exception ex)
         {
@@ -97,6 +109,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _notifyIcon.Text = TruncateTooltip($"BackupMonitor Agent：无法读取服务（{ex.Message}）");
             ReplaceIcon(CreateStatusIcon(Color.DarkGray));
             _refreshItem.Enabled = true;
+            // 读不到状态时两个都留着：让人还能试一把，好过把出路一起藏起来。
+            _startServiceItem.Visible = true;
+            _stopServiceItem.Visible = true;
         }
         finally
         {
@@ -233,6 +248,67 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    /// <summary>
+    /// 启停服务但不退出托盘。
+    ///
+    /// 托盘跑在登录用户身份下，通常没有操作服务的权限，所以拿不到权限时
+    /// 走一次 UAC 提权的 sc.exe——跟"停止并退出"用的是同一条兜底路径。
+    /// </summary>
+    private async Task ToggleServiceAsync(bool start)
+    {
+        if (!start)
+        {
+            var answer = MessageBox.Show(
+                "停止后这台机器将不再扫描、预检和上传备份，服务端会把它记为离线。托盘会继续保留，可以随时再启动。"
+                + Environment.NewLine + Environment.NewLine
+                + "确定要停止 Agent 服务吗？",
+                "停止 Agent 服务",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (answer != DialogResult.Yes)
+                return;
+        }
+
+        _startServiceItem.Enabled = false;
+        _stopServiceItem.Enabled = false;
+        try
+        {
+            await Task.Run(() => { if (start) StartService(); else StopService(); });
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+        {
+            if (!TryElevatedServiceControl(start ? "start" : "stop"))
+            {
+                MessageBox.Show(
+                    $"没有{(start ? "启动" : "停止")} Agent 服务的权限。请使用管理员身份操作。",
+                    "BackupMonitor Agent", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                $"Agent 服务未能{(start ? "启动" : "停止")}：{ex.Message}",
+                "BackupMonitor Agent", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            _startServiceItem.Enabled = true;
+            _stopServiceItem.Enabled = true;
+            await RefreshStatusAsync();
+        }
+    }
+
+    /// <summary>按当前状态决定给哪个入口：停着只给"启动"，跑着只给"停止"。</summary>
+    private void UpdateServiceMenuItems(ServiceControllerStatus status)
+    {
+        var running = status is ServiceControllerStatus.Running
+            or ServiceControllerStatus.StartPending
+            or ServiceControllerStatus.ContinuePending;
+        _startServiceItem.Visible = !running;
+        _stopServiceItem.Visible = running;
+    }
+
     private void StopService()
     {
         using var service = new ServiceController(_serviceName);
@@ -244,14 +320,27 @@ internal sealed class TrayApplicationContext : ApplicationContext
         service.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
     }
 
-    private bool TryElevatedStop()
+    private void StartService()
+    {
+        using var service = new ServiceController(_serviceName);
+        service.Refresh();
+        if (service.Status == ServiceControllerStatus.Running)
+            return;
+
+        service.Start();
+        service.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+    }
+
+    private bool TryElevatedStop() => TryElevatedServiceControl("stop");
+
+    private bool TryElevatedServiceControl(string verb)
     {
         try
         {
             using var process = Process.Start(new ProcessStartInfo
             {
                 FileName = Path.Combine(Environment.SystemDirectory, "sc.exe"),
-                Arguments = $"stop \"{_serviceName.Replace("\"", string.Empty)}\"",
+                Arguments = $"{verb} \"{_serviceName.Replace("\"", string.Empty)}\"",
                 UseShellExecute = true,
                 Verb = "runas",
                 WindowStyle = ProcessWindowStyle.Hidden

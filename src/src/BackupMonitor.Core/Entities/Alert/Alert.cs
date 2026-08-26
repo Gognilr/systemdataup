@@ -44,6 +44,11 @@ public class Alert
 
     public DateTime? AcknowledgedAt { get; set; }
 
+    /// <summary>指派给（功能说明书 8.18）</summary>
+    public Guid? AssignedTo { get; set; }
+
+    public DateTime? AssignedAt { get; set; }
+
     /// <summary>自动恢复时间</summary>
     public DateTime? RecoveredAt { get; set; }
 
@@ -61,5 +66,6 @@ public class Alert
     public Backup.BusinessUnit? BusinessUnit { get; set; }
     public Backup.BackupSet? BackupSet { get; set; }
     public Rbac.User? AcknowledgedByUser { get; set; }
+    public Rbac.User? AssignedToUser { get; set; }
     public ICollection<NotificationDelivery> Deliveries { get; set; } = [];
 }

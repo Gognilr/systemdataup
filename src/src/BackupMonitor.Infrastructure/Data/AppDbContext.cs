@@ -83,6 +83,7 @@ public class AppDbContext : DbContext
     #region 告警与审计
 
     public DbSet<Alert> Alerts => Set<Alert>();
+    public DbSet<AlertSilence> AlertSilences => Set<AlertSilence>();
     public DbSet<NotificationDelivery> NotificationDeliveries => Set<NotificationDelivery>();
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
 

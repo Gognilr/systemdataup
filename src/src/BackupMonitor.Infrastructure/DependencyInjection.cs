@@ -1,6 +1,7 @@
 using System.Threading.Channels;
 using BackupMonitor.Infrastructure.Security;
 using BackupMonitor.Infrastructure.Services;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -23,6 +24,23 @@ public static class DependencyInjection
         services.AddSingleton<SystemSettingsProvider>();
         services.AddScoped<PartitionMaintenanceService>();
 
+        // 整改批次 C · C1：密钥保护抽象，用于加密存储 SMTP 密码 / 企业微信/钉钉 webhook。
+        // 密钥环持久化目录：Turnkey 模式复用 LocalServerBootstrap 已建好并加了 ACL 的
+        // Server:DataDirectory；Secure/开发模式读 Security:DataProtection:KeyPath，
+        // 两者都未配置时退回程序目录下的 App_Data（仅用于本地开发，不建议生产使用）。
+        var dataProtectionKeyPath = FirstNonEmpty(
+            configuration["Server:DataDirectory"] is { Length: > 0 } dataDir ? Path.Combine(dataDir, "DataProtection-Keys") : null,
+            configuration["Security:DataProtection:KeyPath"],
+            Path.Combine(AppContext.BaseDirectory, "App_Data", "DataProtection-Keys"));
+        Directory.CreateDirectory(dataProtectionKeyPath);
+        services.AddDataProtection()
+            .PersistKeysToFileSystem(new DirectoryInfo(dataProtectionKeyPath))
+            .SetApplicationName("BackupMonitor");
+        services.AddSingleton<ISecretProtector, SecretProtector>();
+
+        // 整改批次 C · C4：令牌版本号缓存（60 秒 TTL），供 TokenVersionMiddleware 使用。
+        services.AddSingleton<TokenVersionCache>();
+
         // 请求级服务
         services.AddScoped<ICurrentContext, HttpContextCurrentContext>();
         services.AddScoped<IAuditRecorder, DbAuditRecorder>();
@@ -44,8 +62,10 @@ public static class DependencyInjection
         services.AddScoped<IUploadSessionService, UploadSessionService>();
 
         services.AddScoped<IClientAdminService, ClientAdminService>();
+        services.AddScoped<IMonitoredServiceAdminService, MonitoredServiceAdminService>();
         services.AddScoped<IRegistrationTokenService, RegistrationTokenService>();
         services.AddScoped<IBackupTaskService, BackupTaskService>();
+        services.AddScoped<IRecognizerWizardService, RecognizerWizardService>();
         services.AddScoped<IBatchOperationService, BatchOperationService>();
         services.AddScoped<IBackupSetService, BackupSetService>();
         services.AddScoped<IAlertService, AlertService>();
@@ -67,7 +87,12 @@ public static class DependencyInjection
         services.AddHostedService<NotificationDispatchWorker>();
         services.AddHostedService<RetentionCleanupWorker>();
         services.AddHostedService<PartitionMaintenanceWorker>();
+        services.AddHostedService<SystemWatchdogWorker>();
+        services.AddHostedService<MissedBackupWorker>();
 
         return services;
     }
+
+    private static string FirstNonEmpty(params string?[] values) =>
+        values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v))!;
 }

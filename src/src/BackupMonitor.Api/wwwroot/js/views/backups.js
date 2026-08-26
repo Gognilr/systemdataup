@@ -59,6 +59,11 @@ LOADERS.backups = async function () {
         }
         if (r.locked) b.push(`<button class="small" data-ui-action="act" data-view="backups" data-action="unlock" data-id="${esc(r.id)}">解锁</button>`);
         else if (r.status === 'available') b.push(`<button class="small" data-ui-action="act" data-view="backups" data-action="lock" data-id="${esc(r.id)}">锁定</button>`);
+        // D1：隔离——人工怀疑该版本有问题时的动作，不参与保留计算、不能用于恢复，但也不删除
+        if (r.status === 'available' || r.status === 'verification_failed')
+          b.push(`<button class="small danger" data-ui-action="act" data-view="backups" data-action="quarantine" data-id="${esc(r.id)}">隔离</button>`);
+        else if (r.status === 'quarantined')
+          b.push(`<button class="small primary" data-ui-action="act" data-view="backups" data-action="unquarantine" data-id="${esc(r.id)}">解除隔离</button>`);
         return b.join(' ') || '—';
       } }
     ], data.items, { empty }) + pagerHtml('backups', st);
@@ -85,6 +90,20 @@ ACTIONS['backups:verify'] = async id => {
   const d = await api(`/api/v1/admin/backups/${id}/verify`, { method: 'POST' });
   toast(`校验已开始（操作 ${d.operationId ? String(d.operationId).slice(0, 8) : ''}）`, 'ok'); LOADERS.backups();
 };
+ACTIONS['backups:quarantine'] = async id => {
+  formModal('隔离备份集', [
+    { name: 'reason', label: '隔离原因', type: 'text', required: true,
+      placeholder: '如：校验通过但怀疑数据被截断，待人工核实' }
+  ], async v => {
+    await api(`/api/v1/admin/backups/${id}/quarantine`, { method: 'POST', body: { reason: v.reason } });
+    toast('备份集已隔离', 'ok'); LOADERS.backups();
+  }, '隔离');
+};
+ACTIONS['backups:unquarantine'] = async id => {
+  if (!await confirmModal('解除该备份集的隔离，恢复为可用状态？')) return;
+  await api(`/api/v1/admin/backups/${id}/unquarantine`, { method: 'POST' });
+  toast('已解除隔离', 'ok'); LOADERS.backups();
+};
 ACTIONS['backups:restore'] = async id => createRestore(id);
 function createRestore(backupSetId) {
   formModal('创建恢复请求', [
@@ -108,6 +127,9 @@ export async function vBackupDetail(id) {
       <button data-ui-action="act" data-view="backups" data-action="verify" data-id="${esc(d.id)}">重新校验</button>` : ''}
       ${d.locked ? `<button data-ui-action="act" data-view="backups" data-action="unlock" data-id="${esc(d.id)}">解锁</button>`
         : (d.status === 'available' ? `<button data-ui-action="act" data-view="backups" data-action="lock" data-id="${esc(d.id)}">锁定</button>` : '')}
+      ${d.status === 'available' || d.status === 'verification_failed'
+        ? `<button class="danger" data-ui-action="act" data-view="backups" data-action="quarantine" data-id="${esc(d.id)}">隔离</button>`
+        : (d.status === 'quarantined' ? `<button class="primary" data-ui-action="act" data-view="backups" data-action="unquarantine" data-id="${esc(d.id)}">解除隔离</button>` : '')}
     </div>
     <div class="card"><b class="mono">${esc(d.backupSetCode)}</b> ${status('backup_set_status', d.status)}
       ${d.locked ? '<span class="status status--wait pill">已锁定</span>' : ''}

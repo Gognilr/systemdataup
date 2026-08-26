@@ -1,11 +1,16 @@
-/* js/views/todo.js —— 待办聚合：把需要人做决定的事项放到一个入口 */
+/* js/views/todo.js —— 待办聚合：把需要人做决定的事项放到一个入口
+   B5 中期方案：改用服务端聚合端点 GET /api/v1/admin/reports/todo-summary。
+   此前拉 backup-tasks?pageSize=200 再在浏览器里过滤，PagedQuery.MaxPageSize=200
+   是硬上限——超过 200 个任务时待办会静默漏掉后面的。服务端聚合用 CountAsync 得出计数，
+   不受分页影响；"哪些任务算有问题"的判定也一并搬到服务端（BackupTaskService.OkPrecheckStatuses），
+   不再有浏览器/服务端两份规则。 */
 import { api } from '../api.js';
-import { App, LOADERS } from '../state.js';
-import { $, esc, status, relTime, emptyState, toast } from '../ui.js';
+import { LOADERS } from '../state.js';
+import { $, esc, L, relTime, emptyState } from '../ui.js';
 import { shell, loading } from '../app.js';
 
-const list = data => data?.items || [];
-const ageHours = value => value ? (Date.now() - new Date(value).getTime()) / 3600000 : Infinity;
+const items = section => section?.items || [];
+const count = section => section?.count ?? 0;
 
 function todoItem(icon, type, title, detail, actionText, action) {
   const attrs = action.kind === 'navigate'
@@ -21,47 +26,43 @@ export async function vTodo() {
 
 LOADERS.todo = async function () {
   const wrap = $('#todoWrap'); if (!wrap) return;
-  const errors = [];
-  const read = async (path, fallback) => { try { return await api(path); } catch (e) { errors.push(e); return fallback; } };
-  const [pendingClients, tasksData, readyRestores, criticalAlerts, recentAutoData] = await Promise.all([
-    read('/api/v1/admin/clients?status=pending_approval&page=1&pageSize=100', { items: [] }),
-    read('/api/v1/admin/backup-tasks?page=1&pageSize=200', { items: [] }),
-    read('/api/v1/admin/restore-requests?status=ready&page=1&pageSize=100', { items: [] }),
-    read('/api/v1/admin/alerts?level=critical&status=open&page=1&pageSize=100', { items: [] }),
-    read('/api/v1/admin/clients/recent-auto-enrollments?days=7&limit=20', [])
-  ]);
-  const clients = list(pendingClients);
-  const restores = list(readyRestores);
-  const alerts = list(criticalAlerts);
-  const recentAutoEnrollments = Array.isArray(recentAutoData) ? recentAutoData : [];
-  const failedTasks = list(tasksData).filter(t => t.enabled && (
-    ['failed', 'failure', 'error'].includes(String(t.lastPrecheckStatus || '').toLowerCase()) ||
-    (t.lastScanAt && ageHours(t.lastScanAt) > 24 && ageHours(t.lastSuccessAt) > 72)
-  ));
-  // P2-12：recentAutoEnrollments 会被渲染进列表，却没算进计数，
-  // 于是顶部横幅显示「没有待处理事项」，下方却列着若干条。
-  const count = clients.length + failedTasks.length + restores.length + alerts.length + recentAutoEnrollments.length;
+  let summary;
+  try {
+    summary = await api('/api/v1/admin/reports/todo-summary');
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+    return;
+  }
+
+  const clients = items(summary.pendingApprovalClients);
+  const problematicTasks = items(summary.problematicTasks);
+  const restores = items(summary.readyRestores);
+  const alertsCount = count(summary.criticalAlerts);
+  const recentAutoEnrollments = items(summary.recentAutoEnrollments);
+
+  // 各分组计数一律用服务端 count（不受 preview items 截断影响），
+  // 之前 recentAutoEnrollments 渲染进列表却没算进总数导致横幅显示矛盾（P2-12）的问题
+  // 服务端聚合天然不会再发生：每一段都是"count + 同一批 items"。
+  const totalCount = count(summary.pendingApprovalClients) + count(summary.problematicTasks)
+    + count(summary.readyRestores) + alertsCount + count(summary.recentAutoEnrollments);
   const checkedAt = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
   const parts = [];
-    if (clients.length) parts.push(todoItem('○', 'wait', `${clients.length} 台客户端等待审批`, '注册请求已经进入管理端，审批后才会签发 mTLS 证书。', '去审批', { kind: 'navigate', hash: '#/clients' }));
+  if (clients.length) parts.push(todoItem('○', 'wait', `${count(summary.pendingApprovalClients)} 台客户端等待审批`, '注册请求已经进入管理端，审批后才会签发 mTLS 证书。', '去审批', { kind: 'navigate', hash: '#/clients' }));
   for (const client of recentAutoEnrollments) {
         parts.push(todoItem('○', 'info', `最近自动登记：${esc(client.hostname)}`, `${esc(client.displayName || '')} · 登记：${relTime(client.createdAt)} · 最近心跳：${relTime(client.lastHeartbeatAt)}`, '查看', { kind: 'navigate', hash: `#/clients/${client.id}` }));
   }
-  for (const task of failedTasks.slice(0, 20)) {
-        const reason = task.lastPrecheckStatus ? `最近预检：${esc(task.lastPrecheckStatus)}` : `最近成功：${relTime(task.lastSuccessAt)}`;
+  for (const task of problematicTasks) {
+        const reason = task.lastPrecheckStatus ? `最近预检：${esc(L.precheck[task.lastPrecheckStatus] || task.lastPrecheckStatus)}` : `最近成功：${relTime(task.lastSuccessAt)}`;
         parts.push(todoItem('▲', 'danger', `任务「${esc(task.name)}」需要检查`, `${esc(task.clientHostname || '')} · ${reason}`, '查看', { kind: 'navigate', hash: `#/tasks/${task.id}` }));
   }
-  for (const restore of restores.slice(0, 20)) {
+  if (count(summary.problematicTasks) > problematicTasks.length) {
+        parts.push(todoItem('▲', 'danger', `还有 ${count(summary.problematicTasks) - problematicTasks.length} 个任务需要检查`, '这里只显示最近的一批，其余请到任务列表查看。', '查看全部', { kind: 'navigate', hash: '#/tasks' }));
+  }
+  for (const restore of restores) {
         parts.push(todoItem('○', 'wait', `恢复请求 ${esc(restore.backupSetCode || String(restore.id).slice(0, 8))} 等待签发`, `请求人：${esc(restore.requestedByName || '—')} · ${relTime(restore.requestedAt)}`, '签发', { kind: 'act', view: 'restores', name: 'token', id: restore.id, afterLoader: 'todo' }));
   }
-  if (alerts.length) {
-        parts.push(todoItem('▲', 'danger', `${alerts.length} 条严重告警未确认`, '严重告警需要先确认，再进入处理流程。', '去确认', { kind: 'navigate', hash: '#/alerts' }));
+  if (alertsCount) {
+        parts.push(todoItem('▲', 'danger', `${alertsCount} 条严重告警未确认`, '严重告警需要先确认，再进入处理流程。', '去确认', { kind: 'navigate', hash: '#/alerts' }));
   }
-    const note = errors.length ? '<div class="notice warning">部分事项因当前账号权限不可见；已显示可读取范围内的待办。</div>' : '';
-    wrap.innerHTML = `<div class="todo-toolbar"><div><h2>待办</h2><p class="text-muted">把等待决定的事项集中在这里，处理后会从队列移除。</p></div><button data-ui-action="loader" data-loader="todo">重新检查</button></div>${note}<div class="todo-summary ${count ? 'has-work' : 'is-clear'}"><span class="todo-summary-icon" aria-hidden="true">${count ? '!' : '✓'}</span><strong>${count ? `${count} 项需要处理` : '没有待处理事项'}</strong><span>最后检查 ${checkedAt}</span></div><section class="todo-list" aria-label="待办事项">${parts.join('') || emptyState('ok', { title: '没有待处理事项', sub: `最后检查 ${checkedAt}` })}</section>`;
+    wrap.innerHTML = `<div class="todo-toolbar"><div><h2>待办</h2><p class="text-muted">把等待决定的事项集中在这里，处理后会从队列移除。</p></div><button data-ui-action="loader" data-loader="todo">重新检查</button></div><div class="todo-summary ${totalCount ? 'has-work' : 'is-clear'}"><span class="todo-summary-icon" aria-hidden="true">${totalCount ? '!' : '✓'}</span><strong>${totalCount ? `${totalCount} 项需要处理` : '没有待处理事项'}</strong><span>最后检查 ${checkedAt}</span></div><section class="todo-list" aria-label="待办事项">${parts.join('') || emptyState('ok', { title: '没有待处理事项', sub: `最后检查 ${checkedAt}` })}</section>`;
 };
-
-
-
-
-

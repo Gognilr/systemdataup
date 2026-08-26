@@ -10,7 +10,7 @@ public class BackupQuery : PagedQuery
     public Guid? BusinessUnitId { get; set; }
     public string? ApplicationName { get; set; }
 
-    /// <summary>verifying / available / verification_failed / quarantined / retention_pending / recycle_bin</summary>
+    /// <summary>verifying / available / verification_failed / quarantined / recycle_bin / deleted</summary>
     public string? Status { get; set; }
 
     public DateTime? From { get; set; }
@@ -90,6 +90,12 @@ public class LockBackupRequest
 
     /// <summary>锁到期时间（null 表示永久）</summary>
     public DateTime? ExpiresAt { get; set; }
+}
+
+/// <summary>隔离备份请求（D1）</summary>
+public class QuarantineBackupRequest
+{
+    public string Reason { get; set; } = null!;
 }
 
 /// <summary>重新校验响应（设计书 18.6，异步）</summary>

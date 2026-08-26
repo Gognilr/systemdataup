@@ -41,7 +41,8 @@ public sealed class MigrationRunnerTests
             Assert.True(await reader.ReadAsync());
             Assert.Equal(expectedChecksum, reader.GetString(0));
             Assert.False(reader.IsDBNull(1));
-            Assert.True(reader.GetBoolean(2));
+            // V017 清除了 V005 打上的强制改密标志：口令是安装时人工设的。
+            Assert.False(reader.GetBoolean(2));
         }
 
         await new MigrationRunner().ApplyAsync(

@@ -168,6 +168,12 @@ public class AgentHeartbeatService : IAgentHeartbeatService
         committed = true;
 
         // 告警/通知是旁路副作用，放在快照事务提交后，避免告警去重冲突使心跳事务进入 aborted 状态。
+
+        // 心跳到达即证明客户端还活着：无条件恢复 SystemWatchdogWorker 可能挂起的离线告警。
+        // 不判断「刚才是不是 Offline」——巡检把状态改成 Offline 与心跳落库之间存在竞态，
+        // 恢复一条本就不存在的告警是幂等空操作，漏恢复一条却会让告警中心留下永久红点。
+        await _alerting.RecoverAsync($"client:{client.Id}:offline", ct);
+
         foreach (var alert in serviceAlerts)
         {
             if (alert.Raise)

@@ -1,4 +1,5 @@
 using BackupMonitor.Infrastructure.Services;
+using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.AspNetCore.Authorization;
@@ -27,12 +28,16 @@ public class AdminNotificationController : ApiBaseController
         return OkData(result);
     }
 
-    /// <summary>查询通知渠道配置</summary>
+    /// <summary>
+    /// 查询通知渠道配置。
+    /// 整改批次 C · C1：走 GetSettingsForDisplayAsync，凭据字段（SMTP 密码 / webhook 地址）
+    /// 一律掩码返回，响应体里搜不到明文。
+    /// </summary>
     [HttpGet("notification-settings")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:system.manage")]
     public async Task<ActionResult<ApiResponse<NotificationSettingsDto>>> GetSettings(CancellationToken ct)
     {
-        var result = await _notificationService.GetSettingsAsync(ct);
+        var result = await _notificationService.GetSettingsForDisplayAsync(ct);
         return OkData(result);
     }
 
@@ -44,5 +49,44 @@ public class AdminNotificationController : ApiBaseController
     {
         var result = await _notificationService.UpdateSettingsAsync(request, ct);
         return OkData(result, "通知渠道配置已保存");
+    }
+
+    /// <summary>
+    /// 整改批次 C · C2：发送测试邮件。用当前表单里的配置试发一封，
+    /// 把 SMTP 服务器返回的错误原样带回界面（如 535 Authentication failed），
+    /// 不必等到真实告警发送失败才发现配置错了。
+    /// </summary>
+    [HttpPost("notification-settings/test")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:system.manage")]
+    public async Task<ActionResult<ApiResponse>> SendTestEmail(
+        [FromBody] NotificationTestEmailRequest request, CancellationToken ct)
+    {
+        var email = request.Email;
+
+        // 表单里的密码框可能仍是掩码（用户没有重新输入密码），换成库中当前保存的明文密码
+        if (email.SmtpPassword == NotificationSecretMask.Unchanged)
+        {
+            var current = await _notificationService.GetSettingsAsync(ct);
+            email.SmtpPassword = current.Email.SmtpPassword;
+        }
+
+        var recipient = string.IsNullOrWhiteSpace(request.Recipient)
+            ? email.Recipients.FirstOrDefault(r => !string.IsNullOrWhiteSpace(r))
+            : request.Recipient;
+
+        if (string.IsNullOrWhiteSpace(recipient))
+            throw new ValidationFailedException("请指定测试收件人，或先在收件人列表里填一个邮箱地址");
+
+        try
+        {
+            await NotificationDispatchWorker.SendTestEmailAsync(email, recipient, ct);
+        }
+        catch (Exception ex)
+        {
+            // SMTP 服务器返回的原始错误原样带回界面，不做二次包装
+            throw new BusinessException("SMTP_TEST_FAILED", ex.Message, 400);
+        }
+
+        return OkMessage($"测试邮件已发送至 {recipient}");
     }
 }

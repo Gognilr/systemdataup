@@ -23,7 +23,7 @@ public class LoginResponse
 
     public CurrentUserDto User { get; set; } = null!;
 
-    /// <summary>是否必须立即修改口令（初始管理员首次登录为 true，OPEN-ISSUES #2）</summary>
+    /// <summary>是否必须立即修改口令（仅当口令由系统代设时为 true；安装器设的初始管理员口令不置位，见 V017）</summary>
     public bool MustChangePassword { get; set; }
 
     /// <summary>

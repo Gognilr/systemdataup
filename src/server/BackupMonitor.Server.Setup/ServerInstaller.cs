@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Security.Principal;
 using System.Text.Json;
 using BackupMonitor.Api.Bootstrap;
+using BackupMonitor.Infrastructure.Common;
 using Microsoft.Extensions.Configuration;
 using Npgsql;
 
@@ -169,8 +170,15 @@ internal sealed class ServerInstaller
     {
         if (firstInstall && string.IsNullOrWhiteSpace(request.AdminPassword))
             throw new InvalidOperationException("首次安装必须设置管理员密码。");
-        if (!string.IsNullOrWhiteSpace(request.AdminPassword) && request.AdminPassword.Length < 12)
-            throw new InvalidOperationException("管理员密码至少需要 12 个字符。");
+        // 与 Web 端自助改密、维护面板的重置口令共用 PasswordPolicy。
+        // 原来这里只判长度，"aaaaaaaaaaaa" 能作为初始管理员口令装进去，
+        // 而同一个口令在 Web 端改密时会被拒——三条设置口令的路径必须同一套规则。
+        if (!string.IsNullOrWhiteSpace(request.AdminPassword))
+        {
+            var strengthError = PasswordPolicy.Validate(request.AdminPassword, "admin");
+            if (strengthError is not null)
+                throw new InvalidOperationException(strengthError.Replace("新口令", "管理员密码"));
+        }
         if (!firstInstall && !string.IsNullOrWhiteSpace(request.AdminPassword))
             throw new InvalidOperationException("升级/修复不会修改管理员密码；请使用“重置管理员密码”维护操作。");
         if (request.ApiPort is < 1024 or > 65535 || request.PostgresPort is < 1024 or > 65535)

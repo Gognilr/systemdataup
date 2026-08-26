@@ -1,4 +1,4 @@
-using BackupMonitor.Infrastructure.Services;
+﻿using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.AspNetCore.Authorization;
@@ -46,6 +46,20 @@ public class AdminClientController : ApiBaseController
         return OkData(result);
     }
 
+    /// <summary>
+    /// 概览页用的在线客户端资源快照。
+    /// 单独一个接口而不是给列表接口加参数：列表按分页/排序/筛选组织，
+    /// 而这里要的是"最需要关注的排在最前"的固定视角。
+    /// </summary>
+    [HttpGet("resource-overview")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.read")]
+    public async Task<ActionResult<ApiResponse<IReadOnlyList<ClientResourceRowDto>>>> ResourceOverview(
+        [FromQuery] int limit = 50, CancellationToken ct = default)
+    {
+        var result = await _clientService.GetResourceOverviewAsync(limit, ct);
+        return OkData(result);
+    }
+
     /// <summary>客户端资源指标历史（默认最近 24 小时）</summary>
     [HttpGet("{clientId:guid}/metrics")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.read")]
@@ -86,6 +100,16 @@ public class AdminClientController : ApiBaseController
     {
         await _clientService.DisableAsync(clientId, request, ct);
         return OkMessage("客户端已禁用");
+    }
+
+    /// <summary>重新启用被禁用的客户端（禁用的逆操作；已注销不可恢复）</summary>
+    [HttpPost("{clientId:guid}/enable")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.manage")]
+    public async Task<ActionResult<ApiResponse>> Enable(
+        Guid clientId, [FromBody] EnableClientRequest request, CancellationToken ct)
+    {
+        await _clientService.EnableAsync(clientId, request, ct);
+        return OkMessage("客户端已启用");
     }
 
     /// <summary>注销客户端（15.5，吊销全部证书，不可恢复）</summary>

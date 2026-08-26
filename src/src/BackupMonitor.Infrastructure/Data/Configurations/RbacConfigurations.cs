@@ -27,6 +27,10 @@ public class UserConfiguration : IEntityTypeConfiguration<User>
         // 否则改密成功后显式写 false 会被 EF 视为"未设置"而从 UPDATE 中省略，标志永远清不掉。
         builder.Property(e => e.MustChangePassword).HasColumnName("must_change_password");
         builder.Property(e => e.MfaEnabled).HasColumnName("mfa_enabled").HasDefaultValue(false);
+        // 整改批次 C · C4：不配置 HasDefaultValue(0)——0 恰为 CLR 默认值，写显式 0（如登出/改密后
+        // 端外把它重置为 0 的极端场景）会被 EF 当成"未设置"从 UPDATE 中省略，与上面 MustChangePassword
+        // 同样的哨兵值教训。TokenVersion 只会递增，不会写回 0，这里仍按同一原则处理以防万一。
+        builder.Property(e => e.TokenVersion).HasColumnName("token_version");
         builder.Property(e => e.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("now()").ValueGeneratedOnAdd();
         builder.Property(e => e.UpdatedAt).HasColumnName("updated_at").HasDefaultValueSql("now()").ValueGeneratedOnAddOrUpdate();
         builder.Property(e => e.RowVersion).HasColumnName("row_version").HasDefaultValue(1L).IsConcurrencyToken();

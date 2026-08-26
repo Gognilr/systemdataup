@@ -1,4 +1,4 @@
-namespace BackupMonitor.Agent;
+﻿namespace BackupMonitor.Agent;
 
 public sealed class AgentOptions
 {
@@ -14,13 +14,34 @@ public sealed class AgentOptions
     public bool AllowUnsignedCommands { get; set; }
     public string? DisplayName { get; set; }
     public string DataDirectory { get; set; } = "%ProgramData%\\BackupMonitor\\Agent";
-    public string AgentVersion { get; set; } = "1.0.0";
+    public string AgentVersion { get; set; } = "1.1.0";
     public int HeartbeatIntervalSeconds { get; set; } = 60;
     public int CommandPollIntervalSeconds { get; set; } = 10;
     public bool AllowInsecureTls { get; set; }
     /// <summary>状态目录 ACL 开关；生产默认启用，仅测试可显式关闭。</summary>
     public bool EnforceAcl { get; set; } = true;
     public int MaxUploadRetries { get; set; } = 3;
+
+    /// <summary>本地文件日志保留天数。出问题的机器常在客户现场，日志得留得住又不能撑爆磁盘。</summary>
+    public int LogRetentionDays { get; set; } = 14;
+
+    /// <summary>
+    /// 允许被 browse_path 指令浏览的根路径白名单。
+    ///
+    /// 留空表示"本机全部固定磁盘"——这是默认值，因为备份目录可能在任何盘上，
+    /// 而管理员本来就有权给这台机器建指向任意路径的备份任务。
+    /// 高安全环境可以收紧到具体几个目录，届时 Agent 只允许浏览这些目录及其子目录。
+    /// </summary>
+    public string[] BrowseRoots { get; set; } = [];
+
+    /// <summary>browse_path 单次最多返回的条目数上限（指令参数再大也不超过它）。</summary>
+    public int BrowseMaxEntries { get; set; } = 20000;
+
+    /// <summary>browse_path 单次最大抓取深度上限。</summary>
+    public int BrowseMaxDepth { get; set; } = 6;
+
+    /// <summary>browse_path 单次枚举的时间上限（秒）。超时按截断处理，而不是让指令一直挂着。</summary>
+    public int BrowseTimeoutSeconds { get; set; } = 30;
 
     public string ExpandedDataDirectory =>
         Path.GetFullPath(Environment.ExpandEnvironmentVariables(DataDirectory));

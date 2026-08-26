@@ -85,6 +85,12 @@ public class AlertingService : IAlertingService
                 .OrderByDescending(a => a.LastOccurredAt)
                 .FirstOrDefaultAsync(ct);
 
+            // 静默命中：维护窗口内一台机器持续产生告警时，只累加次数，
+            // 不发通知、不推送 Agent 托盘——但告警本身仍要建/仍要计数，
+            // 这样静默解除或到期后，历史发生次数是完整的（验收标准：计数在静默期内仍在累加）。
+            var silenced = await _db.AlertSilences
+                .AnyAsync(s => s.Until > now && EF.Functions.Like(alertKey, s.AlertKeyPattern), ct);
+
             if (existing is not null)
             {
                 existing.LastOccurredAt = now;
@@ -115,28 +121,35 @@ public class AlertingService : IAlertingService
                 };
                 _db.Alerts.Add(alert);
 
-                // 新告警按渠道配置落待发送通知记录（第二批补充设计；实际发送由发送器实现）
-                await CreateDeliveriesForAsync(alert, ct);
-
-                // Agent 只接收新告警，活动告警后续心跳仅更新次数，不重复弹窗。
-                if (clientId is not null)
+                if (!silenced)
                 {
-                    var severity = level switch
+                    // 新告警按渠道配置落待发送通知记录（第二批补充设计；实际发送由发送器实现）
+                    await CreateDeliveriesForAsync(alert, ct);
+
+                    // Agent 只接收新告警，活动告警后续心跳仅更新次数，不重复弹窗。
+                    if (clientId is not null)
                     {
-                        AlertLevel.Critical => "critical",
-                        AlertLevel.Warning => "warning",
-                        _ => "info"
-                    };
-                    await _agentNotifications.EnqueueAsync(
-                        clientId.Value,
-                        "alert",
-                        severity,
-                        title,
-                        message,
-                        $"alert:{alert.Id}:opened",
-                        alert.Id,
-                        backupSetId,
-                        ct);
+                        var severity = level switch
+                        {
+                            AlertLevel.Critical => "critical",
+                            AlertLevel.Warning => "warning",
+                            _ => "info"
+                        };
+                        await _agentNotifications.EnqueueAsync(
+                            clientId.Value,
+                            "alert",
+                            severity,
+                            title,
+                            message,
+                            $"alert:{alert.Id}:opened",
+                            alert.Id,
+                            backupSetId,
+                            ct);
+                    }
+                }
+                else
+                {
+                    _logger.LogDebug("告警 {AlertKey} 命中静默规则，已建告警但不发通知/不推送托盘", alertKey);
                 }
             }
 
@@ -157,7 +170,15 @@ public class AlertingService : IAlertingService
     {
         try
         {
+            // D2：心跳每次「一切正常」都会调一次 RecoverAsync，绝大多数情况下根本没有活动告警可恢复。
+            // 先做一次存在性判断（alert_key 上有索引，AnyAsync 是一次索引探测），
+            // 没有活动告警就直接返回，省掉一条无谓的 UPDATE（不产生 WAL）。
             var now = DateTime.UtcNow;
+            var hasActive = await _db.Alerts
+                .AnyAsync(a => a.AlertKey == alertKey && ActiveStatuses.Contains(a.Status), ct);
+            if (!hasActive)
+                return;
+
             await _db.Alerts
                 .Where(a => a.AlertKey == alertKey && ActiveStatuses.Contains(a.Status))
                 .ExecuteUpdateAsync(s => s

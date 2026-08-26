@@ -113,6 +113,14 @@ pre.json{background:var(--surface-sunk);border:1px solid var(--border);border-ra
 .chkgrid label{display:flex;align-items:center;gap:var(--s-1);font:var(--t-body);padding:0 var(--s-1)}
 .chkgrid input{width:auto}
 
+/* 扫描计划组合控件：频率决定后面出现哪几个选择器，所以这一行要能换行，
+   不能让「每周」多出来的星期选择把时间选择器挤出可视区。 */
+.cronfield{display:block}
+.cronrow{display:flex;flex-wrap:wrap;gap:var(--s-2);align-items:center}
+.cronrow>select,.cronrow>input{width:auto;min-width:120px;flex:0 1 auto}
+.cronrow>[data-cron-raw]{flex:1 1 200px;min-width:160px}
+.cronrow>[hidden]{display:none}
+
 /* ── P3 信息架构：通知双 Tab / 待办队列 / 轻量提示 ── */
 .text-muted,.tip{color:var(--text-muted);font:var(--t-sm)}
 .text-error{color:var(--err-fg)}
@@ -306,3 +314,84 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 .onboarding-card h2,.onboarding-card h3{margin-top:0}
 .onboarding-steps{grid-template-columns:1fr}
 }
+
+/* ── 建任务向导（目录浏览 / 结构推断 / 规则预演） ──
+   .hint 此前只在 .frow 内有样式，而全站大量在表单外直接用它做辅助说明，
+   那些地方一律按正文字号渲染，"辅助"这层信息层级根本没建立起来。 */
+.hint{font:var(--t-sm);color:var(--text-muted)}
+.frow .hint{margin-top:var(--s-1)}
+
+.dirbar{display:flex;align-items:center;gap:var(--s-2);margin-bottom:var(--s-2);flex-wrap:wrap}
+.dirpath{font-family:var(--font-mono);font-size:12px;background:var(--surface-sunk);
+  border:1px solid var(--border);border-radius:var(--r-md);padding:2px var(--s-2);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+
+.dirtree{border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface);
+  max-height:44vh;overflow:auto;padding:var(--s-1) 0}
+.dnode{display:flex;align-items:center;gap:var(--s-1);min-height:28px;
+  padding:0 var(--s-2) 0 calc(var(--s-2) + var(--lvl,0) * 18px)}
+.dnode:hover{background:var(--surface-sunk)}
+.dnode.is-picked{background:var(--accent-weak);box-shadow:inset 2px 0 0 var(--accent)}
+.dnode.is-root{border-bottom:1px solid var(--border);margin-bottom:var(--s-1);padding-bottom:var(--s-1)}
+.dtoggle{width:20px;min-width:20px;height:20px;padding:0;border:0;background:none;
+  color:var(--text-muted);display:inline-flex;align-items:center;justify-content:center}
+.dtoggle:hover{background:none;color:var(--text)}
+.dname{flex:1;min-width:0;text-align:left;border:0;background:none;padding:2px 0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dname:hover{background:none;text-decoration:underline}
+.dname small{color:var(--text-muted);margin-left:var(--s-1)}
+.dname.is-file{color:var(--text-muted);cursor:default}
+.dname.is-file:hover{text-decoration:none}
+.dmeta{font:var(--t-sm);color:var(--text-muted);white-space:nowrap}
+.dwarn{font:var(--t-sm);color:var(--err);font-weight:600}
+.dirsel{flex:1;font:var(--t-sm);color:var(--text-muted);text-align:left;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.modal .mfoot .dirsel{margin-right:auto}
+
+/* 结论块：一句人话摆在最显眼处，依据紧随其后。
+   只给结论人无法判断对错，"确认"就退化成盲点头。 */
+.wiz-verdict{background:var(--accent-weak);border:1px solid var(--accent);
+  border-radius:var(--r-md);padding:var(--s-3) var(--s-4);margin-bottom:var(--s-4)}
+.wiz-title{font:600 var(--t-sm);color:var(--text-muted);margin-bottom:var(--s-1)}
+.wiz-summary{font:600 var(--t-lg);line-height:1.6;margin:0 0 var(--s-2)}
+.evidence{margin:0;padding-left:18px;color:var(--text-muted);font:var(--t-sm);line-height:1.8}
+
+.filepick{display:flex;flex-direction:column;gap:var(--s-1)}
+.filepick__item{display:flex;align-items:center;gap:var(--s-2);padding:var(--s-1) var(--s-2);
+  border:1px solid var(--border);border-radius:var(--r-md);cursor:pointer}
+.filepick__item:hover{background:var(--surface-sunk)}
+.filepick__item input{width:auto;margin:0}
+.filepick__name{font-family:var(--font-mono);font-size:12px;flex:1;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.filepick__meta{font:var(--t-sm);color:var(--text-muted);white-space:nowrap}
+
+.pvunit{border:1px solid var(--border);border-radius:var(--r-md);padding:var(--s-2) var(--s-3);
+  margin-bottom:var(--s-2)}
+.pvunit.is-bad{border-color:var(--err-bd)}
+.pvunit__head{display:flex;align-items:center;gap:var(--s-2);flex-wrap:wrap}
+.pvfiles{list-style:none;margin:var(--s-1) 0 0;padding:0;font-family:var(--font-mono);font-size:12px}
+.pvfiles li{display:flex;align-items:center;gap:var(--s-2);padding:1px 0;color:var(--text-muted)}
+.pvfiles li.is-required{color:var(--text)}
+.tagreq{font-family:var(--font-sans);font-size:11px;color:var(--accent);
+  border:1px solid var(--accent);border-radius:var(--r-sm);padding:0 4px}
+[data-preview].is-stale{opacity:.5;transition:opacity var(--dur-fast) var(--ease)}
+
+/* 结构化识别规则里的 JSON 实时预览：会看的人能核对，不会看的人不用碰。 */
+.cfgpreview{background:var(--surface-sunk);border:1px solid var(--border);border-radius:var(--r-md);
+  padding:var(--s-2);font-family:var(--font-mono);font-size:12px;white-space:pre-wrap;
+  word-break:break-all;max-height:180px;overflow:auto;margin:0}
+.cfgwarn{color:var(--err);font-weight:600}
+
+/* ── 关键 Windows 服务选择器 ──
+   从机器上真实安装的服务里挑，而不是凭记忆敲 MSSQL$SQLEXPRESS 这种名字。 */
+.svclist{border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface);
+  max-height:46vh;overflow:auto;margin-top:var(--s-2)}
+.svcrow{display:flex;align-items:center;gap:var(--s-3);padding:var(--s-2) var(--s-3);
+  border-bottom:1px solid var(--border);cursor:pointer}
+.svcrow:last-child{border-bottom:0}
+.svcrow:hover{background:var(--surface-sunk)}
+.svcrow.is-monitored{opacity:.55;cursor:default}
+.svcrow.is-monitored:hover{background:none}
+.svcrow__main{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+.svcrow__main b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.svcrow__main .sub{font:var(--t-sm);color:var(--text-muted)}

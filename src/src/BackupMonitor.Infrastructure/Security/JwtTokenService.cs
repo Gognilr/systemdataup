@@ -61,6 +61,12 @@ public static class JwtClaimTypes
 
     /// <summary>客户端证书认证方案写入的主机名 claim</summary>
     public const string ClientHostname = "client_hostname";
+
+    /// <summary>
+    /// 整改批次 C · C4：令牌版本号。签发时写入 users.token_version 的快照，
+    /// TokenVersionMiddleware 拿它跟库中当前值比对（60 秒缓存），不一致即视为令牌已被撤销。
+    /// </summary>
+    public const string TokenVersion = "tv";
 }
 
 /// <summary>管理员访问令牌签发服务</summary>
@@ -86,7 +92,8 @@ public class JwtTokenService
             new(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
             new(JwtRegisteredClaimNames.Iat, new DateTimeOffset(now).ToUnixTimeSeconds().ToString(), ClaimValueTypes.Integer64),
             new(JwtClaimTypes.Username, user.Username),
-            new(JwtClaimTypes.DisplayName, user.DisplayName)
+            new(JwtClaimTypes.DisplayName, user.DisplayName),
+            new(JwtClaimTypes.TokenVersion, user.TokenVersion.ToString(), ClaimValueTypes.Integer32)
         };
 
         // 强制改密状态必须随令牌下发，否则服务端无从判断（OPEN-ISSUES #2）。

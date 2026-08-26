@@ -26,6 +26,33 @@ public sealed class AgentState
     /// <summary>按任务 ID 记录扫描计划的排期状态；键为 taskId 的字符串形式。</summary>
     public Dictionary<string, ScheduledScanState> ScheduledScans { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// still_changing 的跨主循环轮次重试记录；键为 BackupScanResult.CandidateKey。
+    /// 见 AgentWorker.SubmitScansWithRestabilizeAsync / RetryPendingRestabilizeScansAsync：
+    /// 等待预算（maxStabilityWaitSeconds）就是靠这份记录跨越多轮主循环兑现的，
+    /// 不能在主循环里同步 sleep，否则心跳会停摆。
+    /// </summary>
+    public Dictionary<string, RestabilizeEntry> PendingRestabilizeScans { get; set; } =
+        new(StringComparer.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// 单条 still_changing 结果的重试记录。FirstAttemptAtUtc 用来判断是否已经超出
+/// maxStabilityWaitSeconds 预算，NextRetryAtUtc 用来判断本轮主循环是否该重新扫描。
+/// </summary>
+public sealed class RestabilizeEntry
+{
+    public Guid TaskId { get; set; }
+
+    /// <summary>触发这次扫描的指令 ID；计划扫描（无指令触发）为 null。</summary>
+    public Guid? CommandId { get; set; }
+
+    public DateTime FirstAttemptAtUtc { get; set; }
+
+    public DateTime NextRetryAtUtc { get; set; }
+
+    public int AttemptCount { get; set; }
 }
 
 /// <summary>
@@ -146,6 +173,25 @@ public sealed class AgentStateStore
         }
     }
 
+    /// <summary>
+    /// 客户端证书的私钥存放方式。
+    ///
+    /// Windows 上不能用 EphemeralKeySet：mTLS 的客户端认证走 Schannel，而 Schannel 只能使用
+    /// 密钥容器里的私钥，拿不到纯内存的 ephemeral 密钥。表现是握手阶段
+    /// AcquireCredentialsHandle 返回 SEC_E_NO_CREDENTIALS(0x8009030E)，.NET 把它翻译成
+    /// 「platform does not support ephemeral keys」——请求根本发不出去，服务端日志里
+    /// 连一行都不会有。注册阶段是匿名端点、不出示证书，所以能过；一旦装上证书开始心跳就必然失败。
+    ///
+    /// 用 PersistKeySet 而不是 MachineKeySet，与 Kestrel 侧的
+    /// <see cref="BackupMonitor.Api.Bootstrap.ServerCertificateFactory.LoadForKestrel"/> 保持一致：
+    /// 密钥落在服务账户自己的存储里，LocalSystem 和交互式调试都能用；强制 MachineKeySet 会让
+    /// 非管理员身份运行时直接失败。
+    /// </summary>
+    private static X509KeyStorageFlags ClientCertificateStorageFlags =>
+        OperatingSystem.IsWindows()
+            ? X509KeyStorageFlags.PersistKeySet
+            : X509KeyStorageFlags.EphemeralKeySet;
+
     public X509Certificate2? LoadCertificate()
     {
         lock (_sync)
@@ -163,7 +209,7 @@ public sealed class AgentStateStore
                     _state.ProtectedCertificatePfx = Convert.ToBase64String(ProtectBytes(pfx));
                     SaveUnsafe();
                 }
-                return new X509Certificate2(pfx, string.Empty, X509KeyStorageFlags.EphemeralKeySet);
+                return new X509Certificate2(pfx, string.Empty, ClientCertificateStorageFlags);
             }
             catch (Exception ex)
             {

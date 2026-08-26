@@ -34,11 +34,18 @@ public class User : IHasRowVersion
 
     public DateTime PasswordChangedAt { get; set; }
 
-    /// <summary>是否强制修改口令（初始管理员首次登录为 true，改密成功后清除，OPEN-ISSUES #2）</summary>
+    /// <summary>是否强制修改口令（口令由系统代设时置 true，改密成功后清除；安装器设的初始管理员口令不置位，见 V017）</summary>
     public bool MustChangePassword { get; set; }
 
     /// <summary>是否启用 MFA</summary>
     public bool MfaEnabled { get; set; }
+
+    /// <summary>
+    /// 令牌版本号（整改批次 C · C4）。改密、登出、（未来实现的）禁用账号/改角色/改权限
+    /// 都要 ++，签发的 JWT 带同名 tv claim，TokenVersionMiddleware 据此在 60 秒内让
+    /// 已撤销的旧令牌失效，不必等待其自然过期。
+    /// </summary>
+    public int TokenVersion { get; set; }
 
     public DateTime CreatedAt { get; set; }
 

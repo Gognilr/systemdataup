@@ -47,7 +47,14 @@ export async function api(path, opts = {}) {
       return api(path, Object.assign({}, opts, { retried: true }));
     }
     forceLogin();
-    return null;
+    // D4：以前这里 return null，调用方一律直接取 data.xxx，
+    // 会话过期时看到的就是「Cannot read properties of null」而不是干净地回到登录页；
+    // Promise.all 场景（概览页）还会产生 unhandled rejection。
+    // 抛出一个带 code 的 Error，交给各视图既有的 try/catch 兜底（toast 或空态），
+    // forceLogin() 已经完成跳转，这里的异常只是让调用栈别再往下读 data 了。
+    const error = new Error('会话已过期，请重新登录');
+    error.code = 'SESSION_EXPIRED';
+    throw error;
   }
   const { res, json } = result;
   if (!res.ok || (json && json.success === false)) {

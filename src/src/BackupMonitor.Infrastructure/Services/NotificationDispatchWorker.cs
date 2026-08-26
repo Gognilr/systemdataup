@@ -1,14 +1,16 @@
-using System.Net;
-using System.Net.Mail;
 using System.Text;
 using System.Text.Json;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Models.Admin;
+using MailKit.Net.Smtp;
+using MailKit.Security;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using MimeKit;
 
 namespace BackupMonitor.Infrastructure.Services;
 
@@ -17,6 +19,10 @@ namespace BackupMonitor.Infrastructure.Services;
 /// 轮询 notification_deliveries 中 pending 记录，按渠道真实投递（SMTP/企业微信 webhook/钉钉 webhook），
 /// 回写 sent/failed 与尝试次数；超过最大尝试次数置 failed。
 /// 单实例（进程内单 BackgroundService），幂等（只处理 pending 且满足重试间隔的记录）。
+///
+/// 整改批次 C · C2：SMTP 发信换用 MailKit（微软官方文档标注 System.Net.Mail.SmtpClient 不建议
+/// 用于新开发），支持 STARTTLS / 隐式 TLS，能连上真实邮箱服务商（腾讯企业邮、Exchange Online 等
+/// 全部强制 TLS，旧实现从不设置 EnableSsl，连接直接失败）。
 /// </summary>
 public class NotificationDispatchWorker : BackgroundService
 {
@@ -40,11 +46,16 @@ public class NotificationDispatchWorker : BackgroundService
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
 
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IConfiguration _configuration;
     private readonly ILogger<NotificationDispatchWorker> _logger;
 
-    public NotificationDispatchWorker(IServiceScopeFactory scopeFactory, ILogger<NotificationDispatchWorker> logger)
+    public NotificationDispatchWorker(
+        IServiceScopeFactory scopeFactory,
+        IConfiguration configuration,
+        ILogger<NotificationDispatchWorker> logger)
     {
         _scopeFactory = scopeFactory;
+        _configuration = configuration;
         _logger = logger;
     }
 
@@ -106,7 +117,11 @@ public class NotificationDispatchWorker : BackgroundService
         var retryMinutes = Math.Max(0, await settingsProvider.GetIntAsync(RetryIntervalKey, 5, ct));
         var retryCutoff = DateTime.UtcNow.AddMinutes(-retryMinutes);
 
-        var channelSettings = await LoadChannelSettingsAsync(db, ct);
+        // 整改批次 C · C1：渠道配置（含 SMTP 密码 / webhook 地址）现在加密存储，
+        // 统一走 INotificationService.GetSettingsAsync 解密，同时复用它的历史明文惰性迁移逻辑，
+        // 不在本文件里重复维护一份解密/迁移代码。
+        var notificationService = scope.ServiceProvider.GetRequiredService<INotificationService>();
+        var channelSettings = await notificationService.GetSettingsAsync(ct);
 
         var pending = await db.NotificationDeliveries
             .Include(d => d.Alert)
@@ -122,10 +137,12 @@ public class NotificationDispatchWorker : BackgroundService
 
         _logger.LogInformation("通知发送：本轮待投递 {Count} 条", pending.Count);
 
+        var reportTimezone = ResolveTimeZone(_configuration["Reports:Timezone"]);
+
         foreach (var delivery in pending)
         {
             ct.ThrowIfCancellationRequested();
-            await DispatchOneAsync(db, delivery, channelSettings, maxAttempts, ct);
+            await DispatchOneAsync(db, delivery, channelSettings, maxAttempts, reportTimezone, ct);
         }
     }
 
@@ -135,6 +152,7 @@ public class NotificationDispatchWorker : BackgroundService
         Core.Entities.Alert.NotificationDelivery delivery,
         NotificationSettingsDto settings,
         int maxAttempts,
+        TimeZoneInfo reportTimezone,
         CancellationToken ct)
     {
         string? error = null;
@@ -146,7 +164,7 @@ public class NotificationDispatchWorker : BackgroundService
                     if (!settings.Email.Enabled)
                         error = "邮件渠道未启用";
                     else
-                        await SendEmailAsync(settings.Email, delivery, ct);
+                        await SendEmailAsync(settings.Email, delivery, reportTimezone, ct);
                     break;
 
                 case NotificationChannel.Wecom:
@@ -194,14 +212,17 @@ public class NotificationDispatchWorker : BackgroundService
         await db.SaveChangesAsync(ct);
     }
 
-    /// <summary>SMTP 邮件投递</summary>
-    private static async Task SendEmailAsync(
+    /// <summary>SMTP 邮件投递（告警通知场景，正文按报表时区渲染）</summary>
+    private static Task SendEmailAsync(
         EmailChannelSettingsDto email,
         Core.Entities.Alert.NotificationDelivery delivery,
+        TimeZoneInfo reportTimezone,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(email.SmtpHost))
-            throw new InvalidOperationException("SMTP 服务器未配置");
+        var occurredAtUtc = delivery.Alert?.LastOccurredAt;
+        var occurredLocal = occurredAtUtc is null
+            ? (DateTime?)null
+            : TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(occurredAtUtc.Value, DateTimeKind.Utc), reportTimezone);
 
         var subject = $"[备份监控] {delivery.Alert?.Title ?? "系统告警"}";
         var body = new StringBuilder()
@@ -210,23 +231,66 @@ public class NotificationDispatchWorker : BackgroundService
             .AppendLine(delivery.Alert?.Message)
             .AppendLine()
             .AppendLine($"告警等级: {delivery.Alert?.Level}")
-            .AppendLine($"发生时间: {delivery.Alert?.LastOccurredAt:yyyy-MM-dd HH:mm:ss} UTC")
+            // C2 第4点：时间改按系统配置的报表时区渲染，并标注时区名（不再写死 UTC）
+            .AppendLine($"发生时间: {occurredLocal:yyyy-MM-dd HH:mm:ss} ({reportTimezone.Id})")
             .ToString();
 
-        using var client = new SmtpClient(email.SmtpHost, email.SmtpPort);
-        if (!string.IsNullOrWhiteSpace(email.SmtpUsername))
-            client.Credentials = new NetworkCredential(email.SmtpUsername, email.SmtpPassword);
+        return SendEmailCoreAsync(email, delivery.Recipient, subject, body, ct);
+    }
 
-        using var message = new MailMessage
+    /// <summary>
+    /// 整改批次 C · C2：发送测试邮件（管理端「发送测试邮件」按钮，见 AdminNotificationController）。
+    /// 不落任何 notification_deliveries 记录，SMTP 层异常原样向上抛，由调用方把 MailKit/服务器
+    /// 返回的原始错误信息（如 535 Authentication failed）带回界面。
+    /// </summary>
+    public static Task SendTestEmailAsync(EmailChannelSettingsDto email, string recipient, CancellationToken ct)
+    {
+        var body = $"这是一封来自「轻量级集中备份采集与监控系统」的测试邮件，用于验证 SMTP 配置是否正确。" +
+                   $"{Environment.NewLine}发送时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}";
+        return SendEmailCoreAsync(email, recipient, "[备份监控] 测试邮件", body, ct);
+    }
+
+    /// <summary>MailKit 发信核心逻辑，供正式告警投递与"发送测试邮件"共用</summary>
+    private static async Task SendEmailCoreAsync(
+        EmailChannelSettingsDto email,
+        string recipient,
+        string subject,
+        string body,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(email.SmtpHost))
+            throw new InvalidOperationException("SMTP 服务器未配置");
+        if (string.IsNullOrWhiteSpace(recipient))
+            throw new InvalidOperationException("收件人为空");
+
+        var message = new MimeMessage();
+        message.From.Add(MailboxAddress.Parse(
+            string.IsNullOrWhiteSpace(email.FromAddress) ? "backup-monitor@localhost" : email.FromAddress));
+        message.To.Add(MailboxAddress.Parse(recipient));
+        message.Subject = subject;
+        message.Body = new TextPart("plain") { Text = body };
+
+        var secureSocketOptions = (email.SecurityMode ?? "auto").Trim().ToLowerInvariant() switch
         {
-            From = new MailAddress(string.IsNullOrWhiteSpace(email.FromAddress) ? "backup-monitor@localhost" : email.FromAddress),
-            Subject = subject,
-            Body = body,
-            BodyEncoding = Encoding.UTF8
+            "none" => SecureSocketOptions.None,
+            "starttls" => SecureSocketOptions.StartTls,
+            "ssl" => SecureSocketOptions.SslOnConnect,
+            _ => SecureSocketOptions.Auto
         };
-        message.To.Add(delivery.Recipient);
 
-        await client.SendMailAsync(message, ct);
+        using var client = new SmtpClient();
+        await client.ConnectAsync(email.SmtpHost, email.SmtpPort, secureSocketOptions, ct);
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(email.SmtpUsername))
+                await client.AuthenticateAsync(email.SmtpUsername, email.SmtpPassword ?? string.Empty, ct);
+
+            await client.SendAsync(message, ct);
+        }
+        finally
+        {
+            await client.DisconnectAsync(true, ct);
+        }
     }
 
     /// <summary>企业微信/钉钉机器人 webhook 投递（文本消息）</summary>
@@ -273,23 +337,43 @@ public class NotificationDispatchWorker : BackgroundService
         }
     }
 
-    /// <summary>读取渠道配置（与 NotificationService 同一键同一形状）</summary>
-    private async Task<NotificationSettingsDto> LoadChannelSettingsAsync(AppDbContext db, CancellationToken ct)
+    /// <summary>
+    /// 解析报表时区（与 ReportService.ResolveTimeZone 相同的回退链）：
+    /// IANA ID 优先，找不到时尝试常见 Windows 时区 ID 映射，都失败则退回 UTC。
+    /// </summary>
+    private static TimeZoneInfo ResolveTimeZone(string? id)
     {
-        var row = await db.SystemSettings.AsNoTracking()
-            .FirstOrDefaultAsync(s => s.SettingKey == NotificationService.SettingsKey, ct);
-        if (row is null)
-            return new NotificationSettingsDto();
+        if (string.IsNullOrWhiteSpace(id))
+            return TimeZoneInfo.Utc;
 
         try
         {
-            return JsonSerializer.Deserialize<NotificationSettingsDto>(row.SettingValue, JsonOpts)
-                   ?? new NotificationSettingsDto();
+            return TimeZoneInfo.FindSystemTimeZoneById(id.Trim());
         }
-        catch (JsonException ex)
+        catch (TimeZoneNotFoundException)
         {
-            _logger.LogWarning(ex, "通知渠道配置反序列化失败，本轮按默认（全部禁用）处理");
-            return new NotificationSettingsDto();
+            var windowsId = id.Trim() switch
+            {
+                "Asia/Tokyo" => "Tokyo Standard Time",
+                "Asia/Shanghai" => "China Standard Time",
+                "Asia/Singapore" => "Singapore Standard Time",
+                "Europe/London" => "GMT Standard Time",
+                "America/New_York" => "Eastern Standard Time",
+                "America/Los_Angeles" => "Pacific Standard Time",
+                _ => null
+            };
+
+            if (windowsId is not null)
+            {
+                try { return TimeZoneInfo.FindSystemTimeZoneById(windowsId); }
+                catch (TimeZoneNotFoundException) { }
+            }
+
+            return TimeZoneInfo.Utc;
+        }
+        catch (InvalidTimeZoneException)
+        {
+            return TimeZoneInfo.Utc;
         }
     }
 

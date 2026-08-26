@@ -1,10 +1,13 @@
-﻿using System.IO.Compression;
+﻿using System.Buffers;
+using System.Diagnostics;
+using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Models.Agent;
 using BackupMonitor.Shared.Scheduling;
 using Microsoft.Extensions.Options;
@@ -16,7 +19,8 @@ public sealed class AgentWorker : BackgroundService
     private static readonly string[] SupportedCommands =
     [
         "precheck_task", "precheck_all", "upload_candidate", "upload_latest",
-        "rescan", "rehash", "sync_config", "refresh_metrics", "upgrade_agent"
+        "rescan", "rehash", "sync_config", "refresh_metrics", "upgrade_agent",
+        "browse_path", "list_services"
     ];
 
     private readonly AgentOptions _options;
@@ -27,6 +31,8 @@ public sealed class AgentWorker : BackgroundService
     private readonly AgentSignatureVerifier _signatures;
     private readonly SystemProbe _probe;
     private readonly BackupScanner _scanner;
+    private readonly DirectoryBrowser _browser;
+    private readonly InstalledServiceProbe _serviceProbe;
     private readonly ILogger<AgentWorker> _logger;
     private readonly HashSet<Guid> _activeCommands = [];
 
@@ -39,6 +45,8 @@ public sealed class AgentWorker : BackgroundService
         AgentSignatureVerifier signatures,
         SystemProbe probe,
         BackupScanner scanner,
+        DirectoryBrowser browser,
+        InstalledServiceProbe serviceProbe,
         ILogger<AgentWorker> logger)
     {
         _options = options.Value;
@@ -49,6 +57,8 @@ public sealed class AgentWorker : BackgroundService
         _signatures = signatures;
         _probe = probe;
         _scanner = scanner;
+        _browser = browser;
+        _serviceProbe = serviceProbe;
         _logger = logger;
     }
 
@@ -85,6 +95,7 @@ public sealed class AgentWorker : BackgroundService
                     await ClaimAndExecuteCommandsAsync(stoppingToken);
 
                 await RunScheduledScansAsync(config, stoppingToken);
+                await RetryPendingRestabilizeScansAsync(config, stoppingToken);
 
                 var heartbeatDelay = heartbeat.HeartbeatIntervalSeconds > 0
                     ? heartbeat.HeartbeatIntervalSeconds
@@ -331,7 +342,9 @@ public sealed class AgentWorker : BackgroundService
         {
             var result = command.Type switch
             {
-                "precheck_task" => await ExecutePrecheckAsync(command.TaskId, command.Id, ct),
+                "precheck_task" => IsTestOnly(command)
+                    ? await ExecuteRecognitionTestAsync(command.TaskId, ct)
+                    : await ExecutePrecheckAsync(command.TaskId, command.Id, ct),
                 "precheck_all" => await ExecutePrecheckAllAsync(command.Id, ct),
                 "upload_candidate" or "upload_latest" => await ExecuteUploadAsync(command, ct),
                 "rescan" or "rehash" => await ExecutePrecheckAsync(command.TaskId, command.Id, ct),
@@ -340,6 +353,8 @@ public sealed class AgentWorker : BackgroundService
                     : CommandResult.FromFailure("CONFIG_NOT_CHANGED", "配置未变化"),
                 "refresh_metrics" => CommandResult.FromSuccess("OK", "指标将在下一次心跳上报"),
                 "upgrade_agent" => await StageUpgradeAsync(command, ct),
+                "browse_path" => ExecuteBrowse(command, ct),
+                "list_services" => ExecuteListServices(command, ct),
                 _ => CommandResult.FromFailure("COMMAND_UNSUPPORTED", $"不支持的指令类型：{command.Type}")
             };
 
@@ -382,6 +397,212 @@ public sealed class AgentWorker : BackgroundService
         return CommandResult.FromSuccess("PRECHECK_SUBMITTED", $"已提交 {executed} 个预检结果");
     }
 
+    /// <summary>
+    /// 指令参数里是否带 testOnly。识别测试走的是同一种指令，
+    /// 区别在于只看不写——绝不能让"试一下"产生候选备份集。
+    /// </summary>
+    private static bool IsTestOnly(CommandDto command)
+    {
+        if (string.IsNullOrWhiteSpace(command.Payload))
+            return false;
+
+        try
+        {
+            using var document = JsonDocument.Parse(command.Payload);
+            return document.RootElement.TryGetProperty("testOnly", out var value)
+                   && value.ValueKind == JsonValueKind.True;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 识别测试：按当前配置扫一遍，把"会识别出什么"原样报回服务端，不提交预检结果。
+    ///
+    /// 这是给人看的——填完源路径和识别规则，先看看到底会挑中哪些文件、判定通不通过，
+    /// 而不是保存完等到某天需要恢复时才发现规则写错了。
+    /// 因此结果走指令返回值（ResultPayload），不进候选备份集，也不改任务的扫描时间。
+    /// </summary>
+    private async Task<CommandResult> ExecuteRecognitionTestAsync(Guid? taskId, CancellationToken ct)
+    {
+        if (taskId is null)
+            return CommandResult.FromFailure("TASK_ID_REQUIRED", "识别测试指令缺少 taskId");
+
+        var config = LoadVerifiedConfig() ?? await SyncConfigAsync(ct);
+        var task = config?.Tasks.FirstOrDefault(t => t.TaskId == taskId.Value);
+        if (task is null)
+            return CommandResult.FromFailure("TASK_NOT_FOUND", $"本地配置不存在任务：{taskId}");
+
+        var scans = await ScanWithSyncRestabilizeAsync(task, ct);
+        var payload = JsonSerializer.Serialize(new
+        {
+            sourcePath = task.SourcePath,
+            recognizerType = task.RecognizerType,
+            scannedAt = DateTime.UtcNow,
+            results = scans.Select(scan => new
+            {
+                sourceRoot = scan.SourceRoot,
+                businessUnit = scan.BusinessUnit?.DisplayName,
+                status = scan.Status,
+                failureCode = scan.FailureCode,
+                failureMessage = scan.FailureMessage,
+                backupBusinessTime = scan.BackupBusinessTime,
+                totalFiles = scan.Files.Count,
+                totalBytes = scan.Files.Sum(f => f.SizeBytes),
+                // 只回前 50 个文件：识别测试是给人看的，一屏看不完的清单没有意义，
+                // 而完整清单可能有几万条，塞进指令结果里会把 commands 表撑坏。
+                // 属性名必须显式写成小驼峰。匿名对象的简写形式（file.RelativePath）
+                // 序列化出来是 PascalCase，而界面读的是 relativePath——
+                // 结果是文件清单整列显示 undefined，且不报任何错。
+                files = scan.Files.Take(50).Select(file => new
+                {
+                    relativePath = file.RelativePath,
+                    sizeBytes = file.SizeBytes,
+                    lastModifiedAt = file.LastModifiedAt,
+                    isRequired = file.IsRequired
+                })
+            })
+        });
+
+        var passed = scans.Count(scan => scan.Status == "passed");
+        return new CommandResult(
+            true,
+            "RECOGNITION_TESTED",
+            $"扫描到 {scans.Count} 个识别单元，其中 {passed} 个可通过预检",
+            payload);
+    }
+
+    /// <summary>
+    /// 识别测试专用的稳定等待：人在对话框前等结果，不能像计划扫描那样跨主循环轮次重试，
+    /// 但也不能对着 maxStabilityWaitSeconds（可能配了 10 分钟）傻等——
+    /// 因此在 min(maxStabilityWaitSeconds, 60s) 内同步重试，超时就把仍在变化的原因写清楚。
+    /// </summary>
+    private async Task<List<BackupScanResult>> ScanWithSyncRestabilizeAsync(AgentTaskConfigDto task, CancellationToken ct)
+    {
+        var scans = await _scanner.ScanAsync(task, ct);
+        var maxWaitSeconds = Math.Min(Math.Max(task.MaxStabilityWaitSeconds, 0), 60);
+        if (maxWaitSeconds <= 0 || !scans.Any(s => s.Status == "still_changing"))
+            return scans;
+
+        var stabilityDelaySeconds = Math.Max(1, task.StabilityIntervalSeconds);
+        var stopwatch = Stopwatch.StartNew();
+        while (scans.Any(s => s.Status == "still_changing"))
+        {
+            var remaining = maxWaitSeconds - stopwatch.Elapsed.TotalSeconds;
+            if (remaining <= 0)
+                break;
+
+            var delaySeconds = Math.Min(stabilityDelaySeconds, remaining);
+            await Task.Delay(TimeSpan.FromSeconds(delaySeconds), ct);
+            scans = await _scanner.ScanAsync(task, ct);
+        }
+
+        if (stopwatch.Elapsed.TotalSeconds >= maxWaitSeconds)
+        {
+            var waited = (int)stopwatch.Elapsed.TotalSeconds;
+            scans = scans
+                .Select(scan => scan.Status == "still_changing"
+                    ? WithFailureMessage(scan, $"等待了 {waited} 秒后仍在变化")
+                    : scan)
+                .ToList();
+        }
+
+        return scans;
+    }
+
+    /// <summary>
+    /// 目录浏览：抓一棵只含元数据的目录树回给服务端，供建任务向导使用。
+    ///
+    /// 同步执行是有意的——枚举本身是 IO 密集但无需并发，而 DirectoryBrowser 内部
+    /// 已经用条目数/深度/耗时三重限额兜住了最坏情况。
+    /// </summary>
+    private CommandResult ExecuteBrowse(CommandDto command, CancellationToken ct)
+    {
+        BrowsePathCommandPayload payload;
+        try
+        {
+            payload = string.IsNullOrWhiteSpace(command.Payload)
+                ? new BrowsePathCommandPayload()
+                : JsonSerializer.Deserialize<BrowsePathCommandPayload>(command.Payload, BrowseJsonOptions)
+                  ?? new BrowsePathCommandPayload();
+        }
+        catch (JsonException ex)
+        {
+            return CommandResult.FromFailure("BROWSE_PAYLOAD_INVALID", $"浏览指令参数无法解析：{ex.Message}");
+        }
+
+        try
+        {
+            var snapshot = _browser.Browse(payload, ct);
+            var json = JsonSerializer.Serialize(snapshot, BrowseJsonOptions);
+            var message = snapshot.IsDriveList
+                ? $"返回 {snapshot.Entries.Count} 个磁盘"
+                : $"返回 {snapshot.TotalEntries} 个条目{(snapshot.Truncated ? "（已截断）" : "")}";
+            return new CommandResult(true, "BROWSE_OK", message, json);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return CommandResult.FromFailure("BROWSE_FORBIDDEN", ex.Message);
+        }
+        catch (DirectoryNotFoundException ex)
+        {
+            return CommandResult.FromFailure("BROWSE_PATH_NOT_FOUND", ex.Message);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "目录浏览失败 path={Path}", payload.Path);
+            return CommandResult.FromFailure("BROWSE_FAILED", $"目录浏览失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 列出本机安装的 Windows 服务，供服务端配置关键服务监控时挑选。
+    /// 只读，不对任何服务做启停。
+    /// </summary>
+    private CommandResult ExecuteListServices(CommandDto command, CancellationToken ct)
+    {
+        if (!OperatingSystem.IsWindows())
+            return CommandResult.FromFailure("NOT_SUPPORTED", "只有 Windows 客户端支持列出服务");
+
+        var includeStopped = true;
+        if (!string.IsNullOrWhiteSpace(command.Payload))
+        {
+            try
+            {
+                var payload = JsonSerializer.Deserialize<ListServicesCommandPayload>(command.Payload, BrowseJsonOptions);
+                includeStopped = payload?.IncludeStopped ?? true;
+            }
+            catch (JsonException)
+            {
+                // 参数解析不了就按默认来：这条指令只是列个清单，没必要因为参数瑕疵整个失败。
+            }
+        }
+
+        try
+        {
+            var result = _serviceProbe.List(includeStopped, ct);
+            return new CommandResult(
+                true,
+                "SERVICES_LISTED",
+                $"返回 {result.Services.Count} 个服务",
+                JsonSerializer.Serialize(result, BrowseJsonOptions));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "列出 Windows 服务失败");
+            return CommandResult.FromFailure("LIST_SERVICES_FAILED", ex.Message);
+        }
+    }
+
+    /// <summary>浏览结果用小驼峰，与服务端 DTO 的反序列化约定一致。</summary>
+    private static readonly JsonSerializerOptions BrowseJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true
+    };
+
     private async Task<CommandResult> ExecutePrecheckAsync(Guid? taskId, Guid commandId, CancellationToken ct)
     {
         if (taskId is null)
@@ -402,50 +623,206 @@ public sealed class AgentWorker : BackgroundService
     private async Task<int> SubmitScanResultsAsync(AgentTaskConfigDto task, Guid? commandId, CancellationToken ct)
     {
         var scans = await _scanner.ScanAsync(task, ct);
+        return await SubmitScansWithRestabilizeAsync(task, scans, commandId, ct);
+    }
+
+    /// <summary>
+    /// 提交扫描结果；still_changing 的结果套用「跨主循环轮次重试」的稳定等待预算
+    /// （AgentStateStore.PendingRestabilizeScans），而不是在这里同步 sleep——
+    /// 阻塞会让心跳停摆。用于计划扫描与指令预检两条路径；识别测试走的是
+    /// ScanWithSyncRestabilizeAsync 的同步等待，不经过这里。
+    /// </summary>
+    private async Task<int> SubmitScansWithRestabilizeAsync(AgentTaskConfigDto task, List<BackupScanResult> scans, Guid? commandId, CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+        var maxWaitSeconds = task.MaxStabilityWaitSeconds;
+        var stabilityDelaySeconds = Math.Max(1, task.StabilityIntervalSeconds);
+        var submitted = 0;
+
         foreach (var scan in scans)
         {
-            var response = await _api.SubmitPrecheckAsync(task.TaskId, new SubmitPrecheckResultRequest
+            if (scan.Status != "still_changing")
             {
-                CommandId = commandId,
-                BusinessUnit = scan.BusinessUnit,
-                CandidateKey = scan.CandidateKey,
-                SourceRoot = scan.SourceRoot,
-                BackupBusinessTime = scan.BackupBusinessTime,
-                PrecheckStatus = scan.Status,
-                TotalFiles = scan.Files.Count,
-                TotalBytes = scan.Files.Sum(f => f.SizeBytes),
-                QuickFingerprint = scan.QuickFingerprint,
-                ManifestHash = scan.ManifestHash,
-                FailureCode = scan.FailureCode,
-                FailureMessage = scan.FailureMessage,
-                Files = scan.Files
-            }, ct);
+                // 稳定了（或本来就是别的失败原因）：清掉可能存在的重试记录，按老流程上报。
+                if (_stateStore.Snapshot().PendingRestabilizeScans.ContainsKey(scan.CandidateKey))
+                    _stateStore.Update(s => s.PendingRestabilizeScans.Remove(scan.CandidateKey));
 
-            if (response.CandidateBackupSetId is not null && scan.Status == "passed")
-            {
-                _stateStore.Update(s => s.Candidates[scan.CandidateKey] = new LocalCandidateState
-                {
-                    CandidateBackupSetId = response.CandidateBackupSetId,
-                    TaskId = task.TaskId,
-                    CandidateKey = scan.CandidateKey,
-                    SourceRoot = scan.SourceRoot,
-                    ManifestHash = scan.ManifestHash ?? string.Empty,
-                    TotalFiles = scan.Files.Count,
-                    TotalBytes = scan.Files.Sum(f => f.SizeBytes),
-                    Files = scan.Files.Select(f => new LocalCandidateFile
-                    {
-                        RelativePath = f.RelativePath,
-                        FullPath = Path.GetFullPath(Path.Combine(scan.SourceRoot, f.RelativePath.Replace('/', Path.DirectorySeparatorChar))),
-                        SizeBytes = f.SizeBytes,
-                        Sha256 = f.Sha256 ?? string.Empty
-                    }).ToList(),
-                    UpdatedAt = DateTime.UtcNow
-                });
+                await SubmitOneScanAsync(task, scan, commandId, ct);
+                submitted++;
+                continue;
             }
+
+            // 没配 maxStabilityWaitSeconds，或比稳定窗口本身还短：没有可用的重试预算，
+            // 退化成老行为——扫一次就报，等下一个 cron。
+            if (maxWaitSeconds <= 0 || maxWaitSeconds <= task.StabilityIntervalSeconds)
+            {
+                await SubmitOneScanAsync(task, scan, commandId, ct);
+                submitted++;
+                continue;
+            }
+
+            var entry = _stateStore.Snapshot().PendingRestabilizeScans.GetValueOrDefault(scan.CandidateKey);
+            if (entry is null)
+            {
+                var nextRetry = now.AddSeconds(stabilityDelaySeconds);
+                _stateStore.Update(s => s.PendingRestabilizeScans[scan.CandidateKey] = new RestabilizeEntry
+                {
+                    TaskId = task.TaskId,
+                    CommandId = commandId,
+                    FirstAttemptAtUtc = now,
+                    NextRetryAtUtc = nextRetry,
+                    AttemptCount = 1
+                });
+                _logger.LogInformation(
+                    "任务 {Task} 等待稳定，第 1 次重试，将在 {Next:O} 重新扫描 root={Root}",
+                    task.Name, nextRetry, scan.SourceRoot);
+                continue; // 不上报，等主循环下一轮到点重试
+            }
+
+            if (now - entry.FirstAttemptAtUtc >= TimeSpan.FromSeconds(maxWaitSeconds))
+            {
+                // 预算用完，认输：按 still_changing 上报，但把重试历史写进 failureMessage，
+                // 否则运维看到的还是一句没有信息量的话。
+                _stateStore.Update(s => s.PendingRestabilizeScans.Remove(scan.CandidateKey));
+                var message = $"已在 {maxWaitSeconds} 秒内重试 {entry.AttemptCount} 次，文件仍在变化";
+                await SubmitOneScanAsync(task, WithFailureMessage(scan, message), commandId, ct);
+                submitted++;
+                continue;
+            }
+
+            var attempt = entry.AttemptCount + 1;
+            var next = now.AddSeconds(stabilityDelaySeconds);
+            _stateStore.Update(s => s.PendingRestabilizeScans[scan.CandidateKey] = new RestabilizeEntry
+            {
+                TaskId = task.TaskId,
+                CommandId = commandId ?? entry.CommandId,
+                FirstAttemptAtUtc = entry.FirstAttemptAtUtc,
+                NextRetryAtUtc = next,
+                AttemptCount = attempt
+            });
+            _logger.LogInformation(
+                "任务 {Task} 等待稳定，第 {Attempt} 次重试，将在 {Next:O} 重新扫描 root={Root}",
+                task.Name, attempt, next, scan.SourceRoot);
         }
 
-        return scans.Count;
+        return submitted;
     }
+
+    /// <summary>
+    /// 主循环每轮检查一次：PendingRestabilizeScans 里到点的任务重新扫描一遍。
+    /// 等待因此发生在主循环的多次轮次之间，心跳照常，不占用工作线程同步阻塞。
+    /// </summary>
+    private async Task RetryPendingRestabilizeScansAsync(AgentConfigResponse? config, CancellationToken ct)
+    {
+        if (config is null)
+            return;
+
+        // 任务被删除或停用后，残留的重试记录要跟着清掉，否则状态文件只增不减。
+        var liveTaskIds = new HashSet<Guid>(config.Tasks.Select(t => t.TaskId));
+        _stateStore.Update(state =>
+        {
+            foreach (var stale in state.PendingRestabilizeScans
+                         .Where(kv => !liveTaskIds.Contains(kv.Value.TaskId))
+                         .Select(kv => kv.Key)
+                         .ToList())
+                state.PendingRestabilizeScans.Remove(stale);
+        });
+
+        var now = DateTime.UtcNow;
+        var dueTaskIds = _stateStore.Snapshot().PendingRestabilizeScans.Values
+            .Where(e => e.NextRetryAtUtc <= now)
+            .Select(e => e.TaskId)
+            .Distinct()
+            .ToList();
+
+        foreach (var taskId in dueTaskIds)
+        {
+            ct.ThrowIfCancellationRequested();
+            var task = config.Tasks.FirstOrDefault(t => t.TaskId == taskId);
+            if (task is null)
+                continue;
+
+            // 同一个任务下多个业务单元的重试记录可能来自同一次指令触发，延用其 commandId。
+            var commandId = _stateStore.Snapshot().PendingRestabilizeScans.Values
+                .FirstOrDefault(e => e.TaskId == taskId)?.CommandId;
+
+            try
+            {
+                var scans = await _scanner.ScanAsync(task, ct);
+                var submitted = await SubmitScansWithRestabilizeAsync(task, scans, commandId, ct);
+                if (submitted > 0)
+                    _logger.LogInformation("等待稳定后重新扫描完成 task={Task} 已提交 {Count} 个预检结果", task.Name, submitted);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // 一个任务的重试失败不影响其余任务。
+                _logger.LogError(ex, "等待稳定重试扫描失败 task={Task}", task.Name);
+                _stateStore.Update(state => state.LastError = ex.Message);
+            }
+        }
+    }
+
+    private async Task SubmitOneScanAsync(AgentTaskConfigDto task, BackupScanResult scan, Guid? commandId, CancellationToken ct)
+    {
+        var response = await _api.SubmitPrecheckAsync(task.TaskId, new SubmitPrecheckResultRequest
+        {
+            CommandId = commandId,
+            BusinessUnit = scan.BusinessUnit,
+            CandidateKey = scan.CandidateKey,
+            SourceRoot = scan.SourceRoot,
+            BackupBusinessTime = scan.BackupBusinessTime,
+            PrecheckStatus = scan.Status,
+            TotalFiles = scan.Files.Count,
+            TotalBytes = scan.Files.Sum(f => f.SizeBytes),
+            QuickFingerprint = scan.QuickFingerprint,
+            ManifestHash = scan.ManifestHash,
+            FailureCode = scan.FailureCode,
+            FailureMessage = scan.FailureMessage,
+            Files = scan.Files
+        }, ct);
+
+        if (response.CandidateBackupSetId is not null && scan.Status == "passed")
+        {
+            _stateStore.Update(s => s.Candidates[scan.CandidateKey] = new LocalCandidateState
+            {
+                CandidateBackupSetId = response.CandidateBackupSetId,
+                TaskId = task.TaskId,
+                CandidateKey = scan.CandidateKey,
+                SourceRoot = scan.SourceRoot,
+                ManifestHash = scan.ManifestHash ?? string.Empty,
+                TotalFiles = scan.Files.Count,
+                TotalBytes = scan.Files.Sum(f => f.SizeBytes),
+                Files = scan.Files.Select(f => new LocalCandidateFile
+                {
+                    RelativePath = f.RelativePath,
+                    FullPath = Path.GetFullPath(Path.Combine(scan.SourceRoot, f.RelativePath.Replace('/', Path.DirectorySeparatorChar))),
+                    SizeBytes = f.SizeBytes,
+                    Sha256 = f.Sha256 ?? string.Empty
+                }).ToList(),
+                UpdatedAt = DateTime.UtcNow
+            });
+        }
+    }
+
+    /// <summary>BackupScanResult 的属性是 init-only，改 failureMessage 只能整个重建一份。</summary>
+    private static BackupScanResult WithFailureMessage(BackupScanResult scan, string failureMessage) => new()
+    {
+        TaskId = scan.TaskId,
+        CandidateKey = scan.CandidateKey,
+        SourceRoot = scan.SourceRoot,
+        BusinessUnit = scan.BusinessUnit,
+        Status = scan.Status,
+        BackupBusinessTime = scan.BackupBusinessTime,
+        QuickFingerprint = scan.QuickFingerprint,
+        ManifestHash = scan.ManifestHash,
+        FailureCode = scan.FailureCode,
+        FailureMessage = failureMessage,
+        Files = scan.Files
+    };
 
     private async Task<CommandResult> ExecuteUploadAsync(CommandDto command, CancellationToken ct)
     {
@@ -472,6 +849,12 @@ public sealed class AgentWorker : BackgroundService
             IdempotencyKey = candidate.CandidateKey
         }, ct);
 
+        // 限速值优先取指令 payload 里的 bandwidthLimitKbps（服务端三处下发口径之一），
+        // 回退到任务配置的 BandwidthLimitKbps；整个上传会话共用一个节流器实例，
+        // 这样限速是会话级平均值而不是每块独立算，粒度上没必要做到字节级令牌桶。
+        var bandwidthLimitKbps = ReadInt(command.Payload, "bandwidthLimitKbps") ?? task?.BandwidthLimitKbps;
+        var throttle = new ChunkThrottle(bandwidthLimitKbps);
+
         foreach (var remoteFile in session.Files)
         {
             var local = candidate.Files.FirstOrDefault(f => string.Equals(f.RelativePath, remoteFile.RelativePath, StringComparison.OrdinalIgnoreCase));
@@ -482,7 +865,7 @@ public sealed class AgentWorker : BackgroundService
             var indexes = ExpandMissing(missing, local.SizeBytes, session.ChunkSizeBytes);
             foreach (var index in indexes)
             {
-                await UploadChunkWithRetryAsync(session.UploadSessionId, remoteFile.UploadFileId, local.FullPath, index, session.ChunkSizeBytes, ct);
+                await UploadChunkWithRetryAsync(session.UploadSessionId, remoteFile.UploadFileId, local.FullPath, index, session.ChunkSizeBytes, throttle, ct);
             }
 
             await _api.CompleteUploadFileAsync(session.UploadSessionId, remoteFile.UploadFileId, new CompleteUploadFileRequest
@@ -501,7 +884,7 @@ public sealed class AgentWorker : BackgroundService
         return CommandResult.FromSuccess("UPLOAD_ACCEPTED", $"上传会话已提交校验：{completed.VerificationOperationId}");
     }
 
-    private async Task UploadChunkWithRetryAsync(Guid sessionId, Guid fileId, string path, int chunkIndex, int chunkSize, CancellationToken ct)
+    private async Task UploadChunkWithRetryAsync(Guid sessionId, Guid fileId, string path, int chunkIndex, int chunkSize, ChunkThrottle throttle, CancellationToken ct)
     {
         var info = new FileInfo(path);
         var offset = (long)chunkIndex * chunkSize;
@@ -509,35 +892,73 @@ public sealed class AgentWorker : BackgroundService
         if (length <= 0)
             return;
 
-        var bytes = new byte[length];
-        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, useAsync: true);
-        stream.Seek(offset, SeekOrigin.Begin);
-        var read = 0;
-        while (read < length)
+        // 分块默认 8MB，逐块裸分配全部落 LOH；改用 ArrayPool 复用。
+        // 风险点：Rent 返回的数组可能比请求的大，下游一律按 length 切片，
+        // 绝不能把整个 buffer 传出去，否则会把池里的垃圾字节一起传上去。
+        var buffer = ArrayPool<byte>.Shared.Rent(length);
+        try
         {
-            var count = await stream.ReadAsync(bytes.AsMemory(read, length - read), ct);
-            if (count == 0)
-                throw new IOException($"读取文件时提前结束：{path}");
-            read += count;
-        }
-
-        var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
-        Exception? last = null;
-        for (var attempt = 1; attempt <= Math.Max(1, _options.MaxUploadRetries); attempt++)
-        {
-            try
+            await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, useAsync: true);
+            stream.Seek(offset, SeekOrigin.Begin);
+            var read = 0;
+            while (read < length)
             {
-                await _api.UploadChunkAsync(sessionId, fileId, chunkIndex, offset, bytes, hash, ct);
+                var count = await stream.ReadAsync(buffer.AsMemory(read, length - read), ct);
+                if (count == 0)
+                    throw new IOException($"读取文件时提前结束：{path}");
+                read += count;
+            }
+
+            var hash = Convert.ToHexString(SHA256.HashData(buffer.AsSpan(0, length))).ToLowerInvariant();
+            Exception? last = null;
+            for (var attempt = 1; attempt <= Math.Max(1, _options.MaxUploadRetries); attempt++)
+            {
+                try
+                {
+                    await _api.UploadChunkAsync(sessionId, fileId, chunkIndex, offset, buffer.AsMemory(0, length), hash, ct);
+                    // 节流放在上传成功之后而不是之前：失败重试的那几次不重复计费。
+                    await throttle.AfterChunkAsync(length, ct);
+                    return;
+                }
+                catch (Exception ex) when (ex is AgentApiException or HttpRequestException)
+                {
+                    last = ex;
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Min(attempt * 2, 10)), ct);
+                }
+            }
+
+            throw last ?? new IOException($"分块上传失败：{path}#{chunkIndex}");
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    /// <summary>
+    /// 分块粒度的节流器：块级精度对 KB/s 量级的限速已经足够，不需要字节级令牌桶。
+    /// 会话级共用一个实例，限速是整个上传会话的平均值，而不是每块独立算。
+    /// 用 Task.Delay 让出线程，不阻塞任何工作线程，也不会影响心跳。
+    /// </summary>
+    private sealed class ChunkThrottle
+    {
+        private readonly int _bytesPerSecond;
+        private readonly Stopwatch _clock = Stopwatch.StartNew();
+        private long _sentBytes;
+
+        public ChunkThrottle(int? kbps) => _bytesPerSecond = kbps is > 0 ? kbps.Value * 1024 : 0;
+
+        public async Task AfterChunkAsync(int bytes, CancellationToken ct)
+        {
+            if (_bytesPerSecond <= 0)
                 return;
-            }
-            catch (Exception ex) when (ex is AgentApiException or HttpRequestException)
-            {
-                last = ex;
-                await Task.Delay(TimeSpan.FromSeconds(Math.Min(attempt * 2, 10)), ct);
-            }
-        }
 
-        throw last ?? new IOException($"分块上传失败：{path}#{chunkIndex}");
+            _sentBytes += bytes;
+            var expected = TimeSpan.FromSeconds((double)_sentBytes / _bytesPerSecond);
+            var delay = expected - _clock.Elapsed;
+            if (delay > TimeSpan.Zero)
+                await Task.Delay(delay, ct);
+        }
     }
 
     private async Task<CommandResult> StageUpgradeAsync(CommandDto command, CancellationToken ct)
@@ -592,6 +1013,12 @@ public sealed class AgentWorker : BackgroundService
     {
         var value = ReadString(payload, name);
         return Guid.TryParse(value, out var id) ? id : null;
+    }
+
+    private static int? ReadInt(string? payload, string name)
+    {
+        var value = ReadString(payload, name);
+        return int.TryParse(value, out var parsed) ? parsed : null;
     }
 
     private static string? ReadString(string? payload, string name)
@@ -665,10 +1092,10 @@ public sealed class AgentWorker : BackgroundService
                 || !string.Equals(entry.TimeZone, timeZone.Id, StringComparison.Ordinal))
             {
                 var first = cron.GetNextOccurrence(now, timeZone);
-                SaveScheduleEntry(key, task.ScanSchedule!, timeZone.Id, first, lastRunAtUtc: entry?.LastRunAtUtc);
+                var firstDue = SaveScheduleEntry(key, task.ScanSchedule!, timeZone.Id, first, lastRunAtUtc: entry?.LastRunAtUtc, task.RandomDelayMinutes);
                 _logger.LogInformation(
                     "任务 {Task} 的扫描计划已排期 cron={Cron} tz={TimeZone} next={Next:O}",
-                    task.Name, task.ScanSchedule, timeZone.Id, first);
+                    task.Name, task.ScanSchedule, timeZone.Id, firstDue);
                 continue;
             }
 
@@ -677,10 +1104,10 @@ public sealed class AgentWorker : BackgroundService
 
             // 先写回下一次排期再执行：扫描可能耗时很久，中途崩溃不该在重启后重复触发同一次计划。
             var following = cron.GetNextOccurrence(now, timeZone);
-            SaveScheduleEntry(key, task.ScanSchedule!, timeZone.Id, following, lastRunAtUtc: now);
+            var followingDue = SaveScheduleEntry(key, task.ScanSchedule!, timeZone.Id, following, lastRunAtUtc: now, task.RandomDelayMinutes);
 
             _logger.LogInformation(
-                "按扫描计划触发预检 task={Task} cron={Cron} next={Next:O}", task.Name, task.ScanSchedule, following);
+                "按扫描计划触发预检 task={Task} cron={Cron} next={Next:O}", task.Name, task.ScanSchedule, followingDue);
             try
             {
                 var submitted = await SubmitScanResultsAsync(task, commandId: null, ct);
@@ -702,19 +1129,32 @@ public sealed class AgentWorker : BackgroundService
     /// <summary>
     /// 写回排期。nextDueAtUtc 为 null 表示这个表达式描述的时刻永不出现
     /// （例如 2 月 30 日），记成 MaxValue，免得每一轮都重算一次并刷日志。
+    ///
+    /// randomDelayMinutes 大于 0 时叠加 [0, randomDelayMinutes] 分钟的随机偏移，
+    /// 用来错开多台客户端在同一 cron 时刻同时扫描/上传。返回值是叠加偏移后
+    /// 实际写入状态的时刻，调用方的日志要用这个值，而不是叠加前的 cron 时刻，
+    /// 否则日志里的 next= 看不出随机偏移生效了。
     /// </summary>
-    private void SaveScheduleEntry(string key, string cron, string timeZoneId, DateTime? nextDueAtUtc, DateTime? lastRunAtUtc)
+    private DateTime SaveScheduleEntry(string key, string cron, string timeZoneId, DateTime? nextDueAtUtc, DateTime? lastRunAtUtc, int randomDelayMinutes = 0)
     {
         if (nextDueAtUtc is null)
             _logger.LogWarning("扫描计划 {Cron} 在未来四年内没有触发时刻，已停用该任务的定时扫描", cron);
+
+        var due = nextDueAtUtc is null
+            ? DateTime.MaxValue
+            : randomDelayMinutes > 0
+                ? nextDueAtUtc.Value.Add(TimeSpan.FromMinutes(Random.Shared.Next(0, randomDelayMinutes + 1)))
+                : nextDueAtUtc.Value;
 
         _stateStore.Update(state => state.ScheduledScans[key] = new ScheduledScanState
         {
             Cron = cron,
             TimeZone = timeZoneId,
-            NextDueAtUtc = nextDueAtUtc ?? DateTime.MaxValue,
+            NextDueAtUtc = due,
             LastRunAtUtc = lastRunAtUtc
         });
+
+        return due;
     }
 
     /// <summary>

@@ -92,6 +92,7 @@ public class ClientConfiguration : IEntityTypeConfiguration<Client>
         builder.Property(e => e.ApprovedBy).HasColumnName("approved_by");
         builder.Property(e => e.LastHeartbeatAt).HasColumnName("last_heartbeat_at");
         builder.Property(e => e.LastConfigVersion).HasColumnName("last_config_version").HasDefaultValue(0L);
+        builder.Property(e => e.ConfigRevision).HasColumnName("config_revision").HasDefaultValue(0L);
         builder.Property(e => e.CertificateThumbprint).HasColumnName("certificate_thumbprint").HasMaxLength(128);
         builder.Property(e => e.CertificateExpiresAt).HasColumnName("certificate_expires_at");
         builder.Property(e => e.TimeOffsetSeconds).HasColumnName("time_offset_seconds");

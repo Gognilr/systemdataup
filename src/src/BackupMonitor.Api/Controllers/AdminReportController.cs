@@ -52,4 +52,17 @@ public class AdminReportController : ApiBaseController
         var result = await _reportService.GetTaskSummaryAsync(ct);
         return OkData(result);
     }
+
+    /// <summary>
+    /// 待办聚合（B5 中期方案）：把待审批客户端/有问题的任务/待签发恢复/严重告警/最近自动登记
+    /// 一次性聚合返回，计数由服务端 CountAsync 得出，不受 PagedQuery.MaxPageSize=200 天花板影响。
+    /// 只读跨域聚合，沿用本控制器"按域复用 read 权限"的口径，取 tasks.read（问题任务是主体）。
+    /// </summary>
+    [HttpGet("todo-summary")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.read")]
+    public async Task<ActionResult<ApiResponse<TodoSummaryDto>>> TodoSummary(CancellationToken ct)
+    {
+        var result = await _reportService.GetTodoSummaryAsync(ct);
+        return OkData(result);
+    }
 }

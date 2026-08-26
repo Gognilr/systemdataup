@@ -121,3 +121,56 @@ public class TaskSummaryReportDto
 
     public RepositoryCapacityDto Capacity { get; set; } = new();
 }
+
+/// <summary>
+/// 待办聚合的一个分组：Count 由服务端 CountAsync 得出，不受分页影响；
+/// Items 只回前 N 条明细，列表页负责"查看全部"（B5 中期方案）。
+/// </summary>
+public class TodoSectionDto<T>
+{
+    public int Count { get; set; }
+
+    public List<T> Items { get; set; } = [];
+}
+
+/// <summary>待办：待审批客户端条目</summary>
+public class TodoClientItemDto
+{
+    public Guid Id { get; set; }
+    public string Hostname { get; set; } = null!;
+    public string DisplayName { get; set; } = null!;
+    public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>待办：有问题的任务条目</summary>
+public class TodoTaskItemDto
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = null!;
+    public string ClientHostname { get; set; } = null!;
+    public string? LastPrecheckStatus { get; set; }
+    public DateTime? LastScanAt { get; set; }
+    public DateTime? LastSuccessAt { get; set; }
+}
+
+/// <summary>待办：等待签发的恢复请求条目</summary>
+public class TodoRestoreItemDto
+{
+    public Guid Id { get; set; }
+    public string? BackupSetCode { get; set; }
+    public string? RequestedByName { get; set; }
+    public DateTime RequestedAt { get; set; }
+}
+
+/// <summary>
+/// 待办聚合（B5 中期方案）：把"哪些事项算待办"的判定从浏览器搬到服务端，
+/// 用 CountAsync 得出计数，不再受 PagedQuery.MaxPageSize=200 天花板影响。
+/// </summary>
+public class TodoSummaryDto
+{
+    public TodoSectionDto<TodoClientItemDto> PendingApprovalClients { get; set; } = new();
+    public TodoSectionDto<TodoTaskItemDto> ProblematicTasks { get; set; } = new();
+    public TodoSectionDto<TodoRestoreItemDto> ReadyRestores { get; set; } = new();
+    public TodoSectionDto<AlertListItemDto> CriticalAlerts { get; set; } = new();
+    public TodoSectionDto<RecentAutoEnrollmentDto> RecentAutoEnrollments { get; set; } = new();
+}

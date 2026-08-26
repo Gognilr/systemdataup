@@ -64,6 +64,25 @@ public class AdminBackupController : ApiBaseController
         return OkMessage("备份已解锁");
     }
 
+    /// <summary>隔离备份（D1：人工怀疑该版本有问题，不参与保留计算、不能用于恢复，但也不删除）</summary>
+    [HttpPost("{backupSetId:guid}/quarantine")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]
+    public async Task<ActionResult<ApiResponse>> Quarantine(
+        Guid backupSetId, [FromBody] QuarantineBackupRequest request, CancellationToken ct)
+    {
+        await _backupService.QuarantineAsync(backupSetId, request, ct);
+        return OkMessage("备份已隔离");
+    }
+
+    /// <summary>解除隔离（D1）</summary>
+    [HttpPost("{backupSetId:guid}/unquarantine")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]
+    public async Task<ActionResult<ApiResponse>> Unquarantine(Guid backupSetId, CancellationToken ct)
+    {
+        await _backupService.UnquarantineAsync(backupSetId, ct);
+        return OkMessage("已解除隔离");
+    }
+
     /// <summary>重新校验（18.6，异步）</summary>
     [HttpPost("{backupSetId:guid}/verify")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]

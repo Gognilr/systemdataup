@@ -1,4 +1,4 @@
-using BackupMonitor.Infrastructure.Services;
+﻿using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Models.Agent;
@@ -110,5 +110,17 @@ public class AdminBackupTaskController : ApiBaseController
     {
         var result = await _taskService.TestRecognitionAsync(taskId, ct);
         return AcceptedData(result, "识别测试已下发");
+    }
+
+    /// <summary>
+    /// 查询识别测试（或任意指令）的执行结果。
+    /// 识别测试是异步的：指令下发后要等 Agent 领走并执行，界面据此轮询。
+    /// </summary>
+    [HttpGet("commands/{commandId:guid}")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.read")]
+    public async Task<ActionResult<ApiResponse<CommandResultDto>>> GetCommandResult(Guid commandId, CancellationToken ct)
+    {
+        var result = await _taskService.GetCommandResultAsync(commandId, ct);
+        return OkData(result);
     }
 }

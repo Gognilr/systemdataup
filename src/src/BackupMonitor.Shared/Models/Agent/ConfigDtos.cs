@@ -41,6 +41,13 @@ public class AgentTaskConfigDto
     public int? BandwidthLimitKbps { get; set; }
     public int ChunkSizeBytes { get; set; }
 
+    /// <summary>
+    /// 0~1440 分钟，用来错开多台客户端在同一 cron 时刻的扫描/上传洪峰。
+    /// 字段位置固定在 ChunkSizeBytes 之后、RecognizerConfig 之前——
+    /// AgentSignatureCanonicalizer 里的顺序与此一致，改动顺序会让配置签名不兼容。
+    /// </summary>
+    public int RandomDelayMinutes { get; set; }
+
     /// <summary>识别规则配置（jsonb 原样下发）</summary>
     public string RecognizerConfig { get; set; } = "{}";
 

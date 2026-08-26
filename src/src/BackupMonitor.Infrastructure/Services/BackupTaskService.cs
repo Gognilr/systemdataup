@@ -7,6 +7,7 @@ using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Models.Agent;
+using BackupMonitor.Shared.Recognition;
 using BackupMonitor.Shared.Scheduling;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -26,6 +27,7 @@ public interface IBackupTaskService
     Task<DispatchCommandResponse> DispatchPrecheckAsync(Guid taskId, CancellationToken ct = default);
     Task<DispatchCommandResponse> DispatchUploadAsync(Guid taskId, DispatchUploadRequest request, CancellationToken ct = default);
     Task<TestRecognitionResponse> TestRecognitionAsync(Guid taskId, CancellationToken ct = default);
+    Task<CommandResultDto> GetCommandResultAsync(Guid commandId, CancellationToken ct = default);
 }
 
 /// <summary>备份任务服务实现（CRUD 乐观锁 + 暂停/恢复 + 指令下发 + 识别测试）</summary>
@@ -58,6 +60,14 @@ public class BackupTaskService : IBackupTaskService
         UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading,
         UploadStatus.Paused, UploadStatus.RetryWait, UploadStatus.Received, UploadStatus.Verifying
     ];
+
+    /// <summary>
+    /// B5/B4：最近预检状态里"不算问题"的取值——通过、没有新备份、还没扫描过（含从未扫描）。
+    /// 待办页与 GetListAsync(OnlyProblematic) 共用同一份判定，不再各写一份（此前浏览器里
+    /// 用黑名单 ['failed','failure','error']，漏掉了 path_not_found / required_file_missing 等）。
+    /// </summary>
+    internal static readonly PrecheckStatus[] OkPrecheckStatuses =
+        [PrecheckStatus.Passed, PrecheckStatus.NoNewBackup, PrecheckStatus.NotScanned];
 
     private readonly AppDbContext _db;
     private readonly ICommandDispatcher _commands;
@@ -165,6 +175,30 @@ public class BackupTaskService : IBackupTaskService
         return await GetDetailAsync(task.Id, ct);
     }
 
+    /// <summary>
+    /// 查询一条指令的执行状态与结果。识别测试是异步的——下发之后界面要能轮询它跑完没有。
+    /// </summary>
+    public async Task<CommandResultDto> GetCommandResultAsync(Guid commandId, CancellationToken ct = default)
+    {
+        var command = await _db.Commands.AsNoTracking()
+            .FirstOrDefaultAsync(c => c.Id == commandId, ct)
+            ?? throw new NotFoundException("指令", commandId);
+
+        return new CommandResultDto
+        {
+            CommandId = command.Id,
+            CommandType = EnumMapping.ToSnakeCase(command.CommandType),
+            Status = EnumMapping.ToSnakeCase(command.Status),
+            TaskId = command.TaskId,
+            CreatedAt = command.CreatedAt,
+            StartedAt = command.StartedAt,
+            CompletedAt = command.CompletedAt,
+            ResultCode = command.ResultCode,
+            ResultMessage = command.ResultMessage,
+            ResultPayload = command.ResultPayload
+        };
+    }
+
     public async Task DeleteAsync(Guid taskId, CancellationToken ct = default)
     {
         var task = await _db.BackupTasks.FirstOrDefaultAsync(t => t.Id == taskId, ct)
@@ -183,18 +217,36 @@ public class BackupTaskService : IBackupTaskService
         if (hasActiveSessions)
             throw new BusinessException("CONFLICT", "任务存在活动上传会话，不能删除", 409);
 
-        // 未完成的指令一并取消
-        await _db.Commands
-            .Where(c => c.TaskId == taskId && c.Status == CommandStatus.Pending)
-            .ExecuteUpdateAsync(s => s
-                .SetProperty(c => c.Status, CommandStatus.Cancelled)
-                .SetProperty(c => c.CompletedAt, DateTime.UtcNow), ct);
+        // 历史上传会话同样通过外键钉住任务。走到这里候选集必然已清空，
+        // 正常不会再有遗留会话；真有就明确报出来，而不是让数据库把它变成 500。
+        var hasUploadSessions = await _db.UploadSessions.AnyAsync(s => s.TaskId == taskId, ct);
+        if (hasUploadSessions)
+            throw new BusinessException("CONFLICT", "任务存在历史上传会话记录，不能删除", 409);
+
+        // 指令和告警都由外键（ON DELETE NO ACTION）钉着任务。
+        // 原先只是把 pending 指令改成 cancelled——行还在，于是任何点过一次预检的任务
+        // 都会在删除时触发外键冲突，前端只看到「服务器内部错误」，完全无从判断。
+        // 这两类都是任务的附属记录，任务没了它们也失去意义，随任务一并清理；
+        // 删除动作本身记在审计日志里，数量一并留痕。
+        var removedCommands = await _db.Commands
+            .Where(c => c.TaskId == taskId)
+            .ExecuteDeleteAsync(ct);
+        var removedAlerts = await _db.Alerts
+            .Where(a => a.TaskId == taskId)
+            .ExecuteDeleteAsync(ct);
 
         _db.BackupTasks.Remove(task);
         await _db.SaveChangesAsync(ct);
 
         await _audit.RecordAsync("task.delete", AuditResult.Success, "backup_task", taskId,
-            beforeData: JsonSerializer.Serialize(new { task.Id, task.Name, task.ClientId }), ct: ct);
+            beforeData: JsonSerializer.Serialize(new
+            {
+                task.Id,
+                task.Name,
+                task.ClientId,
+                removedCommands,
+                removedAlerts
+            }), ct: ct);
     }
 
     public async Task<PagedResult<BackupTaskListItemDto>> GetListAsync(BackupTaskQuery query, CancellationToken ct = default)
@@ -242,6 +294,31 @@ public class BackupTaskService : IBackupTaskService
                 || EF.Functions.ILike(t.ApplicationName, $"%{keyword}%"));
         }
 
+        if (!string.IsNullOrWhiteSpace(query.PrecheckStatus))
+        {
+            var values = query.PrecheckStatus.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(raw =>
+                {
+                    if (!EnumMapping.TryParseSnakeCase<PrecheckStatus>(raw, out var parsed))
+                        throw new BusinessException("INVALID_REQUEST", $"无效的预检状态：{raw}", 400);
+                    return parsed;
+                })
+                .ToList();
+            if (values.Count > 0)
+                tasks = tasks.Where(t => t.LastPrecheckStatus != null && values.Contains(t.LastPrecheckStatus.Value));
+        }
+
+        if (query.OnlyProblematic is true)
+        {
+            var now = DateTime.UtcNow;
+            var scanStaleCutoff = now.AddHours(-24);
+            var successStaleCutoff = now.AddDays(-3);
+            tasks = tasks.Where(t => t.Enabled && (
+                (t.LastPrecheckStatus != null && !OkPrecheckStatuses.Contains(t.LastPrecheckStatus.Value))
+                || (t.LastScanAt != null && t.LastScanAt < scanStaleCutoff
+                    && (t.LastSuccessAt == null || t.LastSuccessAt < successStaleCutoff))));
+        }
+
         var totalCount = await tasks.LongCountAsync(ct);
 
         var rows = await tasks
@@ -253,6 +330,7 @@ public class BackupTaskService : IBackupTaskService
                 t.Id,
                 t.ClientId,
                 ClientHostname = t.Client.Hostname,
+                ClientDisplayName = t.Client.DisplayName,
                 t.Name,
                 t.ApplicationName,
                 t.SourcePath,
@@ -280,6 +358,7 @@ public class BackupTaskService : IBackupTaskService
             Id = r.Id,
             ClientId = r.ClientId,
             ClientHostname = r.ClientHostname,
+            ClientDisplayName = r.ClientDisplayName,
             Name = r.Name,
             ApplicationName = r.ApplicationName,
             SourcePath = r.SourcePath,
@@ -314,6 +393,7 @@ public class BackupTaskService : IBackupTaskService
             Id = task.Id,
             ClientId = task.ClientId,
             ClientHostname = task.Client.Hostname,
+            ClientDisplayName = task.Client.DisplayName,
             Name = task.Name,
             ApplicationName = task.ApplicationName,
             SourcePath = task.SourcePath,
@@ -588,6 +668,24 @@ public class BackupTaskService : IBackupTaskService
             catch (JsonException)
             {
                 throw new BusinessException("INVALID_REQUEST", "识别规则配置不是合法的 JSON", 400);
+            }
+
+            // 合法 JSON 不等于有效规则。识别规则的解析对不认识的键一律静默忽略，
+            // 于是把 requiredFiles 敲成 requireFiles 的后果是：保存成功、界面正常、
+            // 规则完全失效——直到某天真要恢复数据时才发现。这种错误必须在保存时挡住。
+            var unknownKeys = RecognizerRules.FindUnknownKeys(recognizerConfig);
+            if (unknownKeys.Count > 0)
+            {
+                var details = unknownKeys.Select(key =>
+                {
+                    var suggestion = RecognizerRules.SuggestKey(key);
+                    return suggestion is null ? key : $"{key}（是不是想写 {suggestion}？）";
+                });
+                throw new BusinessException(
+                    "INVALID_REQUEST",
+                    $"识别规则里有无法识别的配置项：{string.Join("、", details)}。"
+                    + $"可用字段：{string.Join(" / ", RecognizerRules.KnownKeys)}",
+                    400);
             }
         }
 

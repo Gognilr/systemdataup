@@ -64,4 +64,33 @@ public class AdminAlertController : ApiBaseController
         await _alertService.CloseAsync(alertId, request, ct);
         return OkMessage("告警已关闭");
     }
+
+    /// <summary>指派告警（功能说明书 8.18）</summary>
+    [HttpPost("{alertId:guid}/assign")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:alerts.handle")]
+    public async Task<ActionResult<ApiResponse>> Assign(
+        Guid alertId, [FromBody] AssignAlertRequest request, CancellationToken ct)
+    {
+        await _alertService.AssignAsync(alertId, request, ct);
+        return OkMessage(request.AssignedTo is null ? "已取消指派" : "告警已指派");
+    }
+
+    /// <summary>创建临时静默（功能说明书 8.18，维护窗口场景）</summary>
+    [HttpPost("{alertId:guid}/silence")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:alerts.handle")]
+    public async Task<ActionResult<ApiResponse<AlertSilenceDto>>> Silence(
+        Guid alertId, [FromBody] SilenceAlertRequest request, CancellationToken ct)
+    {
+        var result = await _alertService.SilenceAsync(alertId, request, ct);
+        return OkData(result);
+    }
+
+    /// <summary>提前解除一条静默</summary>
+    [HttpDelete("silences/{silenceId:guid}")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:alerts.handle")]
+    public async Task<ActionResult<ApiResponse>> RemoveSilence(Guid silenceId, CancellationToken ct)
+    {
+        await _alertService.RemoveSilenceAsync(silenceId, ct);
+        return OkMessage("静默已解除");
+    }
 }

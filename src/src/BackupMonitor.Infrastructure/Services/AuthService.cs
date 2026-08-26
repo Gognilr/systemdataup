@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Entities.Rbac;
+﻿using BackupMonitor.Core.Entities.Rbac;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
@@ -10,7 +10,14 @@ using Microsoft.Extensions.Logging;
 
 namespace BackupMonitor.Infrastructure.Services;
 
-/// <summary>管理员认证服务（设计书 9 认证接口 / 23.2 管理认证）</summary>
+/// <summary>
+/// 管理员认证服务（设计书 9 认证接口 / 23.2 管理认证）。
+///
+/// 整改批次 C · C4：本文件已在改密（ChangePasswordAsync）和登出（LogoutAsync）时把
+/// user.TokenVersion++。当前代码库还没有"禁用账号 / 改角色 / 改权限"的管理接口——
+/// 未来实现这些接口时必须同样 TokenVersion++（写法参考本文件），否则撤权不会在 60 秒内生效，
+/// 权限仍旧烤死在已签发的令牌里直到自然过期。
+/// </summary>
 public interface IAuthService
 {
     Task<LoginResponse> LoginAsync(LoginRequest request, string? clientIp, string? userAgent, CancellationToken ct = default);
@@ -206,6 +213,14 @@ public class AuthService : IAuthService
 
         stored.RevokedAt = DateTime.UtcNow;
         stored.RevokeReason = "logout";
+
+        // 整改批次 C · C4：登出时令牌版本号 ++，让刷新令牌与访问令牌一起失效——
+        // 访问令牌本身无状态（JWT），此前只能等它自然过期（最长 1 小时）；
+        // 现在 TokenVersionMiddleware 最坏 60 秒内就会因为 tv 不匹配拒绝这次登出会话下发的令牌。
+        var user = await _db.Users.FirstOrDefaultAsync(u => u.Id == stored.UserId, ct);
+        if (user is not null)
+            user.TokenVersion++;
+
         await _db.SaveChangesAsync(ct);
     }
 
@@ -233,20 +248,37 @@ public class AuthService : IAuthService
             throw new BusinessException("UNAUTHORIZED", "旧口令错误", 401);
         }
 
-        // 2. 强度校验放在服务端（OPEN-ISSUES #2），不能只依赖前端
+        // 2. 新口令不得与当前口令相同。
+        //    这一条不能省：首次登录的强制改密（MustChangePassword）把「原样填回初始口令」
+        //    当作一次成功改密，会清掉强制改密标记而口令仍是安装器给的那个默认值——
+        //    强制改密这道关就等于自动放行了。此处 oldOk 已经证明 OldPassword 就是当前口令，
+        //    直接比对明文即可，不必再做一次 bcrypt。
+        if (string.Equals(request.OldPassword, request.NewPassword, StringComparison.Ordinal))
+        {
+            await _audit.RecordAsync("auth.change_password", AuditResult.Failure, "user", user.Id,
+                errorMessage: "新口令与当前口令相同", ct: ct);
+            throw new BusinessException("INVALID_REQUEST", "新口令不能与当前口令相同", 400);
+        }
+
+        // 3. 强度校验放在服务端（OPEN-ISSUES #2），不能只依赖前端
         var strengthError = PasswordPolicy.Validate(request.NewPassword, user.Username);
         if (strengthError is not null)
             throw new BusinessException("INVALID_REQUEST", strengthError, 400);
 
-        // 3. 更新口令（bcrypt 成本 12，与 V001/V005 的 gen_salt('bf',12) 一致）
+        // 4. 更新口令（bcrypt 成本 12，与 V001/V005 的 gen_salt('bf',12) 一致）
         var now = DateTime.UtcNow;
         user.PasswordHash = PasswordPolicy.Hash(request.NewPassword);
         user.PasswordChangedAt = now;
         user.MustChangePassword = false;
+
+        // 整改批次 C · C4：令牌版本号 ++。此前这里的注释写"访问令牌为无状态 JWT，
+        // 仍有效至自然过期"，就是权限/身份变更后旧令牌能继续用最长 1 小时的那个洞——
+        // 现在 TokenVersionMiddleware 会在 60 秒缓存 TTL 内把已改密账号的旧访问令牌拒掉。
+        user.TokenVersion++;
+
         await _db.SaveChangesAsync(ct);
 
-        // 4. 吊销该用户全部刷新令牌，强制所有会话用新口令重新登录
-        //    （访问令牌为无状态 JWT，仍有效至自然过期——符合验收口径）
+        // 5. 吊销该用户全部刷新令牌，强制所有会话用新口令重新登录
         await RevokeAllUserTokensAsync(user.Id, "password_changed", ct);
 
         await _audit.RecordAsync("auth.change_password", AuditResult.Success, "user", user.Id, ct: ct);

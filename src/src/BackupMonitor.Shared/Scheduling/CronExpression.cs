@@ -135,6 +135,57 @@ public sealed class CronExpression
         return null;
     }
 
+    /// <summary>
+    /// 求 beforeUtc 之前的上一次触发时刻（UTC）。永远不会返回等于 beforeUtc 的时刻。
+    /// 与 GetNextOccurrence 完全对称：同样在 timeZone 的本地时间上匹配，
+    /// 同样在不匹配时整天/整小时跳跃（逐分钟回退在 4 年搜索窗口下是两百万次迭代）。
+    /// 「这个任务上一次本该在什么时候跑」是漏备份判定的基准，算错等于漏报或误报。
+    /// 表达式描述的日期永不出现时（例如 2 月 30 日）返回 null。
+    /// </summary>
+    public DateTime? GetPreviousOccurrence(DateTime beforeUtc, TimeZoneInfo timeZone)
+    {
+        ArgumentNullException.ThrowIfNull(timeZone);
+
+        var local = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(beforeUtc, DateTimeKind.Utc), timeZone);
+        var candidate = new DateTime(local.Year, local.Month, local.Day, local.Hour, local.Minute, 0, DateTimeKind.Unspecified)
+            .AddMinutes(-1);
+        var limit = candidate.AddYears(-SearchYears);
+
+        while (candidate > limit)
+        {
+            if (!MatchesDate(candidate))
+            {
+                // 整天不匹配：直接退到前一天的 23:59。
+                candidate = candidate.Date.AddDays(-1).AddHours(23).AddMinutes(59);
+                continue;
+            }
+
+            if (!_hours[candidate.Hour])
+            {
+                // 整小时不匹配：退到上一小时的 :59。
+                candidate = candidate.Date.AddHours(candidate.Hour).AddMinutes(-1);
+                continue;
+            }
+
+            if (!_minutes[candidate.Minute])
+            {
+                candidate = candidate.AddMinutes(-1);
+                continue;
+            }
+
+            // 夏令时向前拨掉的那一小时在本地并不存在，跳过；否则 ConvertTimeToUtc 会抛异常。
+            if (timeZone.IsInvalidTime(candidate))
+            {
+                candidate = candidate.AddMinutes(-1);
+                continue;
+            }
+
+            return TimeZoneInfo.ConvertTimeToUtc(candidate, timeZone);
+        }
+
+        return null;
+    }
+
     private bool MatchesDate(DateTime local)
     {
         if (!_months[local.Month])

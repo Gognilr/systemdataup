@@ -7,6 +7,7 @@ using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models.Agent;
+using BackupMonitor.Shared.Recognition;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
@@ -62,6 +63,20 @@ public class AgentPrecheckService : IAgentPrecheckService
                 status = PrecheckStatus.RequiredFileMissing;
                 failureCode = "SERVER_PRECHECK_VALIDATION_FAILED";
                 failureMessage = validationError;
+            }
+            else
+            {
+                // 大小/文件数阈值判定放服务端而不是 Agent：数据全都已经在预检回报里
+                // （TotalBytes / TotalFiles），放服务端不必改配置 DTO 和签名，旧版 Agent 也立刻受益。
+                // 「备份文件突然变成 0 字节」是备份故障里最经典也最容易检测的一种，
+                // 三个阈值字段建库时就有、界面上一直显示，却从来没有任何一处做过比较。
+                var sizeError = ValidateSizeThresholds(task, request);
+                if (sizeError is not null)
+                {
+                    status = PrecheckStatus.SizeAbnormal;
+                    failureCode = "SIZE_ABNORMAL";
+                    failureMessage = sizeError;
+                }
             }
         }
 
@@ -216,7 +231,23 @@ public class AgentPrecheckService : IAgentPrecheckService
         }
 
         // 失败告警
-        if (status is not (PrecheckStatus.Passed or PrecheckStatus.NoNewBackup))
+        if (status == PrecheckStatus.SizeAbnormal)
+        {
+            // 大小异常必须比其他预检失败更响：它意味着备份「跑了但是空的/残缺的」，
+            // 归进 precheck_failed 的 Notice 等级等于埋掉。单独一个 category，
+            // 重要级 high/critical 的任务再升一级到严重。
+            await _alerting.RaiseAsync(
+                $"task:{task.Id}:precheck:size_abnormal",
+                task.ImportanceLevel >= ImportanceLevel.High ? AlertLevel.Critical : AlertLevel.Warning,
+                "size_abnormal",
+                $"任务 {task.Name} 备份大小异常",
+                failureMessage,
+                clientId: clientId,
+                taskId: task.Id,
+                businessUnitId: candidate.BusinessUnitId,
+                ct: ct);
+        }
+        else if (status is not (PrecheckStatus.Passed or PrecheckStatus.NoNewBackup))
         {
             await _alerting.RaiseAsync(
                 $"task:{task.Id}:precheck:{EnumMapping.ToSnakeCase(status)}",
@@ -232,6 +263,8 @@ public class AgentPrecheckService : IAgentPrecheckService
         else
         {
             await _alerting.RecoverAsync($"task:{task.Id}:precheck:failed", ct);
+            // 这一次的大小落回阈值内即视为恢复，否则大小异常告警会永久挂在告警中心。
+            await _alerting.RecoverAsync($"task:{task.Id}:precheck:size_abnormal", ct);
         }
 
         // 下一步动作
@@ -281,6 +314,26 @@ public class AgentPrecheckService : IAgentPrecheckService
     private static PrecheckStatus MapPrecheckStatus(string value) =>
         EnumMapping.ParseSnakeCase<PrecheckStatus>(value, "precheckStatus");
 
+    /// <summary>
+    /// 任务级大小/文件数阈值判定（整改 A3）。三个阈值都留空（null 或 &lt;= 0）时返回 null，
+    /// 行为与改动前完全一致。仅在预检自身已判定为「通过」后调用——
+    /// 失败结果的 TotalBytes/TotalFiles 本来就不可信，不必再拿它们比阈值。
+    /// </summary>
+    private static string? ValidateSizeThresholds(BackupTask task, SubmitPrecheckResultRequest request)
+    {
+        var bytes = request.TotalBytes ?? 0;
+        var files = request.TotalFiles ?? 0;
+
+        if (task.MinTotalBytes is > 0 && bytes < task.MinTotalBytes)
+            return $"备份总大小 {bytes} 字节低于下限 {task.MinTotalBytes} 字节——备份可能未正常生成";
+        if (task.MaxTotalBytes is > 0 && bytes > task.MaxTotalBytes)
+            return $"备份总大小 {bytes} 字节超过上限 {task.MaxTotalBytes} 字节";
+        if (task.MinFileCount is > 0 && files < task.MinFileCount)
+            return $"备份文件数 {files} 少于下限 {task.MinFileCount}";
+
+        return null;
+    }
+
     private static string? ValidatePassedResult(string recognizerConfig, SubmitPrecheckResultRequest request)
     {
         var files = request.Files;
@@ -314,49 +367,20 @@ public class AgentPrecheckService : IAgentPrecheckService
         if (!string.Equals(actualManifest, request.ManifestHash, StringComparison.OrdinalIgnoreCase))
             return "ManifestHash 与文件清单不一致";
 
-        var required = ReadRequiredPatterns(recognizerConfig);
+        // requiredFiles 的读取与匹配语义共用 RecognizerRules：这套判定原先在
+        // Agent 扫描、服务端校验、配置向导三处各写了一份，任何一处改了都不会有人发现
+        // 另外两处没改——而它们判的是同一件事「这份备份完整吗」。
+        var required = RecognizerRules.Parse(recognizerConfig).Required
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
         var relativePaths = files.Select(file => file.RelativePath.Replace('\\', '/')).ToList();
         var missing = required.FirstOrDefault(pattern =>
-            !relativePaths.Any(path => GlobMatch(path, pattern) || GlobMatch(Path.GetFileName(path), pattern)));
+            !relativePaths.Any(path => RecognizerRules.MatchesPath(path, pattern)));
         return missing is null ? null : $"缺少 requiredFiles 文件：{missing}";
-    }
-
-    private static List<string> ReadRequiredPatterns(string? json)
-    {
-        if (string.IsNullOrWhiteSpace(json))
-            return [];
-
-        try
-        {
-            using var document = JsonDocument.Parse(json);
-            var root = document.RootElement;
-            return new[] { "requiredFiles", "requiredPatterns", "required" }
-                .SelectMany(property =>
-                    root.TryGetProperty(property, out var value)
-                        ? value.ValueKind == JsonValueKind.String
-                            ? string.IsNullOrWhiteSpace(value.GetString()) ? [] : [value.GetString()!]
-                            : value.ValueKind == JsonValueKind.Array
-                                ? value.EnumerateArray().Where(item => item.ValueKind == JsonValueKind.String)
-                                    .Select(item => item.GetString()!)
-                                    .Where(item => !string.IsNullOrWhiteSpace(item))
-                                : []
-                        : [])
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
-        }
-        catch (JsonException)
-        {
-            return [];
-        }
     }
 
     private static bool IsSha256(string? value) =>
         !string.IsNullOrWhiteSpace(value)
         && Regex.IsMatch(value, "^[0-9a-fA-F]{64}$", RegexOptions.CultureInvariant);
 
-    private static bool GlobMatch(string value, string pattern)
-    {
-        var regex = "^" + Regex.Escape(pattern.Trim()).Replace(@"\*", ".*").Replace(@"\?", ".") + "$";
-        return Regex.IsMatch(value.Replace('\\', '/'), regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-    }
 }

@@ -48,6 +48,58 @@ function Invoke-Dotnet {
     }
 }
 
+function Invoke-VerifiedCompress {
+    param(
+        [Parameter(Mandatory = $true)][string[]] $Path,
+        [Parameter(Mandatory = $true)][string] $DestinationPath,
+        [Parameter(Mandatory = $true)][string[]] $RequiredEntry
+    )
+
+    # Compress-Archive 在源文件被占用（杀软扫描、进程还没退干净）时只写一条
+    # 非终止错误 —— 脚本顶上的 $ErrorActionPreference 是模块外的，管不到它 ——
+    # 然后照常返回。这样打出来的是一个「下载客户端」404 的安装包，而构建退出码是 0。
+    # 这里做两件事：把它的错误升级成终止错误，压完之后再把包真的打开点名核对。
+    # 重试是针对一个反复观测到的现象：杀毒软件在扫刚发布/刚解压出来的几千个文件，
+    # 期间随机某个文件短时间不可读。这不是构建逻辑的问题，等一会儿就好。
+    # 但重试次数是有界的——次数用尽照样抛错，绝不退化成「静默产出坏包」。
+    $attempts = 4
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        try {
+            Compress-Archive -Path $Path -DestinationPath $DestinationPath -CompressionLevel Optimal -Force -ErrorAction Stop
+            break
+        } catch {
+            if ($attempt -eq $attempts) {
+                throw "Compress-Archive failed after ${attempts} attempts for ${DestinationPath}: $($_.Exception.Message)"
+            }
+            Write-Host "Compress-Archive attempt ${attempt}/${attempts} failed (${DestinationPath}): $($_.Exception.Message)"
+            if (Test-Path -LiteralPath $DestinationPath) {
+                Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
+            }
+            Start-Sleep -Seconds (10 * $attempt)
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $DestinationPath)) {
+        throw "Compress-Archive did not produce ${DestinationPath}."
+    }
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($DestinationPath)
+    try {
+        # zip 条目分隔符两种都可能出现，统一成反斜杠再比。
+        # 反斜杠用 [char]92 拼，免得转义在编辑链路上被吃掉。
+        $sep = [string][char]92
+        $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace('/', $sep) })
+        $missing = @($RequiredEntry | Where-Object { $entries -notcontains $_.Replace('/', $sep) })
+    } finally {
+        $archive.Dispose()
+    }
+    if ($missing.Count -gt 0) {
+        throw "Archive ${DestinationPath} is missing required entries: $($missing -join ', ')"
+    }
+    Write-Host "Verified archive ${DestinationPath} ($($entries.Count) entries)"
+}
+
 if (-not (Test-Path -LiteralPath $payloadLockPath)) {
     throw "Payload lock file is missing: $payloadLockPath"
 }
@@ -152,7 +204,17 @@ Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\uninstall-
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\README.md') -Destination (Join-Path $clientPackageStage 'README.md') -Force
 
 $clientZip = Join-Path $apiPublish 'wwwroot\downloads\BackupMonitor.Agent.zip'
-Compress-Archive -Path (Join-Path $clientPackageStage '*') -DestinationPath $clientZip -CompressionLevel Optimal -Force
+# 这四个名字与 AgentInstaller.ValidatePayload / install-agent.ps1 的期望一致：
+# 少任何一个，客户端解压出来都起不来。
+Invoke-VerifiedCompress `
+    -Path (Join-Path $clientPackageStage '*') `
+    -DestinationPath $clientZip `
+    -RequiredEntry @(
+        'BackupMonitor.Agent.exe',
+        'BackupMonitor.Agent.dll',
+        'BackupMonitor.Agent.Tray.exe',
+        'appsettings.json',
+        'install-agent.ps1')
 $clientSetup = Join-Path $agentSetupPublish 'BackupMonitor.Agent.Setup.exe'
 Copy-Item -LiteralPath $clientSetup -Destination (Join-Path $apiPublish 'wwwroot\downloads\BackupMonitor.Agent.Setup.exe') -Force
 
@@ -185,7 +247,18 @@ $payloadManifest = [ordered]@{
 $payloadManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stageRoot 'payload-manifest.json') -Encoding UTF8
 
 $payloadZip = Join-Path $setupPayloadRoot 'server-payload.zip'
-Compress-Archive -Path $apiPublish, $databaseStage, $postgresStage -DestinationPath $payloadZip -CompressionLevel Optimal -Force
+# 迁移脚本逐个点名：新加一条迁移却没进 payload，表现是装完之后某张表/某个列不存在，
+# 要到运行期才炸。客户端下载入口同理——缺了它网页上那个下载按钮就是 404。
+$payloadRequired = @(
+    'api\BackupMonitor.Api.exe',
+    'api\wwwroot\downloads\BackupMonitor.Agent.zip',
+    'api\wwwroot\downloads\BackupMonitor.Agent.Setup.exe',
+    'postgresql\bin\initdb.exe')
+$payloadRequired += $migrationFiles | ForEach-Object { "database\$($_.Name)" }
+Invoke-VerifiedCompress `
+    -Path @($apiPublish, $databaseStage, $postgresStage) `
+    -DestinationPath $payloadZip `
+    -RequiredEntry $payloadRequired
 
 Invoke-Dotnet @('publish', (Join-Path $srcRoot 'server\BackupMonitor.Server.Setup\BackupMonitor.Server.Setup.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-p:PublishSingleFile=true', '-p:IncludeNativeLibrariesForSelfExtract=true', '-o', $serverSetupPublish)
 

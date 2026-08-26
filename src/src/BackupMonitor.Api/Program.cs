@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.RateLimiting;
 using System.Security.Cryptography.X509Certificates;
@@ -224,6 +225,37 @@ builder.Services.AddSwaggerGen(c =>
 var jwtSettings = new JwtSettings();
 builder.Configuration.GetSection(JwtSettings.SectionName).Bind(jwtSettings);
 
+// 整改批次 C · C3：JWT 签名密钥等关键机密启动即校验，快速失败。
+// 此前 appsettings.json 里 SigningKey 默认是空串，Secure/开发模式漏配环境变量时服务照常启动，
+// 直到第一次登录才在 Encoding.UTF8.GetBytes("") 上炸出一个没有上下文的 500。
+// LAN Turnkey 模式（BACKUPMONITOR_TURNKEY=1）不受影响：localBootstrap.Values 已经在上面
+// 通过 AddInMemoryCollection 合并进 builder.Configuration，这里读到的已经是自动生成后的值。
+static void RequireSecret(string? value, int minBytes, string configPath, string envName, string hint)
+{
+    if (string.IsNullOrWhiteSpace(value) || Encoding.UTF8.GetByteCount(value) < minBytes)
+        throw new InvalidOperationException(
+            $"{configPath} 未配置或强度不足（至少 {minBytes} 字节）。{hint}"
+            + $" 生产环境请设置环境变量 {envName}；LAN Turnkey 模式会自动生成，无需手工配置。");
+}
+
+RequireSecret(jwtSettings.SigningKey, 32, "Security:Jwt:SigningKey", "Security__Jwt__SigningKey",
+    "该密钥用于签发管理端登录令牌，弱密钥等同于任何人都能伪造管理员身份。");
+
+// CommandSigner 自身在显式启用 Security:AllowLegacyCommandHmac 时允许回退到旧 HMAC 密钥
+// （CommandSigningPrivateKey 留空、CommandSigningKey 非空），那是刻意的迁移路径，不在此处拦截；
+// 其余情况下 RSA 私钥缺失或过弱同样属于"漏配"，理应在启动时而不是首次下发指令时才炸。
+var allowLegacyCommandHmac = builder.Configuration.GetValue("Security:AllowLegacyCommandHmac", false);
+if (!allowLegacyCommandHmac)
+{
+    RequireSecret(builder.Configuration["Security:CommandSigningPrivateKey"], 32,
+        "Security:CommandSigningPrivateKey", "Security__CommandSigningPrivateKey",
+        "该密钥用于对下发指令与配置签名，缺失或过弱会让伪造的 Agent 指令被服务端接受。");
+}
+
+RequireSecret(builder.Configuration.GetConnectionString("Default"), 10,
+    "ConnectionStrings:Default", "ConnectionStrings__Default",
+    "缺少数据库连接串，服务无法访问数据。");
+
 builder.Services.AddAuthentication(options =>
     {
         options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
@@ -384,6 +416,12 @@ app.UseStaticFiles();
 
 app.UseRateLimiter();
 app.UseAuthentication();
+
+// 整改批次 C · C4：令牌版本校验，必须位于认证之后（需要 tv claim）、授权之前。
+// 权限以 claim 形式烤死在 access token 里，此前撤权/禁用账号/改角色后已签发的令牌最长还能
+// 用到自然过期（默认 1 小时）。这里比对 token 里的 tv 与库中 users.token_version（60 秒内存缓存，
+// 缓存命中不产生额外 DB 查询），不一致直接 401，最坏 60 秒生效。
+app.UseMiddleware<TokenVersionMiddleware>();
 
 // 强制改密闸门必须位于认证之后（需要 JWT claim）、授权之前（未改密时不应触达任何业务端点）。
 // 静态文件在上面已经短路返回，不会经过这里。

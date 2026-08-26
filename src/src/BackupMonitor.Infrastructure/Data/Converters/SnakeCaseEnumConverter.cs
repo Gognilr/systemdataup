@@ -39,7 +39,7 @@ public static class SnakeCaseHelper
         return sb.ToString();
     }
 
-    /// <summary>snake_case → 枚举值（如 waiting_stable → WaitingStable）</summary>
+    /// <summary>snake_case → 枚举值（如 path_not_found → PathNotFound）</summary>
     public static TEnum FromSnakeCase<TEnum>(string snakeCase)
         where TEnum : struct, Enum
     {

@@ -1,4 +1,4 @@
-using System.ComponentModel.DataAnnotations;
+﻿using System.ComponentModel.DataAnnotations;
 using BackupMonitor.Shared.Models;
 
 namespace BackupMonitor.Shared.Models.Admin;
@@ -114,6 +114,19 @@ public class BackupTaskQuery : PagedQuery
     public string? ApplicationName { get; set; }
     public bool? HasAlert { get; set; }
     public DateTime? LastSuccessBefore { get; set; }
+
+    /// <summary>
+    /// 按最近预检状态过滤，逗号分隔多值（如 path_not_found,required_file_missing）。
+    /// B5：待办页此前靠 pageSize=200 拉全量再在浏览器过滤，超过 200 个任务时静默漏项；
+    /// 加这个参数让待办只拉真正需要的行，天花板问题自然消失。
+    /// </summary>
+    public string? PrecheckStatus { get; set; }
+
+    /// <summary>
+    /// 只看"算有问题"的任务：最近预检非正常态，或已启用但超过一天没扫描且超过三天没成功。
+    /// 判定逻辑与 ReportService.GetTodoSummaryAsync 共用（BackupTaskService.IsProblematic）。
+    /// </summary>
+    public bool? OnlyProblematic { get; set; }
 }
 
 /// <summary>任务列表项</summary>
@@ -122,6 +135,9 @@ public class BackupTaskListItemDto
     public Guid Id { get; set; }
     public Guid ClientId { get; set; }
     public string ClientHostname { get; set; } = null!;
+
+    /// <summary>装机时人填的名字；界面以它为主，主机名只用来消歧。</summary>
+    public string ClientDisplayName { get; set; } = null!;
     public string Name { get; set; } = null!;
     public string ApplicationName { get; set; } = null!;
     public string SourcePath { get; set; } = null!;
@@ -183,4 +199,24 @@ public class DispatchCommandResponse
 
     /// <summary>pending</summary>
     public string Status { get; set; } = "pending";
+}
+
+/// <summary>
+/// 指令执行结果查询。识别测试是异步的：下发一条指令给 Agent，
+/// 界面需要能轮询它跑完没有、跑出了什么。
+/// </summary>
+public class CommandResultDto
+{
+    public Guid CommandId { get; set; }
+    public string CommandType { get; set; } = null!;
+    public string Status { get; set; } = null!;
+    public Guid? TaskId { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime? StartedAt { get; set; }
+    public DateTime? CompletedAt { get; set; }
+    public string? ResultCode { get; set; }
+    public string? ResultMessage { get; set; }
+
+    /// <summary>指令返回的结构化结果（jsonb 原样返回）。</summary>
+    public string? ResultPayload { get; set; }
 }

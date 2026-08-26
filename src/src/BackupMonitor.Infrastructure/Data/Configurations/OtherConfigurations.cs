@@ -68,6 +68,8 @@ public class AlertConfiguration : IEntityTypeConfiguration<Alert>
         builder.Property(e => e.OccurrenceCount).HasColumnName("occurrence_count").HasDefaultValue(1);
         builder.Property(e => e.AcknowledgedBy).HasColumnName("acknowledged_by");
         builder.Property(e => e.AcknowledgedAt).HasColumnName("acknowledged_at");
+        builder.Property(e => e.AssignedTo).HasColumnName("assigned_to");
+        builder.Property(e => e.AssignedAt).HasColumnName("assigned_at");
         builder.Property(e => e.RecoveredAt).HasColumnName("recovered_at");
         builder.Property(e => e.ClosedAt).HasColumnName("closed_at");
         builder.Property(e => e.HandlingNote).HasColumnName("handling_note").HasMaxLength(4000);
@@ -77,6 +79,7 @@ public class AlertConfiguration : IEntityTypeConfiguration<Alert>
         builder.HasIndex(e => e.ClientId).HasDatabaseName("idx_alerts_client");
         builder.HasIndex(e => e.TaskId).HasDatabaseName("idx_alerts_task");
         builder.HasIndex(e => e.LastOccurredAt).IsDescending().HasDatabaseName("idx_alerts_last_occurred");
+        builder.HasIndex(e => e.AssignedTo).HasDatabaseName("idx_alerts_assigned_to");
 
         // 活动告警去重：同一 alert_key 在 open/acknowledged/in_progress 状态下仅一条（部分唯一索引）
         builder.HasIndex(e => e.AlertKey)
@@ -107,6 +110,34 @@ public class AlertConfiguration : IEntityTypeConfiguration<Alert>
         builder.HasOne(e => e.AcknowledgedByUser)
             .WithMany()
             .HasForeignKey(e => e.AcknowledgedBy)
+            .OnDelete(DeleteBehavior.Restrict);
+
+        builder.HasOne(e => e.AssignedToUser)
+            .WithMany()
+            .HasForeignKey(e => e.AssignedTo)
+            .OnDelete(DeleteBehavior.Restrict);
+    }
+}
+
+public class AlertSilenceConfiguration : IEntityTypeConfiguration<AlertSilence>
+{
+    public void Configure(EntityTypeBuilder<AlertSilence> builder)
+    {
+        builder.ToTable("alert_silences");
+
+        builder.HasKey(e => e.Id);
+        builder.Property(e => e.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+        builder.Property(e => e.AlertKeyPattern).HasColumnName("alert_key_pattern").HasMaxLength(255).IsRequired();
+        builder.Property(e => e.Reason).HasColumnName("reason").HasMaxLength(1000).IsRequired();
+        builder.Property(e => e.Until).HasColumnName("until");
+        builder.Property(e => e.CreatedBy).HasColumnName("created_by");
+        builder.Property(e => e.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("now()");
+
+        builder.HasIndex(e => e.Until).HasDatabaseName("idx_alert_silences_until");
+
+        builder.HasOne(e => e.CreatedByUser)
+            .WithMany()
+            .HasForeignKey(e => e.CreatedBy)
             .OnDelete(DeleteBehavior.Restrict);
     }
 }

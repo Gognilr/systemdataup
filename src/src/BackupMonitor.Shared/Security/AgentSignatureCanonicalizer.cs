@@ -76,6 +76,7 @@ public static class AgentSignatureCanonicalizer
                 task.MaxStabilityWaitSeconds.ToString(CultureInfo.InvariantCulture),
                 task.BandwidthLimitKbps?.ToString(CultureInfo.InvariantCulture),
                 task.ChunkSizeBytes.ToString(CultureInfo.InvariantCulture),
+                task.RandomDelayMinutes.ToString(CultureInfo.InvariantCulture),
                 task.RecognizerConfig,
                 task.ConfigVersion.ToString(CultureInfo.InvariantCulture)
             ]);

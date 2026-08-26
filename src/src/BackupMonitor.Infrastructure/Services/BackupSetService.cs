@@ -22,6 +22,12 @@ public interface IBackupSetService
     Task LockAsync(Guid backupSetId, LockBackupRequest request, CancellationToken ct = default);
     Task UnlockAsync(Guid backupSetId, CancellationToken ct = default);
     Task<VerifyBackupResponse> VerifyAsync(Guid backupSetId, CancellationToken ct = default);
+
+    /// <summary>隔离（D1）：人工怀疑该备份有问题时标记，不参与保留计算、不能用于恢复，但也不删除</summary>
+    Task QuarantineAsync(Guid backupSetId, QuarantineBackupRequest request, CancellationToken ct = default);
+
+    /// <summary>解除隔离，恢复为可用状态</summary>
+    Task UnquarantineAsync(Guid backupSetId, CancellationToken ct = default);
 }
 
 /// <summary>备份查询实现（列表/详情/文件/锁定/解锁/重校验）</summary>
@@ -263,6 +269,51 @@ public class BackupSetService : IBackupSetService
 
         await _db.SaveChangesAsync(ct);
         await _audit.RecordAsync("backup.unlock", AuditResult.Success, "backup_set", set.Id, ct: ct);
+    }
+
+    /// <summary>
+    /// 隔离（D1）：人工怀疑该备份有问题时的动作——校验通过但怀疑有问题，
+    /// 标记后不参与保留计算（RetentionCleanupWorker 只处理 Available 状态）、
+    /// 不能用于恢复（RestoreService 只允许对 Available 状态发起恢复），但也不删除。
+    /// </summary>
+    public async Task QuarantineAsync(Guid backupSetId, QuarantineBackupRequest request, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(request.Reason))
+            throw new ValidationFailedException("隔离原因必填");
+
+        var set = await _db.BackupSets.FirstOrDefaultAsync(s => s.Id == backupSetId, ct)
+            ?? throw new NotFoundException("备份版本", backupSetId);
+
+        if (set.Status is not (BackupSetStatus.Available or BackupSetStatus.VerificationFailed))
+            throw new BusinessException("CONFLICT",
+                $"备份版本当前状态为 {EnumMapping.ToSnakeCase(set.Status)}，只有可用或校验失败的版本可以隔离", 409);
+
+        var previousStatus = set.Status;
+        set.Status = BackupSetStatus.Quarantined;
+
+        await _db.SaveChangesAsync(ct);
+        await _audit.RecordAsync("backup.quarantine", AuditResult.Success, "backup_set", set.Id,
+            beforeData: JsonSerializer.Serialize(new { Status = EnumMapping.ToSnakeCase(previousStatus) }),
+            afterData: JsonSerializer.Serialize(new { request.Reason }), ct: ct);
+
+        _logger.LogInformation("备份 {BackupSetId}({Code}) 已隔离：{Reason}", set.Id, set.BackupSetCode, request.Reason);
+    }
+
+    /// <summary>解除隔离（D1），恢复为可用状态</summary>
+    public async Task UnquarantineAsync(Guid backupSetId, CancellationToken ct = default)
+    {
+        var set = await _db.BackupSets.FirstOrDefaultAsync(s => s.Id == backupSetId, ct)
+            ?? throw new NotFoundException("备份版本", backupSetId);
+
+        if (set.Status is not BackupSetStatus.Quarantined)
+            throw new BusinessException("CONFLICT", "备份版本未处于隔离状态", 409);
+
+        set.Status = BackupSetStatus.Available;
+
+        await _db.SaveChangesAsync(ct);
+        await _audit.RecordAsync("backup.unquarantine", AuditResult.Success, "backup_set", set.Id, ct: ct);
+
+        _logger.LogInformation("备份 {BackupSetId}({Code}) 已解除隔离", set.Id, set.BackupSetCode);
     }
 
     /// <summary>重新校验（设计书 18.6，异步：入后台校验队列）</summary>

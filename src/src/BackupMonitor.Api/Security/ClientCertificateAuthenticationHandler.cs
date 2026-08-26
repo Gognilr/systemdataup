@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Security.Claims;
 using System.Text.Encodings.Web;
 using BackupMonitor.Core.Enums;
@@ -95,6 +95,17 @@ public class ClientCertificateAuthenticationHandler : AuthenticationHandler<Clie
             return BuildTicket(client.Id, client.Hostname);
         }
 
+        // 走到这里说明这条连接根本没有出示客户端证书。
+        //
+        // 这是 mTLS 形态下最难查的一种失败：Agent 侧只看到 401，服务端默认什么都不记，
+        // 两边都没有线索，只能靠猜。而服务端其实掌握着最关键的事实——TLS 握手阶段
+        // 对方到底给没给证书。把它记下来，排障就不必再依赖客户机器上的日志。
+        Logger.LogWarning(
+            "客户端认证失败：连接未出示客户端证书 peer={Peer} path={Path}。"
+            + "常见原因：Agent 尚未获批（没有证书）、证书文件损坏，或连接复用了注册阶段建立的匿名连接。",
+            PeerAddress()?.ToString() ?? "unknown",
+            Context.Request.Path.Value);
+
         return AuthenticateResult.NoResult();
     }
 
@@ -151,22 +162,50 @@ public class ClientCertificateAuthenticationHandler : AuthenticationHandler<Clie
             .FirstOrDefaultAsync(c => c.Thumbprint == thumbprint);
 
         if (record is null)
+        {
+            Logger.LogWarning(
+                "客户端认证失败：证书指纹 {Thumbprint} 不在 client_certificates 中 peer={Peer}。"
+                + "常见原因：数据库被重建过而 Agent 仍持有旧证书——需要在客户端重新注册。",
+                thumbprint,
+                PeerAddress()?.ToString() ?? "unknown");
             return AuthenticateResult.Fail("未知的客户端证书");
+        }
 
         var supersededOverlap = record.Status == CertificateStatus.Superseded
             && record.RevokedAt is not null
             && record.RevokedAt.Value.AddDays(7) > DateTime.UtcNow;
         if (record.Status != CertificateStatus.Active && !supersededOverlap)
+        {
+            Logger.LogWarning(
+                "客户端认证失败：证书 {Thumbprint} 状态为 {Status}（clientId={ClientId}）",
+                thumbprint, record.Status, record.ClientId);
             return AuthenticateResult.Fail("客户端证书已吊销或已过期");
+        }
 
         if (record.ExpiresAt < DateTime.UtcNow)
+        {
+            Logger.LogWarning(
+                "客户端认证失败：证书 {Thumbprint} 已于 {ExpiresAt:O} 过期（clientId={ClientId}）",
+                thumbprint, record.ExpiresAt, record.ClientId);
             return AuthenticateResult.Fail("客户端证书已过期");
+        }
 
         var client = record.Client;
         if (client.Status is ClientStatus.Disabled or ClientStatus.Revoked)
+        {
+            Logger.LogWarning(
+                "客户端认证失败：客户端 {ClientId}({Hostname}) 状态为 {Status}",
+                client.Id, client.Hostname, client.Status);
             return AuthenticateResult.Fail("客户端已禁用或已注销");
+        }
+
         if (client.Status == ClientStatus.PendingApproval)
+        {
+            Logger.LogWarning(
+                "客户端认证失败：客户端 {ClientId}({Hostname}) 尚未审批通过",
+                client.Id, client.Hostname);
             return AuthenticateResult.Fail("客户端尚未审批通过");
+        }
 
         return BuildTicket(client.Id, client.Hostname);
     }

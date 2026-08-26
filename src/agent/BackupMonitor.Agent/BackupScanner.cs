@@ -1,8 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
-using System.Text.RegularExpressions;
 using BackupMonitor.Shared.Models.Agent;
+using BackupMonitor.Shared.Recognition;
 
 namespace BackupMonitor.Agent;
 
@@ -21,17 +20,15 @@ public sealed class BackupScanResult
     public List<PrecheckFileDto> Files { get; init; } = [];
 }
 
+/// <summary>
+/// 按识别规则在真实文件系统上找出"一份备份"。
+///
+/// 规则的解析与匹配语义不在这里，而在 BackupMonitor.Shared.Recognition.RecognizerRules：
+/// 服务端的配置向导要在目录快照上预演同一套规则，两份实现迟早分叉，
+/// 而分叉的表现是向导说的和实际扫的不一致且无人察觉。这里只负责"怎么遍历磁盘"。
+/// </summary>
 public sealed class BackupScanner
 {
-    private sealed record Rules(
-        List<string> Includes,
-        List<string> Excludes,
-        List<string> Required,
-        List<string> ExcludeDirectories,
-        bool Recursive,
-        string? BatchRegex,
-        int BusinessUnitDepth = 1);
-
     private readonly ILogger<BackupScanner> _logger;
 
     public BackupScanner(ILogger<BackupScanner> logger)
@@ -47,7 +44,7 @@ public sealed class BackupScanner
             return [Failure(task, source, "path_not_found", $"源目录不存在：{source}")];
         }
 
-        var rules = ParseRules(task.RecognizerConfig);
+        var rules = RecognizerRules.Parse(task.RecognizerConfig);
         var roots = SelectRoots(source, task.RecognizerType, rules);
         var results = new List<BackupScanResult>();
 
@@ -82,7 +79,10 @@ public sealed class BackupScanner
                     LastModifiedAt = file.LastWriteTimeUtc,
                     Sha256 = await ComputeSha256Async(file.FullName, ct),
                     QuickHash = await ComputeQuickHashAsync(file.FullName, ct),
-                    IsRequired = rules.Required.Count == 0 || rules.Required.Any(pattern => GlobMatch(relative, pattern))
+                    // 这里曾经只用 GlobMatch(relative, pattern)，而缺失判定用的是 MatchesPath。
+                    // 于是 requiredFiles 写 UFDATA.BAK、文件在子目录里时，判定算它到场、
+                    // 界面却不给它标 [必需]——同一个事实在两处显示不一致。
+                    IsRequired = rules.IsRequiredFile(relative)
                 });
             }
 
@@ -94,8 +94,7 @@ public sealed class BackupScanner
                 .OrderBy(f => f.RelativePath, StringComparer.OrdinalIgnoreCase)
                 .Select(f => $"{f.RelativePath}|{f.SizeBytes}|{f.LastModifiedAt.Ticks}|{f.QuickHash}"));
             var candidateKey = $"{task.TaskId:N}:{businessUnit?.ExternalKey ?? "root"}:{manifestHash}";
-            var missingRequired = rules.Required.Any(pattern =>
-                !fileDtos.Any(file => MatchesPath(file.RelativePath, pattern)));
+            var missingRequired = rules.HasMissingRequired(fileDtos.Select(f => f.RelativePath));
 
             results.Add(new BackupScanResult
             {
@@ -129,7 +128,7 @@ public sealed class BackupScanner
             FailureMessage = message
         };
 
-    private List<(string Root, PrecheckBusinessUnitDto? BusinessUnit)> SelectRoots(string source, string recognizerType, Rules rules)
+    private List<(string Root, PrecheckBusinessUnitDto? BusinessUnit)> SelectRoots(string source, string recognizerType, RecognizerRules rules)
     {
         var normalized = recognizerType.Trim().ToLowerInvariant();
         if (normalized == "subdirectory_units")
@@ -137,21 +136,42 @@ public sealed class BackupScanner
             try
             {
                 var depth = rules.BusinessUnitDepth;
-                return Directory.EnumerateDirectories(
+                var units = Directory.EnumerateDirectories(
                         source,
                         "*",
                         depth <= 1 ? SearchOption.TopDirectoryOnly : SearchOption.AllDirectories)
                     .Where(p => DirectoryDepth(source, p) == depth)
-                    .Where(p => !IsExcludedDirectory(p, rules.ExcludeDirectories))
-                    .Where(p => rules.BatchRegex is null || RegexMatches(Path.GetFileName(p), rules.BatchRegex))
+                    .Where(p => !rules.IsExcludedDirectory(p))
+                    .Where(p => rules.BatchRegex is null || RecognizerRules.RegexMatches(Path.GetFileName(p), rules.BatchRegex))
                     .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                    .Select(p => (p, (PrecheckBusinessUnitDto?)new PrecheckBusinessUnitDto
+                    .Select(p =>
                     {
-                        ExternalKey = Path.GetFileName(p),
-                        DisplayName = Path.GetFileName(p),
-                        SourceRelativePath = Path.GetRelativePath(source, p).Replace('\\', '/')
-                    }))
+                        var relative = Path.GetRelativePath(source, p).Replace('\\', '/');
+                        return (Path: p, Unit: (PrecheckBusinessUnitDto?)new PrecheckBusinessUnitDto
+                        {
+                            // ExternalKey 曾经取叶子目录名，depth≥2 时必然撞车：
+                            // 账套001/20260824 与 账套002/20260824 的叶子名都是 20260824，
+                            // 而业务单元的唯一键是 (task_id, external_key)——两个账套会被合并成同一个单元。
+                            // 相对路径才是这个单元在源目录下的唯一身份。
+                            ExternalKey = relative,
+                            DisplayName = relative,
+                            SourceRelativePath = relative
+                        });
+                    })
                     .ToList();
+
+                // U8 这类结构是两层的：账套是业务单元，账套下每天一个备份目录。
+                // 只按 depth 定位到账套的话，CollectFiles 会把所有天的文件混成一份，
+                // 每天换一次 manifest，越滚越大且永远不代表"某一天的那份备份"。
+                // unitLayout=latest_directory 让每个单元内部再取最新的那个子目录。
+                if (rules.UnitLayout == "latest_directory")
+                {
+                    return units
+                        .Select(entry => (Root: SelectLatestChildDirectory(entry.Path, rules), entry.Unit))
+                        .ToList();
+                }
+
+                return units.Select(entry => (entry.Path, entry.Unit)).ToList();
             }
             catch (Exception ex)
             {
@@ -164,14 +184,14 @@ public sealed class BackupScanner
         {
             var directories = SafeEnumerateDirectories(source, rules)
                 .Where(d => rules.BatchRegex is null
-                            || RegexMatches(Path.GetRelativePath(source, d.FullName).Replace('\\', '/'), rules.BatchRegex)
-                            || RegexMatches(d.Name, rules.BatchRegex))
+                            || RecognizerRules.RegexMatches(Path.GetRelativePath(source, d.FullName).Replace('\\', '/'), rules.BatchRegex)
+                            || RecognizerRules.RegexMatches(d.Name, rules.BatchRegex))
                 .ToList();
             var latest = directories
                 .Select(d => new
                 {
                     Path = d.FullName,
-                    Latest = SafeEnumerateFiles(d.FullName, SearchOption.AllDirectories, rules.ExcludeDirectories)
+                    Latest = SafeEnumerateFiles(d.FullName, SearchOption.AllDirectories, rules)
                         .Where(f => IsAllowed(f, d.FullName, rules))
                         .Select(f => f.LastWriteTimeUtc)
                         .DefaultIfEmpty(DateTime.MinValue)
@@ -185,7 +205,7 @@ public sealed class BackupScanner
         if (normalized == "latest_single_file")
         {
             var searchOption = rules.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-            var latest = SafeEnumerateFiles(source, searchOption, rules.ExcludeDirectories)
+            var latest = SafeEnumerateFiles(source, searchOption, rules)
                 .Where(f => IsAllowed(f, source, rules))
                 .OrderByDescending(f => f.LastWriteTimeUtc)
                 .FirstOrDefault();
@@ -195,10 +215,43 @@ public sealed class BackupScanner
         return [(source, null)];
     }
 
-    private static List<FileInfo> CollectFiles(string root, Rules rules, CancellationToken ct)
+    /// <summary>
+    /// 取业务单元内最新的那个子目录。判定依据是"目录里最新文件的修改时间"，
+    /// 而不是目录自身的时间戳——很多备份程序建好目录后才慢慢往里写，目录时间没有参考价值。
+    /// 单元下还没有任何子目录时退回单元本身，让上层照常走"没有符合规则的文件"这条失败路径，
+    /// 而不是凭空少掉一个业务单元。
+    /// </summary>
+    private static string SelectLatestChildDirectory(string unitRoot, RecognizerRules rules)
+    {
+        try
+        {
+            var latest = Directory.EnumerateDirectories(unitRoot, "*", SearchOption.TopDirectoryOnly)
+                .Where(p => !rules.IsExcludedDirectory(p))
+                .Select(p => new
+                {
+                    Path = p,
+                    Latest = SafeEnumerateFiles(p, SearchOption.AllDirectories, rules)
+                        .Where(f => IsAllowed(f, p, rules))
+                        .Select(f => f.LastWriteTimeUtc)
+                        .DefaultIfEmpty(DateTime.MinValue)
+                        .Max()
+                })
+                .OrderByDescending(x => x.Latest)
+                .ThenByDescending(x => x.Path, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault();
+
+            return latest?.Path ?? unitRoot;
+        }
+        catch (Exception)
+        {
+            return unitRoot;
+        }
+    }
+
+    private static List<FileInfo> CollectFiles(string root, RecognizerRules rules, CancellationToken ct)
     {
         var option = rules.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-        var files = SafeEnumerateFiles(root, option, rules.ExcludeDirectories)
+        var files = SafeEnumerateFiles(root, option, rules)
             .Where(f => IsAllowed(f, root, rules))
             .OrderBy(f => f.FullName, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -209,117 +262,24 @@ public sealed class BackupScanner
         return files;
     }
 
-    private static Rules ParseRules(string? json)
-    {
-        var result = new Rules([], [], [], [], true, null, 1);
-        if (string.IsNullOrWhiteSpace(json))
-            return result;
-
-        try
-        {
-            using var document = JsonDocument.Parse(json);
-            var root = document.RootElement;
-            result.Includes.AddRange(ReadStrings(root, "includePatterns"));
-            result.Includes.AddRange(ReadStrings(root, "includes"));
-            result.Excludes.AddRange(ReadStrings(root, "excludePatterns"));
-            result.Excludes.AddRange(ReadStrings(root, "excludes"));
-            result.ExcludeDirectories.AddRange(ReadStrings(root, "excludeDirectories"));
-            result.ExcludeDirectories.AddRange(ReadStrings(root, "excludeDirs"));
-            result.Required.AddRange(ReadStrings(root, "requiredFiles"));
-            result.Required.AddRange(ReadStrings(root, "requiredPatterns"));
-            result.Required.AddRange(ReadStrings(root, "required"));
-            if (root.TryGetProperty("recursive", out var recursive)
-                && (recursive.ValueKind == JsonValueKind.True || recursive.ValueKind == JsonValueKind.False))
-            {
-                result = result with { Recursive = recursive.GetBoolean() };
-            }
-
-            if (root.TryGetProperty("businessUnitDepth", out var depth)
-                && depth.TryGetInt32(out var parsedDepth)
-                && parsedDepth > 0)
-            {
-                result = result with { BusinessUnitDepth = Math.Min(parsedDepth, 32) };
-            }
-
-            if (root.TryGetProperty("batchRegex", out var batchRegex)
-                && batchRegex.ValueKind == JsonValueKind.String
-                && !string.IsNullOrWhiteSpace(batchRegex.GetString()))
-            {
-                result = result with { BatchRegex = batchRegex.GetString() };
-            }
-        }
-        catch
-        {
-            // 无效的识别规则仍允许基础文件发现，服务端会在配置校验阶段提示管理员。
-        }
-
-        return result;
-    }
-
-    private static IEnumerable<string> ReadStrings(JsonElement root, string property)
-    {
-        if (!root.TryGetProperty(property, out var value))
-            return [];
-        if (value.ValueKind == JsonValueKind.String)
-            return string.IsNullOrWhiteSpace(value.GetString()) ? [] : [value.GetString()!];
-        return value.ValueKind == JsonValueKind.Array
-            ? value.EnumerateArray().Where(e => e.ValueKind == JsonValueKind.String).Select(e => e.GetString()!).Where(s => !string.IsNullOrWhiteSpace(s))
-            : [];
-    }
-
-    private static bool IsAllowed(FileInfo file, string root, Rules rules)
+    /// <summary>把 FileInfo 折成共享规则需要的四个事实，判定本身在 RecognizerRules 里。</summary>
+    private static bool IsAllowed(FileInfo file, string root, RecognizerRules rules)
     {
         var relative = Path.GetRelativePath(root, file.FullName).Replace('\\', '/');
+        bool hidden;
+        try { hidden = (file.Attributes & FileAttributes.Hidden) != 0; }
+        catch (Exception) { hidden = false; }
 
-        // 显式排除永远优先。
-        if (rules.Excludes.Any(pattern => MatchesPath(relative, pattern) || GlobMatch(file.FullName, pattern)))
-            return false;
-
-        if (rules.BatchRegex is not null
-            && !RegexMatches(relative, rules.BatchRegex)
-            && !RegexMatches(Path.GetFileName(root), rules.BatchRegex))
-            return false;
-
-        var matchesInclude = rules.Includes.Any(pattern => MatchesPath(relative, pattern) || GlobMatch(file.FullName, pattern));
-        if (rules.Includes.Count > 0 && !matchesInclude)
-            return false;
-
-        // 被 includePatterns 或 requiredFiles 点名的文件跳过下面的启发式判断：
-        // 管理员已经明确说了要这个文件，系统没有资格替他判断那是不是半成品。
-        if (matchesInclude || rules.Required.Any(pattern => MatchesPath(relative, pattern)))
-            return true;
-
-        // 启发式：正在写入或明显是半成品的文件不该被当成一份备份。
-        //
-        // 注意 .bak 不在此列。它曾经在，但那是把通用桌面经验（config.ini.bak 是编辑器留下的副本）
-        // 搬进了备份领域——SQL Server 的 BACKUP DATABASE 默认产出的就是 .bak，
-        // 在一个备份监控系统里把 .bak 当垃圾滤掉，等于对最常见的备份格式集体失明，
-        // 而且失明得毫无提示：界面上只会显示「未发现符合识别规则的备份文件」。
-        // 真要排除随手留下的 .bak，用 excludePatterns 明确写出来。
-        if ((file.Attributes & FileAttributes.Hidden) != 0)
-            return false;
-
-        return !file.Name.StartsWith('~')
-               && !file.Name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)
-               && !file.Name.EndsWith(".partial", StringComparison.OrdinalIgnoreCase);
+        return rules.IsAllowedFile(relative, file.FullName, file.Name, hidden, Path.GetFileName(root));
     }
 
-    private static bool MatchesPath(string relative, string pattern) =>
-        GlobMatch(relative, pattern) || GlobMatch(Path.GetFileName(relative), pattern);
-
-    private static bool GlobMatch(string value, string pattern)
-    {
-        var regex = "^" + Regex.Escape(pattern.Trim()).Replace(@"\*", ".*").Replace(@"\?", ".") + "$";
-        return Regex.IsMatch(value.Replace('\\', '/'), regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-    }
-
-    private static IEnumerable<DirectoryInfo> SafeEnumerateDirectories(string root, Rules rules)
+    private static IEnumerable<DirectoryInfo> SafeEnumerateDirectories(string root, RecognizerRules rules)
     {
         try
         {
             var option = rules.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
             return Directory.EnumerateDirectories(root, "*", option)
-                .Where(p => !IsExcludedDirectory(p, rules.ExcludeDirectories))
+                .Where(p => !rules.IsExcludedDirectory(p))
                 .Select(p => new DirectoryInfo(p))
                 .ToList();
         }
@@ -329,10 +289,7 @@ public sealed class BackupScanner
         }
     }
 
-    private static IEnumerable<FileInfo> SafeEnumerateFiles(
-        string root,
-        SearchOption option,
-        IReadOnlyCollection<string> excludedDirectories)
+    private static IEnumerable<FileInfo> SafeEnumerateFiles(string root, SearchOption option, RecognizerRules rules)
     {
         try
         {
@@ -342,25 +299,13 @@ public sealed class BackupScanner
             })
             .Where(f => f is not null)
             .Select(f => f!)
-            .Where(f => !IsExcludedDirectory(f.DirectoryName, excludedDirectories))
+            .Where(f => !rules.IsExcludedDirectory(f.DirectoryName))
             .ToList();
         }
         catch
         {
             return [];
         }
-    }
-
-    private static bool IsExcludedDirectory(string? path, IReadOnlyCollection<string> excludedDirectories)
-    {
-        if (string.IsNullOrWhiteSpace(path) || excludedDirectories.Count == 0)
-            return false;
-
-        var segments = path.Split(
-            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
-            StringSplitOptions.RemoveEmptyEntries);
-        return segments.Any(segment => excludedDirectories.Any(excluded =>
-            GlobMatch(segment, excluded.Trim())));
     }
 
     private static int DirectoryDepth(string root, string path)
@@ -371,26 +316,6 @@ public sealed class BackupScanner
         return relative.Split(
             [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
             StringSplitOptions.RemoveEmptyEntries).Length;
-    }
-
-    private static bool RegexMatches(string value, string pattern)
-    {
-        try
-        {
-            return Regex.IsMatch(
-                value,
-                pattern,
-                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
-                TimeSpan.FromSeconds(1));
-        }
-        catch (ArgumentException)
-        {
-            return false;
-        }
-        catch (RegexMatchTimeoutException)
-        {
-            return false;
-        }
     }
 
     private static async Task<string> ComputeSha256Async(string path, CancellationToken ct)

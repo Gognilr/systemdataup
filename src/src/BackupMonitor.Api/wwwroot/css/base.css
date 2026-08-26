@@ -26,6 +26,19 @@ textarea{min-height:68px;resize:vertical}
 .fadv>summary{cursor:pointer;font:var(--t-body);color:var(--text-muted);user-select:none;margin-bottom:var(--s-3)}
 .fadv>summary:hover{color:var(--text)}
 
+/* 建任务第一步的结构选择卡片 */
+.tpl-list{display:flex;flex-direction:column;gap:var(--s-2)}
+.tpl-item{display:flex;align-items:flex-start;gap:var(--s-2);padding:var(--s-3);
+  border:1px solid var(--border);border-radius:var(--r-md);cursor:pointer}
+.tpl-item:hover{border-color:var(--border-strong);background:var(--surface-sunk)}
+.tpl-item:has(input:checked){border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+.tpl-item input{width:auto;margin:2px 0 0}
+.tpl-copy{display:flex;flex-direction:column;gap:2px}
+.tpl-copy small{color:var(--text-muted)}
+
+/* 越界指标：颜色之外再加字重，不靠颜色单独承载信息 */
+.cell-warn{color:var(--err);font-weight:600}
+
 /* ── 按钮 ── */
 /* 审查 P1-4：按钮样式此前只以 button.xxx 这种元素限定选择器定义，
    而 <a class="button"> / <a class="primary button"> 两个类都吃不到——

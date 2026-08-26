@@ -18,6 +18,10 @@
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="8.0.11" />
     <PackageReference Include="Npgsql" Version="8.0.6" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.11" />
+    <!-- 整改批次 C · C2：System.Net.Mail.SmtpClient 微软文档标注不建议用于新开发，且不支持隐式 TLS（465）。
+         MailKit/MimeKit 是官方文档推荐的替代品，支持 STARTTLS 与隐式 TLS。 -->
+    <PackageReference Include="MailKit" Version="4.17.0" />
+    <PackageReference Include="MimeKit" Version="4.17.0" />
   </ItemGroup>
 
   <ItemGroup>

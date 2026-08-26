@@ -14,6 +14,9 @@ internal sealed class SetupForm : Form
     private readonly Button _cancel = new();
     private readonly Button _resetPassword = new();
     private readonly Button _restartServices = new();
+    private readonly Button _stopServices = new();
+    private readonly Button _startServices = new();
+    private readonly Label _serviceStatus = new();
     private readonly Button _openWeb = new();
     private readonly Button _diagnostics = new();
     private readonly Button _showFingerprint = new();
@@ -120,6 +123,8 @@ internal sealed class SetupForm : Form
         _maintenancePanel.Padding = new Padding(0, 8, 0, 0);
         _resetPassword.Text = "重置管理员密码";
         _restartServices.Text = "重启服务";
+        _stopServices.Text = "停止服务";
+        _startServices.Text = "启动服务";
         _openWeb.Text = "打开管理网页";
         _diagnostics.Text = "运行诊断";
         _showFingerprint.Text = "查看服务端指纹";
@@ -131,6 +136,8 @@ internal sealed class SetupForm : Form
         foreach (var button in new[]
         {
             _resetPassword,
+            _startServices,
+            _stopServices,
             _restartServices,
             _showFingerprint,
             _reissueServerCertificate,
@@ -145,8 +152,15 @@ internal sealed class SetupForm : Form
             button.AutoSize = true;
             _maintenancePanel.Controls.Add(button);
         }
+        // 服务状态摆在按钮之后：先知道现在是什么状态，才知道该按哪个按钮。
+        _serviceStatus.AutoSize = true;
+        _serviceStatus.Margin = new Padding(6, 10, 0, 0);
+        _maintenancePanel.Controls.Add(_serviceStatus);
+
         _resetPassword.Click += async (_, _) => await ResetPasswordAsync();
         _restartServices.Click += async (_, _) => await RestartServicesAsync();
+        _stopServices.Click += async (_, _) => await StopServicesAsync();
+        _startServices.Click += async (_, _) => await StartServicesAsync();
         _openWeb.Click += (_, _) => OpenWeb();
         _diagnostics.Click += async (_, _) => await ShowDiagnosticsAsync();
         _showFingerprint.Click += (_, _) => ShowServerFingerprint();
@@ -157,6 +171,7 @@ internal sealed class SetupForm : Form
         _uninstall.Click += async (_, _) => await UninstallAsync();
         _maintenancePanel.Enabled = ServerInstaller.IsInstalled();
         root.Controls.Add(_maintenancePanel, 0, 7);
+        RefreshServiceStatus();
         AcceptButton = _install;
         CancelButton = _cancel;
     }
@@ -304,6 +319,77 @@ internal sealed class SetupForm : Form
         finally
         {
             SetBusy(false);
+            RefreshServiceStatus();
+        }
+    }
+
+    /// <summary>
+    /// 停止服务端。要确认——停止之后管理网页打不开、客户端心跳全部失败，
+    /// 这跟「重启」几秒钟的中断不是一回事，人得知道自己在做什么。
+    /// </summary>
+    private async Task StopServicesAsync()
+    {
+        var answer = MessageBox.Show(
+            this,
+            "停止后管理网页将无法访问，所有客户端的心跳、预检和上传都会失败，直到重新启动服务。\n\n"
+            + "确定要停止 BackupMonitor Server 和 PostgreSQL 吗？",
+            "停止服务",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        if (answer != DialogResult.Yes)
+            return;
+
+        SetBusy(true);
+        try
+        {
+            await _maintenance.StopServicesAsync(CancellationToken.None);
+            _status.Text = "服务已停止。";
+            MessageBox.Show(this, "BackupMonitor Server 和 PostgreSQL 已停止。", "维护完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "停止失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+            RefreshServiceStatus();
+        }
+    }
+
+    private async Task StartServicesAsync()
+    {
+        SetBusy(true);
+        try
+        {
+            await _maintenance.StartServicesAsync(CancellationToken.None);
+            _status.Text = "服务已启动。";
+            MessageBox.Show(this, "PostgreSQL 和 BackupMonitor Server 已启动。", "维护完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "启动失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+            RefreshServiceStatus();
+        }
+    }
+
+    private void RefreshServiceStatus()
+    {
+        if (!_maintenancePanel.Enabled)
+            return;
+        try
+        {
+            var (server, postgres) = _maintenance.GetServiceStatuses();
+            _serviceStatus.Text = $"服务状态：Server {server} · PostgreSQL {postgres}";
+        }
+        catch (Exception ex)
+        {
+            _serviceStatus.Text = "服务状态：读取失败（" + ex.Message + "）";
         }
     }
 

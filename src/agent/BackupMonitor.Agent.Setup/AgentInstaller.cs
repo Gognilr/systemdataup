@@ -150,7 +150,12 @@ internal sealed class AgentInstaller
 
             await Task.Run(() =>
             {
-                progress.Report(new InstallProgress("正在停止旧版本服务…", 68));
+                progress.Report(new InstallProgress("正在停止旧版本服务和托盘…", 68));
+                // 托盘和服务是两个进程，且托盘就跑在安装目录里。只停服务的话，
+                // 托盘仍然锁着 Accessibility.dll、System.Windows.Forms.dll 这些
+                // WinForms 程序集，紧接着的覆盖复制必然撞共享冲突——
+                // 「修复/重新安装」在任何一台托盘正常运行的机器上都会失败。
+                StopTray();
                 StopAndDeleteExistingService();
 
                 progress.Report(new InstallProgress("正在复制客户端文件…", 73));
@@ -205,11 +210,32 @@ internal sealed class AgentInstaller
                 runKey?.DeleteValue(RunValueName, throwOnMissingValue: false);
             Registry.CurrentUser.DeleteSubKeyTree(@"Software\BackupMonitor\AgentSetup", throwOnMissingSubKey: false);
 
-            DeleteDirectorySafely(Expand(InstallDirectory), Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "BackupMonitor"));
+            // 两个目录各删各的、各自收集错误。安装目录删不掉就直接抛的话，
+            // 数据目录会原封不动留在盘上——里面的 state.json 存着客户端身份和证书，
+            // 重装后被沿用，表现成「客户端重装了但服务端看到的还是旧身份」。
+            var failures = new List<Exception>();
+            TryDelete(() => DeleteDirectorySafely(Expand(InstallDirectory), Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "BackupMonitor")));
             if (removeData)
-                DeleteDirectorySafely(Expand(DataDirectory), Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BackupMonitor"));
+                TryDelete(() => DeleteDirectorySafely(Expand(DataDirectory), Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BackupMonitor")));
+
+            if (failures.Count > 0)
+                throw new AggregateException(
+                    "卸载未能删除全部目录，残留内容会在下次安装时被沿用，请重启计算机后再次运行卸载。",
+                    failures);
+
+            void TryDelete(Action delete)
+            {
+                try
+                {
+                    delete();
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    failures.Add(ex);
+                }
+            }
         }, ct);
     }
 
@@ -385,7 +411,21 @@ internal sealed class AgentInstaller
                 || name.Equals("uninstall-agent.ps1", StringComparison.OrdinalIgnoreCase)
                 || name.Equals("README.md", StringComparison.OrdinalIgnoreCase))
                 continue;
-            File.Copy(sourcePath, Path.Combine(installDir, name), overwrite: true);
+            try
+            {
+                File.Copy(sourcePath, Path.Combine(installDir, name), overwrite: true);
+            }
+            catch (IOException ex)
+            {
+                // 原样抛出的是一句英文的 "being used by another process"，只说了文件名，
+                // 没说该拿它怎么办。这一步能撞占用的就那么几种情况，直接写出来。
+                throw new IOException(
+                    $"覆盖 {name} 失败：文件正被其他进程占用。"
+                    + Environment.NewLine
+                    + "请确认托盘图标已退出、Agent 服务已停止（可用下方「停止服务」），再重试；"
+                    + "仍然失败通常是杀毒软件正在扫描该目录，稍等片刻或重启后再装。",
+                    ex);
+            }
         }
     }
 
@@ -454,6 +494,51 @@ internal sealed class AgentInstaller
         key?.SetValue(RunValueName, $"\"{trayPath}\" {arguments}", RegistryValueKind.String);
     }
 
+    /// <summary>
+    /// 停止 Agent 服务（不删除）。
+    ///
+    /// 停止 Agent 意味着这台机器上的备份从此刻起无人看管——扫描、预检、上传全停，
+    /// 服务端会把它记成离线。所以这是个需要人明确确认的动作，但它必须存在：
+    /// 现场要做磁盘维护、要临时腾出带宽、要排查是不是 Agent 影响了业务软件，
+    /// 没有这个按钮，唯一的出路是 services.msc，而那不是给运维之外的人准备的地方。
+    /// </summary>
+    public void StopService()
+    {
+        using var service = new ServiceController(ServiceName);
+        service.Refresh();
+        if (service.Status == ServiceControllerStatus.Stopped)
+            return;
+
+        service.Stop();
+        service.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+    }
+
+    /// <summary>启动 Agent 服务。</summary>
+    public void StartService() => StartServiceAndWait();
+
+    /// <summary>当前服务状态，给维护界面显示。</summary>
+    public static string GetServiceStatusText()
+    {
+        try
+        {
+            using var service = new ServiceController(ServiceName);
+            service.Refresh();
+            return service.Status switch
+            {
+                ServiceControllerStatus.Running => "运行中",
+                ServiceControllerStatus.Stopped => "已停止",
+                ServiceControllerStatus.StartPending => "正在启动",
+                ServiceControllerStatus.StopPending => "正在停止",
+                ServiceControllerStatus.Paused => "已暂停",
+                _ => service.Status.ToString()
+            };
+        }
+        catch (InvalidOperationException)
+        {
+            return "未安装";
+        }
+    }
+
     private static void StartServiceAndWait()
     {
         RunSc("start", ServiceName);
@@ -494,7 +579,12 @@ internal sealed class AgentInstaller
             {
                 process.CloseMainWindow();
                 if (!process.WaitForExit(3000))
+                {
                     process.Kill(entireProcessTree: true);
+                    // Kill 只是投递终止请求，句柄要等进程真正退出才释放；
+                    // 不等这一下，紧接着删安装目录就会撞上托盘还占着的文件。
+                    process.WaitForExit(5000);
+                }
             }
             catch
             {
@@ -619,7 +709,27 @@ internal sealed class AgentInstaller
         if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase)
             || string.Equals(target, root, StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("客户端卸载目录不在 BackupMonitor 专用目录内。");
-        if (Directory.Exists(path))
-            Directory.Delete(path, recursive: true);
+        // 句柄释放是异步的：服务刚停、托盘刚退，文件可能还锁着几百毫秒。
+        // 重试比一次就失败更贴合实际，全部用尽再抛出可读的错误。
+        for (var attempt = 0; ; attempt++)
+        {
+            if (!Directory.Exists(path))
+                return;
+
+            try
+            {
+                Directory.Delete(path, recursive: true);
+                return;
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+            {
+                if (attempt >= 9)
+                    throw new IOException(
+                        $"删除 {path} 失败：{ex.Message}。该文件仍被其他进程占用，请重启计算机后再次运行卸载。",
+                        ex);
+
+                Thread.Sleep(1000);
+            }
+        }
     }
 }

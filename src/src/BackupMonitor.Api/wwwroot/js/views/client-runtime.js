@@ -1,5 +1,6 @@
 import {
-  $, esc, emptyState, fmtBytes, fmtDT, relTime, status, tableHtml
+  $, esc, L, emptyState, fmtBytes, fmtDT, relTime, status, tableHtml, clientName,
+  clientCaps, actBtn, runtimeBadge
 } from '../ui.js';
 
 const sessionLabels = {
@@ -58,7 +59,21 @@ function sessionState(value) {
   return sessionLabels[value] || value || '—';
 }
 
-function renderTables(detail) {
+/* 实际状态必须跟「期望」比着看，而不是单看是不是 running。
+   期望 stopped 的服务真的停着，那是正常，之前一律标红是在制造假警报；
+   而被停用监控（enabled=false）的行不该显示成故障。 */
+function serviceActual(row) {
+  const actual = row.actualState;
+  if (!actual) return '<span class="sub">尚未采样</span>';
+  const label = L.service_actual[actual] || actual;
+  if (row.enabled === false) return `<span class="sub">${esc(label)}（已停用监控）</span>`;
+  const matched = actual === row.expectedState;
+  return matched
+    ? `<span class="status status--ok">${esc(label)}</span>`
+    : `<span class="status status--err pill">${esc(label)}</span>`;
+}
+
+function renderTables(detail, caps) {
   const sessions = detail.userSessions || [];
   const services = detail.monitoredServices || [];
   return `<div class="runtime-detail-grid">
@@ -68,12 +83,23 @@ function renderTables(detail) {
       { l: '来源', render: r => `${esc(r.clientName || '本机')}<span class="sub">${esc(r.clientAddress || (r.isRemote ? '远程' : '本地'))}</span>` },
       { l: '登录时间', render: r => fmtDT(r.logonAt) }
     ], sessions, { empty: emptyState('ok', { title: '当前没有可见的 Windows 登录会话', sub: 'Agent 会在下一次心跳刷新会话列表' }) })}</section>
-    <section class="card runtime-detail-card"><div class="runtime-card-head"><h3>关键 Windows 服务</h3><span>${services.length} 项</span></div>${tableHtml([
+    <section class="card runtime-detail-card">
+      <div class="runtime-card-head">
+        <h3>关键 Windows 服务</h3>
+        <span>${services.length} 项
+          ${actBtn({
+            label: '＋ 添加', view: 'clients', action: 'addService', id: detail.id,
+            allowed: caps.canDispatch, why: caps.whyDispatch, hint: caps.whyDispatch
+          })}
+        </span>
+      </div>${tableHtml([
       { l: '服务', render: r => `${esc(r.displayName)}<span class="sub mono">${esc(r.serviceName)}</span>` },
-      { l: '期望', render: r => esc(r.expectedState || '—') },
-      { l: '实际', render: r => r.actualState === 'running' ? status('result', 'success') : r.actualState === 'stopped' ? status('result', 'failure') : esc(r.actualState || '—') },
-      { l: '采样', render: r => relTime(r.lastSampledAt) }
-    ], services, { empty: emptyState('first', { title: '未配置关键服务', sub: '在客户端配置中添加需要监控的 Windows 服务' }) })}</section>
+      { l: '期望', render: r => esc(L.service_expected[r.expectedState] || r.expectedState || '—') },
+      { l: '实际', render: r => serviceActual(r) },
+      { l: '采样', render: r => relTime(r.lastSampledAt) },
+      { l: '', render: r => `<button class="small" data-ui-action="act" data-view="clients" data-action="editService" data-id="${esc(detail.id)}:${esc(r.definitionId)}">编辑</button>
+        <button class="small" data-ui-action="act" data-view="clients" data-action="delService" data-id="${esc(detail.id)}:${esc(r.definitionId)}">移除</button>` }
+    ], services, { empty: emptyState('first', { title: '未配置关键服务', sub: '点上方「添加」，从这台机器上实际安装的服务里挑' }) })}</section>
   </div>`;
 }
 
@@ -85,13 +111,25 @@ export function renderClientRuntimeDetail(detail, history) {
     ? `${fmtBytes(metrics.memoryAvailableBytes)} 可用 / ${fmtBytes(metrics.memoryTotalBytes)}`
     : fmtBytes(metrics.memoryAvailableBytes);
   const hasAlert = Number(detail.activeAlertCount) > 0;
+  const caps = clientCaps(detail);
+  const uploadingNames = detail.activeUploadTaskNames || [];
+  // 「正在上传」比"上传中"这三个字更有用的是"在传哪个任务"——
+  // 运维要判断的是"这台机器现在动不得，是因为哪件事还没完"。
+  const runtimeText = caps.busy
+    ? (caps.runtime === 'uploading'
+        ? `正在上传：${uploadingNames.length ? uploadingNames.join('、') : `${detail.activeUploadCount || 0} 个备份集`}`
+        : `正在执行 ${detail.runningCommandCount || 0} 条指令`)
+    : '当前空闲';
 
   return `<div class="runtime-shell">
     <div class="runtime-head">
-      <div><a class="runtime-back" href="#/clients">← 返回客户端列表</a><h1>${esc(detail.hostname)}</h1><div class="runtime-subtitle">${esc(detail.displayName || '')} · ${esc(detail.osName || '未知系统')} ${esc(detail.architecture || '')}</div></div>
-      <div class="runtime-actions"><button data-ui-action="act" data-view="clients" data-action="metrics" data-id="${esc(detail.id)}">立即采样</button><button class="primary" data-ui-action="act" data-view="clients" data-action="refreshDetail" data-id="${esc(detail.id)}">刷新页面</button></div>
+      <div><a class="runtime-back" href="#/clients">← 返回客户端列表</a><h1>${esc(clientName(detail))}</h1><div class="runtime-subtitle">${esc(detail.hostname)} · ${esc(detail.osName || '未知系统')} ${esc(detail.architecture || '')}</div></div>
+      <div class="runtime-actions">${actBtn({
+        label: '立即采样', view: 'clients', action: 'metrics', id: detail.id, small: false,
+        allowed: caps.canDispatch, why: caps.whyDispatch, hint: caps.whyDispatch
+      })}<button class="primary" data-ui-action="act" data-view="clients" data-action="refreshDetail" data-id="${esc(detail.id)}">刷新页面</button></div>
     </div>
-    <div class="runtime-statusbar ${hasAlert ? 'has-alert' : ''}"><span class="runtime-status-dot"></span><strong>${status('client_status', detail.status)}</strong><span>最近心跳 ${relTime(detail.lastHeartbeatAt)}</span><span>指标采样 ${relTime(metrics.receivedAt)}</span><span>${hasAlert ? `${esc(detail.activeAlertCount)} 个活动告警` : '暂无活动告警'}</span></div>
+    <div class="runtime-statusbar ${hasAlert ? 'has-alert' : ''}"><span class="runtime-status-dot"></span><strong>${status('client_status', detail.status)}${runtimeBadge(detail)}</strong><span>${esc(runtimeText)}</span><span>最近心跳 ${relTime(detail.lastHeartbeatAt)}</span><span>指标采样 ${relTime(metrics.receivedAt)}</span><span>${hasAlert ? `${esc(detail.activeAlertCount)} 个活动告警` : '暂无活动告警'}</span></div>
     <div class="runtime-kpis">
       <section class="runtime-kpi ${Number(metrics.cpuPercent) >= 85 ? 'warn' : ''}"><span>系统 CPU</span><strong>${value(metrics.cpuPercent, 1, '%')}</strong><small>Agent CPU ${value(metrics.agentCpuPercent, 1, '%')}</small></section>
       <section class="runtime-kpi ${Number(metrics.memoryPercent) >= 90 ? 'warn' : ''}"><span>系统内存</span><strong>${value(metrics.memoryPercent, 1, '%')}</strong><small>${esc(memoryText)}</small></section>
@@ -122,7 +160,7 @@ export function renderClientRuntimeDetail(detail, history) {
       { l: '可用率', num: true, render: r => Number(r.totalBytes) > 0 ? value(Number(r.freeBytes) / Number(r.totalBytes) * 100, 1, '%') : '—' },
       { l: '采样', render: r => relTime(r.sampledAt) }
     ], detail.disks, { empty: emptyState('first', { title: '暂无磁盘信息', sub: 'Agent 上报指标后自动填充' }) })}</section>
-    ${renderTables(detail)}
+    ${renderTables(detail, caps)}
     <details class="card runtime-technical"><summary>技术字段与诊断</summary><div class="kv">
       <div class="row"><div class="k">配置版本</div><div class="v">${esc(detail.lastConfigVersion ?? '—')}</div></div>
       <div class="row"><div class="k">审批时间</div><div class="v">${fmtDT(detail.approvedAt)}</div></div>

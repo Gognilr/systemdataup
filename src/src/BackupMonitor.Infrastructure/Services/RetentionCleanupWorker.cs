@@ -342,6 +342,8 @@ public class RetentionCleanupWorker : BackgroundService
             if (policy is null)
                 continue;
 
+            // D1：只取 Available 状态的备份集参与 GFS 保留计算，Quarantined（已隔离）天然被排除在外——
+            // 隔离是人工怀疑有问题时的动作，不参与保留计算、不能用于恢复，但也不删除。
             var sets = await db.BackupSets
                 .Include(s => s.RetentionLocks)
                 .Where(s => s.TaskId == task.Id && s.Status == BackupSetStatus.Available)

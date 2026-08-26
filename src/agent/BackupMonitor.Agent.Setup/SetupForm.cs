@@ -18,10 +18,13 @@ internal sealed class SetupForm : Form
     private readonly ProgressBar _progress = new();
     private readonly Button _install = new();
     private readonly Button _uninstall = new();
+    private readonly Button _stopService = new();
+    private readonly Button _startService = new();
     private readonly Button _test = new();
     private readonly Button _cancel = new();
     private readonly AgentInstaller _installer = new();
     private readonly LanDiscoveryClient _discovery = new();
+    private bool _busy;
 
     public SetupForm()
     {
@@ -90,6 +93,9 @@ internal sealed class SetupForm : Form
             if (_discoveredServers.SelectedItem is DiscoveredServer server)
                 _serverUrl.Text = server.ApiAddress;
         };
+        // 没有目标地址就不该让人点「安装 Agent」——点下去只会走到一个校验弹窗，
+        // 而这一步真正缺的是「扫到服务端」或「手工填一个地址」。
+        _serverUrl.TextChanged += (_, _) => UpdateInstallEnabled();
         _rescan.Text = "重新扫描";
         _rescan.AutoSize = true;
         _rescan.Click += async (_, _) => await DiscoverAsync();
@@ -168,16 +174,30 @@ internal sealed class SetupForm : Form
         _uninstall.Visible = false;
         _uninstall.Click += async (_, _) => await UninstallAsync();
 
+        _stopService.Text = "停止服务";
+        _stopService.AutoSize = true;
+        _stopService.Visible = false;
+        _stopService.Click += async (_, _) => await StopServiceAsync();
+
+        _startService.Text = "启动服务";
+        _startService.AutoSize = true;
+        _startService.Visible = false;
+        _startService.Click += async (_, _) => await StartServiceAsync();
+
         _test.Text = "测试连接";
         _test.AutoSize = true;
         _test.Click += async (_, _) => await TestConnectionAsync();
 
         buttons.Controls.Add(_cancel);
         buttons.Controls.Add(_uninstall);
+        buttons.Controls.Add(_startService);
+        buttons.Controls.Add(_stopService);
         buttons.Controls.Add(_install);
         buttons.Controls.Add(_test);
         root.Controls.Add(buttons, 0, 8);
 
+        _install.Enabled = false;
+        _test.Enabled = false;
         AcceptButton = _install;
         CancelButton = _cancel;
         Load += (_, _) => LoadDefaults();
@@ -227,14 +247,17 @@ internal sealed class SetupForm : Form
         try
         {
             using var key = Registry.CurrentUser.OpenSubKey(@"Software\BackupMonitor\AgentSetup");
-            _serverUrl.Text = key?.GetValue("ServerUrl") as string ?? "https://127.0.0.1:5080";
+            // 不再预填 https://127.0.0.1:5080：客户端机器上本机几乎不可能是服务端，
+            // 这个「看着有效」的默认值会让安装按钮在什么都没扫到时依然可点。
+            _serverUrl.Text = key?.GetValue("ServerUrl") as string ?? string.Empty;
         }
         catch
         {
-            _serverUrl.Text = "https://127.0.0.1:5080";
+            _serverUrl.Text = string.Empty;
         }
         _serverUrl.SelectAll();
         _serverUrl.Focus();
+        UpdateInstallEnabled();
     }
 
     private async Task TestConnectionAsync()
@@ -285,7 +308,12 @@ internal sealed class SetupForm : Form
             }
             else
             {
-                SetStatus("未发现服务端；可以在上方手工填写地址后继续。", Color.DarkOrange, 5);
+                SetStatus(
+                    HasServerTarget()
+                        ? "未发现服务端；将使用上方填写的地址安装。"
+                        : "未发现服务端；请在上方手工填写服务端地址后再安装。",
+                    Color.DarkOrange,
+                    5);
             }
         }
         catch (Exception ex)
@@ -296,6 +324,7 @@ internal sealed class SetupForm : Form
         {
             _rescan.Enabled = true;
             _discoveredServers.Enabled = true;
+            UpdateInstallEnabled();
         }
     }
 
@@ -400,9 +429,68 @@ internal sealed class SetupForm : Form
     {
         var installed = AgentInstaller.IsInstalled();
         _uninstall.Visible = installed;
+        _stopService.Visible = installed;
+        _startService.Visible = installed;
         _install.Text = installed ? "修复/重新安装" : "安装 Agent";
         if (installed)
-            SetStatus("检测到已安装的 Agent，可修复/重新安装或卸载。", Color.DimGray, _progress.Value);
+            SetStatus(
+                $"检测到已安装的 Agent（服务{AgentInstaller.GetServiceStatusText()}），可启停服务、修复/重新安装或卸载。",
+                Color.DimGray, _progress.Value);
+    }
+
+    /// <summary>
+    /// 停止 Agent 服务。停掉之后这台机器的备份就没人看着了，所以要确认；
+    /// 但这个按钮必须有——现场要做磁盘维护、要临时腾带宽、要排查是不是 Agent
+    /// 影响了业务软件时，不该逼着人去 services.msc 里找一个服务名。
+    /// </summary>
+    private async Task StopServiceAsync()
+    {
+        var answer = MessageBox.Show(
+            this,
+            "停止后这台机器将不再扫描、预检和上传备份，服务端会把它记为离线，直到重新启动服务。"
+            + Environment.NewLine + Environment.NewLine
+            + "确定要停止 Agent 服务吗？",
+            "停止 Agent 服务",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+        if (answer != DialogResult.Yes)
+            return;
+
+        SetBusy(true, "正在停止 Agent 服务…");
+        try
+        {
+            await Task.Run(() => _installer.StopService());
+            SetStatus($"Agent 服务已停止（当前{AgentInstaller.GetServiceStatusText()}）。", Color.DimGray, _progress.Value);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "停止失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+            UpdateMaintenanceState();
+        }
+    }
+
+    private async Task StartServiceAsync()
+    {
+        SetBusy(true, "正在启动 Agent 服务…");
+        try
+        {
+            await Task.Run(() => _installer.StartService());
+            SetStatus($"Agent 服务已启动（当前{AgentInstaller.GetServiceStatusText()}）。", Color.DimGray, _progress.Value);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "启动失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+            UpdateMaintenanceState();
+        }
     }
 
     private bool TryReadInputs(out string serverUrl, out string displayName, out string registrationToken)
@@ -422,6 +510,23 @@ internal sealed class SetupForm : Form
         return true;
     }
 
+    /// <summary>
+    /// 有没有一个可以安装到的服务端：扫到并选中，或者人工填了一个合法地址。
+    /// </summary>
+    private bool HasServerTarget()
+    {
+        var text = _serverUrl.Text.Trim().TrimEnd('/');
+        return Uri.TryCreate(text, UriKind.Absolute, out var uri)
+            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+    }
+
+    private void UpdateInstallEnabled()
+    {
+        var ready = !_busy && HasServerTarget();
+        _install.Enabled = ready;
+        _test.Enabled = ready;
+    }
+
     private void ToggleAdvanced()
     {
         _advancedPanel.Visible = !_advancedPanel.Visible;
@@ -437,9 +542,11 @@ internal sealed class SetupForm : Form
         _discoveredServers.Enabled = !busy;
         _rescan.Enabled = !busy;
         _advancedToggle.Enabled = !busy;
-        _install.Enabled = !busy;
+        _busy = busy;
+        UpdateInstallEnabled();
         _uninstall.Enabled = !busy;
-        _test.Enabled = !busy;
+        _stopService.Enabled = !busy;
+        _startService.Enabled = !busy;
         if (message is not null)
             SetStatus(message, Color.DimGray, busy ? Math.Max(1, _progress.Value) : _progress.Value);
         UseWaitCursor = busy;

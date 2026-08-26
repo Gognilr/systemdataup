@@ -1,5 +1,5 @@
 import { api } from '../api.js';
-import { $, esc, emptyState, fmtBytes, fmtDT } from '../ui.js';
+import { $, esc, emptyState, fmtBytes, fmtDT, relTime, status, tableHtml, clientName } from '../ui.js';
 import { shell, loading } from '../app.js';
 
 const byValue = (items, value) => (items || []).find(item => item.value === value)?.count || 0;
@@ -106,6 +106,35 @@ function renderCapacity(capacity, totalBytes, dailyUploads) {
   </div>`;
 }
 
+/* ── 在线客户端资源 ──
+   "现在哪台机器吃紧"是运维每天都要回答的问题，此前只能一台台点进详情去看。
+   排序不按名字：有告警的、内存最紧张的排最前，否则真正要看的那台会淹没在列表中间。 */
+function renderClientResources(rows) {
+  if (!rows || !rows.length)
+    return emptyState('first', { title: '还没有客户端上报指标', sub: '客户端完成审批并开始心跳后，这里会显示实时资源占用' });
+
+  const pct = v => (v == null ? '—' : `${Number(v).toFixed(0)}%`);
+  // 阈值与服务端告警默认值对齐（CPU 85 / 内存 90 / 源盘可用 10），
+  // 免得界面标红的和真正触发告警的不是同一批机器。
+  const warn = (v, limit) => (v != null && Number(v) >= limit ? ' class="cell-warn"' : '');
+
+  return tableHtml(
+    [
+      { l: '客户端', render: r => `<a href="#/clients/${esc(r.id)}"><b>${esc(clientName(r))}</b></a><span class="sub mono">${esc(r.hostname)}</span>` },
+      { l: '状态', render: r => status('client_status', r.status) },
+      { l: 'CPU', render: r => `<span${warn(r.cpuPercent, 85)}>${pct(r.cpuPercent)}</span>` },
+      { l: '内存', render: r => `<span${warn(r.memoryPercent, 90)}>${pct(r.memoryPercent)}</span>`
+          + (r.memoryTotalBytes ? `<span class="sub">${fmtBytes(r.memoryTotalBytes - (r.memoryAvailableBytes || 0))} / ${fmtBytes(r.memoryTotalBytes)}</span>` : '') },
+      { l: 'Agent 内存', render: r => (r.agentMemoryBytes ? fmtBytes(r.agentMemoryBytes) : '—') },
+      { l: '源盘可用', render: r => r.minSourceDiskFreePercent == null
+          ? '<span class="sub">无源盘</span>'
+          : `<span${r.minSourceDiskFreePercent <= 10 ? ' class="cell-warn"' : ''}>${pct(r.minSourceDiskFreePercent)}</span><span class="sub mono">${esc(r.minSourceDiskName || '')}</span>` },
+      { l: '告警', render: r => (r.activeAlertCount ? `<a href="#/alerts" class="cell-warn">${esc(r.activeAlertCount)}</a>` : '—') },
+      { l: '最近心跳', render: r => (r.lastHeartbeatAt ? relTime(r.lastHeartbeatAt) : '—') }
+    ],
+    rows);
+}
+
 export async function vDashboard() {
   $('#app').innerHTML = shell('overview', '概览', loading());
   try {
@@ -116,6 +145,8 @@ export async function vDashboard() {
       api('/api/v1/admin/reports/task-summary'),
       api('/api/v1/admin/restore-requests?status=ready&page=1&pageSize=100').catch(() => ({ items: [] }))
     ]);
+    // 资源列表失败不该把整个概览拖垮——它是附加视图，不是概览的前提。
+    const clientResources = await api('/api/v1/admin/clients/resource-overview?limit=50').catch(() => []);
     const failedTasks = (taskSummary.matrix || []).filter(row => row.days?.some(day => day.status === 'failed')).length;
     const todoCount = byValue(clientSummary.byStatus, 'pending_approval') + byValue(alertSummary.byLevel, 'critical') + failedTasks + (restoreData?.items?.length || 0);
     const online = byValue(clientSummary.byStatus, 'online');
@@ -130,6 +161,7 @@ export async function vDashboard() {
       <section class="card"><div class="dashboard-section-head"><h2>待办队列</h2><a href="#/todo">查看全部 →</a></div><div class="dashboard-todo">${renderTodoQueue(clientSummary, alertSummary, taskSummary, restoreData)}</div></section>
       <section class="card">${renderCapacity(taskSummary.capacity, backupSummary.totalBytes, backupSummary.dailyUploads)}</section>
     </div>
+    <section class="card"><div class="dashboard-section-head"><h2>客户端资源</h2><small>最近一次心跳 · 告警与内存吃紧的排前</small></div>${renderClientResources(clientResources)}</section>
     <section class="card"><div class="dashboard-section-head"><h2>备份时序</h2><small>最近 14 天 · 任务按异常优先</small></div>${renderMatrix(taskSummary)}</section>`;
   } catch (e) {
     $('#view').innerHTML = `<div class="empty"><span class="e-glyph" aria-hidden="true">!</span><div class="e-title">概览加载失败</div><div class="e-sub">${esc(e.message)}</div></div>`;

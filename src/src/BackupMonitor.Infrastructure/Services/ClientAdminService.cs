@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -22,9 +22,11 @@ public interface IClientAdminService
         int days = 7, int limit = 20, CancellationToken ct = default);
     Task<CertificateRenewalResponse> RenewCertificateAsync(Guid clientId, CancellationToken ct = default);
     Task<ClientMetricsHistoryDto> GetMetricsHistoryAsync(Guid clientId, int hours = 24, int limit = 1440, CancellationToken ct = default);
+    Task<IReadOnlyList<ClientResourceRowDto>> GetResourceOverviewAsync(int limit = 50, CancellationToken ct = default);
     Task<ApproveClientResponseDto> ApproveAsync(Guid clientId, CancellationToken ct = default);
     Task RejectAsync(Guid clientId, string? reason, CancellationToken ct = default);
     Task DisableAsync(Guid clientId, DisableClientRequest request, CancellationToken ct = default);
+    Task EnableAsync(Guid clientId, EnableClientRequest request, CancellationToken ct = default);
     Task RevokeAsync(Guid clientId, RevokeClientRequest request, CancellationToken ct = default);
     Task<DispatchCommandResponse> RefreshMetricsAsync(Guid clientId, CancellationToken ct = default);
 }
@@ -49,6 +51,18 @@ public class ClientAdminService : IClientAdminService
         SortWhitelist.By<Client, DateTime>(c => c.CreatedAt);
     private static readonly AlertStatus[] ActiveAlertStatuses =
         [AlertStatus.Open, AlertStatus.Acknowledged, AlertStatus.InProgress];
+
+    // 「正在干活」的两种形态：上传会话还没落地，或者指令还没跑完。
+    // 上传这一组与 BatchOperationService / BackupTaskService 判定 CLIENT_BUSY 用的是同一组状态——
+    // 界面上锁的依据必须和服务端回绝的依据一致，否则会出现「按钮亮着，点了报 409」。
+    private static readonly UploadStatus[] ActiveUploadStatuses =
+    [
+        UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading,
+        UploadStatus.Paused, UploadStatus.RetryWait, UploadStatus.Received, UploadStatus.Verifying
+    ];
+
+    private static readonly CommandStatus[] RunningCommandStatuses =
+        [CommandStatus.Pending, CommandStatus.Claimed, CommandStatus.Running];
 
     private readonly AppDbContext _db;
     private readonly CertificateAuthority _certificateAuthority;
@@ -150,9 +164,27 @@ public class ClientAdminService : IClientAdminService
             .Select(g => new { ClientId = g.Key, Count = g.Count() })
             .ToListAsync(ct);
 
-        var items = rows.Select(r => new ClientListItemDto
+        var uploadCounts = await _db.UploadSessions
+            .Where(u => pageIds.Contains(u.ClientId) && ActiveUploadStatuses.Contains(u.Status))
+            .GroupBy(u => u.ClientId)
+            .Select(g => new { ClientId = g.Key, Count = g.Count() })
+            .ToListAsync(ct);
+
+        var commandCounts = await _db.Commands
+            .Where(c => pageIds.Contains(c.ClientId)
+                        && RunningCommandStatuses.Contains(c.Status)
+                        && c.ExpiresAt > DateTime.UtcNow)
+            .GroupBy(c => c.ClientId)
+            .Select(g => new { ClientId = g.Key, Count = g.Count() })
+            .ToListAsync(ct);
+
+        var items = rows.Select(r =>
         {
-            Id = r.Id,
+            var activeUploads = uploadCounts.FirstOrDefault(u => u.ClientId == r.Id)?.Count ?? 0;
+            var runningCommands = commandCounts.FirstOrDefault(c => c.ClientId == r.Id)?.Count ?? 0;
+            return new ClientListItemDto
+            {
+                Id = r.Id,
             Hostname = r.Hostname,
             DisplayName = r.DisplayName,
             ClientGroupId = r.ClientGroupId,
@@ -167,12 +199,25 @@ public class ClientAdminService : IClientAdminService
                 : Math.Max(0, (int)Math.Ceiling((r.CertificateExpiresAt.Value - DateTime.UtcNow).TotalDays)),
             LastHeartbeatAt = r.LastHeartbeatAt,
             CreatedAt = r.CreatedAt,
-            ActiveAlertCount = alertCounts.FirstOrDefault(a => a.ClientId == r.Id)?.Count ?? 0,
-            TaskCount = taskCounts.FirstOrDefault(t => t.ClientId == r.Id)?.Count ?? 0
+                ActiveAlertCount = alertCounts.FirstOrDefault(a => a.ClientId == r.Id)?.Count ?? 0,
+                TaskCount = taskCounts.FirstOrDefault(t => t.ClientId == r.Id)?.Count ?? 0,
+                ActiveUploadCount = activeUploads,
+                RunningCommandCount = runningCommands,
+                RuntimeState = ResolveRuntimeState(activeUploads, runningCommands)
+            };
         }).ToList();
 
         return PagedResult<ClientListItemDto>.Create(items, totalCount, query.Page, query.PageSize);
     }
+
+    /// <summary>
+    /// 把两个计数收敛成界面上那一个词。上传优先于普通指令：正在传数据这件事
+    /// 对"现在能不能动这台机器"的影响最大。
+    /// </summary>
+    private static string ResolveRuntimeState(int activeUploadCount, int runningCommandCount)
+        => activeUploadCount > 0 ? "uploading"
+        : runningCommandCount > 0 ? "working"
+        : "idle";
 
     public async Task<ClientDetailDto> GetDetailAsync(Guid clientId, CancellationToken ct = default)
     {
@@ -185,6 +230,15 @@ public class ClientAdminService : IClientAdminService
         var activeAlertCount = await _db.Alerts.CountAsync(a =>
             a.ClientId == clientId && ActiveAlertStatuses.Contains(a.Status), ct);
         var taskCount = await _db.BackupTasks.CountAsync(t => t.ClientId == clientId, ct);
+
+        var activeUploads = await _db.UploadSessions.AsNoTracking()
+            .Where(u => u.ClientId == clientId && ActiveUploadStatuses.Contains(u.Status))
+            .Select(u => u.Task.Name)
+            .ToListAsync(ct);
+        var runningCommandCount = await _db.Commands.CountAsync(
+            c => c.ClientId == clientId
+                 && RunningCommandStatuses.Contains(c.Status)
+                 && c.ExpiresAt > DateTime.UtcNow, ct);
 
         var disks = await _db.ClientDisks.AsNoTracking()
             .Where(d => d.ClientId == clientId)
@@ -236,6 +290,10 @@ public class ClientAdminService : IClientAdminService
             CreatedAt = client.CreatedAt,
             ActiveAlertCount = activeAlertCount,
             TaskCount = taskCount,
+            ActiveUploadCount = activeUploads.Count,
+            RunningCommandCount = runningCommandCount,
+            RuntimeState = ResolveRuntimeState(activeUploads.Count, runningCommandCount),
+            ActiveUploadTaskNames = activeUploads.Distinct().ToList(),
 
             MachineId = client.MachineId,
             OsVersion = client.OsVersion,
@@ -314,6 +372,99 @@ public class ClientAdminService : IClientAdminService
                 LastHeartbeatAt = c.LastHeartbeatAt
             })
             .ToListAsync(ct);
+    }
+
+    /// <summary>
+    /// 概览页用的客户端资源快照：每台机器取最近一次心跳的指标 + 最紧张的备份源盘。
+    ///
+    /// 只取仍在服役的客户端（已禁用/已注销的没有观察价值），按"最需要关注"排序——
+    /// 有活动告警的排最前，其次是内存吃紧的。默认排序如果按主机名，
+    /// 那么真正需要看的那台机器会淹没在字母表中间。
+    /// </summary>
+    public async Task<IReadOnlyList<ClientResourceRowDto>> GetResourceOverviewAsync(
+        int limit = 50, CancellationToken ct = default)
+    {
+        limit = Math.Clamp(limit, 1, 200);
+
+        var clients = await _db.Clients.AsNoTracking()
+            .Where(c => c.Status != ClientStatus.Disabled
+                        && c.Status != ClientStatus.Revoked
+                        && c.Status != ClientStatus.PendingApproval)
+            .Select(c => new
+            {
+                c.Id,
+                c.Hostname,
+                c.DisplayName,
+                c.Status,
+                c.LastHeartbeatAt
+            })
+            .ToListAsync(ct);
+
+        if (clients.Count == 0)
+            return [];
+
+        var ids = clients.Select(c => c.Id).ToList();
+
+        // 每台机器最近一次心跳。分区表上按 client_id 分组取首行，
+        // 走的是 (client_id, received_at DESC) 索引。
+        var metrics = await _db.ClientHeartbeats.AsNoTracking()
+            .Where(h => ids.Contains(h.ClientId))
+            .GroupBy(h => h.ClientId)
+            .Select(g => g.OrderByDescending(h => h.ReceivedAt).First())
+            .ToListAsync(ct);
+        var metricsById = metrics.ToDictionary(h => h.ClientId);
+
+        // 备份源盘里最紧张的那块。非源盘不参与——系统盘满不满不是这个系统要回答的问题。
+        var disks = await _db.ClientDisks.AsNoTracking()
+            .Where(d => ids.Contains(d.ClientId) && d.IsSourceVolume
+                        && d.TotalBytes != null && d.TotalBytes > 0 && d.FreeBytes != null)
+            .Select(d => new { d.ClientId, d.DriveName, d.TotalBytes, d.FreeBytes })
+            .ToListAsync(ct);
+        var tightestDisk = disks
+            .GroupBy(d => d.ClientId)
+            .ToDictionary(
+                g => g.Key,
+                g => g.OrderBy(d => (decimal)d.FreeBytes!.Value / d.TotalBytes!.Value).First());
+
+        var alertCounts = await _db.Alerts.AsNoTracking()
+            .Where(a => a.ClientId != null && ids.Contains(a.ClientId.Value)
+                        && ActiveAlertStatuses.Contains(a.Status))
+            .GroupBy(a => a.ClientId!.Value)
+            .Select(g => new { ClientId = g.Key, Count = g.Count() })
+            .ToListAsync(ct);
+        var alertsById = alertCounts.ToDictionary(a => a.ClientId, a => a.Count);
+
+        return clients
+            .Select(c =>
+            {
+                metricsById.TryGetValue(c.Id, out var heartbeat);
+                tightestDisk.TryGetValue(c.Id, out var disk);
+
+                return new ClientResourceRowDto
+                {
+                    Id = c.Id,
+                    Hostname = c.Hostname,
+                    DisplayName = c.DisplayName,
+                    Status = EnumMapping.ToSnakeCase(c.Status),
+                    LastHeartbeatAt = c.LastHeartbeatAt,
+                    CpuPercent = heartbeat?.CpuPercent,
+                    MemoryPercent = heartbeat?.MemoryPercent,
+                    MemoryTotalBytes = heartbeat?.MemoryTotalBytes,
+                    MemoryAvailableBytes = heartbeat?.MemoryAvailableBytes,
+                    AgentMemoryBytes = heartbeat?.AgentMemoryBytes,
+                    SystemUptimeSeconds = heartbeat?.SystemUptimeSeconds,
+                    MinSourceDiskName = disk?.DriveName,
+                    MinSourceDiskFreePercent = disk is null
+                        ? null
+                        : Math.Round((decimal)disk.FreeBytes!.Value / disk.TotalBytes!.Value * 100, 2),
+                    ActiveAlertCount = alertsById.GetValueOrDefault(c.Id)
+                };
+            })
+            .OrderByDescending(r => r.ActiveAlertCount)
+            .ThenByDescending(r => r.MemoryPercent ?? -1)
+            .ThenBy(r => r.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .Take(limit)
+            .ToList();
     }
 
     public async Task<ClientMetricsHistoryDto> GetMetricsHistoryAsync(
@@ -541,6 +692,53 @@ public class ClientAdminService : IClientAdminService
 
         await _audit.RecordAsync("client.disable", AuditResult.Success, "client", client.Id,
             afterData: JsonSerializer.Serialize(new { status = "disabled", request.Reason }), ct: ct);
+    }
+
+    /// <summary>
+    /// 重新启用被禁用的客户端。
+    ///
+    /// 禁用此前是一条单行道：界面上没有回头路，接口层面也没有。而"先停掉这台机器，
+    /// 等业务迁完再开回来"是个再正常不过的运维动作，不该只能靠改数据库解决。
+    ///
+    /// 只置回 offline 而不是 online——它现在到底在不在线由下一次心跳说了算
+    /// （AgentHeartbeatService 会把 offline 翻成 online 或 certificate_expired）。
+    /// 注销不可逆：证书已经吊销，机器必须重新登记审批，所以这里不接受 revoked。
+    /// </summary>
+    public async Task EnableAsync(Guid clientId, EnableClientRequest request, CancellationToken ct = default)
+    {
+        var client = await _db.Clients.FirstOrDefaultAsync(c => c.Id == clientId, ct)
+            ?? throw new NotFoundException("客户端", clientId);
+
+        if (client.Status != ClientStatus.Disabled)
+            throw new BusinessException("CONFLICT",
+                $"客户端当前状态为 {EnumMapping.ToSnakeCase(client.Status)}，只有已禁用的客户端可以启用", 409);
+
+        // 被拒绝的注册申请同样落在 disabled 上，但它从来没有过证书——
+        // 把它"启用"只会得到一台永远连不上的机器，必须让它重新登记走审批。
+        var hasActiveCertificate = await _db.ClientCertificates.AnyAsync(
+            c => c.ClientId == clientId && c.Status == CertificateStatus.Active, ct);
+        if (!hasActiveCertificate)
+            throw new BusinessException("CONFLICT",
+                "该客户端没有有效证书（注册被拒或证书已吊销），需要在客户端机器上重新登记并审批", 409);
+
+        client.Status = ClientStatus.Offline;
+        client.Notes = string.IsNullOrWhiteSpace(request.Reason)
+            ? "已重新启用"
+            : $"已重新启用：{request.Reason}";
+
+        try
+        {
+            await _db.SaveChangesAsync(ct);
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            throw new ConcurrencyConflictException("客户端");
+        }
+
+        await _audit.RecordAsync("client.enable", AuditResult.Success, "client", client.Id,
+            afterData: JsonSerializer.Serialize(new { status = "offline", request.Reason }), ct: ct);
+
+        _logger.LogInformation("客户端 {ClientId}({Hostname}) 已重新启用", client.Id, client.Hostname);
     }
 
     /// <summary>注销客户端（设计书 15.5，吊销全部证书，不可恢复）</summary>
