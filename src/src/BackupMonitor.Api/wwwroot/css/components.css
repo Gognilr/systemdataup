@@ -348,6 +348,19 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .modal .mfoot .dirsel{margin-right:auto}
 
+/* 存储设置的"当前生效"事实块。
+   刻意不复用 .kv：那是 auto-fill 多列网格，为一堆短键值对设计的。
+   放长路径进去会被排成并排三列，路径溢出格子直接压在右边一列的文字上。
+   这里固定两列——标签一列、值一列——并让值列可换行。 */
+.storage-facts{display:grid;grid-template-columns:auto minmax(0,1fr);
+  gap:var(--s-1) var(--s-3);align-items:baseline;margin-bottom:var(--s-3)}
+.storage-facts dt{color:var(--text-muted);font:var(--t-sm);white-space:nowrap}
+.storage-facts dd{margin:0;min-width:0;display:flex;align-items:center;gap:var(--s-2);flex-wrap:wrap}
+/* 生效路径要能整条看全并选中复制，所以在这里放开 .dirpath 的单行省略 */
+.storage-facts .dirpath{overflow:visible;text-overflow:clip;white-space:normal;word-break:break-all}
+.storage-path-input{display:flex;gap:var(--s-2);align-items:center}
+.storage-path-input input{flex:1;min-width:0}
+
 /* 结论块：一句人话摆在最显眼处，依据紧随其后。
    只给结论人无法判断对错，"确认"就退化成盲点头。 */
 .wiz-verdict{background:var(--accent-weak);border:1px solid var(--accent);

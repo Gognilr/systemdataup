@@ -13,6 +13,13 @@ public class StorageSettingsDto
     public StoragePathDto Staging { get; set; } = new();
 
     /// <summary>
+    /// 服务端主机名。
+    /// 管理页面常常不是在服务器本机上打开的，而这里所有路径、目录选择器列出的磁盘，
+    /// 指的都是服务端这台机器——界面必须把这台机器是谁写出来，否则很容易当成本机路径。
+    /// </summary>
+    public string ServerHostname { get; set; } = null!;
+
+    /// <summary>
     /// 仓库路径改过之后，落在当前仓库根之外的备份集数量。
     /// 这些备份集的文件仍然在老目录里可用，但保留策略的物理清理会拒绝删除它们
     /// （RetentionCleanupWorker 的围栏只认当前仓库根），需要人工搬迁或清理。
@@ -46,6 +53,47 @@ public class StoragePathDto
 
     /// <summary>探测过程中的问题描述（目录不可写、盘符不存在等），正常时为 null</summary>
     public string? Problem { get; set; }
+}
+
+/// <summary>
+/// 服务端本机目录浏览结果（存储设置的目录选择器用）。
+/// 只列目录，不列文件，也不读取任何文件内容。
+/// </summary>
+public class StorageBrowseResponseDto
+{
+    /// <summary>true 表示这一层是磁盘列表（未指定 path 时）</summary>
+    public bool IsDriveList { get; set; }
+
+    /// <summary>当前所在目录；磁盘列表时为 null</summary>
+    public string? Path { get; set; }
+
+    /// <summary>上级目录；已在盘符根或磁盘列表时为 null</summary>
+    public string? ParentPath { get; set; }
+
+    public List<StorageBrowseEntryDto> Entries { get; set; } = [];
+
+    /// <summary>子目录太多，只返回了前若干条</summary>
+    public bool Truncated { get; set; }
+
+    /// <summary>因权限读不到的子目录数量</summary>
+    public int DeniedCount { get; set; }
+}
+
+/// <summary>目录浏览的一项（磁盘或子目录）</summary>
+public class StorageBrowseEntryDto
+{
+    public string Name { get; set; } = null!;
+
+    public string Path { get; set; } = null!;
+
+    /// <summary>是否是磁盘根（磁盘列表里为 true）</summary>
+    public bool IsDrive { get; set; }
+
+    /// <summary>磁盘剩余空间；仅磁盘项有值</summary>
+    public long? FreeBytes { get; set; }
+
+    /// <summary>磁盘总容量；仅磁盘项有值</summary>
+    public long? TotalBytes { get; set; }
 }
 
 /// <summary>

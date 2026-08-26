@@ -31,6 +31,19 @@ public class AdminStorageSettingsController : ApiBaseController
         return OkData(result);
     }
 
+    /// <summary>
+    /// 浏览服务端本机目录，给存储设置的目录选择器用。
+    /// 不传 path 返回磁盘列表；只返回目录，不返回文件。
+    /// </summary>
+    [HttpGet("storage-settings/browse")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:system.manage")]
+    public async Task<ActionResult<ApiResponse<StorageBrowseResponseDto>>> Browse(
+        [FromQuery] string? path, CancellationToken ct)
+    {
+        var result = await _storageSettings.BrowseAsync(path, ct);
+        return OkData(result);
+    }
+
     /// <summary>更新存储设置。留空表示清除该项配置，回落到 appsettings / 程序目录默认值</summary>
     [HttpPut("storage-settings")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:system.manage")]

@@ -17,6 +17,9 @@ public interface IStorageSettingsService
 
     /// <summary>更新设置。留空表示清除该项配置，回落到 appsettings 或程序目录默认值</summary>
     Task<StorageSettingsDto> UpdateAsync(UpdateStorageSettingsRequest request, CancellationToken ct = default);
+
+    /// <summary>浏览服务端本机目录（path 为空时返回磁盘列表）。只列目录，不列文件</summary>
+    Task<StorageBrowseResponseDto> BrowseAsync(string? path, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -29,6 +32,10 @@ public interface IStorageSettingsService
 public class StorageSettingsService : IStorageSettingsService
 {
     private const int MaxPathLength = 2048;
+
+    /// <summary>单次目录浏览返回的子目录上限。超出就截断并告诉界面，不做分页——
+    /// 存储根一般选在层级很浅的地方，需要翻两千个同级目录才能找到的场景不存在。</summary>
+    private const int MaxBrowseEntries = 2000;
 
     private readonly AppDbContext _db;
     private readonly IUploadStorage _storage;
@@ -62,6 +69,7 @@ public class StorageSettingsService : IStorageSettingsService
         {
             Repository = repository,
             Staging = staging,
+            ServerHostname = Environment.MachineName,
             BackupSetsOutsideRoot = await CountBackupSetsOutsideRootAsync(repository.EffectivePath, ct)
         };
     }
@@ -105,6 +113,104 @@ public class StorageSettingsService : IStorageSettingsService
             repository ?? "(清除)", staging ?? "(清除)");
 
         return await GetAsync(ct);
+    }
+
+    /// <summary>
+    /// 浏览服务端本机目录。
+    ///
+    /// 只枚举目录名，不碰文件内容，并且只对 system.manage 开放——能改存储路径的人本来就能
+    /// 把备份写到本机任意目录，让他先看一眼目录树不额外扩大任何权限，却省掉了"把路径背下来
+    /// 再手敲一遍"这件事（敲错一个字符的结果是备份默默写进另一个目录）。
+    /// </summary>
+    public Task<StorageBrowseResponseDto> BrowseAsync(string? path, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return Task.FromResult(ListDrives());
+
+        var target = path.Trim();
+        if (!Path.IsPathFullyQualified(target))
+            throw new ValidationFailedException("浏览路径必须是绝对路径");
+
+        var full = Path.GetFullPath(target);
+        if (!Directory.Exists(full))
+            throw new BusinessException("NOT_FOUND", $"目录不存在：{full}", 404);
+
+        var response = new StorageBrowseResponseDto
+        {
+            Path = full,
+            ParentPath = Directory.GetParent(full)?.FullName
+        };
+
+        var denied = 0;
+        var names = new List<string>();
+        try
+        {
+            foreach (var directory in Directory.EnumerateDirectories(full))
+            {
+                ct.ThrowIfCancellationRequested();
+
+                // 逐项判权限：整个目录能列，不代表每个子目录都能进。
+                // 单项失败只计数，不能让整次浏览失败——否则一个装了权限的子目录
+                // 就能让上级目录在界面上彻底打不开。
+                try
+                {
+                    var info = new DirectoryInfo(directory);
+                    if (info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                        continue;
+                    names.Add(info.Name);
+                }
+                catch (UnauthorizedAccessException) { denied++; }
+                catch (IOException) { denied++; }
+
+                if (names.Count >= MaxBrowseEntries)
+                {
+                    response.Truncated = true;
+                    break;
+                }
+            }
+        }
+        catch (UnauthorizedAccessException)
+        {
+            throw new BusinessException("STORAGE_PATH_UNUSABLE", $"没有权限读取目录 {full}", 403);
+        }
+
+        response.DeniedCount = denied;
+        response.Entries = names
+            .OrderBy(n => n, StringComparer.OrdinalIgnoreCase)
+            .Select(n => new StorageBrowseEntryDto { Name = n, Path = Path.Combine(full, n) })
+            .ToList();
+
+        return Task.FromResult(response);
+    }
+
+    /// <summary>磁盘列表。跳过未就绪的驱动器——光驱和没插的可移动盘选了也没意义</summary>
+    private static StorageBrowseResponseDto ListDrives()
+    {
+        var response = new StorageBrowseResponseDto { IsDriveList = true };
+
+        foreach (var drive in DriveInfo.GetDrives())
+        {
+            try
+            {
+                if (!drive.IsReady || drive.DriveType is DriveType.CDRom or DriveType.Ram)
+                    continue;
+
+                response.Entries.Add(new StorageBrowseEntryDto
+                {
+                    Name = string.IsNullOrWhiteSpace(drive.VolumeLabel)
+                        ? drive.Name
+                        : $"{drive.Name}（{drive.VolumeLabel}）",
+                    Path = drive.RootDirectory.FullName,
+                    IsDrive = true,
+                    FreeBytes = drive.AvailableFreeSpace,
+                    TotalBytes = drive.TotalSize
+                });
+            }
+            catch (IOException) { /* 驱动器在枚举途中掉线，跳过 */ }
+            catch (UnauthorizedAccessException) { /* 同上 */ }
+        }
+
+        return response;
     }
 
     /// <summary>解析一个存储根并实地探测其状态（只读探测，不创建目录）</summary>
@@ -195,9 +301,15 @@ public class StorageSettingsService : IStorageSettingsService
 
         // 盘符根（D:\）会让备份直接铺在整个磁盘的根目录上，而保留策略删除时的
         // "至少两级目录"守卫会拒绝清理这类路径下的备份集——建出来就是个删不掉的仓库。
+        // UNC 共享根（\\nas\backup）同理：GetRelativePath 得到 "."，一样过不了那道守卫。
         var root = Path.GetPathRoot(full);
         if (string.Equals(full.TrimEnd(Path.DirectorySeparatorChar), root?.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
-            throw new ValidationFailedException($"{label}不能是驱动器根目录，请指定一个子目录，例如 {root}BackupRepository");
+        {
+            // 示例路径用 Path.Combine 拼：盘符根自带尾部反斜杠，UNC 共享根不带，
+            // 直接字符串相加会给出 \\nas\backupBackupRepository 这种照抄就错的示例。
+            var example = Path.Combine(full, "BackupRepository");
+            throw new ValidationFailedException($"{label}不能是驱动器或共享的根目录，请指定一个子目录，例如 {example}");
+        }
 
         return full;
     }

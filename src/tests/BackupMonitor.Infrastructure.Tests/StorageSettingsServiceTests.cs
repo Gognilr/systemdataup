@@ -201,6 +201,113 @@ public class StorageSettingsServiceTests : IDisposable
             new UpdateStorageSettingsRequest { RepositoryPath = driveRoot }));
     }
 
+    /// <summary>
+    /// UNC 共享根同样要拒绝（保留策略的"至少两级目录"守卫对它一样删不掉），
+    /// 而且提示里给出的示例路径必须是能照抄的。
+    ///
+    /// 盘符根自带尾部反斜杠、UNC 共享根不带，早先用字符串相加拼示例，
+    /// 于是 UNC 情况下给出的是 \\nas\backupBackupRepository —— 照着改一遍还是错的。
+    /// </summary>
+    [Fact]
+    public async Task UNC共享根被拒绝_且示例路径带分隔符()
+    {
+        await using var provider = BuildServices();
+        using var scope = provider.CreateScope();
+        var service = scope.ServiceProvider.GetRequiredService<IStorageSettingsService>();
+
+        var ex = await Assert.ThrowsAsync<ValidationFailedException>(() => service.UpdateAsync(
+            new UpdateStorageSettingsRequest { RepositoryPath = @"\\nas\backup" }));
+
+        Assert.Contains(@"\\nas\backup\BackupRepository", ex.Message);
+    }
+
+    /// <summary>
+    /// 管理页面多半不是在服务器本机上打开的。响应必须带上服务端主机名，
+    /// 界面才能说清楚"这些路径和磁盘是哪台机器上的"——否则很容易被当成本机路径。
+    /// </summary>
+    [Fact]
+    public async Task 读取设置_带回服务端主机名()
+    {
+        await using var provider = BuildServices();
+        using var scope = provider.CreateScope();
+        var service = scope.ServiceProvider.GetRequiredService<IStorageSettingsService>();
+
+        var settings = await service.GetAsync();
+
+        Assert.Equal(Environment.MachineName, settings.ServerHostname);
+    }
+
+    /// <summary>
+    /// 目录浏览只返回子目录，不返回文件。
+    ///
+    /// 这个接口的存在意义就是"别让人手敲路径"——敲错一个字符不会报错，备份会安静地
+    /// 写进另一个目录，等到要恢复时才发现。同时它绝不能变成一个文件浏览器：
+    /// 选存储根用不到文件名，多列一样东西就多一分把服务器目录内容泄露出去的面。
+    /// </summary>
+    [Fact]
+    public async Task 浏览目录_只列子目录不列文件()
+    {
+        await using var provider = BuildServices();
+        using var scope = provider.CreateScope();
+        var service = scope.ServiceProvider.GetRequiredService<IStorageSettingsService>();
+
+        Directory.CreateDirectory(Path.Combine(_tempRoot, "repository"));
+        Directory.CreateDirectory(Path.Combine(_tempRoot, "staging"));
+        await File.WriteAllTextAsync(Path.Combine(_tempRoot, "readme.txt"), "不该出现在浏览结果里");
+
+        var result = await service.BrowseAsync(_tempRoot);
+
+        Assert.False(result.IsDriveList);
+        Assert.Equal(Path.GetFullPath(_tempRoot), result.Path);
+        Assert.NotNull(result.ParentPath);
+        Assert.Equal(new[] { "repository", "staging" }, result.Entries.Select(e => e.Name).ToArray());
+        Assert.DoesNotContain(result.Entries, e => e.Name.EndsWith(".txt", StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>不传路径时返回磁盘列表，并带上容量——选盘时最需要知道的就是还剩多少空间。</summary>
+    [Fact]
+    public async Task 不传路径_返回带容量的磁盘列表()
+    {
+        await using var provider = BuildServices();
+        using var scope = provider.CreateScope();
+        var service = scope.ServiceProvider.GetRequiredService<IStorageSettingsService>();
+
+        var result = await service.BrowseAsync(null);
+
+        Assert.True(result.IsDriveList);
+        Assert.NotEmpty(result.Entries);
+        Assert.All(result.Entries, e =>
+        {
+            Assert.True(e.IsDrive);
+            Assert.NotNull(e.FreeBytes);
+            Assert.NotNull(e.TotalBytes);
+        });
+    }
+
+    /// <summary>浏览也必须挡住相对路径，否则它会按服务进程的当前目录解释。</summary>
+    [Fact]
+    public async Task 浏览相对路径被拒绝()
+    {
+        await using var provider = BuildServices();
+        using var scope = provider.CreateScope();
+        var service = scope.ServiceProvider.GetRequiredService<IStorageSettingsService>();
+
+        await Assert.ThrowsAsync<ValidationFailedException>(() => service.BrowseAsync(@"windows\system32"));
+    }
+
+    /// <summary>浏览不存在的目录返回 404，而不是抛一个未处理异常把整页打成 500。</summary>
+    [Fact]
+    public async Task 浏览不存在的目录_返回404()
+    {
+        await using var provider = BuildServices();
+        using var scope = provider.CreateScope();
+        var service = scope.ServiceProvider.GetRequiredService<IStorageSettingsService>();
+
+        var missing = Path.Combine(_tempRoot, "no-such-directory");
+        var ex = await Assert.ThrowsAsync<BusinessException>(() => service.BrowseAsync(missing));
+        Assert.Equal(404, ex.StatusCode);
+    }
+
     /// <summary>正式仓库和上传暂存指向同一个目录：半成品和正式备份会混在一起。</summary>
     [Fact]
     public async Task 仓库与暂存指向同一目录时被拒绝()
