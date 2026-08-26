@@ -1,3 +1,4 @@
+using BackupMonitor.Shared.Security;
 using BackupMonitor.Infrastructure.Common;
 
 namespace BackupMonitor.Infrastructure.Tests;

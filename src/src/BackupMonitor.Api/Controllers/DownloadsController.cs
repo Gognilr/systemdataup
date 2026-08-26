@@ -1,3 +1,4 @@
+using BackupMonitor.Shared.Security;
 using System.IO.Compression;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Services;

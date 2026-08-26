@@ -22,9 +22,10 @@ public sealed record RecognizerRules(
     bool Recursive,
     string? BatchRegex,
     int BusinessUnitDepth = 1,
-    string? UnitLayout = null)
+    string? UnitLayout = null,
+    string? GroupBy = null)
 {
-    public static RecognizerRules Empty() => new([], [], [], [], true, null, 1, null);
+    public static RecognizerRules Empty() => new([], [], [], [], true, null, 1, null, null);
 
     /// <summary>
     /// 识别规则里所有被承认的键名。
@@ -39,7 +40,7 @@ public sealed record RecognizerRules(
         "excludePatterns", "excludes",
         "excludeDirectories", "excludeDirs",
         "requiredFiles", "requiredPatterns", "required",
-        "recursive", "businessUnitDepth", "unitLayout", "batchRegex"
+        "recursive", "businessUnitDepth", "unitLayout", "batchRegex", "groupBy"
     ];
 
     /// <summary>
@@ -159,6 +160,13 @@ public sealed record RecognizerRules(
                 result = result with { UnitLayout = unitLayout.GetString()!.Trim().ToLowerInvariant() };
             }
 
+            if (root.TryGetProperty("groupBy", out var groupBy)
+                && groupBy.ValueKind == JsonValueKind.String
+                && !string.IsNullOrWhiteSpace(groupBy.GetString()))
+            {
+                result = result with { GroupBy = groupBy.GetString()!.Trim() };
+            }
+
             if (root.TryGetProperty("batchRegex", out var batchRegex)
                 && batchRegex.ValueKind == JsonValueKind.String
                 && !string.IsNullOrWhiteSpace(batchRegex.GetString()))
@@ -234,6 +242,87 @@ public sealed record RecognizerRules(
                && !fileName.EndsWith(".partial", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// 从收集到的文件里挑出「最新的一组」。
+    ///
+    /// 为什么在这里而不在两侧各写一份：与本文件头部注释的理由完全相同。
+    /// 分组语义一旦 Agent 与服务端分叉，表现是「向导说会识别出这些文件、实际扫描是另一批」，
+    /// 而且没有人会察觉。
+    ///
+    /// 为什么是「收集之后的一次筛选」而不是一种新识别器：SelectRoots 的返回值是目录，
+    /// 而文件组不是目录；要让它返回文件组就得改签名，波及两处 SelectRoots 的全部分支。
+    /// 插在 CollectFiles 之后只需要一个切入点，且任何识别器类型都能叠加使用。
+    ///
+    /// 规则：按分组键归组 → 每组取组内最新文件时间作为该组时间 → 取时间最大的一组；
+    /// 时间相同则按分组键倒序，保证结果稳定而不依赖枚举顺序（R1 的教训）。
+    /// GroupBy 为空时原样返回——这是默认值，所以存量任务行为完全不变。
+    /// </summary>
+    /// <param name="files">已经过 IsAllowedFile 筛选的文件</param>
+    /// <param name="relativePathOf">取文件相对采集根的路径，'/' 或 '\' 分隔均可</param>
+    /// <param name="lastWriteOf">取文件最后修改时间</param>
+    public IReadOnlyList<T> SelectLatestGroup<T>(
+        IReadOnlyList<T> files,
+        Func<T, string> relativePathOf,
+        Func<T, DateTime> lastWriteOf)
+    {
+        if (string.IsNullOrWhiteSpace(GroupBy) || files.Count == 0)
+            return files;
+
+        var groups = files
+            .GroupBy(file => GroupKeyOf(relativePathOf(file)), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (groups.Count <= 1)
+            return files;
+
+        var newest = groups
+            .OrderByDescending(g => g.Max(lastWriteOf))
+            .ThenByDescending(g => g.Key, StringComparer.OrdinalIgnoreCase)
+            .First();
+
+        return newest.ToList();
+    }
+
+    /// <summary>
+    /// 一个文件的分组键。
+    ///
+    /// - "basename"：去掉扩展名的文件名（致远 OA 的 NAME.zip + NAME.properties）；
+    /// - 其它字符串：当作正则，取第一个捕获组；
+    ///   编译不过或匹配不上的文件归入 <see cref="UngroupedKey"/> 并保留——
+    ///   沿用 RegexMatches 已有的「异常吞掉、退化为不过滤」策略。一条写错的 groupBy
+    ///   不该让备份凭空消失。
+    /// </summary>
+    public string GroupKeyOf(string relativePath)
+    {
+        var fileName = FileNameOf(relativePath.Replace('\\', '/'));
+        if (string.Equals(GroupBy, "basename", StringComparison.OrdinalIgnoreCase))
+        {
+            var index = fileName.LastIndexOf('.');
+            return index <= 0 ? fileName : fileName[..index];
+        }
+
+        try
+        {
+            var match = Regex.Match(
+                fileName,
+                GroupBy!,
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
+                TimeSpan.FromSeconds(1));
+            if (match.Success && match.Groups.Count > 1 && match.Groups[1].Success)
+                return match.Groups[1].Value;
+        }
+        catch (ArgumentException)
+        {
+            // 正则编译不过：所有文件归入同一个"未分组"键，等价于不分组。
+        }
+        catch (RegexMatchTimeoutException)
+        {
+        }
+
+        return UngroupedKey;
+    }
+
+    /// <summary>无法从 groupBy 得出分组键的文件的归属。刻意用一个文件名里不可能出现的值。</summary>
+    public const string UngroupedKey = "\u0000ungrouped";
     /// <summary>某个文件是否被 requiredFiles 点名。</summary>
     public bool IsRequiredFile(string relativePath) =>
         Required.Count == 0 || Required.Any(pattern => MatchesPath(relativePath, pattern));

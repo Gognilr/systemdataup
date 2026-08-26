@@ -57,7 +57,8 @@ async function createToken() {
     const overlay = openModal('注册令牌已创建', `<p>请立即复制下面的明文令牌并交给 Agent 安装人员。关闭此窗口后，服务器不会再次显示明文。</p>
       <div class="frow"><label>注册令牌</label><textarea id="rt_plain" class="mono" readonly>${esc(result.token)}</textarea></div>
       <div class="frow"><label>客户端安装程序</label><a href="/downloads/BackupMonitor.Agent.Setup.exe" download>下载 BackupMonitor.Agent.Setup.exe</a></div>
-      <div class="frow"><label>高级部署</label><a href="/downloads/BackupMonitor.Agent.zip" download>下载 ZIP / PowerShell 脚本包</a></div>`, { okText: '复制令牌并关闭' });
+      <div class="frow"><label>高级部署</label><a href="/downloads/BackupMonitor.Agent.zip" download>下载 ZIP / PowerShell 脚本包</a></div>
+      <div class="frow"><label>系统要求</label><p class="hint">Windows Server 2016 及以上可直接安装。Server 2012 / 2012 R2 需先打系统补丁 KB2999226（走 Windows Update 全量更新即可）并安装 <a href="/downloads/VC_redist.x64.exe" download>VC++ 2015-2022 运行库</a>，否则安装程序无法启动。装不上时先在目标机上双击 <a href="/downloads/check-prereq.cmd" download>check-prereq.cmd</a> 自检。</p></div>`, { okText: '复制令牌并关闭' });
     overlay.querySelector('[data-ok]').addEventListener('click', async () => {
       try { await navigator.clipboard.writeText(result.token); toast('令牌已复制', 'ok'); } catch { toast('浏览器未授予剪贴板权限，请手动复制', 'err'); }
       closeModal();

@@ -109,7 +109,10 @@ export function runDirectoryWizard(clientId) {
           method: 'POST',
           // 确认目录时一律抓满 3 层：这一次是冲着"看懂这个目录"去的，
           // 盘根那条省钱的规则（只抓一层）在这里反而会让推断看到一个空目录。
-          body: { path: path || null, maxDepth: andInfer ? 3 : browseDepth(path), maxEntries: 3000 }
+          // 推断抓 4 层：Backup(1) → 年(2) → 月(3) → 组内文件(4)。抓 3 层时
+        // 年/月分层的文件正好落在第 4 层，推断会看到"月目录是空的"而认不出结构。
+        // 上限是服务端 clamp 的 6；抓不全时 HasGaps 置位，置信度会相应下调并说明。
+        body: { path: path || null, maxDepth: andInfer ? 4 : browseDepth(path), maxEntries: 3000 }
         });
         st.commandId = dispatched.commandId;
         const snapshot = await waitForSnapshot(st.commandId, alive, stage => {
@@ -175,7 +178,9 @@ export function runDirectoryWizard(clientId) {
        只发生在"就用这个目录"这一次点击上），再推断。 */
     function needsOwnSnapshot() {
       if (!st.snapshot || st.snapshot.isDriveList || !st.selected) return false;
-      return st.selected !== normPath(st.snapshot.root) || (st.snapshot.maxDepth || 0) < 3;
+      // 与推断请求的 maxDepth 保持一致：手上这份快照浅于 4 层就重抓一次，
+      // 否则年/月分层的文件落在第 4 层，推断会把月目录看成空的。
+      return st.selected !== normPath(st.snapshot.root) || (st.snapshot.maxDepth || 0) < 4;
     }
 
     /* ── 第二步：推断 + 预演 ── */
@@ -242,7 +247,8 @@ export function runDirectoryWizard(clientId) {
           method: 'POST',
           body: {
             commandId: st.commandId,
-            path: st.selected,
+            // 与 buildResult 同一个来源：预演的目录必须和最终建出来的任务一致。
+            path: proposedSourcePath(st),
             recognizerType: st.proposal.recognizerType,
             recognizerConfig: buildConfig(st),
             stabilityIntervalSeconds: STABILITY_INTERVAL_SECONDS
@@ -417,9 +423,17 @@ function buildConfig(st) {
   return JSON.stringify(config, null, 2);
 }
 
+/* 方案给出的源路径可能与用户点中的目录不同：年/月分层会产出带通配的
+   D:\Backup\*\*，让任务跨月、跨年自动跟随。这里必须用方案的那个，
+   用 st.selected 会把通配悄悄丢掉，任务又变回写死到某个月。 */
+function proposedSourcePath(st) {
+  const proposed = st.proposal && st.proposal.sourcePath;
+  return proposed ? displayPath(proposed) : displayPath(st.selected);
+}
+
 function buildResult(st) {
   return {
-    sourcePath: displayPath(st.selected),
+    sourcePath: proposedSourcePath(st),
     recognizerType: st.proposal.recognizerType,
     recognizerConfig: buildConfig(st),
     applicationName: st.proposal.suggestedApplicationName || ''

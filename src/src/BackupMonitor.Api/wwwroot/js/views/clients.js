@@ -22,13 +22,17 @@ export async function vClients() {
       <a class="primary button" href="/downloads/BackupMonitor.Agent.Setup.exe" download>下载客户端安装程序</a>
       <button class="button" id="client-advanced-toggle" data-ui-action="method" data-method="toggleClientAdvanced" aria-expanded="false">高级设置</button>
     </div>
+    <p class="text-muted">Windows Server 2016 及以上可直接安装。Server 2012 / 2012 R2 需先打系统补丁 KB2999226（走 Windows Update 全量更新即可）并安装 <a href="/downloads/VC_redist.x64.exe" download>VC++ 2015-2022 运行库</a>，否则安装程序无法启动。不确定时先下载 <a href="/downloads/check-prereq.cmd" download>安装前自检 check-prereq.cmd</a> 在目标机上双击运行。</p>
     <div id="client-advanced" class="card" hidden>
       <div class="dashboard-section-head"><h2>高级部署</h2><small>仅在 Secure 模式或运维人员使用</small></div>
       <p class="text-muted">局域网一键安装不需要令牌。只有使用 Secure 部署模式时，才需要创建注册令牌或下载兼容包。</p>
       <div class="toolbar compact-toolbar">
         <a class="button" href="#/registration-tokens">管理注册令牌</a>
         <a class="button" href="/downloads/BackupMonitor.Agent.zip" download>下载兼容 ZIP 包</a>
+        <a class="button" href="/downloads/VC_redist.x64.exe" download>下载 VC++ 2015-2022 运行库</a>
+        <a class="button" href="/downloads/check-prereq.cmd" download>下载安装前自检脚本</a>
       </div>
+      <p class="text-muted">ZIP 包里的 install-agent.ps1 需要 PowerShell 3.0 以上。Server 2012 R2 出厂是 PowerShell 4.0，满足要求；更低的系统请改用 EXE 安装程序。</p>
     </div>
     <div id="deployment-status-card" class="card" role="status" aria-live="polite">正在读取部署状态…</div>
     <div class="card onboarding-card">

@@ -1,4 +1,4 @@
-namespace BackupMonitor.Infrastructure.Common;
+namespace BackupMonitor.Shared.Security;
 
 /// <summary>
 /// 上传相对路径安全校验（设计书 23.4 路径安全）：

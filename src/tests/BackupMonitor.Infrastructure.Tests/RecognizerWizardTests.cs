@@ -242,6 +242,78 @@ public sealed class RecognizerWizardTests : IDisposable
         Assert.Contains(partial.Evidence, e => e.Contains("没有被完整抓取", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// 致远 OA：一份备份 = 同名的 .zip（数据）+ .properties（元数据），一个月约 30 组。
+    ///
+    /// 两种扩展名数量完全相同，稳定排序下 .properties 会排在 .zip 前面（p < z），
+    /// 于是向导曾经产出 {"includePatterns":["*.properties"]}——真正的数据包被规则
+    /// 彻底排除，而元数据每天准时出现，任务天天判 passed。
+    /// 所以这里断言的不是"推荐得好不好"，而是"*.zip 绝不能被漏掉"。
+    /// </summary>
+    [Fact]
+    public void 同名成对文件时数据包必须进必需文件()
+    {
+        for (var day = 1; day <= 30; day++)
+        {
+            var stem = $"2026-08-{day:00}@02_00";
+            Write($"{stem}.zip", new string('x', 4096));
+            Write($"{stem}.properties", "meta");
+        }
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        var required = RecognizerRules.Parse(proposal.RecognizerConfig).Required;
+        Assert.Contains("*.zip", required);
+
+        // includePatterns 可以不写；一旦写了，*.zip 必须在里面。
+        var includes = RecognizerRules.Parse(proposal.RecognizerConfig).Includes;
+        if (includes.Count > 0)
+            Assert.Contains("*.zip", includes);
+
+        Assert.Equal("multi_file_set", proposal.RecognizerType);
+
+        // requiredFiles 保证 zip 不被排除，groupBy 保证 30 天不被算成一份。少任何一半都还是错的。
+        Assert.Equal("basename", RecognizerRules.Parse(proposal.RecognizerConfig).GroupBy);
+
+        // 依据要说清楚看到了什么，否则"确认"就是盲点头。
+        Assert.Contains(proposal.Evidence, e => e.Contains("30 组", StringComparison.Ordinal));
+        Assert.Contains(proposal.Evidence, e => e.Contains("*.zip", StringComparison.Ordinal)
+                                                && e.Contains("*.properties", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 反向用例：没有成对文件时不能改坏已有行为，仍然走 latest_single_file。
+    /// </summary>
+    [Fact]
+    public void 没有成对文件时仍然按最新单文件推断()
+    {
+        for (var day = 1; day <= 30; day++)
+            Write($"db_2026-08-{day:00}.bak", new string('x', 4096));
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        Assert.Equal("latest_single_file", proposal.RecognizerType);
+        Assert.Equal(["*.bak"], RecognizerRules.Parse(proposal.RecognizerConfig).Includes);
+    }
+
+    /// <summary>
+    /// 平局用例：两种扩展名各 5 个、文件名互不成对，只能靠体积决胜。
+    /// 不按体积决胜的话，胜负取决于文件枚举顺序——正是 R1 那个缺陷的成因。
+    /// </summary>
+    [Fact]
+    public void 扩展名数量打平时按体积决胜()
+    {
+        for (var i = 1; i <= 5; i++)
+        {
+            Write($"payload{i}.zip", new string('x', 200_000));
+            Write($"meta{i}.properties", "kv");
+        }
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        Assert.Equal("latest_single_file", proposal.RecognizerType);
+        Assert.Equal(["*.zip"], RecognizerRules.Parse(proposal.RecognizerConfig).Includes);
+    }
     [Theory]
     [InlineData("20260825", true)]
     [InlineData("2026-08-25", true)]
@@ -255,6 +327,145 @@ public sealed class RecognizerWizardTests : IDisposable
     public void 日期目录识别(string name, bool expected) =>
         Assert.Equal(expected, StructureInference.LooksLikeDate(name));
 
+    // ---------- 年/月数字分层 ----------
+
+    [Theory]
+    [InlineData("2026", true, false)]
+    [InlineData("1990", true, false)]
+    [InlineData("2100", true, false)]
+    [InlineData("1989", false, false)]
+    [InlineData("08", false, true)]
+    [InlineData("8", false, true)]
+    [InlineData("12", false, true)]
+    [InlineData("31", false, true)]
+    [InlineData("32", false, false)]
+    [InlineData("00", false, false)]
+    [InlineData("ZT001", false, false)]
+    [InlineData("账套001", false, false)]
+    // 8 位数字既不是年也不是月——它归 LooksLikeDate 管，两条判定不能互相抢。
+    [InlineData("20260817", false, false)]
+    [InlineData("2026年", false, false)]
+    [InlineData("08月", false, false)]
+    public void 年月目录识别(string name, bool isYear, bool isMonthOrDay)
+    {
+        Assert.Equal(isYear, StructureInference.LooksLikeYear(name));
+        Assert.Equal(isMonthOrDay, StructureInference.LooksLikeMonthOrDay(name));
+    }
+
+    /// <summary>致远 OA：Backup\2025\12、Backup\2026\07（空）、Backup\2026\08（30 组）。</summary>
+    private void BuildSeeyonLayout()
+    {
+        Write(@"2025\12\2025-12-31@02_00.zip", new string('x', 4096));
+        Write(@"2025\12\2025-12-31@02_00.properties", "meta");
+        Directory.CreateDirectory(Path.Combine(_root, "2026", "07"));
+        for (var day = 1; day <= 30; day++)
+        {
+            var stem = $@"2026\08\2026-08-{day:00}@02_00";
+            Write($"{stem}.zip", new string('x', 4096));
+            Write($"{stem}.properties", "meta");
+        }
+    }
+
+    [Fact]
+    public void 推断出年月分层并给出通配源路径()
+    {
+        BuildSeeyonLayout();
+
+        var proposal = StructureInference.Infer(Snapshot(maxDepth: 4), DateTime.UtcNow);
+
+        Assert.Equal("multi_file_set", proposal.RecognizerType);
+        Assert.True(proposal.Confidence >= 70, $"置信度过低：{proposal.Confidence}");
+        // 年/月/组三层都规整，给 85；任一层比例落在 60%-90% 之间才降到 70。
+        Assert.Equal(85, proposal.Confidence);
+
+        // 源路径必须带通配，否则到了 9 月任务就失效，且失效的表现是 path_not_found。
+        Assert.EndsWith("/*/*", proposal.SourcePath, StringComparison.Ordinal);
+
+        var rules = RecognizerRules.Parse(proposal.RecognizerConfig);
+        Assert.Equal("basename", rules.GroupBy);
+        Assert.Contains("*.zip", rules.Required);
+        Assert.False(rules.Recursive);
+    }
+
+    /// <summary>
+    /// 结论要有依据。只给结论不给依据，"确认"就退化成盲点头——
+    /// 这是整个向导的立论点，不是可有可无的文案。
+    /// </summary>
+    [Fact]
+    public void 年月分层的依据说清楚了看到什么()
+    {
+        BuildSeeyonLayout();
+
+        var proposal = StructureInference.Infer(Snapshot(maxDepth: 4), DateTime.UtcNow);
+
+        Assert.True(proposal.Evidence.Count >= 3, $"依据太少：{proposal.Evidence.Count} 条");
+        Assert.Contains(proposal.Evidence, e => e.Contains("年份目录", StringComparison.Ordinal)
+                                                && e.Contains("2026", StringComparison.Ordinal));
+        Assert.Contains(proposal.Evidence, e => e.Contains("月份目录", StringComparison.Ordinal)
+                                                && e.Contains("08", StringComparison.Ordinal));
+        Assert.Contains(proposal.Evidence, e => e.Contains("30 组", StringComparison.Ordinal)
+                                                && e.Contains("*.zip", StringComparison.Ordinal));
+        Assert.Contains(proposal.Evidence, e => e.Contains("只认最新的一组", StringComparison.Ordinal));
+
+        // 一句人话要说清"只看最新那组"和"跨月自动跟随"。
+        Assert.Contains("最新", proposal.Summary, StringComparison.Ordinal);
+        Assert.Contains("跨月", proposal.Summary, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 数字分层这条分支同样受 HasGaps 约束：快照没抓全时置信度下调并说明，
+    /// 而不是拿着看得见的那部分装作看懂了整棵树。
+    ///
+    /// 用月目录下一棵更深的子树来制造触顶——年/月两层本身在 maxDepth=3 就已经抓全了
+    /// （Backup→年(1)→月(2)→文件(3)），把向导的推断深度提到 4 是给"再深一层"的结构
+    /// 留余量，对本结构不改变结论。
+    /// </summary>
+    [Fact]
+    public void 快照没抓全时年月分层的结论要声明不完整()
+    {
+        BuildSeeyonLayout();
+        Write(@"2026\08\archive\2025\old.zip", "x");
+
+        var deep = StructureInference.Infer(Snapshot(maxDepth: 6), DateTime.UtcNow);
+        var shallow = StructureInference.Infer(Snapshot(maxDepth: 3), DateTime.UtcNow);
+
+        // 两边都仍然认出了年/月分层——差别只在"这次抓全了没有"。
+        Assert.Equal("multi_file_set", deep.RecognizerType);
+        Assert.Equal("multi_file_set", shallow.RecognizerType);
+        Assert.True(shallow.Confidence < deep.Confidence,
+            $"抓不全却给了同样的置信度：{shallow.Confidence} vs {deep.Confidence}");
+        Assert.Contains(shallow.Evidence, e => e.Contains("没有被完整抓取", StringComparison.Ordinal));
+    }
+    /// <summary>空的 07 不能顶掉有备份的 08。</summary>
+    [Fact]
+    public void 空月份目录不会被选成最新()
+    {
+        Write(@"2026\07\keep-me-out.zip", "x");
+        File.Delete(Path.Combine(_root, "2026", "07", "keep-me-out.zip"));
+        for (var day = 1; day <= 5; day++)
+        {
+            Write($@"2026\08\2026-08-{day:00}@02_00.zip", new string('x', 4096));
+            Write($@"2026\08\2026-08-{day:00}@02_00.properties", "meta");
+        }
+        Directory.CreateDirectory(Path.Combine(_root, "2026", "09"));
+
+        var proposal = StructureInference.Infer(Snapshot(maxDepth: 4), DateTime.UtcNow);
+
+        Assert.Contains(proposal.Evidence, e => e.Contains("最新的是 08", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 数字分层这条新分支不能抢走既有的判定。ZT001\20260825\ 仍然是 subdirectory_units。
+    /// </summary>
+    [Fact]
+    public void 数字分层不抢走账套加日期的结构()
+    {
+        BuildU8Layout(units: 3);
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        Assert.Equal("subdirectory_units", proposal.RecognizerType);
+    }
     // ---------- 规则预演 ----------
 
     [Fact]
@@ -319,9 +530,20 @@ public sealed class RecognizerWizardTests : IDisposable
     [InlineData("multi_file_set", """{"requiredFiles":["*.bak"]}""")]
     [InlineData("multi_file_set", """{"recursive":false}""")]
     [InlineData("subdirectory_units", """{"businessUnitDepth":2,"requiredFiles":["UFDATA.BAK"]}""")]
-    public async Task 预演结果与实际扫描一致(string recognizerType, string recognizerConfig)
+    // groupBy：分组语义在 RecognizerRules 里实现一次、两侧共用，这几条是它不分叉的唯一自动化防线。
+    [InlineData("multi_file_set", """{"recursive":true,"groupBy":"basename"}""")]
+    [InlineData("subdirectory_units", """{"businessUnitDepth":1,"unitLayout":"latest_directory","groupBy":"basename"}""")]
+    [InlineData("subdirectory_units", """{"businessUnitDepth":2,"groupBy":"^([A-Za-z]+)"}""")]
+    [InlineData("latest_directory", """{"groupBy":"basename","requiredFiles":["UFDATA.BAK"]}""")]
+    // 非法正则：两侧必须同样退化为不分组，而不是一侧抛异常、一侧照常。
+    [InlineData("multi_file_set", """{"recursive":true,"groupBy":"^([unclosed"}""")]
+    // 通配源路径：两侧各自展开，必须落到同一个目录再谈判定一致。
+    [InlineData("latest_directory", """{"requiredFiles":["UFDATA.BAK"]}""", @"*")]
+    [InlineData("multi_file_set", """{"recursive":true,"requiredFiles":["UFDATA.BAK"]}""", @"*\*")]
+    public async Task 预演结果与实际扫描一致(string recognizerType, string recognizerConfig, string? sourcePattern = null)
     {
         BuildU8Layout(units: 3, incompleteUnits: "ZT002");
+        var sourcePath = sourcePattern is null ? _root : Path.Combine(_root, sourcePattern);
 
         var scanner = new BackupScanner(NullLogger<BackupScanner>.Instance);
         var scanned = await scanner.ScanAsync(new AgentTaskConfigDto
@@ -329,7 +551,7 @@ public sealed class RecognizerWizardTests : IDisposable
             TaskId = Guid.NewGuid(),
             Name = "一致性测试",
             ApplicationName = "用友 U8",
-            SourcePath = _root,
+            SourcePath = sourcePath,
             RecognizerType = recognizerType,
             TaskMode = "automatic",
             Enabled = true,
@@ -338,10 +560,27 @@ public sealed class RecognizerWizardTests : IDisposable
         }, CancellationToken.None);
 
         var snapshot = Browse(maxDepth: 6, maxEntries: 20000);
+        var rules = RecognizerRules.Parse(recognizerConfig);
+        var snapshotRoot = SnapshotNode.FromSnapshot(snapshot);
+
+        // 通配展开也要两侧一致：服务端在快照上展开，Agent 在真实磁盘上展开。
+        // 先断言两边选中的是同一个目录，再比后面的判定，否则"文件列表一致"
+        // 有可能是在两个不同目录上各自自洽。
+        var (expandedSource, expandFailure) = SnapshotRecognizer.ExpandSource(snapshotRoot, sourcePath, rules);
+        Assert.Null(expandFailure);
+        Assert.NotNull(expandedSource);
+        var previewBase = expandedSource!.FullPath;
+        if (sourcePattern is not null)
+        {
+            Assert.Equal(
+                Normalize(Path.GetRelativePath(_root, ExpandOnDisk(sourcePath))),
+                Normalize(Path.GetRelativePath(_root, previewBase.Replace('/', Path.DirectorySeparatorChar))));
+        }
+
         var preview = SnapshotRecognizer.Preview(
-            SnapshotNode.FromSnapshot(snapshot),
+            expandedSource,
             recognizerType,
-            RecognizerRules.Parse(recognizerConfig),
+            rules,
             stabilityIntervalSeconds: 0,
             snapshot.CapturedAt,
             snapshot.DeniedPaths,
@@ -349,8 +588,9 @@ public sealed class RecognizerWizardTests : IDisposable
 
         Assert.Equal(scanned.Count, preview.Units.Count);
 
+        var scanBase = sourcePattern is null ? _root : ExpandOnDisk(sourcePath);
         var scannedByRoot = scanned
-            .ToDictionary(s => Normalize(Path.GetRelativePath(_root, s.SourceRoot)), StringComparer.OrdinalIgnoreCase);
+            .ToDictionary(s => Normalize(Path.GetRelativePath(scanBase, s.SourceRoot)), StringComparer.OrdinalIgnoreCase);
         foreach (var unit in preview.Units)
         {
             var key = Normalize(unit.SourceRoot);
@@ -369,6 +609,24 @@ public sealed class RecognizerWizardTests : IDisposable
     }
 
     private static string Normalize(string path) => path.Replace('\\', '/').TrimEnd('/');
+
+    /// <summary>在真实磁盘上展开通配，供测试自己算出期望的采集根。</summary>
+    private static string ExpandOnDisk(string pattern)
+    {
+        var expansion = WildcardPath.Expand(
+            pattern,
+            current => Directory.Exists(current)
+                ? Directory.EnumerateDirectories(current).Select(p => new DirectoryInfo(p))
+                : [],
+            d => d.Name,
+            d => d.FullName,
+            d => d.EnumerateFiles("*", SearchOption.AllDirectories)
+                  .Select(f => f.LastWriteTimeUtc)
+                  .DefaultIfEmpty(DateTime.MinValue)
+                  .Max());
+        Assert.True(expansion.Success, expansion.FailureMessage);
+        return expansion.Path!;
+    }
 
     /// <summary>
     /// 指令参数在服务端用默认选项序列化（PascalCase），Agent 用小驼峰策略反序列化。
@@ -450,7 +708,7 @@ public sealed class RecognizerWizardTests : IDisposable
         var json = """
         {"includePatterns":["*.bak"],"excludePatterns":["*.log"],"excludeDirectories":["temp"],
          "requiredFiles":["a.bak"],"recursive":false,"businessUnitDepth":2,
-         "unitLayout":"latest_directory","batchRegex":"^\\d{8}$"}
+         "unitLayout":"latest_directory","batchRegex":"^\\d{8}$","groupBy":"basename"}
         """;
 
         Assert.Empty(RecognizerRules.FindUnknownKeys(json));

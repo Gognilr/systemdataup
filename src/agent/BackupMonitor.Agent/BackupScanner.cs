@@ -39,12 +39,29 @@ public sealed class BackupScanner
     public async Task<List<BackupScanResult>> ScanAsync(AgentTaskConfigDto task, CancellationToken ct)
     {
         var source = Environment.ExpandEnvironmentVariables(task.SourcePath);
+        var rules = RecognizerRules.Parse(task.RecognizerConfig);
+
+        // 通配展开必须排在 Directory.Exists 之前——带 * 的路径本身当然不存在。
+        // 只在真的写了 * 时才走这条路径，不带通配的源路径行为与从前逐字节相同。
+        if (WildcardPath.ContainsWildcard(source))
+        {
+            var expansion = WildcardPath.Expand(
+                source,
+                current => SafeEnumerateChildDirectories(current, rules),
+                directory => directory.Name,
+                directory => directory.FullName,
+                directory => NewestAllowedFileTime(directory.FullName, rules));
+            if (!expansion.Success)
+                return [Failure(task, source, "path_not_found", expansion.FailureMessage!)];
+
+            source = expansion.Path!;
+        }
+
         if (!Directory.Exists(source))
         {
             return [Failure(task, source, "path_not_found", $"源目录不存在：{source}")];
         }
 
-        var rules = RecognizerRules.Parse(task.RecognizerConfig);
         var roots = SelectRoots(source, task.RecognizerType, rules);
         var results = new List<BackupScanResult>();
 
@@ -52,6 +69,20 @@ public sealed class BackupScanner
         {
             ct.ThrowIfCancellationRequested();
             var files = CollectFiles(selected.Root, rules, ct);
+
+            // groupBy 把「同目录下的一组文件」收敛成一份备份。不套这一层的话，
+            // 致远 OA 的 08 目录里 30 天的备份会被当成一份：manifest 每天变一次、
+            // candidateKey 跟着变，永远不代表某一天的那份；而且每次扫描都要把 30 个
+            // zip 全部读一遍算 SHA-256，按每个 2GB 算是一次 60GB 的磁盘 I/O。
+            //
+            // 位置很关键：必须排在 files.Count == 0 判断之前——分组后为空同样应当走
+            // no_new_backup，而不是拿一个空集合往下算 manifest。
+            // 分组语义本身在 RecognizerRules 里，与服务端预演共用同一份实现。
+            files = rules.SelectLatestGroup(
+                files,
+                f => Path.GetRelativePath(selected.Root, f.FullName),
+                f => f.LastWriteTimeUtc).ToList();
+
             var businessUnit = selected.BusinessUnit;
             if (files.Count == 0)
             {
@@ -202,6 +233,12 @@ public sealed class BackupScanner
             return latest is null ? [(source, null)] : [(latest.Path, null)];
         }
 
+        // 整个源目录算一份备份。这是 multi_file_set 的**定义**，不是没匹配上的兜底——
+        // 它一直靠落到函数末尾的默认返回工作，行为恰好正确，但那是巧合。
+        // 写成显式分支，改动默认返回时才不会顺手把这个类型一起改坏。
+        if (normalized == "multi_file_set")
+            return [(source, null)];
+
         if (normalized == "latest_single_file")
         {
             var searchOption = rules.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
@@ -225,16 +262,14 @@ public sealed class BackupScanner
     {
         try
         {
+            // 与通配展开用的是同一口径，抽成 NewestAllowedFileTime 共用：
+            // 两处各写一遍的话，"最新"在两个地方会慢慢变成两个意思。
             var latest = Directory.EnumerateDirectories(unitRoot, "*", SearchOption.TopDirectoryOnly)
                 .Where(p => !rules.IsExcludedDirectory(p))
                 .Select(p => new
                 {
                     Path = p,
-                    Latest = SafeEnumerateFiles(p, SearchOption.AllDirectories, rules)
-                        .Where(f => IsAllowed(f, p, rules))
-                        .Select(f => f.LastWriteTimeUtc)
-                        .DefaultIfEmpty(DateTime.MinValue)
-                        .Max()
+                    Latest = NewestAllowedFileTime(p, rules)
                 })
                 .OrderByDescending(x => x.Latest)
                 .ThenByDescending(x => x.Path, StringComparer.OrdinalIgnoreCase)
@@ -272,6 +307,33 @@ public sealed class BackupScanner
 
         return rules.IsAllowedFile(relative, file.FullName, file.Name, hidden, Path.GetFileName(root));
     }
+
+    /// <summary>通配展开用：某个目录的直接子目录，受 excludeDirectories 约束。</summary>
+    private static IEnumerable<DirectoryInfo> SafeEnumerateChildDirectories(string root, RecognizerRules rules)
+    {
+        try
+        {
+            return Directory.EnumerateDirectories(root, "*", SearchOption.TopDirectoryOnly)
+                .Where(p => !rules.IsExcludedDirectory(p))
+                .Select(p => new DirectoryInfo(p))
+                .ToList();
+        }
+        catch (Exception)
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// 目录内最新的、符合规则的文件时间。与 SelectLatestChildDirectory 同一口径：
+    /// 不看目录自身的时间戳。空目录（例如被清空的 07）得到 DateTime.MinValue，排在最后。
+    /// </summary>
+    private static DateTime NewestAllowedFileTime(string directory, RecognizerRules rules) =>
+        SafeEnumerateFiles(directory, SearchOption.AllDirectories, rules)
+            .Where(f => IsAllowed(f, directory, rules))
+            .Select(f => f.LastWriteTimeUtc)
+            .DefaultIfEmpty(DateTime.MinValue)
+            .Max();
 
     private static IEnumerable<DirectoryInfo> SafeEnumerateDirectories(string root, RecognizerRules rules)
     {

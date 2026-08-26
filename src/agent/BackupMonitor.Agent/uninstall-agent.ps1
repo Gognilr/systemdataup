@@ -1,3 +1,4 @@
+#Requires -Version 3.0
 [CmdletBinding()]
 param(
     [string] $InstallDir = "$env:ProgramFiles\BackupMonitor\Agent",
@@ -9,7 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Uninstalling BackupMonitor Agent requires an elevated PowerShell session.'
 }

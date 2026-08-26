@@ -256,7 +256,7 @@ async function taskFormFields(initial, template, prefill, client) {
     { name: 'name', label: '任务名称', type: 'text', value: v.name, required: true, placeholder: '如 财务库每日全备' },
     { name: 'applicationName', label: '应用名称', type: 'text', value: v.applicationName, required: true, placeholder: '如 SQLServer / Oracle / FileSet' },
     { name: 'sourcePath', label: '源路径', type: 'text', value: v.sourcePath, required: true,
-      placeholder: 'D:\\backup\\finance', hint: '客户端机器上的路径，不是服务端上的路径' },
+      placeholder: 'D:\\backup\\finance', hint: '客户端机器上的路径，不是服务端上的路径。支持 * 通配，多个匹配时取最新的一个，例如 D:\\backup\\*\\* —— 按年/月分层的备份可以这样跨月自动跟随。' },
     { name: 'recognizerType', label: '识别器类型', type: 'select', value: recognizerType, required: true,
       options: optsOf(L.recognizer), hint: '源路径下如何认出「一份备份」' },
     // 必需文件不进高级选项：它决定「这份备份算不算完整」，是识别规则里唯一

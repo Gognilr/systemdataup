@@ -60,7 +60,12 @@ public static class SnapshotRecognizer
             Incomplete = root.HasGaps
         };
 
-        var files = CollectFiles(root, rules).ToList();
+        // 与 BackupScanner.ScanAsync 对称的一步，共用 RecognizerRules 里那份分组实现。
+        // 位置同样在 files.Count == 0 判断之前：分组后为空要走 no_new_backup。
+        var files = rules.SelectLatestGroup(
+            CollectFiles(root, rules).ToList(),
+            f => f.Relative,
+            f => f.Node.LastModifiedAt ?? DateTime.MinValue).ToList();
         if (files.Count == 0)
         {
             unit.Status = "no_new_backup";
@@ -116,6 +121,39 @@ public static class SnapshotRecognizer
         return unit;
     }
 
+    /// <summary>
+    /// 与 BackupScanner.ScanAsync 开头那段通配展开一一对应的快照版本，
+    /// 共用 WildcardPath 里那一份逐段展开实现。
+    ///
+    /// 不共用的话，向导预演的是一个目录、Agent 实际扫描的是另一个——
+    /// 而这种分叉恰恰在"跨月自动跟随"这类场景下最不容易被人发现。
+    /// </summary>
+    /// <returns>展开后的节点；失败时 Source 为 null 且 FailureMessage 有值。</returns>
+    public static (SnapshotNode? Source, string? FailureMessage) ExpandSource(
+        SnapshotNode root, string? sourcePathPattern, RecognizerRules rules)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePathPattern))
+            return (root, null);
+        if (!WildcardPath.ContainsWildcard(sourcePathPattern))
+            return (root.Resolve(sourcePathPattern.Trim()), null);
+
+        var expansion = WildcardPath.Expand(
+            sourcePathPattern.Trim(),
+            current => root.Resolve(current)?.Directories.Where(d => !rules.IsExcludedDirectory(d.FullPath))
+                       ?? Enumerable.Empty<SnapshotNode>(),
+            directory => directory.Name,
+            directory => directory.FullPath,
+            directory => NewestAllowedFile(directory, rules));
+
+        if (!expansion.Success)
+            return (null, expansion.FailureMessage);
+
+        var node = root.Resolve(expansion.Path!);
+        return node is null
+            ? (null, $"通配展开到 {expansion.Path}，但它不在本次目录浏览抓到的范围内，无法预演。")
+            : (node, null);
+    }
+
     /// <summary>与 BackupScanner.SelectRoots 一一对应的快照版本。</summary>
     public static List<(SnapshotNode Root, string? UnitName)> SelectRoots(
         SnapshotNode source, string recognizerType, RecognizerRules rules)
@@ -157,6 +195,10 @@ public static class SnapshotRecognizer
 
             return latest is null ? [(source, null)] : [(latest.Node, null)];
         }
+
+        // 整个源目录算一份备份——multi_file_set 的定义，不是兜底。理由见 BackupScanner 同名分支。
+        if (normalized == "multi_file_set")
+            return [(source, null)];
 
         if (normalized == "latest_single_file")
         {

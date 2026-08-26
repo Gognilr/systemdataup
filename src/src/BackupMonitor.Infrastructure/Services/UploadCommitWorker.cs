@@ -1,3 +1,4 @@
+using BackupMonitor.Shared.Security;
 using System.Text.Json;
 using System.Threading.Channels;
 using BackupMonitor.Core.Entities.Backup;

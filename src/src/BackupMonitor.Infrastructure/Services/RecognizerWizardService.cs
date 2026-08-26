@@ -131,10 +131,22 @@ public class RecognizerWizardService : IRecognizerWizardService
         // 推断出来的规则立刻在同一份快照上跑一遍。
         // 只给结论不给结果，人没有办法判断这条规则对不对——而他一眼就能认出
         // "ZT007 只有一个文件"这种事实是不是符合他的预期。
+        // 推断出来的规则是针对"展开之后的那个目录"的（数字分层会产出带通配的源路径），
+        // 所以预演也必须跑在展开之后的节点上。跑在 Backup 上会得出"没有备份"，
+        // 而那正是向导最不该撒的那种谎——规则是对的，只是预演找错了目录。
+        var proposedRules = RecognizerRules.Parse(proposal.RecognizerConfig);
+        var previewSource = source;
+        if (WildcardPath.ContainsWildcard(proposal.SourcePath))
+        {
+            var (expanded, _) = SnapshotRecognizer.ExpandSource(source, proposal.SourcePath, proposedRules);
+            if (expanded is not null)
+                previewSource = expanded;
+        }
+
         proposal.Preview = SnapshotRecognizer.Preview(
-            source,
+            previewSource,
             proposal.RecognizerType,
-            RecognizerRules.Parse(proposal.RecognizerConfig),
+            proposedRules,
             DefaultStabilityIntervalSeconds,
             snapshot.CapturedAt,
             snapshot.DeniedPaths,
@@ -160,11 +172,12 @@ public class RecognizerWizardService : IRecognizerWizardService
             }
         }
 
-        var (snapshot, source) = await ResolveScopeAsync(request, ct);
+        var rules = RecognizerRules.Parse(request.RecognizerConfig);
+        var (snapshot, source) = await ResolveScopeAsync(request, ct, rules);
         return SnapshotRecognizer.Preview(
             source,
             request.RecognizerType,
-            RecognizerRules.Parse(request.RecognizerConfig),
+            rules,
             request.StabilityIntervalSeconds,
             snapshot.CapturedAt,
             snapshot.DeniedPaths,
@@ -173,7 +186,7 @@ public class RecognizerWizardService : IRecognizerWizardService
 
     /// <summary>取出快照并定位到请求指定的目录。</summary>
     private async Task<(BrowseSnapshotDto Snapshot, SnapshotNode Source)> ResolveScopeAsync(
-        SnapshotScopedRequest request, CancellationToken ct)
+        SnapshotScopedRequest request, CancellationToken ct, RecognizerRules? rules = null)
     {
         var command = await _db.Commands.AsNoTracking().FirstOrDefaultAsync(c => c.Id == request.CommandId, ct)
             ?? throw new NotFoundException("指令", request.CommandId);
@@ -192,7 +205,13 @@ public class RecognizerWizardService : IRecognizerWizardService
         if (string.IsNullOrWhiteSpace(request.Path))
             return (snapshot, root);
 
-        var source = root.Resolve(request.Path.Trim())
+        // 源路径允许写 *（D:\Seeyon\A6\Backup\*\*）。展开走的是与 Agent 共用的
+        // WildcardPath，否则预演会定位到与实际扫描不同的目录。
+        var (expanded, failure) = SnapshotRecognizer.ExpandSource(root, request.Path, rules ?? RecognizerRules.Empty());
+        if (failure is not null)
+            throw new BusinessException("INVALID_REQUEST", failure, 400);
+
+        var source = expanded
             ?? throw new BusinessException("INVALID_REQUEST", $"该路径不在本次浏览的范围内：{request.Path}", 400);
         if (!source.IsDirectory)
             throw new BusinessException("INVALID_REQUEST", "识别推断需要指向一个目录，而不是文件", 400);

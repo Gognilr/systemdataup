@@ -125,6 +125,47 @@ if ($actualArchiveHash -ne $postgresLock.sha256.ToLowerInvariant()) {
     throw "PostgreSQL payload SHA-256 mismatch. Expected $($postgresLock.sha256), got ${actualArchiveHash}: $postgresArchive"
 }
 
+# ---- VC++ 2015-2022 x64 运行库 -------------------------------------------
+# 一个包两个用途：
+#   1) 服务端内置的 PostgreSQL 是 MSVC 编译的，直接导入 vcruntime140.dll /
+#      vcruntime140_1.dll / msvcp140.dll，这三个任何 Windows 版本都不自带；
+#   2) 客户端下载页要给 Server 2012 / 2012 R2 一个可下载的运行库入口。
+# 这里改成与 PostgreSQL 同一套「URL + SHA-256 锁定」，并保留 Authenticode 复核。
+# aka.ms/vs/17/release 是「当前版本」指针，会随微软发布而变：哈希失配多半不是投毒
+# 而是微软发了新版，所以失败信息里要写清正确的处置是核对签名后刷新 payload-lock.json，
+# 而不是把校验关掉。
+$vcredistLock = $payloadLock.vcredist
+foreach ($property in @('version', 'fileName', 'cacheName', 'url', 'sha256')) {
+    if ([string]::IsNullOrWhiteSpace([string]$vcredistLock.$property)) {
+        throw "VC++ redistributable payload lock is missing '$property'."
+    }
+}
+if ($vcredistLock.sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw 'VC++ redistributable payload lock sha256 must be exactly 64 hexadecimal characters.'
+}
+$vcRedistCache = Join-Path $PayloadCacheRoot $vcredistLock.cacheName
+if (-not (Test-Path -LiteralPath $vcRedistCache)) {
+    Write-Host "Downloading locked VC++ redistributable: $($vcredistLock.url)"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $vcredistLock.url -OutFile $vcRedistCache -UseBasicParsing
+}
+$actualVcRedistHash = (Get-FileHash -LiteralPath $vcRedistCache -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actualVcRedistHash -ne $vcredistLock.sha256.ToLowerInvariant()) {
+    throw ("VC++ redistributable SHA-256 mismatch. Expected $($vcredistLock.sha256), got ${actualVcRedistHash}: ${vcRedistCache}. " +
+        'aka.ms/vs/17/release is a moving pointer: if Microsoft shipped a newer build, verify the new file''s Authenticode signature and refresh scripts/payload-lock.json.')
+}
+$vcSignature = Get-AuthenticodeSignature -LiteralPath $vcRedistCache
+if ($vcSignature.Status -ne 'Valid') {
+    throw "$($vcredistLock.cacheName) Authenticode signature is not valid: $($vcSignature.Status)"
+}
+if ($vcSignature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+    throw "$($vcredistLock.cacheName) is not signed by Microsoft: $($vcSignature.SignerCertificate.Subject)"
+}
+$vcRedistVersion = [string](Get-Item -LiteralPath $vcRedistCache).VersionInfo.ProductVersion
+if ($vcRedistVersion -ne [string]$vcredistLock.version) {
+    throw "VC++ redistributable version mismatch. Expected $($vcredistLock.version), got '$vcRedistVersion'."
+}
+
 if (-not (Test-Path -LiteralPath (Join-Path $srcRoot 'database\V001__initial_schema.sql'))) {
     throw 'Database migration root is missing V001__initial_schema.sql.'
 }
@@ -202,9 +243,13 @@ Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\appsetting
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\install-agent.ps1') -Destination (Join-Path $clientPackageStage 'install-agent.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\uninstall-agent.ps1') -Destination (Join-Path $clientPackageStage 'uninstall-agent.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\README.md') -Destination (Join-Path $clientPackageStage 'README.md') -Force
+# 现场自检脚本必须与客户端包同行：P1（PowerShell 版本）和 P2（缺 UCRT）在现场
+# 表现都是「装不上」，其中缺 UCRT 那条连日志都不会留。这个纯批处理脚本是双击
+# 安装程序之前唯一能把问题指出来的东西。
+Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\check-prereq.cmd') -Destination (Join-Path $clientPackageStage 'check-prereq.cmd') -Force
 
 $clientZip = Join-Path $apiPublish 'wwwroot\downloads\BackupMonitor.Agent.zip'
-# 这四个名字与 AgentInstaller.ValidatePayload / install-agent.ps1 的期望一致：
+# 这几个名字与 AgentInstaller.ValidatePayload / install-agent.ps1 的期望一致：
 # 少任何一个，客户端解压出来都起不来。
 Invoke-VerifiedCompress `
     -Path (Join-Path $clientPackageStage '*') `
@@ -214,9 +259,15 @@ Invoke-VerifiedCompress `
         'BackupMonitor.Agent.dll',
         'BackupMonitor.Agent.Tray.exe',
         'appsettings.json',
-        'install-agent.ps1')
+        'install-agent.ps1',
+        'check-prereq.cmd')
 $clientSetup = Join-Path $agentSetupPublish 'BackupMonitor.Agent.Setup.exe'
 Copy-Item -LiteralPath $clientSetup -Destination (Join-Path $apiPublish 'wwwroot\downloads\BackupMonitor.Agent.Setup.exe') -Force
+
+# 下载页的另外两个入口：前置运行库和现场自检脚本。两者都要单独可下载——
+# 缺 UCRT 的机器连安装程序都起不来，不可能靠包里的东西自救。
+Copy-Item -LiteralPath $vcRedistCache -Destination (Join-Path $apiPublish "wwwroot\downloads\$($vcredistLock.fileName)") -Force
+Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\check-prereq.cmd') -Destination (Join-Path $apiPublish 'wwwroot\downloads\check-prereq.cmd') -Force
 
 $migrationFiles = Get-ChildItem -LiteralPath (Join-Path $srcRoot 'database') -Filter '*.sql' -File
 if ($migrationFiles.Count -eq 0) {
@@ -253,6 +304,8 @@ $payloadRequired = @(
     'api\BackupMonitor.Api.exe',
     'api\wwwroot\downloads\BackupMonitor.Agent.zip',
     'api\wwwroot\downloads\BackupMonitor.Agent.Setup.exe',
+    'api\wwwroot\downloads\VC_redist.x64.exe',
+    'api\wwwroot\downloads\check-prereq.cmd',
     'postgresql\bin\initdb.exe')
 $payloadRequired += $migrationFiles | ForEach-Object { "database\$($_.Name)" }
 Invoke-VerifiedCompress `
@@ -274,34 +327,22 @@ Copy-Item -LiteralPath $agentSetup -Destination (Join-Path $distRoot 'BackupMoni
 # 只有这个脚本能在双击 exe 之前把问题指出来。
 Copy-Item -LiteralPath (Join-Path $repoRoot 'deploy\Check-Prerequisites.ps1') -Destination (Join-Path $distRoot 'Check-Prerequisites.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'deploy\Install-UcrtPrerequisites.ps1') -Destination (Join-Path $distRoot 'Install-UcrtPrerequisites.ps1') -Force
+# Check-Prerequisites.ps1 需要 PowerShell 才能跑，而「PowerShell 太旧」本身就是一种
+# 装不上的原因。check-prereq.cmd 是纯批处理，任何 Windows 上都能双击，作为兜底同行。
+Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\check-prereq.cmd') -Destination (Join-Path $distRoot 'check-prereq.cmd') -Force
 
 # ---- 前置运行库 ----------------------------------------------------------
 # 内置 PostgreSQL 是 MSVC 编译的，直接导入 vcruntime140.dll / vcruntime140_1.dll /
 # msvcp140.dll。这三个任何 Windows 版本都不自带，缺了安装能装完但数据库服务起不来，
 # 而且报的是另一个 DLL 缺失，很容易被当成新问题。所以必须与安装包同行。
 #
-# 这里不做 SHA-256 锁定：aka.ms/vs/17/release 是「当前版本」指针，按设计会随微软更新
-# 而变，钉死哈希只会让构建在某天突然失败。改为校验 Authenticode 签名有效且签发者是
-# 微软——对移动目标而言这才是有意义的完整性判据。
+# 二进制本体在脚本前半段已经按 payload-lock.json 取得并校验过（SHA-256 + Authenticode），
+# 这里只负责摆放，不再重复下载与校验——两处各校验一次的话，迟早会有一处被改漏。
 $prerequisiteRoot = Join-Path $distRoot 'prerequisites'
 New-Item -ItemType Directory -Path $prerequisiteRoot -Force | Out-Null
-$vcRedistCache = Join-Path $PayloadCacheRoot 'vc_redist.x64.exe'
-if (-not (Test-Path -LiteralPath $vcRedistCache)) {
-    Write-Host 'Downloading VC++ 2015-2022 x64 redistributable'
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile $vcRedistCache -UseBasicParsing
-}
-$vcSignature = Get-AuthenticodeSignature -LiteralPath $vcRedistCache
-if ($vcSignature.Status -ne 'Valid') {
-    throw "vc_redist.x64.exe Authenticode signature is not valid: $($vcSignature.Status)"
-}
-if ($vcSignature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
-    throw "vc_redist.x64.exe is not signed by Microsoft: $($vcSignature.SignerCertificate.Subject)"
-}
 Copy-Item -LiteralPath $vcRedistCache -Destination (Join-Path $prerequisiteRoot 'vc_redist.x64.exe') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'deploy\PREREQUISITES.md') -Destination (Join-Path $prerequisiteRoot 'README.md') -Force
-$vcVersion = (Get-Item -LiteralPath $vcRedistCache).VersionInfo.ProductVersion
-"{0}  vc_redist.x64.exe  ({1})" -f (Get-FileHash -LiteralPath $vcRedistCache -Algorithm SHA256).Hash.ToLowerInvariant(), $vcVersion |
+"{0}  vc_redist.x64.exe  ({1})" -f $actualVcRedistHash, $vcRedistVersion |
     Set-Content -LiteralPath (Join-Path $prerequisiteRoot 'SHA256SUMS.txt') -Encoding ASCII
 
 $sumLines = foreach ($name in @('BackupMonitor.Server.Setup.exe', 'BackupMonitor.Agent.Setup.exe')) {

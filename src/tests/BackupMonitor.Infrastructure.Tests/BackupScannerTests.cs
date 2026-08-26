@@ -228,6 +228,241 @@ public sealed class BackupScannerTests : IDisposable
         Assert.All(keys, key => Assert.Contains('/', key));
     }
 
+    // ---------- 源路径通配 ----------
+
+    private async Task<List<BackupScanResult>> ScanPathAsync(string sourcePath, string recognizerType, string recognizerConfig)
+    {
+        var scanner = new BackupScanner(NullLogger<BackupScanner>.Instance);
+        return await scanner.ScanAsync(new AgentTaskConfigDto
+        {
+            TaskId = Guid.NewGuid(),
+            Name = "通配测试",
+            ApplicationName = "Seeyon",
+            SourcePath = sourcePath,
+            RecognizerType = recognizerType,
+            TaskMode = "automatic",
+            Enabled = true,
+            RecognizerConfig = recognizerConfig,
+            StabilityIntervalSeconds = 0
+        }, CancellationToken.None);
+    }
+
+    /// <summary>root\2025\12、root\2026\07（空）、root\2026\08（有文件），root\*\* 应当扫到 2026\08。</summary>
+    [Fact]
+    public async Task 通配源路径逐段取最新()
+    {
+        WriteFile(Path.Combine("2025", "12", "old.bak"));
+        WriteFile(Path.Combine("2026", "08", "new.bak"));
+        Directory.CreateDirectory(Path.Combine(_root, "2026", "07"));
+
+        File.SetLastWriteTimeUtc(Path.Combine(_root, "2025", "12", "old.bak"), new DateTime(2025, 12, 31, 2, 0, 0, DateTimeKind.Utc));
+        File.SetLastWriteTimeUtc(Path.Combine(_root, "2026", "08", "new.bak"), new DateTime(2026, 8, 20, 2, 0, 0, DateTimeKind.Utc));
+
+        var result = Assert.Single(await ScanPathAsync(
+            Path.Combine(_root, "*", "*"), "multi_file_set", """{"recursive":false}"""));
+
+        Assert.Equal("passed", result.Status);
+        Assert.Equal(Path.Combine(_root, "2026", "08"), result.SourceRoot);
+        Assert.Equal("new.bak", Assert.Single(result.Files).RelativePath);
+    }
+
+    /// <summary>
+    /// 空的 2026\07 不能被选中。它的目录时间戳比 08 新（后建的），
+    /// 只有按"目录内最新文件时间"判定才会把它排到后面——很多备份程序先建目录
+    /// 再慢慢往里写，目录自身的时间没有参考价值。
+    /// </summary>
+    [Fact]
+    public async Task 通配展开不选空目录()
+    {
+        WriteFile(Path.Combine("2026", "08", "new.bak"));
+        var empty = Path.Combine(_root, "2026", "09");
+        Directory.CreateDirectory(empty);
+
+        File.SetLastWriteTimeUtc(Path.Combine(_root, "2026", "08", "new.bak"), new DateTime(2026, 8, 20, 2, 0, 0, DateTimeKind.Utc));
+        // 让空目录的目录时间戳明显更新，确保断言的是"按内容时间"而不是碰巧。
+        Directory.SetLastWriteTimeUtc(empty, DateTime.UtcNow);
+
+        var result = Assert.Single(await ScanPathAsync(
+            Path.Combine(_root, "*", "*"), "multi_file_set", """{"recursive":false}"""));
+
+        Assert.Equal(Path.Combine(_root, "2026", "08"), result.SourceRoot);
+    }
+
+    /// <summary>
+    /// 通配一个都没匹配上时，失败信息必须说清楚是通配没匹配上，
+    /// 而不是让人以为路径写错了跑去改一条本来正确的配置。
+    /// </summary>
+    [Fact]
+    public async Task 通配无匹配时报路径未找到且说明原因()
+    {
+        WriteFile(Path.Combine("2026", "08", "new.bak"));
+
+        var result = Assert.Single(await ScanPathAsync(
+            Path.Combine(_root, "9999", "*"), "multi_file_set", "{}"));
+
+        Assert.Equal("path_not_found", result.Status);
+        Assert.Contains("通配", result.FailureMessage);
+        Assert.Contains("不是路径写错了", result.FailureMessage);
+    }
+
+    /// <summary>穿越必须被拒绝：展开只会把 * 换成真实目录名，唯一的穿越来源是人写进来的 ..。</summary>
+    [Fact]
+    public async Task 通配路径里的父目录段被拒绝()
+    {
+        WriteFile(Path.Combine("2026", "08", "new.bak"));
+
+        var result = Assert.Single(await ScanPathAsync(
+            Path.Combine(_root, "..", "*"), "multi_file_set", "{}"));
+
+        Assert.Equal("path_not_found", result.Status);
+        Assert.Contains("..", result.FailureMessage);
+    }
+
+    /// <summary>通配只允许出现在目录段。盘符段带 * 是完全不同的一件事，必须明确拒绝而不是猜。</summary>
+    [Fact]
+    public async Task 盘符段的通配被拒绝()
+    {
+        var result = Assert.Single(await ScanPathAsync(
+            @"*:\Backup\2026", "multi_file_set", "{}"));
+
+        Assert.Equal("path_not_found", result.Status);
+        Assert.Contains("盘符", result.FailureMessage);
+    }
+
+    /// <summary>不带通配的源路径行为与从前完全一致——展开这条路径压根不会被走到。</summary>
+    [Fact]
+    public async Task 不带通配的源路径不受影响()
+    {
+        WriteFile("full.bak");
+
+        var result = Assert.Single(await ScanPathAsync(_root, "multi_file_set", "{}"));
+
+        Assert.Equal("passed", result.Status);
+        Assert.Equal(_root, result.SourceRoot);
+    }
+    // ---------- groupBy：一次备份 = 同目录下的一组文件 ----------
+
+    /// <summary>
+    /// 致远 OA：08 目录里躺着一个月约 30 组 NAME.zip + NAME.properties。
+    ///
+    /// 不分组的话这 30 天会被算成"一份"：manifest 每天变一次、candidateKey 跟着变，
+    /// 永远不代表某一天的那份备份；而且每次扫描要把 30 个 zip 全读一遍算 SHA-256。
+    /// </summary>
+    [Fact]
+    public async Task 按文件名分组时只取最新的一组()
+    {
+        for (var day = 1; day <= 30; day++)
+        {
+            var stem = $"2026-08-{day:00}@02_00";
+            WriteFile($"{stem}.zip");
+            WriteFile($"{stem}.properties");
+            var stamp = new DateTime(2026, 8, day, 2, 0, 0, DateTimeKind.Utc);
+            File.SetLastWriteTimeUtc(Path.Combine(_root, $"{stem}.zip"), stamp);
+            File.SetLastWriteTimeUtc(Path.Combine(_root, $"{stem}.properties"), stamp.AddSeconds(5));
+        }
+
+        var result = await ScanAsync("multi_file_set", """{"recursive":false,"groupBy":"basename"}""");
+
+        Assert.Equal("passed", result.Status);
+        Assert.Equal(2, result.Files.Count);
+        Assert.Equal(
+            ["2026-08-30@02_00.properties", "2026-08-30@02_00.zip"],
+            result.Files.Select(f => f.RelativePath).OrderBy(x => x, StringComparer.Ordinal).ToArray());
+
+        // 业务时间是这一组的最新时间，而不是整个目录的最新时间——这里两者恰好相同，
+        // 但下面那个用例证明它确实跟着组走。
+        Assert.Equal(new DateTime(2026, 8, 30, 2, 0, 5, DateTimeKind.Utc), result.BackupBusinessTime);
+    }
+
+    /// <summary>
+    /// 业务时间必须是被选中那一组的最新时间。
+    /// 目录里另有一个更旧的组、但它的某个文件时间戳被改得很新时，
+    /// 取"整个目录最新"会得出一个不属于这份备份的时间。
+    /// </summary>
+    [Fact]
+    public async Task 业务时间取所选组的最新时间而不是整个目录的()
+    {
+        WriteFile("old.zip");
+        WriteFile("old.properties");
+        WriteFile("new.zip");
+        WriteFile("new.properties");
+
+        var oldTime = new DateTime(2026, 8, 1, 2, 0, 0, DateTimeKind.Utc);
+        var newTime = new DateTime(2026, 8, 20, 2, 0, 0, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(Path.Combine(_root, "old.zip"), oldTime);
+        File.SetLastWriteTimeUtc(Path.Combine(_root, "old.properties"), oldTime);
+        File.SetLastWriteTimeUtc(Path.Combine(_root, "new.zip"), newTime);
+        File.SetLastWriteTimeUtc(Path.Combine(_root, "new.properties"), newTime.AddMinutes(1));
+
+        var result = await ScanAsync("multi_file_set", """{"recursive":false,"groupBy":"basename"}""");
+
+        Assert.Equal(2, result.Files.Count);
+        Assert.All(result.Files, f => Assert.StartsWith("new.", f.RelativePath, StringComparison.Ordinal));
+        Assert.Equal(newTime.AddMinutes(1), result.BackupBusinessTime);
+    }
+
+    /// <summary>groupBy 也可以写正则，用第一个捕获组当分组键。</summary>
+    [Fact]
+    public async Task 正则形式的分组键按捕获组归组()
+    {
+        foreach (var day in new[] { "2026-08-18", "2026-08-19" })
+        {
+            WriteFile($"{day}_full.bak");
+            WriteFile($"{day}_log.trn");
+            var stamp = DateTime.Parse(day + "T02:00:00Z").ToUniversalTime();
+            File.SetLastWriteTimeUtc(Path.Combine(_root, $"{day}_full.bak"), stamp);
+            File.SetLastWriteTimeUtc(Path.Combine(_root, $"{day}_log.trn"), stamp);
+        }
+
+        var result = await ScanAsync(
+            "multi_file_set",
+            """{"recursive":false,"groupBy":"^(\\d{4}-\\d{2}-\\d{2})"}""");
+
+        Assert.Equal(2, result.Files.Count);
+        Assert.All(result.Files, f => Assert.StartsWith("2026-08-19", f.RelativePath, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 编译不过的正则不能抛异常，也不能让备份凭空消失——退化为不分组。
+    /// 沿用 RegexMatches 已有的异常吞掉策略：一条写错的 groupBy 的代价应当是
+    /// "分组没生效"，而不是"这台机器再也没有备份了"。
+    /// </summary>
+    [Fact]
+    public async Task 非法正则的分组键退化为不分组()
+    {
+        WriteFile("a.bak");
+        WriteFile("b.bak");
+
+        var result = await ScanAsync("multi_file_set", """{"recursive":false,"groupBy":"^([unclosed"}""");
+
+        Assert.Equal("passed", result.Status);
+        Assert.Equal(2, result.Files.Count);
+    }
+
+    /// <summary>不写 groupBy 时行为与从前完全一致——这是"老任务零影响"的证明。</summary>
+    [Fact]
+    public async Task 不写分组键时收集整个目录()
+    {
+        WriteFile("2026-08-18@02_00.zip");
+        WriteFile("2026-08-18@02_00.properties");
+        WriteFile("2026-08-19@02_00.zip");
+        WriteFile("2026-08-19@02_00.properties");
+
+        var result = await ScanAsync("multi_file_set", """{"recursive":false}""");
+
+        Assert.Equal(4, result.Files.Count);
+    }
+
+    /// <summary>分组后为空同样要走 no_new_backup，不能拿空集合往下算 manifest。</summary>
+    [Fact]
+    public async Task 分组前就没有匹配文件时报没有新备份()
+    {
+        WriteFile("readme.tmp");
+
+        var result = await ScanAsync("multi_file_set", """{"recursive":false,"groupBy":"basename"}""");
+
+        Assert.Equal("no_new_backup", result.Status);
+    }
     /// <summary>账套下还没有任何日期目录时，要报"没有备份"而不是让这个账套整个消失。</summary>
     [Fact]
     public async Task 账套下没有备份目录时仍然报告该账套()

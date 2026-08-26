@@ -24,6 +24,12 @@ public static class StructureInference
     private const double DateLayerThreshold = 0.6;
 
     /// <summary>
+    /// 一个目录要被判定为"一份备份由多个同名文件构成"，需要这个比例的 basename
+    /// 拥有 ≥2 个不同扩展名。
+    /// </summary>
+    private const double PairedFileThreshold = 0.6;
+
+    /// <summary>
     /// 输出识别规则用的序列化选项。
     /// TypeInfoResolver 必须显式给：JsonNode.ToJsonString 传入自定义 options 时不会
     /// 回退到默认解析器，缺了它会在写 JsonArray 里的字符串时直接抛 InvalidOperationException。
@@ -42,6 +48,22 @@ public static class StructureInference
 
         if (directories.Count == 0)
             return InferFlatDirectory(source, files, evidence);
+
+        // 情形零：纯数字分层（年 \ 月）。致远 OA 的 Backup\2026\08\ 就是这一种。
+        //
+        // 排在情形一之前是因为它更具体——要求年、月两层同时成立，先判不会抢走原有分支；
+        // 不成立时原样落回下面，连 evidence 都不留（它自己攒一份，成了才交出去）。
+        //
+        // 这里是**新增**一条识别，而不是放宽 LooksLikeDate 的 6 位数字下限：
+        // 那个下限正是用来把 ZT001、账套001 挡在外面的，放宽会引入更糟的误判。
+        var yearDirectories = directories.Where(d => LooksLikeYear(d.Name)).ToList();
+        var yearRatio = (double)yearDirectories.Count / directories.Count;
+        if (yearRatio >= DateLayerThreshold)
+        {
+            var numeric = InferNumericLayers(source, yearDirectories, yearRatio);
+            if (numeric is not null)
+                return numeric;
+        }
 
         var dateDirectories = directories.Where(d => LooksLikeDate(d.Name)).ToList();
         var dateRatio = (double)dateDirectories.Count / directories.Count;
@@ -147,9 +169,48 @@ public static class StructureInference
                 $"{source.Name} 下没有看到任何文件", evidence, [], []);
         }
 
+        // 先问一句"一份备份是不是由同名的多个文件构成"——这一步必须排在按扩展名分组之前。
+        //
+        // 致远 OA 的 2026-08-17@02_00.zip + 同名 .properties 就是这种结构：两种扩展名各 30 个，
+        // 按数量分组是平局，谁排第一取决于文件枚举顺序（名字序，p 在 z 前）。只挑一个写进
+        // includePatterns 的后果被 RecognizerRules.IsAllowedFile 放大成：所有 zip 被彻底排除，
+        // 不扫描、不哈希、不上传、不参与缺失判定；而 .properties 每天准时出现，任务天天判 passed。
+        // zip 是 0 字节、压缩中断、磁盘满只写了元数据——这些真正的故障一个都不会告警。
+        // 这是一个备份监控系统能给出的最危险的那种错误答案，所以成对结构必须先于扩展名判定。
+        var paired = DetectPairedFiles(files);
+        if (paired is not null)
+        {
+            evidence.Add($"{source.Name} 里有 {files.Count} 个文件，按去掉扩展名的文件名可以分成 {paired.GroupCount} 组");
+            evidence.Add($"其中 {paired.PairedGroupCount} 组由多个同名文件构成，每组包含 {string.Join("、", paired.Extensions)}");
+            evidence.Add($"最新的一组是 {paired.NewestGroupName}（{PreviewNames(paired.NewestGroupFiles)}）");
+
+            // includePatterns 这里刻意不写。写全部扩展名与不写在本结构上等价，
+            // 而一旦有人日后"顺手精简"成单个扩展名，就会退回上面那个静默缺陷。
+            // groupBy 与 requiredFiles 是一对：requiredFiles 保证 zip 不被排除，
+            // groupBy 保证一个月的 30 组不被算成一份（manifest 每天变、每次扫描
+            // 把 30 个 zip 全读一遍算 SHA-256）。少任何一半，OA 这类结构都还是错的。
+            var pairedConfig = new JsonObject
+            {
+                ["recursive"] = false,
+                ["groupBy"] = "basename"
+            };
+            AddRequired(pairedConfig, paired.Candidates);
+
+            return Build(
+                source, "multi_file_set", pairedConfig,
+                confidence: paired.Ratio >= 0.9 ? 80 : 68,
+                summary: $"{source.Name} 里每份备份由 {paired.Extensions.Count} 个同名文件组成"
+                         + $"（{string.Join("、", paired.Extensions)}），共 {paired.GroupCount} 组，"
+                         + $"每次只认最新的一组：{paired.NewestGroupName}",
+                evidence, paired.Candidates, [source]);
+        }
+
         var byExtension = files
             .GroupBy(f => Extension(f.Name), StringComparer.OrdinalIgnoreCase)
             .OrderByDescending(g => g.Count())
+            // 平局时按总字节数决胜。数量相同的两种扩展名里，数据包和元数据的体积差
+            // 四到五个数量级，一比就分得出来；不加这一手，胜负取决于枚举顺序。
+            .ThenByDescending(g => g.Sum(f => f.SizeBytes))
             .ToList();
         var largest = byExtension[0];
 
@@ -187,6 +248,218 @@ public static class StructureInference
         return Build(source, "multi_file_set", setConfig, required.Count > 0 ? 68 : 45,
             $"{source.Name} 里有 {files.Count} 个文件，凑齐算一份完整备份" + DescribeRequired(required),
             evidence, required, [source]);
+    }
+
+    /// <summary>
+    /// 纯数字分层：源目录 → 年 → 月 → 文件。
+    ///
+    /// 任一层不成立就返回 null，由调用方落回既有分支——这里不硬撑，
+    /// 也不把攒到一半的 evidence 交出去（那会让人看到一堆与结论无关的观察）。
+    /// </summary>
+    private static RecognizerProposalDto? InferNumericLayers(
+        SnapshotNode source, List<SnapshotNode> yearDirectories, double yearRatio)
+    {
+        var evidence = new List<string>();
+        var latestYear = yearDirectories
+            .OrderByDescending(d => d.Name, StringComparer.OrdinalIgnoreCase)
+            .First();
+        evidence.Add(
+            $"{source.Name} 下有 {yearDirectories.Count} 个年份目录（{PreviewNames(yearDirectories)}），"
+            + $"最新的是 {latestYear.Name}");
+
+        var monthCandidates = VisibleDirectories(latestYear).ToList();
+        if (monthCandidates.Count == 0)
+            return null;
+
+        var monthDirectories = monthCandidates.Where(d => LooksLikeMonthOrDay(d.Name)).ToList();
+        var monthRatio = (double)monthDirectories.Count / monthCandidates.Count;
+        if (monthRatio < DateLayerThreshold)
+            return null;
+
+        // 服务器通常只保留一个月，旧月份目录会被清空或删掉。所以"最新的月"先看有没有内容，
+        // 再按名字——只按名字的话，一个刚建出来还没写东西的空目录会顶掉真正有备份的那个。
+        var latestMonth = monthDirectories
+            .OrderByDescending(d => VisibleFiles(d).Any())
+            .ThenByDescending(d => d.Name, StringComparer.OrdinalIgnoreCase)
+            .First();
+        evidence.Add(
+            $"{latestYear.Name} 下有 {monthDirectories.Count} 个月份目录（{PreviewNames(monthDirectories)}），"
+            + $"最新的是 {latestMonth.Name}");
+
+        var monthFiles = VisibleFiles(latestMonth).ToList();
+        if (monthFiles.Count == 0)
+        {
+            evidence.Add($"{latestMonth.Name} 里这次没有看到文件");
+            return null;
+        }
+
+        var config = new JsonObject { ["recursive"] = false };
+        List<RequiredFileCandidateDto> required;
+        string groupSummary;
+
+        // 分组方案复用 R1 那套成对检测：一份备份由同名的多个文件构成时，
+        // 每天一组、只认最新的一组，靠 groupBy 表达。
+        var paired = DetectPairedFiles(monthFiles);
+        if (paired is not null)
+        {
+            config["groupBy"] = "basename";
+            required = paired.Candidates;
+            evidence.Add(
+                $"{latestMonth.Name} 里有 {paired.GroupCount} 组同名文件，"
+                + $"每组包含 {string.Join("、", paired.Extensions)}");
+            evidence.Add($"每次只认最新的一组：{paired.NewestGroupName}");
+            groupSummary = $"每天一组（{string.Join("、", paired.Extensions)}），每次只看最新的那一组";
+        }
+        else
+        {
+            required = InferRequiredFiles([latestMonth], evidence);
+            var newest = monthFiles.OrderByDescending(f => f.LastModifiedAt ?? DateTime.MinValue).First();
+            evidence.Add($"{latestMonth.Name} 里有 {monthFiles.Count} 个文件，最新的是 {newest.Name}");
+            groupSummary = $"{latestMonth.Name} 里的 {monthFiles.Count} 个文件凑齐算一份";
+        }
+
+        AddRequired(config, required);
+
+        // 源路径写成通配，任务才能跨月、跨年自动跟随；写死到 08 的话，
+        // 到了 9 月表现是 path_not_found，需要有人记得去改。
+        var wildcardSource = $"{source.FullPath}/*/*";
+
+        // 三层都清晰才给 85；任一层的比例落在 60%–90% 之间说明结构不完全规整，给 70。
+        // HasGaps 的减 20 由 Build 统一处理，不在这里另开一套。
+        var fullyRegular = yearRatio >= 0.9
+                           && monthRatio >= 0.9
+                           && paired is not null
+                           && paired.Ratio >= 0.9;
+
+        return Build(
+            source, "multi_file_set", config,
+            confidence: fullyRegular ? 85 : 70,
+            summary: $"{source.Name} 下按年、月分层，最新的是 {latestYear.Name}\\{latestMonth.Name}；"
+                     + groupSummary
+                     + $"；源路径写成 {wildcardSource.Replace('/', '\\')}，跨月、跨年自动跟随",
+            evidence, required, [latestMonth],
+            sourcePathOverride: wildcardSource);
+    }
+
+    /// <summary>
+    /// 目录名是不是一个年份：整个名字只有 4 位数字，且落在 1990–2100。
+    ///
+    /// 与 LooksLikeDate 并列而不是去放宽它的 6 位数字下限——那个下限正是用来把
+    /// ZT001、账套001 挡在外面的。要求"整个名字只有数字"同样是刻意的：
+    /// 2026年、08月 这类一律认不出来，宁可交给人选模板，也不要认错。
+    /// </summary>
+    public static bool LooksLikeYear(string? name) =>
+        IsAllAsciiDigits(name)
+        && name!.Length == 4
+        && int.TryParse(name, out var year)
+        && year is >= 1990 and <= 2100;
+
+    /// <summary>目录名是不是月或日：整个名字只有 1–2 位数字，且落在 1–31。</summary>
+    public static bool LooksLikeMonthOrDay(string? name) =>
+        IsAllAsciiDigits(name)
+        && name!.Length is 1 or 2
+        && int.TryParse(name, out var value)
+        && value is >= 1 and <= 31;
+
+    /// <summary>全角数字（０８）不算——它几乎一定不是备份程序建出来的目录。</summary>
+    private static bool IsAllAsciiDigits(string? name) =>
+        !string.IsNullOrEmpty(name) && name.All(char.IsAsciiDigit);
+
+    /// <summary>
+    /// 一个目录里"成对文件"的观察结果：一份备份由同名的若干个文件构成。
+    /// 不成立时 DetectPairedFiles 返回 null。
+    /// </summary>
+    private sealed record PairedFileSet(
+        int GroupCount,
+        int PairedGroupCount,
+        double Ratio,
+        IReadOnlyList<string> Extensions,
+        List<RequiredFileCandidateDto> Candidates,
+        string NewestGroupName,
+        IReadOnlyList<SnapshotNode> NewestGroupFiles);
+
+    /// <summary>
+    /// 判断"一份备份由同名的多个文件构成"：按去掉扩展名的文件名分组，
+    /// 若 <see cref="PairedFileThreshold"/> 以上的组拥有 ≥2 个不同扩展名即成立。
+    ///
+    /// 判不成立就返回 null，交回按扩展名的老路径——宁可认不出来交给人选，
+    /// 也不要认错（本文件头部的既定原则）。两处刻意收紧：
+    /// 只有一组时"分组"没有意义（那就是几个文件凑一份备份，按精确文件名点名更准）；
+    /// 没有任何扩展名达到推荐线时同样不成立，否则会产出一份谁都不必需的 requiredFiles。
+    /// </summary>
+    private static PairedFileSet? DetectPairedFiles(IReadOnlyList<SnapshotNode> files)
+    {
+        if (files.Count == 0)
+            return null;
+
+        var groups = files
+            .GroupBy(f => BaseName(f.Name), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (groups.Count < 2)
+            return null;
+
+        var paired = groups.Where(g => DistinctExtensions(g).Count >= 2).ToList();
+        var ratio = (double)paired.Count / groups.Count;
+        if (ratio < PairedFileThreshold)
+            return null;
+
+        // 扩展名的"每组都出现"用 RequiredThreshold，与 BuildCandidates 同一把尺子。
+        var stats = new Dictionary<string, (int Count, long Size)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var group in paired)
+        {
+            foreach (var extension in DistinctExtensions(group))
+            {
+                var size = group
+                    .Where(f => string.Equals(Extension(f.Name), extension, StringComparison.OrdinalIgnoreCase))
+                    .Max(f => f.SizeBytes);
+                stats[extension] = stats.TryGetValue(extension, out var existing)
+                    ? (existing.Count + 1, Math.Max(existing.Size, size))
+                    : (1, size);
+            }
+        }
+
+        var candidates = stats
+            .OrderByDescending(kv => kv.Value.Count)
+            .ThenByDescending(kv => kv.Value.Size)
+            .Select(kv => new RequiredFileCandidateDto
+            {
+                Pattern = "*" + kv.Key,
+                PresentIn = kv.Value.Count,
+                TotalUnits = paired.Count,
+                TypicalSizeBytes = kv.Value.Size,
+                Recommended = kv.Value.Count >= Math.Ceiling(paired.Count * RequiredThreshold)
+            })
+            .ToList();
+        if (!candidates.Any(c => c.Recommended))
+            return null;
+
+        // 时间相同时按组名倒序，保证结果稳定而不依赖枚举顺序——R1 的教训就是这个。
+        var newest = groups
+            .OrderByDescending(g => g.Max(f => f.LastModifiedAt ?? DateTime.MinValue))
+            .ThenByDescending(g => g.Key, StringComparer.OrdinalIgnoreCase)
+            .First();
+
+        return new PairedFileSet(
+            groups.Count,
+            paired.Count,
+            ratio,
+            candidates.Select(c => c.Pattern).ToList(),
+            candidates,
+            newest.Key,
+            newest.ToList());
+    }
+
+    private static List<string> DistinctExtensions(IEnumerable<SnapshotNode> files) =>
+        files.Select(f => Extension(f.Name))
+            .Where(e => !string.IsNullOrEmpty(e))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    /// <summary>去掉扩展名的文件名。边界与 Extension 一致：前导点的文件不算有扩展名。</summary>
+    private static string BaseName(string name)
+    {
+        var index = name.LastIndexOf('.');
+        return index <= 0 ? name : name[..index];
     }
 
     /// <summary>
@@ -311,7 +584,8 @@ public static class StructureInference
         string summary,
         List<string> evidence,
         IReadOnlyList<RequiredFileCandidateDto> required,
-        IReadOnlyList<SnapshotNode> leaves)
+        IReadOnlyList<SnapshotNode> leaves,
+        string? sourcePathOverride = null)
     {
         // 快照本身没抓全时，推断依据就是不完整的，置信度必须相应下调并说明。
         if (source.HasGaps)
@@ -322,7 +596,7 @@ public static class StructureInference
 
         return new RecognizerProposalDto
         {
-            SourcePath = source.FullPath,
+            SourcePath = sourcePathOverride ?? source.FullPath,
             RecognizerType = recognizerType,
             RecognizerConfig = config.ToJsonString(ConfigJson),
             Confidence = confidence,
