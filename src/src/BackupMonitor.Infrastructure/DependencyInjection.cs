@@ -60,6 +60,7 @@ public static class DependencyInjection
 
         services.AddScoped<IUploadStorage, UploadStorage>();
         services.AddScoped<IUploadSessionService, UploadSessionService>();
+        services.AddScoped<IStorageSettingsService, StorageSettingsService>();
 
         services.AddScoped<IClientAdminService, ClientAdminService>();
         services.AddScoped<IMonitoredServiceAdminService, MonitoredServiceAdminService>();

@@ -23,8 +23,8 @@ public class CreateBackupTaskRequest
     [Required]
     public string RecognizerType { get; set; } = null!;
 
-    /// <summary>automatic / approval_required / manual / monitor_only</summary>
-    public string TaskMode { get; set; } = "approval_required";
+    /// <summary>automatic / approval_required / manual / monitor_only（默认 automatic：扫到即传，不需要人工干预）</summary>
+    public string TaskMode { get; set; } = "automatic";
 
     public bool Enabled { get; set; } = true;
 
@@ -74,7 +74,7 @@ public class UpdateBackupTaskRequest
     [Required]
     public string RecognizerType { get; set; } = null!;
 
-    public string TaskMode { get; set; } = "approval_required";
+    public string TaskMode { get; set; } = "automatic";
     public bool Enabled { get; set; } = true;
     public int Priority { get; set; } = 100;
     public string ImportanceLevel { get; set; } = "normal";
@@ -155,6 +155,9 @@ public class BackupTaskListItemDto
 /// <summary>任务详情</summary>
 public class BackupTaskDetailDto : BackupTaskListItemDto
 {
+    /// <summary>暂停前的任务模式。界面据此在「恢复」时显示会回到哪个模式，null 表示未暂停过</summary>
+    public string? PreviousTaskMode { get; set; }
+
     public Guid? TemplateId { get; set; }
     public int Priority { get; set; }
     public string? ScanSchedule { get; set; }

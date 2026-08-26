@@ -36,7 +36,7 @@ export const NAV_GROUPS = [
     ['backups', '备份集', '▤'], ['restores', '恢复', '↺']
   ] },
   { key: 'manage', label: '管理', items: [
-    ['retention', '保留策略', '◫'], ['notifications', '通知', '✉'],
+    ['settings', '存储设置', '⚙'], ['retention', '保留策略', '◫'], ['notifications', '通知', '✉'],
     ['upgrades', 'Agent 升级', '↑'], ['job-history', '作业历史', '◷'], ['audit', '审计日志', '≡']
   ] }
 ];
@@ -456,13 +456,15 @@ const VIEW_LOADERS = {
   backups: () => import('./views/backups.js'), restores: () => import('./views/restores.js'),
   alerts: () => import('./views/alerts.js'), notifications: () => import('./views/notifications.js'),
   audit: () => import('./views/audit.js'), retention: () => import('./views/retention.js'),
-  'job-history': () => import('./views/job-history.js'), upgrades: () => import('./views/upgrades.js')
+  'job-history': () => import('./views/job-history.js'), upgrades: () => import('./views/upgrades.js'),
+  settings: () => import('./views/settings.js')
 };
 const VIEW_EXPORTS = {
   overview: 'vDashboard', todo: 'vTodo', clients: 'vClients', tasks: 'vTasks', backups: 'vBackups',
   restores: 'vRestores', alerts: 'vAlerts', notifications: 'vNotifications', audit: 'vAudit',
   'registration-tokens': 'vRegistrationTokens',
-  retention: 'vRetention', 'job-history': 'vJobHistory', upgrades: 'vUpgrades'
+  retention: 'vRetention', 'job-history': 'vJobHistory', upgrades: 'vUpgrades',
+  settings: 'vSettings'
 };
 const DRAWER_EXPORTS = { tasks: 'openTaskDrawer', restores: 'openRestoreDrawer', alerts: 'openAlertDrawer', audit: 'openAuditDrawer' };
 async function route() {

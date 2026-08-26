@@ -23,7 +23,12 @@ public class BackupTask : IHasRowVersion
 
     public RecognizerType RecognizerType { get; set; }
 
-    public TaskMode TaskMode { get; set; } = TaskMode.ApprovalRequired;
+    /// <summary>
+    /// 任务模式。默认自动：预检通过即下发上传，全程无人工介入。
+    /// 曾默认 ApprovalRequired，但候选备份集的审批没有任何管理界面入口，
+    /// 于是新建的任务默认就卡在 wait_for_approval 上永远不上传——默认值反了。
+    /// </summary>
+    public TaskMode TaskMode { get; set; } = TaskMode.Automatic;
 
     /// <summary>暂停前的任务模式（恢复时还原，V002）</summary>
     public TaskMode? PreviousTaskMode { get; set; }

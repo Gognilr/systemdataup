@@ -8,8 +8,9 @@ namespace BackupMonitor.Api.Middleware;
 ///
 /// 管理端 access token 里带 tv claim（JwtTokenService.CreateAccessToken 签发），
 /// 与库中 users.token_version（TokenVersionCache，60 秒缓存）比对：
-/// 改密、登出、（未来实现的）禁用账号/改角色/改权限都会让 TokenVersion++，
-/// 不一致直接 401，最坏 60 秒后已撤销的令牌就作废，不必等到自然过期。
+/// 改密与登出会让 TokenVersion++，不一致直接 401，最坏 60 秒后旧令牌作废，
+/// 不必等到自然过期。（产品是单管理员形态，没有禁用账号/改角色/改权限这类撤权动作，
+/// 详见 IAuthService 的说明。）
 ///
 /// 位于认证之后（需要 tv claim）、授权之前。只处理带 tv claim 的管理端 JWT；
 /// Agent 走客户端证书方案，其主体不含此 claim，不受影响。

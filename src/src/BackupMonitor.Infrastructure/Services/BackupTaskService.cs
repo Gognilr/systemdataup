@@ -408,6 +408,8 @@ public class BackupTaskService : IBackupTaskService
             ConfigVersion = task.ConfigVersion,
             ActiveAlertCount = activeAlertCount,
 
+            PreviousTaskMode = task.PreviousTaskMode.HasValue
+                ? EnumMapping.ToSnakeCase(task.PreviousTaskMode.Value) : null,
             TemplateId = task.TemplateId,
             Priority = task.Priority,
             ScanSchedule = task.ScanSchedule,
@@ -462,7 +464,7 @@ public class BackupTaskService : IBackupTaskService
         if (task.TaskMode != TaskMode.Paused)
             throw new BusinessException("CONFLICT", "任务未处于暂停状态", 409);
 
-        task.TaskMode = task.PreviousTaskMode ?? TaskMode.ApprovalRequired;
+        task.TaskMode = task.PreviousTaskMode ?? TaskMode.Automatic;
         task.PreviousTaskMode = null;
         task.ConfigVersion++;
 

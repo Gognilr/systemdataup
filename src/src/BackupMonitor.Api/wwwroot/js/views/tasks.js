@@ -5,7 +5,7 @@ import {
   $, esc, L, optsOf, status, fmtBytes, fmtDT, relTime, shortId, prettyJson,
   tableHtml, pagerHtml, skeleton, emptyState, hasFilter, batchBarHtml,
   toast, errToast, confirmModal, formModal, openDrawer, openModal, closeModal, clientLabel, clientName,
-  describeCron
+  describeCron, searchPickerHtml, initSearchPicker
 } from '../ui.js';
 import { shell, loading } from '../app.js';
 import { runDirectoryWizard } from './recognizer-wizard.js';
@@ -233,6 +233,15 @@ async function taskFormFields(initial, template, prefill, client) {
   const cfg = parseRecognizerConfig(v.recognizerConfig);
   const recognizerType = v.recognizerType || 'latest_directory';
 
+  // 暂停中的任务：后端不接受把模式改成 paused（要走暂停/恢复接口），下拉里也没有这一项。
+  // 直接回填 'paused' 会让浏览器落到列表第一项上，保存后任务被静默恢复且模式还被改掉。
+  // 这里显式回填「暂停前的模式」，并把保存即恢复这件事写在提示里。
+  const isPaused = v.taskMode === 'paused';
+  const taskModeValue = isPaused ? (v.previousTaskMode || 'automatic') : (v.taskMode || 'automatic');
+  const pausedHint = isPaused
+    ? '任务当前处于暂停状态。保存表单会按这里选中的模式让它恢复运行；想继续暂停就直接关掉表单。'
+    : '';
+
   const fields = [];
   // 建任务只有四件事必须由人决定：哪台机器、叫什么、备份的是什么应用、备份文件落在哪个目录。
   // 其余全部有可用默认值，收进「高级选项」——铺开十几个输入框会把「必须填什么」淹掉。
@@ -255,9 +264,12 @@ async function taskFormFields(initial, template, prefill, client) {
     { name: 'cfgRequired', label: '必需文件', type: 'textarea', rows: 3, value: cfg.required.join('\n'),
       placeholder: 'UFDATA.BAK\nUfErpAct.Lst',
       hint: '一行一个。每次备份必须包含这些文件，缺任何一个就判为不完整。留空表示不检查。支持 * 通配，大小写不敏感' },
-    { name: 'taskMode', label: '任务模式', type: 'select', value: v.taskMode || 'approval_required',
-      options: optsOf(L.task_mode).filter(o => o.v !== 'paused'),
-      hint: '需审批：扫到的备份要人工确认后才入库；自动：扫到即入库' },
+    // 任务模式收进高级选项：默认「自动」已经是绝大多数人要的行为——扫到就传，不需要人管。
+    // 它此前摆在基本项里，默认值又是「需审批」，等于每建一个任务都要求使用者先理解一套
+    // 他多半不需要的审批流程；而审批本身在管理端没有入口，选错了任务就静默不上传。
+    { name: 'taskMode', label: '任务模式', type: 'select', value: taskModeValue,
+      options: optsOf(L.task_mode).filter(o => o.v !== 'paused'), advanced: true,
+      hint: pausedHint || '自动：扫到即上传入库（默认，不需要人工干预）；仅监控：只扫描告警、不上传；需审批/手动：要人在管理端逐份下发上传' },
     { name: 'importanceLevel', label: '重要级', type: 'select', value: v.importanceLevel || 'normal', options: optsOf(L.importance), advanced: true },
     { name: 'enabled', label: '状态', labelText: '启用该任务', type: 'checkbox', value: v.enabled !== false, advanced: true },
     { name: 'priority', label: '优先级', type: 'number', value: v.priority ?? 100, hint: '数值小的优先', advanced: true },
@@ -560,19 +572,41 @@ async function applyRequiredFiles(taskId, patterns) {
 /* 第 0 步：在哪台机器上。
    浏览目录需要先知道是哪台客户端，所以这一问提到了最前面——它本来也是建任务
    第一个要决定的事。 */
-function chooseClient(clients) {
+/* 第 0 步：在哪台机器上。
+   B5：此前一次拉 200 台塞进下拉框，超过 200 台的部署会静默丢掉后面的机器，
+   而使用者看不出自己在一个被截断的列表里挑。改成按关键字问服务端要匹配项。 */
+function chooseClient() {
   return new Promise(resolve => {
     let settled = false;
     const finish = value => { if (!settled) { settled = true; resolve(value); } };
-    const ov = formModal('新建备份任务 · 在哪台机器上', [
-      {
-        name: 'clientId', label: '客户端', type: 'select', required: true,
-        options: clients.map(c => ({ v: c.id, t: `${clientLabel(c)} · ${L.client_status[c.status] || c.status}` })),
-        hint: '备份文件在这台机器上'
-      }
-    ], vals => { finish(clients.find(c => c.id === vals.clientId) || null); }, '下一步');
+    const ov = openModal('新建备份任务 · 在哪台机器上',
+      `${searchPickerHtml('task-client', { placeholder: '输入主机名或显示名搜索' })}
+       <div class="hint" style="margin-top:8px">备份文件在这台机器上</div>`,
+      { okText: '下一步', persistent: true });
+
+    const picker = initSearchPicker(ov, 'task-client', { search: searchClients });
     ov.addEventListener('bm:dismiss', () => finish(null));
+    ov.querySelector('[data-ok]').addEventListener('click', () => {
+      const client = picker.selected();
+      if (!client) { toast('请先选择一台客户端', 'err'); return; }
+      finish(client);
+      closeModal(ov);
+    });
   });
+}
+
+/* 客户端搜索：只取前 20 条，总数由服务端给，剩下的靠继续输入关键字收敛。 */
+async function searchClients(keyword) {
+  const qs = `page=1&pageSize=20${keyword ? `&keyword=${encodeURIComponent(keyword)}` : ''}`;
+  const d = await api(`/api/v1/admin/clients?${qs}`);
+  return {
+    total: d.totalCount,
+    items: (d.items || []).map(c => ({
+      v: c.id, raw: c,
+      t: clientLabel(c),
+      sub: L.client_status[c.status] || c.status
+    }))
+  };
 }
 
 /* 第 1 步：怎么告诉系统备份在哪。
@@ -620,13 +654,7 @@ function supportsBrowse(version) {
 }
 
 ACTIONS['tasks:create'] = async () => {
-  const clients = await api('/api/v1/admin/clients?page=1&pageSize=200');
-  if (!clients.items.length) {
-    toast('暂无已登记的客户端——请先在客户端机器上安装 Agent 并完成审批', 'err');
-    return;
-  }
-
-  const client = await chooseClient(clients.items);
+  const client = await chooseClient();
   if (!client) return;
 
   const mode = await chooseSetupMode(client);

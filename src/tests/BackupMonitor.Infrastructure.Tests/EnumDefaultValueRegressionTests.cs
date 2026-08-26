@@ -95,11 +95,18 @@ public class EnumDefaultValueRegressionTests
     }
 
     /// <summary>
-    /// 对照组：不显式赋值时，实体初始化器应保证默认语义仍为
-    /// ApprovalRequired / Normal（与原数据库默认值一致），行为不回退。
+    /// 对照组：不显式赋值时，实体初始化器给出的默认语义为 Automatic / Normal。
+    ///
+    /// TaskMode 的默认值从 ApprovalRequired 改成了 Automatic（V021）：审批模式在管理端
+    /// 没有放行入口，按它建出来的任务会一直不上传，默认值本身就是缺陷。
+    ///
+    /// 注意由此带来的一个副作用：task_mode 的库默认值同样改成了 'automatic'，因此
+    /// 「显式写入 0 号成员」用例对 TaskMode 已经不再有鉴别力（写不写列，结果都是
+    /// automatic）。那条用例现在靠 importance_level（Low vs 库默认 normal）
+    /// 继续守住 HasDefaultValue 回归。
     /// </summary>
     [Fact]
-    public async Task 未显式赋值_实体初始化器默认值保持不变()
+    public async Task 未显式赋值_实体初始化器默认为自动模式()
     {
         Guid taskId;
 
@@ -132,7 +139,7 @@ public class EnumDefaultValueRegressionTests
                 .AsNoTracking()
                 .SingleAsync(t => t.Id == taskId);
 
-            Assert.Equal(TaskMode.ApprovalRequired, reloaded.TaskMode);
+            Assert.Equal(TaskMode.Automatic, reloaded.TaskMode);
             Assert.Equal(ImportanceLevel.Normal, reloaded.ImportanceLevel);
         }
     }

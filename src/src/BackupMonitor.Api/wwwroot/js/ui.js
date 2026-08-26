@@ -589,3 +589,115 @@ export function batchBarHtml(key) {
     <button class="small" data-ui-action="clear-selection" data-batch-key="${esc(key)}">取消选择</button>
   </div>`;
 }
+
+/* ── 搜索式选择器：输入关键字 → 服务端只返回匹配的前 N 条 → 点选。
+   替代此前「一次拉 200 条塞进下拉框」的写法。那种写法在客户端超过 200 台时会
+   静默丢掉后面的，而使用者完全看不出自己是在一个被截断的列表里挑——
+   这里改成永远只展示「本次搜索的前 N 条」，并在还有更多时明说还有多少。
+
+   search(keyword) 由调用方提供（ui.js 不依赖 api.js，避免模块环）：
+   返回 { items: [{ v, t, sub, raw }], total }，total 是服务端的匹配总数。 */
+export function searchPickerHtml(id, { multi = false, placeholder = '输入名称或主机名搜索' } = {}) {
+  return `<div class="picker" data-picker="${esc(id)}">
+    <input type="search" class="picker-input" placeholder="${esc(placeholder)}" autocomplete="off" aria-label="${esc(placeholder)}">
+    ${multi ? '<div class="picker-chips" hidden></div>' : ''}
+    <div class="picker-list" role="listbox" aria-busy="false"><div class="picker-empty">正在加载…</div></div>
+  </div>`;
+}
+
+/* 返回 { selected() } —— 单选返回 raw 或 null，多选返回 raw 数组。
+   调用方拿到的是搜索结果里的原始对象，不是 id：后续步骤（比如按 agentVersion
+   决定能不能浏览目录）需要整条记录，只回 id 会逼调用方再查一次。 */
+export function initSearchPicker(root, id, { search, multi = false, onChange = null } = {}) {
+  const box = root.querySelector(`[data-picker="${id}"]`);
+  const input = box.querySelector('.picker-input');
+  const list = box.querySelector('.picker-list');
+  const chips = box.querySelector('.picker-chips');
+  const picked = new Map();          // v -> { v, t, sub, raw }
+  let single = null;
+  let seq = 0;                        // 只认最后一次请求的结果，防止慢响应盖掉新结果
+
+  const notify = () => { if (typeof onChange === 'function') onChange(selected()); };
+  const selected = () => (multi ? [...picked.values()].map(x => x.raw) : (single ? single.raw : null));
+
+  const renderChips = () => {
+    if (!chips) return;
+    chips.hidden = picked.size === 0;
+    chips.innerHTML = [...picked.values()].map(o =>
+      `<span class="picker-chip">${esc(o.t)}<button type="button" class="picker-chip-x" data-drop="${esc(o.v)}" aria-label="移除 ${esc(o.t)}">×</button></span>`).join('');
+  };
+
+  const markRows = () => {
+    for (const row of list.querySelectorAll('.picker-item')) {
+      const on = multi ? picked.has(row.dataset.v) : (single && single.v === row.dataset.v);
+      row.classList.toggle('is-on', !!on);
+      row.setAttribute('aria-selected', on ? 'true' : 'false');
+    }
+  };
+
+  const run = async () => {
+    const mine = ++seq;
+    const keyword = input.value.trim();
+    list.setAttribute('aria-busy', 'true');
+    let result;
+    try { result = await search(keyword); }
+    catch (e) {
+      if (mine !== seq) return;
+      list.setAttribute('aria-busy', 'false');
+      list.innerHTML = `<div class="picker-empty">搜索失败：${esc(e && e.message ? e.message : String(e))}</div>`;
+      return;
+    }
+    if (mine !== seq) return;
+    list.setAttribute('aria-busy', 'false');
+    const items = (result && result.items) || [];
+    const total = result && Number.isFinite(result.total) ? result.total : items.length;
+    if (!items.length) {
+      list.innerHTML = `<div class="picker-empty">${keyword ? '没有匹配的结果，换个关键字试试' : '暂无可选项'}</div>`;
+      return;
+    }
+    list.innerHTML = items.map(o =>
+      `<div class="picker-item" role="option" tabindex="0" data-v="${esc(o.v)}">
+        <span class="picker-item-t">${esc(o.t)}</span>${o.sub ? `<span class="picker-item-sub">${esc(o.sub)}</span>` : ''}
+      </div>`).join('')
+      + (total > items.length ? `<div class="picker-more">还有 ${total - items.length} 条未显示，继续输入关键字缩小范围</div>` : '');
+    // 行数据挂在闭包里，点选时不必再查一次
+    for (const row of list.querySelectorAll('.picker-item'))
+      row._opt = items.find(o => String(o.v) === row.dataset.v);
+    markRows();
+  };
+
+  const choose = row => {
+    const opt = row._opt;
+    if (!opt) return;
+    if (multi) {
+      if (picked.has(opt.v)) picked.delete(opt.v); else picked.set(opt.v, opt);
+      renderChips();
+    } else {
+      single = opt;
+    }
+    markRows();
+    notify();
+  };
+
+  let timer = null;
+  input.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(run, 250); });
+  list.addEventListener('click', ev => {
+    const row = ev.target.closest('.picker-item');
+    if (row) choose(row);
+  });
+  list.addEventListener('keydown', ev => {
+    const row = ev.target.closest('.picker-item');
+    if (row && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); choose(row); }
+  });
+  if (chips) chips.addEventListener('click', ev => {
+    const x = ev.target.closest('[data-drop]');
+    if (!x) return;
+    picked.delete(x.dataset.drop);
+    renderChips();
+    markRows();
+    notify();
+  });
+
+  run();
+  return { selected };
+}

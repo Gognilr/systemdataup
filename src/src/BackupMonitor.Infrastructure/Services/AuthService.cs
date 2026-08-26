@@ -13,10 +13,14 @@ namespace BackupMonitor.Infrastructure.Services;
 /// <summary>
 /// 管理员认证服务（设计书 9 认证接口 / 23.2 管理认证）。
 ///
-/// 整改批次 C · C4：本文件已在改密（ChangePasswordAsync）和登出（LogoutAsync）时把
-/// user.TokenVersion++。当前代码库还没有"禁用账号 / 改角色 / 改权限"的管理接口——
-/// 未来实现这些接口时必须同样 TokenVersion++（写法参考本文件），否则撤权不会在 60 秒内生效，
-/// 权限仍旧烤死在已签发的令牌里直到自然过期。
+/// 整改批次 C · C4：本文件在改密（ChangePasswordAsync）和登出（LogoutAsync）时把
+/// user.TokenVersion++，签发的 JWT 带同名 tv claim，TokenVersionMiddleware 据此在
+/// 60 秒内拒掉旧令牌，不必等它自然过期。
+///
+/// 产品形态是单管理员，不做用户管理（多账号、角色、逐项授权都不在范围内），
+/// 所以没有"禁用账号 / 改角色 / 改权限"这类撤权动作，tv 的触发点就只有改密和登出这两个。
+/// 若日后真要加多用户，那些接口必须同样 TokenVersion++（写法参考本文件），
+/// 否则权限会烤死在已签发的令牌里直到自然过期。
 /// </summary>
 public interface IAuthService
 {

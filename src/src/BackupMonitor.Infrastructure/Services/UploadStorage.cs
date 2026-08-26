@@ -18,6 +18,12 @@ public interface IUploadStorage
     /// <summary>正式仓库根目录（优先 system_settings.repository_path）</summary>
     Task<string> GetRepositoryRootAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// 解析某个存储根的取值与来源，不创建目录。
+    /// 管理端「存储设置」用它回答两个问题：现在实际用的是哪个目录，这个值是谁给的。
+    /// </summary>
+    Task<StorageRootResolution> ResolveRootAsync(string settingKey, CancellationToken ct = default);
+
     /// <summary>会话暂存目录</summary>
     Task<string> GetSessionDirectoryAsync(Guid sessionId, CancellationToken ct = default);
 
@@ -43,9 +49,41 @@ public interface IUploadStorage
     Task CleanupSessionAsync(Guid sessionId, CancellationToken ct = default);
 }
 
+/// <summary>存储根的解析结果：最终路径 + 这个值是谁给的</summary>
+/// <param name="Path">解析出的绝对路径（未创建目录）</param>
+/// <param name="Source">database / configuration / default，见 <see cref="StorageRootSource"/></param>
+public readonly record struct StorageRootResolution(string Path, string Source);
+
+/// <summary>存储根取值来源</summary>
+public static class StorageRootSource
+{
+    /// <summary>system_settings 表里管理员配置的值</summary>
+    public const string Database = "database";
+
+    /// <summary>appsettings 的 Storage:* 配置项</summary>
+    public const string Configuration = "configuration";
+
+    /// <summary>都没配时的兜底：程序目录下的 data\repository|staging</summary>
+    public const string Default = "default";
+}
+
 /// <summary>上传暂存实现</summary>
 public class UploadStorage : IUploadStorage
 {
+    /// <summary>正式仓库根在 system_settings 中的键</summary>
+    public const string RepositorySettingKey = "repository_path";
+
+    /// <summary>暂存根在 system_settings 中的键</summary>
+    public const string StagingSettingKey = "staging_path";
+
+    /// <summary>两个存储根各自的回退链定义：appsettings 配置键 + 兜底子目录名</summary>
+    private static readonly Dictionary<string, (string ConfigKey, string DefaultSubdirectory)> RootDefinitions =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            [RepositorySettingKey] = ("Storage:RepositoryPath", "repository"),
+            [StagingSettingKey] = ("Storage:StagingPath", "staging")
+        };
+
     private readonly SystemSettingsProvider _settings;
     private readonly IConfiguration _configuration;
     private readonly AppDbContext _db;
@@ -63,24 +101,42 @@ public class UploadStorage : IUploadStorage
         _logger = logger;
     }
 
+    /// <summary>
+    /// 解析存储根：system_settings → appsettings 的 Storage:* → 程序目录下的 data\&lt;子目录&gt;。
+    ///
+    /// 三层都用 IsNullOrWhiteSpace 判空，不用 ??。appsettings.json 里 Storage:StagingPath
+    /// 的出厂值是空串而不是缺省键，`_configuration[...] ?? 默认值` 取到的是空串本身，
+    /// 于是 Directory.CreateDirectory("") 抛 ArgumentException——库里没配路径的部署
+    /// （V014 之后就是这个状态）任何一次仓库解析都会炸，且错误信息跟路径毫无关系。
+    /// </summary>
+    public async Task<StorageRootResolution> ResolveRootAsync(string settingKey, CancellationToken ct = default)
+    {
+        if (!RootDefinitions.TryGetValue(settingKey, out var definition))
+            throw new ArgumentOutOfRangeException(nameof(settingKey), settingKey, "未知的存储根配置键");
+
+        var fromDb = await _settings.GetStringAsync(settingKey, ct);
+        if (!string.IsNullOrWhiteSpace(fromDb))
+            return new StorageRootResolution(fromDb.Trim(), StorageRootSource.Database);
+
+        var fromConfig = _configuration[definition.ConfigKey];
+        if (!string.IsNullOrWhiteSpace(fromConfig))
+            return new StorageRootResolution(fromConfig.Trim(), StorageRootSource.Configuration);
+
+        return new StorageRootResolution(
+            Path.Combine(AppContext.BaseDirectory, "data", definition.DefaultSubdirectory),
+            StorageRootSource.Default);
+    }
+
     public async Task<string> GetStagingRootAsync(CancellationToken ct = default)
     {
-        var fromDb = await _settings.GetStringAsync("staging_path", ct);
-        var root = !string.IsNullOrWhiteSpace(fromDb)
-            ? fromDb
-            : _configuration["Storage:StagingPath"]
-              ?? Path.Combine(AppContext.BaseDirectory, "data", "staging");
+        var root = (await ResolveRootAsync(StagingSettingKey, ct)).Path;
         Directory.CreateDirectory(root);
         return root;
     }
 
     public async Task<string> GetRepositoryRootAsync(CancellationToken ct = default)
     {
-        var fromDb = await _settings.GetStringAsync("repository_path", ct);
-        var root = !string.IsNullOrWhiteSpace(fromDb)
-            ? fromDb
-            : _configuration["Storage:RepositoryPath"]
-              ?? Path.Combine(AppContext.BaseDirectory, "data", "repository");
+        var root = (await ResolveRootAsync(RepositorySettingKey, ct)).Path;
         Directory.CreateDirectory(root);
         return root;
     }

@@ -52,6 +52,13 @@ public class SystemSettingsProvider
         return null;
     }
 
+    /// <summary>
+    /// 丢弃缓存，下一次读取直接回库。
+    /// 管理端改完配置必须调一次：60 秒 TTL 对后台工作器无所谓，但对刚点了保存、
+    /// 正盯着页面看新路径生不生效的人来说，那一分钟里界面显示的是旧值。
+    /// </summary>
+    public void Invalidate() => _cacheExpiresAt = DateTime.MinValue;
+
     private async Task<Dictionary<string, JsonElement>> GetSettingsAsync(CancellationToken ct)
     {
         if (DateTime.UtcNow < _cacheExpiresAt)

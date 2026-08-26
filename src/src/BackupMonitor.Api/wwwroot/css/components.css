@@ -395,3 +395,19 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 .svcrow__main{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
 .svcrow__main b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .svcrow__main .sub{font:var(--t-sm);color:var(--text-muted)}
+
+/* ── 搜索式选择器（替代 pageSize=200 的全量下拉） ── */
+.picker{border:1px solid var(--border);border-radius:var(--r-md);padding:var(--s-2);background:var(--surface)}
+.picker-input{width:100%;margin-bottom:var(--s-2)}
+.picker-chips{display:flex;flex-wrap:wrap;gap:var(--s-1);margin-bottom:var(--s-2)}
+.picker-chip{display:inline-flex;align-items:center;gap:var(--s-1);padding:0 var(--s-2);border-radius:99px;background:var(--surface-sunk);border:1px solid var(--border);font:var(--t-sm)}
+.picker-chip-x{border:0;background:none;padding:0 0 0 var(--s-1);cursor:pointer;color:var(--text-muted);line-height:1}
+.picker-chip-x:hover{color:var(--err-fg);background:none}
+.picker-list{max-height:240px;overflow-y:auto;border-top:1px solid var(--border)}
+.picker-item{display:flex;align-items:baseline;gap:var(--s-2);padding:var(--s-1) var(--s-2);cursor:pointer;border-bottom:1px solid var(--border)}
+.picker-item:last-child{border-bottom:0}
+.picker-item:hover{background:var(--surface-sunk)}
+.picker-item.is-on{background:var(--surface-sunk);box-shadow:inset 2px 0 0 var(--accent)}
+.picker-item-sub{color:var(--text-muted);font:var(--t-sm)}
+.picker-empty,.picker-more{padding:var(--s-3) var(--s-2);color:var(--text-muted);font:var(--t-sm);text-align:center}
+.picker-more{border-top:1px dashed var(--border)}
