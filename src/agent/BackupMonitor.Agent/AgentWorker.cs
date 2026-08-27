@@ -1110,7 +1110,9 @@ public sealed class AgentWorker : BackgroundService
         // 审计 B-15：ReportProgressAsync 服务端和客户端都实现了，AgentWorker 一次都没调过——
         // 于是「正在传 50GB」这件事在管理端表现为一条什么都不显示的「正在执行」。
         var totalBytes = Math.Max(1L, candidate.TotalBytes);
-        var progress = new ProgressReporter(_api, _logger, command.Id, totalBytes);
+        var progress = new ProgressReporter(
+            (payload, token) => _api.ReportProgressAsync(command.Id, payload, token),
+            _logger, command.Id, totalBytes);
         long sentBytes = 0;
 
         try
@@ -1175,23 +1177,35 @@ public sealed class AgentWorker : BackgroundService
     ///
     /// 上报失败只记 LogDebug 吞掉：它是装饰，让它把一次正在进行的上传搞失败是本末倒置。
     /// </summary>
-    private sealed class ProgressReporter
+    internal sealed class ProgressReporter
     {
         private static readonly TimeSpan MinInterval = TimeSpan.FromSeconds(30);
         private const decimal MinPercentDelta = 5m;
 
-        private readonly AgentApiClient _api;
+        // 只依赖「怎么把一条进度发出去」，不依赖 AgentApiClient 本身。
+        // AgentApiClient 是 sealed、方法非虚、构造还要 HttpClient，挡着这个类没法被测；
+        // 而这个类里真正容易写错的是节流判断，跟 HTTP 一点关系都没有。
+        private readonly Func<CommandProgressRequest, CancellationToken, Task> _send;
         private readonly ILogger _logger;
         private readonly Guid _commandId;
         private readonly long _totalBytes;
         private readonly Stopwatch _clock = Stopwatch.StartNew();
 
-        private TimeSpan _lastReportedAt = TimeSpan.MinValue;
+        // 初值取「负一个间隔」而不是 TimeSpan.MinValue。
+        // TimeSpan.MinValue 的 ticks 是 long.MinValue，Elapsed 减它必然溢出 Int64，
+        // 抛出的 OverflowException（消息「TimeSpan overflowed because the duration is too long.」）
+        // 会一路冒到 ExecuteUploadAsync 的兜底 catch，把整次上传判成失败——
+        // 每块传完都会调 ReportAsync，所以是第一块传完就炸，任何上传都完不成。
+        // 语义与下面 -MinPercentDelta 一致：让第一次调用直接放行，
+        // 传大文件的人一开始就能看到进度在动，而不是先干等 30 秒。
+        private TimeSpan _lastReportedAt = -MinInterval;
         private decimal _lastReportedPercent = -MinPercentDelta;
 
-        public ProgressReporter(AgentApiClient api, ILogger logger, Guid commandId, long totalBytes)
+        public ProgressReporter(
+            Func<CommandProgressRequest, CancellationToken, Task> send,
+            ILogger logger, Guid commandId, long totalBytes)
         {
-            _api = api;
+            _send = send;
             _logger = logger;
             _commandId = commandId;
             _totalBytes = totalBytes;
@@ -1199,16 +1213,20 @@ public sealed class AgentWorker : BackgroundService
 
         public async Task ReportAsync(long sentBytes, string currentPath, CancellationToken ct)
         {
-            var percent = Math.Clamp(Math.Round((decimal)sentBytes * 100 / _totalBytes, 2), 0, 100);
-            if (_clock.Elapsed - _lastReportedAt < MinInterval || percent - _lastReportedPercent < MinPercentDelta)
-                return;
-
-            _lastReportedAt = _clock.Elapsed;
-            _lastReportedPercent = percent;
-
+            // try 包住整个方法体，而不是只包那次 HTTP 调用。
+            // 原先节流判断在 try 之外，它自己抛的异常就绕过了本类
+            //「上报只是装饰，绝不能把正在进行的上传搞失败」这条约定，
+            // 结果是一个纯展示功能整整挡住了备份主链路。
             try
             {
-                await _api.ReportProgressAsync(_commandId, new CommandProgressRequest
+                var percent = Math.Clamp(Math.Round((decimal)sentBytes * 100 / _totalBytes, 2), 0, 100);
+                if (_clock.Elapsed - _lastReportedAt < MinInterval || percent - _lastReportedPercent < MinPercentDelta)
+                    return;
+
+                _lastReportedAt = _clock.Elapsed;
+                _lastReportedPercent = percent;
+
+                await _send(new CommandProgressRequest
                 {
                     Percent = percent,
                     Stage = "uploading",
@@ -1309,13 +1327,45 @@ public sealed class AgentWorker : BackgroundService
     /// 会话级共用一个实例，限速是整个上传会话的平均值，而不是每块独立算。
     /// 用 Task.Delay 让出线程，不阻塞任何工作线程，也不会影响心跳。
     /// </summary>
-    private sealed class ChunkThrottle
+    internal sealed class ChunkThrottle
     {
-        private readonly int _bytesPerSecond;
+        /// <summary>
+        /// 累计等待时间的上界（一天）。见 ComputeDelay 里的说明。
+        /// </summary>
+        private const double MaxThrottleSeconds = 86400d;
+
+        private readonly long _bytesPerSecond;
         private readonly Stopwatch _clock = Stopwatch.StartNew();
         private long _sentBytes;
 
-        public ChunkThrottle(int? kbps) => _bytesPerSecond = kbps is > 0 ? kbps.Value * 1024 : 0;
+        public ChunkThrottle(int? kbps) => _bytesPerSecond = ToBytesPerSecond(kbps);
+
+        /// <summary>
+        /// kbps 换算成字节/秒。必须先转 long 再乘：int × int 在 kbps 超过 2^21 时溢出，
+        /// 绕回来可能是个很小的正数——「限速 4 GB/s」实际变成限速 1 KB/s，
+        /// 而这种错误在界面上完全看不出来，只表现为传得莫名其妙地慢。
+        /// </summary>
+        internal static long ToBytesPerSecond(int? kbps) => kbps is > 0 ? (long)kbps.Value * 1024 : 0;
+
+        /// <summary>
+        /// 这一块传完之后该等多久。
+        ///
+        /// 拆成静态纯函数是为了能测：原来的写法要真的跑起 Stopwatch 和 Task.Delay
+        /// 才验得了，等于验不了，而限速算错的表现是「传得慢」——最不容易被发现的那种故障。
+        ///
+        /// 秒数夹一个上界再进 TimeSpan：FromSeconds 超出表示范围会抛 OverflowException。
+        /// 同一个文件里的 ProgressReporter 刚因为一次 TimeSpan 溢出把所有上传打挂过，
+        /// 不给它第二次机会。真跑到这个上界说明限速值本身就配错了。
+        /// </summary>
+        internal static TimeSpan ComputeDelay(long bytesPerSecond, long sentBytes, TimeSpan elapsed)
+        {
+            if (bytesPerSecond <= 0)
+                return TimeSpan.Zero;
+
+            var seconds = Math.Min((double)sentBytes / bytesPerSecond, MaxThrottleSeconds);
+            var delay = TimeSpan.FromSeconds(seconds) - elapsed;
+            return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
+        }
 
         public async Task AfterChunkAsync(int bytes, CancellationToken ct)
         {
@@ -1323,8 +1373,7 @@ public sealed class AgentWorker : BackgroundService
                 return;
 
             _sentBytes += bytes;
-            var expected = TimeSpan.FromSeconds((double)_sentBytes / _bytesPerSecond);
-            var delay = expected - _clock.Elapsed;
+            var delay = ComputeDelay(_bytesPerSecond, _sentBytes, _clock.Elapsed);
             if (delay > TimeSpan.Zero)
                 await Task.Delay(delay, ct);
         }
@@ -1396,7 +1445,11 @@ public sealed class AgentWorker : BackgroundService
                && packageUri.Port == serverUri.Port;
     }
 
-    private static IEnumerable<int> ExpandMissing(MissingChunksResponse missing, long size, int chunkSize)
+    /// <summary>
+    /// 服务端回的「还缺哪些块」展开成块号序列。internal 是为了能测：
+    /// 展开错了的后果是漏传几个块，而漏传的块在会话完成校验之前不会有任何征兆。
+    /// </summary>
+    internal static IEnumerable<int> ExpandMissing(MissingChunksResponse missing, long size, int chunkSize)
     {
         if (missing.Missing is { Count: > 0 })
             return missing.Missing;

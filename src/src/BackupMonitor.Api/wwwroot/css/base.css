@@ -80,9 +80,17 @@ button.small,.button.small{padding:var(--s-1) var(--s-2);font:var(--t-sm)}
 .topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:var(--s-2) var(--s-6);display:flex;justify-content:space-between;align-items:center;flex-shrink:0}
 .topbar-title{display:flex;align-items:center;gap:var(--s-2);font-weight:600}
 .topbar-menu{display:none;padding:0 var(--s-1);border:0;background:transparent;font-size:16px}
+.topbar-command{display:flex;align-items:center;gap:var(--s-2);min-width:200px;padding:var(--s-1) var(--s-2);color:var(--text-muted);font:var(--t-sm);background:var(--surface-sunk);cursor:pointer}
+.topbar-command:hover{color:var(--text);border-color:var(--border-strong)}
+.topbar-command .topbar-command-text{flex:1;text-align:left}
 .topbar .who{color:var(--text-muted);font:var(--t-body)}
 .topbar .who b{color:var(--text)}
 .content{padding:var(--s-6);flex:1;overflow:auto;min-height:0}
+
+@media (max-width:900px){
+  .topbar-command{min-width:0}
+  .topbar-command .topbar-command-text,.topbar-command kbd{display:none}
+}
 
 @media (max-width:720px){
   .sidebar{position:fixed;inset:0 auto 0 0;z-index:30;box-shadow:var(--e-2)}

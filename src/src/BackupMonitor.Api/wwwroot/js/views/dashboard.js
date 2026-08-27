@@ -1,5 +1,5 @@
 import { api } from '../api.js';
-import { $, esc, emptyState, fmtBytes, fmtDT, relTime, status, tableHtml, clientName } from '../ui.js';
+import { $, esc, emptyState, fmtBytes, fmtDT, fmtRate, fmtDuration, relTime, status, tableHtml, clientName, xferBar } from '../ui.js';
 import { shell, loading } from '../app.js';
 
 const byValue = (items, value) => (items || []).find(item => item.value === value)?.count || 0;
@@ -135,6 +135,32 @@ function renderClientResources(rows) {
     rows);
 }
 
+/* ── 正在传输 ──
+   备份在跑的时候，概览页是人第一眼看的地方。此前这里没有任何一个数字会动，
+   一份几十 GB 的备份传两小时，概览上和什么都没发生完全一样。
+   只放摘要和最该盯的三条，完整列表在「传输中」页。 */
+function renderTransfers(rows) {
+  if (!rows || !rows.length) return '';
+  const total = rows.reduce((n, r) => n + Number(r.totalBytes || 0), 0);
+  const done = rows.reduce((n, r) => n + Number(r.uploadedBytes || 0), 0);
+  const rated = rows.filter(r => r.bytesPerSecond != null);
+  const rate = rated.reduce((n, r) => n + Number(r.bytesPerSecond), 0);
+  const stalled = rows.filter(r => r.stalled).length;
+  // 服务端已按「卡住的优先、剩余量大的优先」排好，直接取前三条即可。
+  const top = rows.slice(0, 3);
+  return `<section class="card"><div class="dashboard-section-head">
+      <h2>正在传输</h2><a href="#/transfers">查看全部 →</a>
+    </div>
+    <div class="text-muted">${esc(rows.length)} 条 · ${fmtBytes(done)} / ${fmtBytes(total)} · 合计 ${rated.length ? fmtRate(rate) : '速度计算中'}${stalled ? ` · <span class="cell-warn">${esc(stalled)} 条疑似卡住</span>` : ''}</div>
+    ${tableHtml([
+      { l: '客户端', render: r => `<a href="#/clients/${esc(r.clientId)}">${esc(r.clientDisplayName || r.hostname)}</a>` },
+      { l: '任务', k: 'taskName' },
+      { l: '进度', render: r => `${xferBar(r.percent, r.stalled)}<span class="sub">${Number(r.percent).toFixed(1)}% · ${fmtBytes(r.uploadedBytes)} / ${fmtBytes(r.totalBytes)}</span>` },
+      { l: '速度', num: true, render: r => fmtRate(r.bytesPerSecond) },
+      { l: '预计剩余', num: true, render: r => (r.etaSeconds == null ? '<span class="sub">—</span>' : esc(fmtDuration(r.etaSeconds))) }
+    ], top)}</section>`;
+}
+
 export async function vDashboard() {
   $('#app').innerHTML = shell('overview', '概览', loading());
   try {
@@ -147,6 +173,7 @@ export async function vDashboard() {
     ]);
     // 资源列表失败不该把整个概览拖垮——它是附加视图，不是概览的前提。
     const clientResources = await api('/api/v1/admin/clients/resource-overview?limit=50').catch(() => []);
+    const transfers = (await api('/api/v1/admin/upload-sessions/active').catch(() => [])) || [];
     const failedTasks = (taskSummary.matrix || []).filter(row => row.days?.some(day => day.status === 'failed')).length;
     const todoCount = byValue(clientSummary.byStatus, 'pending_approval') + byValue(alertSummary.byLevel, 'critical') + failedTasks + (restoreData?.items?.length || 0);
     const online = byValue(clientSummary.byStatus, 'online');
@@ -157,6 +184,7 @@ export async function vDashboard() {
       <span class="status-mark" aria-hidden="true">${todoCount ? '!' : '✓'}</span><strong class="status-title">${todoCount ? `${todoCount} 项需要关注` : '一切正常'}</strong>
       <span class="status-meta"><span>${esc(online)} 台在线${offline ? ` · ${esc(offline)} 台离线或疑似离线` : ''}</span><span>${esc(lastUpload)}</span><span>${esc(taskSummary.totalTasks || 0)} 个备份任务</span></span>
     </div>
+    ${renderTransfers(transfers)}
     <div class="dashboard-columns">
       <section class="card"><div class="dashboard-section-head"><h2>待办队列</h2><a href="#/todo">查看全部 →</a></div><div class="dashboard-todo">${renderTodoQueue(clientSummary, alertSummary, taskSummary, restoreData)}</div></section>
       <section class="card">${renderCapacity(taskSummary.capacity, backupSummary.totalBytes, backupSummary.dailyUploads)}</section>

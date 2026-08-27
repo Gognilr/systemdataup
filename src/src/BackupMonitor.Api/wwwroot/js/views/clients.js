@@ -5,7 +5,7 @@ import {
   $, esc, L, optsOf, status, fmtBytes, fmtDT, relTime, shortId,
   tableHtml, pagerHtml, skeleton, emptyState, hasFilter, batchBarHtml,
   toast, errToast, confirmModal, formModal, openModal, closeModal, clientName,
-  clientCaps, actBtn, runtimeBadge
+  clientCaps, actBtn, actMenu, runtimeBadge, ipCell, ipDetailRows
 } from '../ui.js';
 import { shell, loading } from '../app.js';
 import { renderClientRuntimeDetail } from './client-runtime.js';
@@ -120,6 +120,9 @@ LOADERS.clients = async function () {
       { l: '分组', k: 'clientGroupName' },
       { l: '系统', render: r => esc(r.osName || '—') },
       { l: 'Agent', k: 'agentVersion', sort: true },
+      // 找一台机器最常用的线索就是 IP，为看一眼 IP 逐台点进详情抽屉是没有道理的。
+      // 这里放服务端观测到的对端地址而不是自报的网卡列表：它只有一个值、永远最新。
+      { l: 'IP', render: r => ipCell(r) },
       // 「在线」只回答"连得上吗"。真正决定"现在能不能动它"的是它正在干什么，
       // 所以两个状态并排放：连接状态 + 运行状态。
       { l: '状态', k: 'status', sort: true, render: r => status('client_status', r.status) + runtimeBadge(r) },
@@ -137,15 +140,20 @@ LOADERS.clients = async function () {
             actBtn({ label: '拒绝', view: 'clients', action: 'reject', id: r.id, cls: 'danger' })
           ].join(' ');
         }
-        const b = [actBtn({
+        // 主操作只留「刷新指标」——日常真正会点的就这一个。
+        // 启用/禁用/注销收进溢出菜单：它们不是日常动作，而「注销」不可恢复，
+        // 原先它和「刷新指标」一样大小、挨在一起，误点一次就没得救了。
+        const primary = actBtn({
           label: '刷新指标', view: 'clients', action: 'metrics', id: r.id,
           allowed: caps.canDispatch, why: caps.whyDispatch, hint: caps.whyDispatch
-        })];
-        b.push(caps.canEnable
-          ? actBtn({ label: '启用', view: 'clients', action: 'enable', id: r.id, cls: 'primary' })
-          : actBtn({ label: '禁用', view: 'clients', action: 'disable', id: r.id, allowed: caps.canDisable, why: caps.whyDisable }));
-        b.push(actBtn({ label: '注销', view: 'clients', action: 'revoke', id: r.id, cls: 'danger', allowed: caps.canRevoke, why: caps.whyRevoke }));
-        return b.join(' ');
+        });
+        const more = actMenu([
+          caps.canEnable
+            ? actBtn({ label: '启用', view: 'clients', action: 'enable', id: r.id, cls: 'primary', small: false })
+            : actBtn({ label: '禁用', view: 'clients', action: 'disable', id: r.id, allowed: caps.canDisable, why: caps.whyDisable, small: false }),
+          actBtn({ label: '注销', view: 'clients', action: 'revoke', id: r.id, cls: 'danger', allowed: caps.canRevoke, why: caps.whyRevoke, small: false })
+        ]);
+        return `${primary} ${more}`;
       } }
     ], data.items, { empty, stateKey: 'clients' }) + pagerHtml('clients', st);
     const bb = $('#bb-clients');
@@ -257,7 +265,7 @@ async function legacyClientDetail(id) {
         <div class="row"><div class="k">主机名</div><div class="v mono">${esc(d.hostname)}</div></div>
         <div class="row"><div class="k">机器 ID</div><div class="v mono">${esc(d.machineId || '—')}</div></div>
         <div class="row"><div class="k">系统 / 架构</div><div class="v">${esc(d.osName || '—')} ${esc(d.osVersion || '')} / ${esc(d.architecture || '—')}</div></div>
-        <div class="row"><div class="k">IP 地址</div><div class="v">${esc(d.ipAddresses || '—')}</div></div>
+        ${ipDetailRows(d)}
         <div class="row"><div class="k">Agent 版本</div><div class="v">${esc(d.agentVersion || '—')}</div></div>
         <div class="row"><div class="k">分组</div><div class="v">${esc(d.clientGroupName || '—')}</div></div>
         <div class="row"><div class="k">最近心跳</div><div class="v">${fmtDT(d.lastHeartbeatAt)}</div></div>

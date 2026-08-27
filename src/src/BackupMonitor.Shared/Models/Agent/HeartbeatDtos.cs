@@ -23,6 +23,15 @@ public class HeartbeatRequest
     /// <summary>当前 Windows 登录会话</summary>
     public List<HeartbeatUserSessionDto>? UserSessions { get; set; }
 
+    /// <summary>
+    /// 本机网卡地址列表。
+    ///
+    /// 与磁盘 / 服务 / 会话同属快照，只在 <see cref="SnapshotUnchanged"/> 为 false 时上报；
+    /// 为 null 时服务端不动库，保留上一次的值。
+    /// 原先这份数据只在注册请求里出现过一次，换网段之后库里就是错的。
+    /// </summary>
+    public List<string>? IpAddresses { get; set; }
+
     /// <summary>Agent 侧活动指令 ID 列表</summary>
     public List<Guid>? ActiveCommands { get; set; }
 
@@ -30,9 +39,9 @@ public class HeartbeatRequest
     public List<Guid>? ActiveUploads { get; set; }
 
     /// <summary>
-    /// 磁盘 / 服务状态 / 用户会话三块快照与上一次心跳完全相同（审计 B-09）。
+    /// 磁盘 / 服务状态 / 用户会话 / 网卡地址四块快照与上一次心跳完全相同（审计 B-09）。
     ///
-    /// 为 true 时 Disks / ServiceStates / UserSessions 一律为 null，不重复上报——
+    /// 为 true 时 Disks / ServiceStates / UserSessions / IpAddresses 一律为 null，不重复上报——
     /// 心跳每分钟一次，而这三块在绝大多数时间里一个字节都不会变。
     /// 服务端已经是「为 null 就不动库」的语义，唯一需要额外处理的是磁盘告警：
     /// 它必须回落到库里已有的记录继续判定，否则「快照没变」会变成「不再评估」。

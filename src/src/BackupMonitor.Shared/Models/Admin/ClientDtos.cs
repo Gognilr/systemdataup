@@ -35,6 +35,17 @@ public class ClientListItemDto
     public int? CertificateRemainingDays { get; set; }
 
     public DateTime? LastHeartbeatAt { get; set; }
+
+    /// <summary>
+    /// 服务端最近一次心跳观测到的对端 IP。
+    ///
+    /// 放进列表项而不是只放详情：找一台机器最常用的线索就是 IP，
+    /// 为看一眼 IP 逐台点进详情抽屉是没有道理的。
+    /// 选它而不选 Agent 自报的网卡列表，是因为它只有一个值、永远最新，
+    /// 而且必然是真正连得通的那个——列表里放一串地址既挤又要人自己猜。
+    /// </summary>
+    public string? LastRemoteIp { get; set; }
+
     public DateTime CreatedAt { get; set; }
     public int ActiveAlertCount { get; set; }
     public int TaskCount { get; set; }
@@ -62,7 +73,15 @@ public class ClientDetailDto : ClientListItemDto
     public string? MachineId { get; set; }
     public string? OsVersion { get; set; }
     public string? Architecture { get; set; }
-    public string? IpAddresses { get; set; }
+    /// <summary>
+    /// Agent 自报的本机网卡地址列表。
+    ///
+    /// 这里是解析后的数组，不是库里的 jsonb 原文——原先直接把原文透出去，
+    /// 界面上显示的就是带方括号和引号的 ["192.168.1.37","fe80::…"]。
+    /// jsonb 是存储细节，不该穿过 API 露给前端。
+    /// </summary>
+    public List<string> IpAddresses { get; set; } = [];
+
     public DateTime? ApprovedAt { get; set; }
     public Guid? ApprovedBy { get; set; }
     public string? ApprovedByName { get; set; }

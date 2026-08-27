@@ -155,6 +155,15 @@ pre.json{background:var(--surface-sunk);border:1px solid var(--border);border-ra
 .command-panel{position:relative;width:min(640px,calc(100vw - 32px));margin:12vh auto 0;background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);box-shadow:var(--e-2);overflow:hidden}
 .command-head{display:flex;align-items:center;justify-content:space-between;padding:var(--s-3) var(--s-4);border-bottom:1px solid var(--border)}
 .command-head h2{margin:0;font:600 var(--t-lg)}
+/* 操作列溢出菜单：主操作留在外面，其余收进这里 */
+.act-menu{position:relative;display:inline-block}
+.act-menu>summary{display:inline-flex;align-items:center;justify-content:center;min-width:26px;height:24px;padding:0 var(--s-1);border:1px solid var(--border);border-radius:var(--r-sm);background:var(--surface);color:var(--text-muted);cursor:pointer;list-style:none;user-select:none}
+.act-menu>summary::-webkit-details-marker{display:none}
+.act-menu>summary:hover{color:var(--text);border-color:var(--border-strong)}
+.act-menu[open]>summary{color:var(--text);border-color:var(--border-strong);background:var(--surface-sunk)}
+.act-menu-pop{position:absolute;right:0;top:calc(100% + 4px);z-index:20;display:flex;flex-direction:column;gap:var(--s-1);min-width:132px;padding:var(--s-2);border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface);box-shadow:var(--e-2)}
+.act-menu-pop button{width:100%;justify-content:flex-start;text-align:left}
+
 kbd{display:inline-flex;align-items:center;justify-content:center;min-width:22px;padding:0 var(--s-1);border:1px solid var(--border-strong);border-radius:var(--r-sm);background:var(--surface-sunk);font:var(--t-micro);color:var(--text-muted)}
 .command-input{width:100%;border:0;border-bottom:1px solid var(--border);border-radius:0;padding:var(--s-3) var(--s-4);font:var(--t-md)}
 .command-input:focus{outline:2px solid var(--accent);outline-offset:-2px}
@@ -424,3 +433,10 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 .picker-item-sub{color:var(--text-muted);font:var(--t-sm)}
 .picker-empty,.picker-more{padding:var(--s-3) var(--s-2);color:var(--text-muted);font:var(--t-sm);text-align:center}
 .picker-more{border-top:1px dashed var(--border)}
+
+/* ── 传输进度条 ──
+   与 .capacity-meter 同一套视觉，但要窄一格：它在表格行里，不能把行高撑起来。
+   卡住的那条换成警告色而不是加动画——动画会让"没在动"看起来像"在动"。 */
+.xfer-bar{height:6px;border-radius:99px;background:var(--surface-sunk);overflow:hidden;min-width:120px;margin-bottom:2px}
+.xfer-bar span{display:block;height:100%;background:var(--accent);border-radius:inherit;transition:width .4s ease}
+.xfer-bar.is-stalled span{background:var(--warn)}

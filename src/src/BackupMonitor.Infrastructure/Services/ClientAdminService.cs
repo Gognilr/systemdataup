@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -145,6 +145,7 @@ public class ClientAdminService : IClientAdminService
                 c.EnrollmentMode,
                 c.CertificateExpiresAt,
                 c.LastHeartbeatAt,
+                c.LastRemoteIp,
                 c.CreatedAt
             })
             .ToListAsync(ct);
@@ -198,6 +199,7 @@ public class ClientAdminService : IClientAdminService
                 ? null
                 : Math.Max(0, (int)Math.Ceiling((r.CertificateExpiresAt.Value - DateTime.UtcNow).TotalDays)),
             LastHeartbeatAt = r.LastHeartbeatAt,
+            LastRemoteIp = r.LastRemoteIp,
             CreatedAt = r.CreatedAt,
                 ActiveAlertCount = alertCounts.FirstOrDefault(a => a.ClientId == r.Id)?.Count ?? 0,
                 TaskCount = taskCounts.FirstOrDefault(t => t.ClientId == r.Id)?.Count ?? 0,
@@ -208,6 +210,28 @@ public class ClientAdminService : IClientAdminService
         }).ToList();
 
         return PagedResult<ClientListItemDto>.Create(items, totalCount, query.Page, query.PageSize);
+    }
+
+    /// <summary>
+    /// 把 clients.ip_addresses 的 jsonb 原文解析成字符串数组。
+    ///
+    /// 这一列历史上由 JsonSerializer.Serialize(List&lt;string&gt;) 写入，
+    /// 但它是 jsonb，理论上可以被人手工改成任何形状；解析失败时返回空列表，
+    /// 不能让一条脏数据把整个客户端详情接口打成 500。
+    /// </summary>
+    private static List<string> ParseIpAddresses(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return [];
+
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<List<string>>(json) ?? [];
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return [];
+        }
     }
 
     /// <summary>
@@ -287,6 +311,7 @@ public class ClientAdminService : IClientAdminService
             Status = EnumMapping.ToSnakeCase(client.Status),
             EnrollmentMode = client.EnrollmentMode,
             LastHeartbeatAt = client.LastHeartbeatAt,
+            LastRemoteIp = client.LastRemoteIp,
             CreatedAt = client.CreatedAt,
             ActiveAlertCount = activeAlertCount,
             TaskCount = taskCount,
@@ -298,7 +323,7 @@ public class ClientAdminService : IClientAdminService
             MachineId = client.MachineId,
             OsVersion = client.OsVersion,
             Architecture = client.Architecture,
-            IpAddresses = client.IpAddresses,
+            IpAddresses = ParseIpAddresses(client.IpAddresses),
             ApprovedAt = client.ApprovedAt,
             ApprovedBy = client.ApprovedBy,
             ApprovedByName = client.ApprovedByUser?.DisplayName,

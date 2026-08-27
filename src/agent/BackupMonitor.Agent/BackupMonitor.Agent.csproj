@@ -12,6 +12,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- AgentWorker 里真正容易写错的几块（进度节流、限速换算、缺块展开）都是嵌套私有类型。
+         把它们开到 internal 并只对测试程序集可见，好过为了可测把实现细节变成公开 API。 -->
+    <InternalsVisibleTo Include="BackupMonitor.Agent.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
     <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />

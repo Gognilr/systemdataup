@@ -59,6 +59,10 @@ public static class DependencyInjection
         services.AddScoped<IAgentPrecheckService, AgentPrecheckService>();
 
         services.AddScoped<IUploadStorage, UploadStorage>();
+        // 速度采样器必须是单例：算「现在多快」要拿这次和上一次比，
+        // 按请求新建的话每次都是第一次，永远比不出增量。
+        services.AddSingleton<UploadRateSampler>();
+        services.AddScoped<IUploadProgressService, UploadProgressService>();
         services.AddScoped<IUploadSessionService, UploadSessionService>();
         services.AddScoped<IStorageSettingsService, StorageSettingsService>();
 
@@ -97,6 +101,7 @@ public static class DependencyInjection
         services.AddHostedService<SystemWatchdogWorker>();
         services.AddHostedService<MissedBackupWorker>();
         services.AddHostedService<LifecycleExpiryWorker>();
+        services.AddHostedService<RepositoryReconcileWorker>();
 
         return services;
     }

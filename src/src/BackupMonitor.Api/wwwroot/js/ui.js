@@ -23,6 +23,7 @@ export const L = {
   service_actual: { running: '运行中', stopped: '已停止', paused: '已暂停', not_found: '服务不存在', unknown: '未知' },
   service_start_type: { boot: '引导启动', system: '系统启动', auto: '自动', manual: '手动', disabled: '已禁用' },
   client_runtime: { idle: '空闲', uploading: '上传中', working: '执行中' },
+  upload_status: { created: '已创建', waiting_permission: '等待放行', uploading: '传输中', paused: '已暂停', retry_wait: '等待重试', received: '已接收', verifying: '校验中', verified: '已校验', committed: '已入库', failed: '失败', cancelled: '已取消', expired: '已过期' },
   precheck: { not_scanned: '未扫描', passed: '通过', still_changing: '仍在变化', no_new_backup: '没有新备份', required_file_missing: '缺少必需文件', size_abnormal: '大小异常', path_not_found: '路径不存在', access_denied: '拒绝访问', failed: '失败' }
 };
 
@@ -37,9 +38,14 @@ const STATUS_MAP = {
   requested: ['wait'], ready: ['wait'], downloading: ['busy'],
   completed: ['ok'], failed: ['err', 'pill'], expired: ['off'],
   critical: ['err', 'pill'], warning: ['wait'], notice: ['mut'],
-  open: ['err', 'pill'], acknowledged: ['busy'], in_progress: ['busy'],
+  // 告警列表里「等级」和「状态」并排，原先 critical 和 open 都是红胶囊，
+  // 一行两个一模一样的红块——重复三遍的警报等于没有警报。
+  // 红色留给等级（它才回答"有多严重"），状态只回答"处理到哪一步了"，用琥珀点。
+  open: ['wait'], acknowledged: ['busy'], in_progress: ['busy'],
   recovered: ['ok'], closed: ['off'], ignored: ['off'],
   pending: ['wait'], sent: ['ok'],
+  created: ['wait'], waiting_permission: ['wait'], retry_wait: ['wait'],
+  received: ['busy'], verified: ['ok'], committed: ['ok'],
   automatic: ['ok'], approval_required: ['busy'], manual: ['mut'], monitor_only: ['mut'], paused: ['wait'],
   success: ['ok'], failure: ['err', 'pill'],
   running: ['busy'], partial: ['wait'], cancelled: ['off'],
@@ -63,6 +69,37 @@ export function fmtBytes(n) {
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
   return (i === 0 ? n : n.toFixed(2)) + ' ' + u[i];
 }
+/* 速度和剩余时间：算不出来的时候一律给 —— 而不是 0。
+   「0 B/s」和「剩余 0 秒」看起来都像是个结论，实际是「不知道」，
+   而在一次慢传输里，人正是靠这两个数判断该不该去查网络。 */
+export function fmtRate(bps) {
+  if (bps == null) return '—';
+  return fmtBytes(bps) + '/s';
+}
+export function fmtDuration(sec) {
+  if (sec == null) return '—';
+  sec = Math.max(0, Math.round(Number(sec)));
+  if (sec < 60) return `${sec} 秒`;
+  if (sec < 3600) return `${Math.round(sec / 60)} 分钟`;
+  if (sec < 86400) {
+    const h = Math.floor(sec / 3600);
+    const m = Math.round((sec % 3600) / 60);
+    return m ? `${h} 小时 ${m} 分` : `${h} 小时`;
+  }
+  const d = Math.floor(sec / 86400);
+  // 超过一个月的预估没有参考价值，给个上界比给个精确的假数字诚实。
+  if (d > 30) return '超过 30 天';
+  const h = Math.round((sec % 86400) / 3600);
+  return h ? `${d} 天 ${h} 小时` : `${d} 天`;
+}
+
+/* 传输进度条。数字要和条子放在一起：光有条子读不出还差多少，
+   光有百分比看不出这一批里哪条最拖后腿。 */
+export function xferBar(percent, stalled) {
+  const p = Math.max(0, Math.min(100, Number(percent) || 0));
+  return `<div class="xfer-bar${stalled ? ' is-stalled' : ''}" role="progressbar" aria-valuenow="${p.toFixed(1)}" aria-valuemin="0" aria-valuemax="100"><span style="width:${p.toFixed(2)}%"></span></div>`;
+}
+
 export function fmtDT(v) {
   if (!v) return '—';
   const d = new Date(v);
@@ -164,7 +201,29 @@ export function runtimeBadge(c) {
   const detail = rt === 'uploading'
     ? `正在上传 ${c.activeUploadCount || 0} 个备份集`
     : `有 ${c.runningCommandCount || 0} 条指令正在执行`;
-  return ` <span title="${esc(detail)}">${status('client_runtime', rt)}</span>`;
+  // 「上传中」做成到「传输中」页的链接：看到这个徽标的人，下一个问题必然是
+  // 「传到哪了、还要多久」，而那个答案在另一个页面上。
+  return rt === 'uploading'
+    ? ` <a href="#/transfers" title="${esc(detail)}：查看传输进度">${status('client_runtime', rt)}</a>`
+    : ` <span title="${esc(detail)}">${status('client_runtime', rt)}</span>`;
+}
+
+/* 客户端 IP 有两种含义，界面上必须分开说，否则人分不清"机器上有这个地址"和"我们在用这个地址"：
+   lastRemoteIp 是服务端实际收到心跳的那个对端地址，每次心跳刷新，必然连得通；
+   ipAddresses 是 Agent 自报的本机网卡列表，能看出多网卡和网段，但只在列表变化时才重报。 */
+export function ipCell(c) {
+  const ip = c && c.lastRemoteIp;
+  if (!ip) return '<span class="sub">—</span>';
+  return `<span class="mono">${esc(ip)}</span>`;
+}
+
+export function ipDetailRows(c) {
+  const list = Array.isArray(c && c.ipAddresses) ? c.ipAddresses : [];
+  const nics = list.length
+    ? list.map(ip => `<span class="mono">${esc(ip)}</span>`).join('<br>')
+    : '—';
+  return `<div class="row"><div class="k">对端 IP</div><div class="v mono">${esc((c && c.lastRemoteIp) || '—')}<span class="sub">服务端最近一次收到心跳的地址</span></div></div>
+        <div class="row"><div class="k">本机网卡地址</div><div class="v">${nics}</div></div>`;
 }
 
 /* 动作按钮。allowed=false 时不是把按钮藏起来，而是变灰 + title 说明原因——
@@ -175,6 +234,23 @@ export function actBtn({ label, view, action, id, cls = '', allowed = true, why 
     return `<button${klass ? ` class="${esc(klass)}"` : ''} disabled title="${esc(why || '当前状态下不可用')}">${esc(label)}</button>`;
   return `<button${klass ? ` class="${esc(klass)}"` : ''} data-ui-action="act" data-view="${esc(view)}" data-action="${esc(action)}" data-id="${esc(id)}"${hint ? ` title="${esc(hint)}"` : ''}>${esc(label)}</button>`;
 }
+
+/* 溢出菜单。操作列此前把所有动作平铺出来，一行三四个按钮不分主次，
+   最要命的是「注销」和「刷新指标」长得一样大、挨在一起——注销不可恢复。
+   主操作留在外面，其余收进菜单：既压掉视觉噪声，也让危险动作多一次点击。
+
+   用原生 <details> 而不是自己写开合状态：键盘可达、Esc 可关，不需要额外脚本。 */
+export function actMenu(items, label = '更多操作') {
+  const body = items.filter(Boolean).join('');
+  if (!body) return '';
+  return `<details class="act-menu"><summary class="small" title="${esc(label)}" aria-label="${esc(label)}">⋯</summary><div class="act-menu-pop">${body}</div></details>`;
+}
+
+/* 点别处就收起来。不做这件事的话，菜单会一直摊在那儿盖住下面几行。 */
+document.addEventListener('click', e => {
+  for (const menu of document.querySelectorAll('details.act-menu[open]'))
+    if (!menu.contains(e.target)) menu.open = false;
+});
 
 export function prettyJson(s) {
   if (!s) return '—';

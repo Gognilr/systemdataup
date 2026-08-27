@@ -25,6 +25,7 @@ public class AgentHeartbeatService : IAgentHeartbeatService
     private readonly IAlertingService _alerting;
     private readonly IAgentNotificationService _agentNotifications;
     private readonly IAgentConfigService _configService;
+    private readonly ICurrentContext _context;
     private readonly ILogger<AgentHeartbeatService> _logger;
 
     public AgentHeartbeatService(
@@ -33,6 +34,7 @@ public class AgentHeartbeatService : IAgentHeartbeatService
         IAlertingService alerting,
         IAgentNotificationService agentNotifications,
         IAgentConfigService configService,
+        ICurrentContext context,
         ILogger<AgentHeartbeatService> logger)
     {
         _db = db;
@@ -40,6 +42,7 @@ public class AgentHeartbeatService : IAgentHeartbeatService
         _alerting = alerting;
         _agentNotifications = agentNotifications;
         _configService = configService;
+        _context = context;
         _logger = logger;
     }
 
@@ -88,6 +91,21 @@ public class AgentHeartbeatService : IAgentHeartbeatService
             client.AgentVersion = agentVersion;
         if (request.ClientTime is not null)
             client.TimeOffsetSeconds = (int)Math.Clamp((now - request.ClientTime.Value.ToUniversalTime()).TotalSeconds, int.MinValue, int.MaxValue);
+
+        // 服务端实际看到的对端地址。UseForwardedHeaders 已在更早的中间件里把
+        // RemoteIpAddress 还原成 nginx 后面的真实客户端 IP，这里拿到的就是那个值。
+        // 它每次心跳都刷新，所以「最近心跳来自哪个地址」永远是准的——
+        // 而 Agent 自报的网卡列表只回答「机器上有哪些地址」，回答不了哪个在用。
+        var remoteIp = _context.ClientIp;
+        if (!string.IsNullOrWhiteSpace(remoteIp))
+            client.LastRemoteIp = remoteIp.Length > 64 ? remoteIp[..64] : remoteIp;
+
+        // 网卡列表只在变化的那次心跳带上来（SnapshotUnchanged 语义），
+        // 为 null 表示「没变」而不是「没有」，不能拿它去覆盖库里已有的值。
+        if (request.IpAddresses is not null)
+            client.IpAddresses = request.IpAddresses.Count > 0
+                ? System.Text.Json.JsonSerializer.Serialize(request.IpAddresses)
+                : null;
         if (client.Status is ClientStatus.Offline or ClientStatus.SuspectedOffline or ClientStatus.CertificateExpired)
         {
             client.Status = client.CertificateExpiresAt is not null && client.CertificateExpiresAt <= now

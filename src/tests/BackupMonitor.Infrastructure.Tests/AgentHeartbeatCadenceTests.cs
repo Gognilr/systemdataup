@@ -30,8 +30,24 @@ public sealed class AgentHeartbeatCadenceTests
         Assert.Null(second.ServiceStates);
         Assert.Null(second.UserSessions);
 
-        // 免报的只有那三块。指标每次都不同，本来就要带。
+        // 免报的只有那几块。指标每次都不同，本来就要带。
         Assert.NotNull(second.Metrics);
+    }
+
+    [Fact]
+    public void 网卡地址随快照一起上报且不重复发送()
+    {
+        // 原先这份数据只在注册请求里出现过一次，之后永不刷新：
+        // 换网段、DHCP 续租之后库里那份就是错的，而界面看不出它是旧的。
+        // 现在它并进快照摘要，跟着「变了才发」的节奏走。
+        var probe = new SystemProbe();
+
+        var first = probe.BuildHeartbeat(0, null, []);
+        Assert.NotNull(first.IpAddresses);
+
+        var second = probe.BuildHeartbeat(0, null, []);
+        Assert.True(second.SnapshotUnchanged);
+        Assert.Null(second.IpAddresses);
     }
 
     [Fact]

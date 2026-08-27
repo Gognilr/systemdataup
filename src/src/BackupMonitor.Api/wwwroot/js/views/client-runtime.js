@@ -1,6 +1,6 @@
 import {
   $, esc, L, emptyState, fmtBytes, fmtDT, relTime, status, tableHtml, clientName,
-  clientCaps, actBtn, runtimeBadge
+  clientCaps, actBtn, runtimeBadge, ipDetailRows
 } from '../ui.js';
 
 const sessionLabels = {
@@ -144,7 +144,7 @@ export function renderClientRuntimeDetail(detail, history) {
         ${chart(points, 'networkReceiveBps', '网络接收', 'network', v => `${fmtBytes(v)}/s`)}
       </div></section>
       <section class="card runtime-meta"><div class="runtime-card-head"><h2>运行概况</h2><span>设备与安全信息</span></div><div class="kv">
-        <div class="row"><div class="k">IP 地址</div><div class="v">${esc(detail.ipAddresses || '—')}</div></div>
+        ${ipDetailRows(detail)}
         <div class="row"><div class="k">Agent 版本</div><div class="v">${esc(detail.agentVersion || '—')}</div></div>
         <div class="row"><div class="k">机器 ID</div><div class="v mono">${esc(detail.machineId || '—')}</div></div>
         <div class="row"><div class="k">系统运行时长</div><div class="v">${metrics.systemUptimeSeconds ? `${Math.floor(metrics.systemUptimeSeconds / 86400)} 天 ${Math.floor(metrics.systemUptimeSeconds / 3600) % 24} 小时` : '—'}</div></div>

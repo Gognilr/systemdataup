@@ -44,8 +44,9 @@ public sealed class SystemProbe
         var disks = GetDisks(sourceRoots);
         var services = GetServices(config?.MonitoredServices ?? []);
         var sessions = GetUserSessions();
+        var ipAddresses = GetIpAddresses();
 
-        var digest = ComputeSnapshotDigest(disks, services, sessions);
+        var digest = ComputeSnapshotDigest(disks, services, sessions, ipAddresses);
         var unchanged = _lastSnapshotDigest is not null && _lastSnapshotDigest == digest;
         _lastSnapshotDigest = digest;
 
@@ -59,6 +60,7 @@ public sealed class SystemProbe
             Disks = unchanged ? null : disks,
             ServiceStates = unchanged ? null : services,
             UserSessions = unchanged ? null : sessions,
+            IpAddresses = unchanged ? null : ipAddresses,
             SnapshotUnchanged = unchanged,
             ActiveCommands = activeCommands.ToList(),
             ActiveUploads = []
@@ -66,7 +68,7 @@ public sealed class SystemProbe
     }
 
     /// <summary>
-    /// 三块快照的稳定摘要（审计 B-09）。
+    /// 四块快照的稳定摘要（审计 B-09）。
     ///
     /// 逐字段拼接而不是序列化整个对象：JSON 序列化会把 SampledAt 这类每次都变的字段
     /// 一起算进去，摘要就永远不相同，这个优化等于没做。
@@ -74,7 +76,8 @@ public sealed class SystemProbe
     private static string ComputeSnapshotDigest(
         List<HeartbeatDiskDto>? disks,
         List<HeartbeatServiceStateDto>? services,
-        List<HeartbeatUserSessionDto>? sessions)
+        List<HeartbeatUserSessionDto>? sessions,
+        List<string>? ipAddresses)
     {
         // 磁盘可用空间按 64MB 粒度取整：它每次采样都会有几 KB 的抖动，
         // 按字节比对会让摘要永不相同，而告警阈值是百分比，这个粒度足够。
@@ -115,6 +118,12 @@ public sealed class SystemProbe
                 .Append(session.State).Append(fieldSeparator)
                 .Append(session.IsRemote ? '1' : '0').Append(itemSeparator);
         }
+
+        // 网卡地址排序后入摘要：同一台机器上枚举顺序不保证稳定，
+        // 不排序会让「地址没变」被误判成「变了」，每次心跳都白写一遍库。
+        builder.Append(sectionSeparator);
+        foreach (var ip in (ipAddresses ?? []).OrderBy(a => a, StringComparer.OrdinalIgnoreCase))
+            builder.Append(ip).Append(itemSeparator);
 
         return Convert.ToHexString(
             System.Security.Cryptography.SHA256.HashData(

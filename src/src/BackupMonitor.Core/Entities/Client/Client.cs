@@ -30,8 +30,22 @@ public class Client : IHasRowVersion
     /// <summary>Agent 版本号</summary>
     public string? AgentVersion { get; set; }
 
-    /// <summary>IP 地址列表（jsonb）</summary>
+    /// <summary>
+    /// Agent 自报的本机网卡地址列表（jsonb 字符串数组）。
+    ///
+    /// 原先只在注册时写一次，之后永不刷新；现在心跳会在网卡列表变化时带上并覆盖。
+    /// 注意它是「机器上有哪些地址」，不是「服务端从哪个地址收到的心跳」——后者见 <see cref="LastRemoteIp"/>。
+    /// </summary>
     public string? IpAddresses { get; set; }
+
+    /// <summary>
+    /// 服务端最近一次心跳观测到的对端 IP。
+    ///
+    /// 与 <see cref="IpAddresses"/> 互补：多网卡机器自报一串地址，
+    /// 但到底哪个真正连得通、当前在用哪个，只有服务端看到的这个能回答；
+    /// 它也永远是最新的，不依赖 Agent 是否重新上报。
+    /// </summary>
+    public string? LastRemoteIp { get; set; }
 
     public ClientStatus Status { get; set; } = ClientStatus.PendingApproval;
 

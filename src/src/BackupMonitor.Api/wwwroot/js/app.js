@@ -27,7 +27,7 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 /* ── 信息架构（UI-REDESIGN §5）：按运维工作分组，而不是按 REST 端点排列 ── */
 export const NAV_GROUPS = [
   { key: 'watch', label: '值守', items: [
-    ['overview', '概览', '⌂'], ['todo', '待办', '○'], ['alerts', '告警', '▲']
+    ['overview', '概览', '⌂'], ['transfers', '传输中', '⇅'], ['todo', '待办', '○'], ['alerts', '告警', '▲']
   ] },
   { key: 'fleet', label: '机群', items: [
     ['clients', '客户端', '◉'], ['tasks', '备份任务', '▣']
@@ -64,6 +64,11 @@ export function shell(active, title, body) {
   <div class="main">
     <div class="topbar">
       <div class="topbar-title"><button class="topbar-menu" data-ui-action="method" data-method="toggleSidebar" aria-label="切换侧栏">☰</button><span>${esc(title)}</span></div>
+      <!-- 命令面板此前只能靠 Ctrl/⌘ K 打开，而这个快捷键只写在「键盘快捷键」弹窗里——
+           一个没人知道入口的功能等于不存在。顶栏放一个看得见的入口，顺带把快捷键教出去。 -->
+      <button class="topbar-command" data-ui-action="method" data-method="openCommands" aria-label="打开命令面板">
+        <span aria-hidden="true">⌕</span><span class="topbar-command-text">搜索或跳转</span><kbd>${navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl'} K</kbd>
+      </button>
       <div class="who">${App.user ? esc(App.user.displayName || App.user.username) : ''}
         &nbsp;<button class="small" id="densityBtn" data-ui-action="method" data-method="toggleDensity" aria-label="切换行密度" title="切换行密度">${density === 'comfortable' ? '▤ 紧凑' : '▦ 宽松'}</button>
         <button class="small" id="themeBtn" data-ui-action="method" data-method="toggleTheme" aria-label="切换明暗主题">${effTheme() === 'dark' ? '☀ 浅色' : '☾ 深色'}</button>
@@ -347,6 +352,8 @@ async function renderCommands(query = '') {
   }
   renderCommandItems(items.slice(0, 24));
 }
+App.openCommands = function () { openCommandPalette(); };
+
 function openCommandPalette(initial = '') {
   ensureCommandPalette();
   commandEl.hidden = false;
@@ -433,7 +440,7 @@ document.addEventListener('keydown', e => {
   }
   if (keyPrefix === 'g') {
     keyPrefix = '';
-    const routes = { d: 'overview', c: 'clients', a: 'alerts' };
+    const routes = { d: 'overview', c: 'clients', a: 'alerts', t: 'transfers' };
     if (routes[e.key]) { e.preventDefault(); location.hash = '#/' + routes[e.key]; return; }
   }
   if (e.key === 'j') { e.preventDefault(); focusListRow(1); }
@@ -452,6 +459,7 @@ const LEGACY_ROUTES = {
 /* 视图按路由加载：登录首屏只带认证与基础组件，避免把所有列表代码提前下载。 */
 const VIEW_LOADERS = {
   overview: () => import('./views/dashboard.js'), todo: () => import('./views/todo.js'),
+  transfers: () => import('./views/transfers.js'),
   clients: () => import('./views/clients.js'), 'registration-tokens': () => import('./views/registration-tokens.js'), tasks: () => import('./views/tasks.js'),
   backups: () => import('./views/backups.js'), restores: () => import('./views/restores.js'),
   alerts: () => import('./views/alerts.js'), notifications: () => import('./views/notifications.js'),
@@ -460,7 +468,7 @@ const VIEW_LOADERS = {
   settings: () => import('./views/settings.js')
 };
 const VIEW_EXPORTS = {
-  overview: 'vDashboard', todo: 'vTodo', clients: 'vClients', tasks: 'vTasks', backups: 'vBackups',
+  overview: 'vDashboard', transfers: 'vTransfers', todo: 'vTodo', clients: 'vClients', tasks: 'vTasks', backups: 'vBackups',
   restores: 'vRestores', alerts: 'vAlerts', notifications: 'vNotifications', audit: 'vAudit',
   'registration-tokens': 'vRegistrationTokens',
   retention: 'vRetention', 'job-history': 'vJobHistory', upgrades: 'vUpgrades',
