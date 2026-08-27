@@ -20,3 +20,11 @@ appsettings.*.local.json
 # ---- 运行时产物 ----
 logs/
 *.log
+
+# ---- 构建产物与发布包（体积大，走 Releases，不入库）----
+artifacts/
+dist/*.exe
+dist/prerequisites/*.exe
+src/server/BackupMonitor.Server.Setup/payload/*.zip
+src/src/BackupMonitor.Api/wwwroot/downloads/*.exe
+src/src/BackupMonitor.Api/wwwroot/downloads/*.zip
