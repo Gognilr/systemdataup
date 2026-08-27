@@ -231,6 +231,16 @@ public class BackupTaskService : IBackupTaskService
         var removedCommands = await _db.Commands
             .Where(c => c.TaskId == taskId)
             .ExecuteDeleteAsync(ct);
+        // 审计 G-13：先把这些告警下还没发出去的通知取消掉，再删告警。
+        // notification_deliveries.alert_id 是「告警删除后置空」，删完这些投递会变成
+        // 孤儿 pending 记录——派发器只看投递自身的状态，于是任务都删掉了，
+        // 它的告警邮件还在继续重试发送。顺序不能反：删完告警就查不到 task_id 了。
+        var cancelledDeliveries = await _db.NotificationDeliveries
+            .Where(d => d.Alert != null
+                        && d.Alert.TaskId == taskId
+                        && d.Status == NotificationStatus.Pending)
+            .ExecuteUpdateAsync(s => s.SetProperty(d => d.Status, NotificationStatus.Cancelled), ct);
+
         var removedAlerts = await _db.Alerts
             .Where(a => a.TaskId == taskId)
             .ExecuteDeleteAsync(ct);
@@ -245,7 +255,8 @@ public class BackupTaskService : IBackupTaskService
                 task.Name,
                 task.ClientId,
                 removedCommands,
-                removedAlerts
+                removedAlerts,
+                cancelledDeliveries
             }), ct: ct);
     }
 

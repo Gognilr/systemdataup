@@ -21,23 +21,32 @@ public sealed class AgentProtocolHardeningTests
             "nonce-1",
             "refresh_metrics",
             Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
-            instant);
+            instant,
+            taskId: null,
+            candidateBackupSetId: null,
+            payload: null);
         var unspecifiedPayload = AgentSignatureCanonicalizer.CommandPayload(
             Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             "nonce-1",
             "refresh_metrics",
             Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
-            unspecified);
+            unspecified,
+            taskId: null,
+            candidateBackupSetId: null,
+            payload: null);
         var localPayload = AgentSignatureCanonicalizer.CommandPayload(
             Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             "nonce-1",
             "refresh_metrics",
             Guid.Parse("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
-            local);
+            local,
+            taskId: null,
+            candidateBackupSetId: null,
+            payload: null);
 
         Assert.Equal(utcPayload, unspecifiedPayload);
         Assert.Equal(utcPayload, localPayload);
-        Assert.StartsWith("v1|", Encoding.UTF8.GetString(utcPayload));
+        Assert.StartsWith("v2|", Encoding.UTF8.GetString(utcPayload));
         var timestamp = Convert.ToBase64String(Encoding.UTF8.GetBytes(
                 AgentSignatureCanonicalizer.ToUnixMilliseconds(instant).ToString()))
             .TrimEnd('=')

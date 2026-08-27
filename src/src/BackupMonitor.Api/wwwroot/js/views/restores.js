@@ -74,6 +74,11 @@ export async function openRestoreDrawer(id, viaNav = false) {
       <div class="row"><div class="k">用途</div><div class="v">${esc(d.purpose)}</div></div>
       <div class="row"><div class="k">请求时间</div><div class="v">${fmtDT(d.requestedAt)}</div></div>
       <div class="row"><div class="k">校验完成</div><div class="v">${fmtDT(d.verifiedAt)}</div></div>
+      ${d.status === 'verifying' && d.verificationQueueLength != null
+        ? `<div class="row"><div class="k">校验队列</div><div class="v">${d.verificationQueueLength > 0
+            ? `前面还有 ${d.verificationQueueLength} 个任务`
+            : '正在校验'}</div></div>`
+        : ''}
       <div class="row"><div class="k">下载有效期至</div><div class="v">${fmtDT(d.downloadExpiresAt)}</div></div>
       <div class="row"><div class="k">已下载</div><div class="v">${fmtBytes(d.downloadedBytes)}</div></div>
       <div class="row"><div class="k">完成时间</div><div class="v">${fmtDT(d.completedAt)}</div></div>

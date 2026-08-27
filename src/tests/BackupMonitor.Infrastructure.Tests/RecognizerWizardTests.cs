@@ -466,6 +466,63 @@ public sealed class RecognizerWizardTests : IDisposable
 
         Assert.Equal("subdirectory_units", proposal.RecognizerType);
     }
+    /// <summary>
+    /// 元旦刚建出来、还空着的 2027 不能顶掉真正有备份的 2026。
+    ///
+    /// 只按名字挑"最新的年"的话，向导会对一个它本来看得懂的结构回一句"没能看懂"；
+    /// 而扫描端的通配展开按内容时间挑，根本不会选中那个空目录——两边对"最新"的
+    /// 判断在这里岔开，正是这类缺陷最难被发现的形态。
+    /// </summary>
+    [Fact]
+    public void 空的新年份目录不会让推断失败()
+    {
+        BuildSeeyonLayout();
+        Directory.CreateDirectory(Path.Combine(_root, "2027"));
+
+        var proposal = StructureInference.Infer(Snapshot(maxDepth: 4), DateTime.UtcNow);
+
+        Assert.Equal("multi_file_set", proposal.RecognizerType);
+        Assert.EndsWith("/*/*", proposal.SourcePath, StringComparison.Ordinal);
+        Assert.Contains(proposal.Evidence, e => e.Contains("最新的是 2026", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 推断产出通配源路径之后，服务端必须能把它展开回正确的目录再预演。
+    ///
+    /// 这两步正是 RecognizerWizardService.InferAsync 做的事（那条链路要连数据库，
+    /// 这里直接测它调用的那两个函数）。预演跑在没展开的 Backup 上会得出"没有备份"——
+    /// 规则是对的，只是预演找错了目录，而这是向导最不该撒的那种谎。
+    /// </summary>
+    [Fact]
+    public void 通配方案能展开回正确目录并预演出最新一组()
+    {
+        BuildSeeyonLayout();
+
+        var snapshot = Browse(maxDepth: 4);
+        var root = SnapshotNode.FromSnapshot(snapshot);
+        var proposal = StructureInference.Infer(root, snapshot.CapturedAt);
+        var rules = RecognizerRules.Parse(proposal.RecognizerConfig);
+
+        var (expanded, failure) = SnapshotRecognizer.ExpandSource(root, proposal.SourcePath, rules);
+        Assert.Null(failure);
+        Assert.NotNull(expanded);
+        Assert.Equal("08", expanded!.Name);
+
+        var preview = SnapshotRecognizer.Preview(
+            expanded,
+            proposal.RecognizerType,
+            rules,
+            stabilityIntervalSeconds: 0,
+            snapshot.CapturedAt,
+            snapshot.DeniedPaths,
+            snapshot.Truncated);
+
+        var unit = Assert.Single(preview.Units);
+        Assert.Equal("passed", unit.Status);
+        // 30 组里只认最新的一组，一组两个文件。
+        Assert.Equal(2, unit.TotalFiles);
+        Assert.All(unit.Files, f => Assert.StartsWith("2026-08-30@02_00", f.RelativePath, StringComparison.Ordinal));
+    }
     // ---------- 规则预演 ----------
 
     [Fact]

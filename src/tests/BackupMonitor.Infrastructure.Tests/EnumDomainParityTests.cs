@@ -33,7 +33,9 @@ public class EnumDomainParityTests
         { "precheck_status", Values<PrecheckStatus>() },
         { "client_status", Values<ClientStatus>() },
         { "importance_level", Values<ImportanceLevel>() },
-        { "audit_result", Values<AuditResult>() }
+        { "audit_result", Values<AuditResult>() },
+        // 审计 G-12 新增 cancelled，把这个域一并纳入守护范围
+        { "notification_status", Values<NotificationStatus>() }
     };
 
     private static string[] Values<TEnum>() where TEnum : struct, Enum =>

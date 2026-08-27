@@ -51,13 +51,27 @@ public sealed class AgentSignatureVerifier : IDisposable
             return false;
         }
 
+        // 三级回退 v2 → v1 → legacy：发布顺序要求 Agent 先于服务端升级，
+        // 因此新 Agent 必须能验尚未升级的服务端签出来的 v1 指令。
+        // 灰度窗口结束后删掉后两级（已登记在 docs/系统审查-整改追踪.md）。
         var payload = AgentSignatureCanonicalizer.CommandPayload(
             command.Id,
             command.Nonce,
             command.Type,
             clientId,
-            command.ExpiresAt);
+            command.ExpiresAt,
+            command.TaskId,
+            command.CandidateBackupSetId,
+            command.Payload);
         return Verify(payload, command.Signature)
+            || Verify(
+                AgentSignatureCanonicalizer.CommandPayloadV1(
+                    command.Id,
+                    command.Nonce,
+                    command.Type,
+                    clientId,
+                    command.ExpiresAt),
+                command.Signature)
             || Verify(
                 AgentSignatureCanonicalizer.LegacyCommandPayload(
                     command.Id,

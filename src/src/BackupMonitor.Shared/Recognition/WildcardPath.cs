@@ -93,6 +93,11 @@ public static class WildcardPath
             return Expansion.Fail($"源路径的通配不能出现在盘符段：{pattern}");
         }
 
+        // 相对路径没有可以当围栏的字面前缀，下面的 IsUnderBase 会以一条看不懂的
+        // "落到了  之外"收场。带通配的源路径必须是绝对路径，在这里说清楚。
+        if (root.Length == 0)
+            return Expansion.Fail($"带通配的源路径必须是绝对路径（要带盘符或 UNC 前缀）：{pattern}");
+
         if (segments.Count == 0)
             return Expansion.Fail($"源路径无法解析：{pattern}");
 

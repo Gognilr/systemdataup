@@ -45,7 +45,13 @@ public class CommandSigner
         _legacyHmacKey = System.Text.Encoding.UTF8.GetBytes(legacyKey);
     }
 
-    /// <summary>对指令签名：覆盖 id、nonce、类型、客户端、过期时间，防篡改防重放</summary>
+    /// <summary>
+    /// 对指令签名：覆盖 id、nonce、类型、客户端、过期时间，以及决定「做什么」的
+    /// taskId / candidateBackupSetId / payload（审计 C-01，v2 起）。
+    ///
+    /// command.Payload 直接取实体上从库里读回来的字符串，不做任何 JSON 往返——
+    /// jsonb 的规范化文本必须逐字节地进签名，中途重新序列化会得到另一份文本。
+    /// </summary>
     public string SignCommand(Command command)
     {
         var payload = AgentSignatureCanonicalizer.CommandPayload(
@@ -53,7 +59,10 @@ public class CommandSigner
             command.Nonce,
             EnumMapping.ToSnakeCase(command.CommandType),
             command.ClientId,
-            command.ExpiresAt);
+            command.ExpiresAt,
+            command.TaskId,
+            command.CandidateBackupSetId,
+            command.Payload);
         return Sign(payload);
     }
 

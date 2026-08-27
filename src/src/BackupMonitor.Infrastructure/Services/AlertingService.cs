@@ -1,6 +1,7 @@
 using System.Text.Json;
 using BackupMonitor.Core.Entities.Alert;
 using BackupMonitor.Core.Enums;
+using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.EntityFrameworkCore;
@@ -96,8 +97,36 @@ public class AlertingService : IAlertingService
                 existing.LastOccurredAt = now;
                 existing.OccurrenceCount++;
                 existing.Message = message ?? existing.Message;
-                if (level < existing.Level)
-                    existing.Level = level; // Critical=0 数值小即等级高
+
+                // 审计 G-11：等级提升是最该被推送的信号，原先却恰好是唯一不推送的。
+                // 磁盘可用率从 14%（Warning）掉到 3%（Critical），等级在库里升上去了，
+                // 但通知与托盘推送全在下面的 else 分支里，于是没有任何人收到消息——
+                // 而唯一那封警告邮件可能是几天前发的、早被忽略了。
+                var escalated = level < existing.Level;   // Critical=0，数值小即等级高
+                if (escalated)
+                    existing.Level = level;
+
+                if (escalated && !silenced)
+                {
+                    // 标题带前缀，让收件人一眼看出这不是同一封警告的重发
+                    await CreateDeliveriesForAsync(existing, ct, titlePrefix: "【已升级】");
+
+                    if (clientId is not null)
+                    {
+                        // 去重键带等级：Warning→Critical 推一次，
+                        // 之后同等级的重复发生不再推（托盘不是用来刷屏的）。
+                        await _agentNotifications.EnqueueAsync(
+                            clientId.Value,
+                            "alert",
+                            SeverityOf(level),
+                            "【已升级】" + title,
+                            message,
+                            $"alert:{existing.Id}:escalated:{EnumMapping.ToSnakeCase(level)}",
+                            existing.Id,
+                            backupSetId,
+                            ct);
+                    }
+                }
             }
             else
             {
@@ -126,19 +155,13 @@ public class AlertingService : IAlertingService
                     // 新告警按渠道配置落待发送通知记录（第二批补充设计；实际发送由发送器实现）
                     await CreateDeliveriesForAsync(alert, ct);
 
-                    // Agent 只接收新告警，活动告警后续心跳仅更新次数，不重复弹窗。
+                    // Agent 只接收新告警与等级提升，活动告警后续心跳仅更新次数，不重复弹窗。
                     if (clientId is not null)
                     {
-                        var severity = level switch
-                        {
-                            AlertLevel.Critical => "critical",
-                            AlertLevel.Warning => "warning",
-                            _ => "info"
-                        };
                         await _agentNotifications.EnqueueAsync(
                             clientId.Value,
                             "alert",
-                            severity,
+                            SeverityOf(level),
                             title,
                             message,
                             $"alert:{alert.Id}:opened",
@@ -171,19 +194,33 @@ public class AlertingService : IAlertingService
         try
         {
             // D2：心跳每次「一切正常」都会调一次 RecoverAsync，绝大多数情况下根本没有活动告警可恢复。
-            // 先做一次存在性判断（alert_key 上有索引，AnyAsync 是一次索引探测），
-            // 没有活动告警就直接返回，省掉一条无谓的 UPDATE（不产生 WAL）。
+            // 先查一次（alert_key 上有索引，只取 id 就是一次索引扫描），空集直接返回，
+            // 省掉两条无谓的 UPDATE（不产生 WAL）。
+            //
+            // 审计 G-12：这里取的是 ID 列表而不是直接 ExecuteUpdate——
+            // ExecuteUpdate 不支持跨表条件，而下面取消投递必须按 alert_id 定位。
             var now = DateTime.UtcNow;
-            var hasActive = await _db.Alerts
-                .AnyAsync(a => a.AlertKey == alertKey && ActiveStatuses.Contains(a.Status), ct);
-            if (!hasActive)
+            var recoveringIds = await _db.Alerts
+                .Where(a => a.AlertKey == alertKey && ActiveStatuses.Contains(a.Status))
+                .Select(a => a.Id)
+                .ToListAsync(ct);
+            if (recoveringIds.Count == 0)
                 return;
 
             await _db.Alerts
-                .Where(a => a.AlertKey == alertKey && ActiveStatuses.Contains(a.Status))
+                .Where(a => recoveringIds.Contains(a.Id))
                 .ExecuteUpdateAsync(s => s
                     .SetProperty(a => a.Status, AlertStatus.Recovered)
                     .SetProperty(a => a.RecoveredAt, now), ct);
+
+            // 审计 G-12：告警恢复了，还没发出去的通知就不该再发。
+            // 派发器只看投递记录自身的状态，不回查告警——短暂抖动产生的邮件
+            // 会在告警早已恢复之后继续发，重试间隔 5 分钟最多 3 次，一次抖动发三轮。
+            await _db.NotificationDeliveries
+                .Where(d => d.AlertId != null
+                            && recoveringIds.Contains(d.AlertId.Value)
+                            && d.Status == NotificationStatus.Pending)
+                .ExecuteUpdateAsync(s => s.SetProperty(d => d.Status, NotificationStatus.Cancelled), ct);
         }
         catch (Exception ex)
         {
@@ -191,8 +228,19 @@ public class AlertingService : IAlertingService
         }
     }
 
-    /// <summary>为新告警生成待发送通知记录（渠道配置见 system_settings: notification_channels）</summary>
-    private async Task CreateDeliveriesForAsync(Alert alert, CancellationToken ct)
+    /// <summary>告警等级到托盘提示 severity 的映射</summary>
+    private static string SeverityOf(AlertLevel level) => level switch
+    {
+        AlertLevel.Critical => "critical",
+        AlertLevel.Warning => "warning",
+        _ => "info"
+    };
+
+    /// <summary>
+    /// 为告警生成待发送通知记录（渠道配置见 system_settings: notification_channels）。
+    /// titlePrefix 供等级提升复用同一套渠道展开逻辑（审计 G-11）。
+    /// </summary>
+    private async Task CreateDeliveriesForAsync(Alert alert, CancellationToken ct, string? titlePrefix = null)
     {
         try
         {
@@ -219,7 +267,8 @@ public class AlertingService : IAlertingService
                         Channel = NotificationChannel.Email,
                         Recipient = recipient.Trim(),
                         Status = NotificationStatus.Pending,
-                        AttemptCount = 0
+                        AttemptCount = 0,
+                        TitlePrefix = titlePrefix
                     });
                 }
             }
@@ -233,7 +282,8 @@ public class AlertingService : IAlertingService
                     Channel = NotificationChannel.Wecom,
                     Recipient = Truncate(settings.Wecom.WebhookUrl.Trim(), 255),
                     Status = NotificationStatus.Pending,
-                    AttemptCount = 0
+                    AttemptCount = 0,
+                    TitlePrefix = titlePrefix
                 });
             }
 
@@ -246,7 +296,8 @@ public class AlertingService : IAlertingService
                     Channel = NotificationChannel.Dingtalk,
                     Recipient = Truncate(settings.Dingtalk.WebhookUrl.Trim(), 255),
                     Status = NotificationStatus.Pending,
-                    AttemptCount = 0
+                    AttemptCount = 0,
+                    TitlePrefix = titlePrefix
                 });
             }
         }

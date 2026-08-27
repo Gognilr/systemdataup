@@ -9,6 +9,7 @@ using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace BackupMonitor.Infrastructure.Services;
@@ -57,7 +58,7 @@ public class BackupSetService : IBackupSetService
 
     public BackupSetService(
         AppDbContext db,
-        Channel<WorkItem> workChannel,
+        [FromKeyedServices(QueueKeys.Verify)] Channel<WorkItem> workChannel,
         ICurrentContext context,
         IAuditRecorder audit,
         ILogger<BackupSetService> logger)

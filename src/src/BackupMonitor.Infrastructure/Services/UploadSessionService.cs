@@ -39,6 +39,7 @@ public class UploadSessionService : IUploadSessionService
         IUploadStorage storage,
         SystemSettingsProvider settings,
         IAuditRecorder audit,
+        [Microsoft.Extensions.DependencyInjection.FromKeyedServices(QueueKeys.Commit)]
         System.Threading.Channels.Channel<WorkItem> commitQueue,
         ILogger<UploadSessionService> logger)
     {
@@ -66,7 +67,10 @@ public class UploadSessionService : IUploadSessionService
             if (existing is not null)
             {
                 if (existing.Status is not (UploadStatus.Failed or UploadStatus.Cancelled or UploadStatus.Expired))
-                    return BuildCreateResponse(existing, resumed: true);
+                {
+                    var existingTimeout = await _settings.GetIntAsync(LifecycleExpiryWorker.SessionTimeoutKey, 3600, ct);
+                    return BuildCreateResponse(existing, resumed: true, existingTimeout);
+                }
 
                 // 失败会话保留作审计，但释放幂等键，让同一候选可以创建全新的重试会话。
                 existing.IdempotencyKey = null;
@@ -128,7 +132,10 @@ public class UploadSessionService : IUploadSessionService
         if (freeBytes < requiredBytes)
             throw new BusinessException("STORAGE_SPACE_LOW", $"暂存空间不足（需 {requiredBytes} 字节，可用 {freeBytes} 字节）", 507);
 
-        var sessionTimeout = await _settings.GetIntAsync("upload_session_timeout_seconds", 3600, ct);
+        // 审计 A-03：这个值原先取出来就没再用过（编译器不报 CS0219，因为它来自方法调用），
+        // 于是「会话超时」这件事从头到尾没有任何人执行。现在它有两个真实用途：
+        // 下面返回给 Agent 的 ExpiresAt，以及 LifecycleExpiryWorker 的过期判定基准。
+        var sessionTimeout = await _settings.GetIntAsync(LifecycleExpiryWorker.SessionTimeoutKey, 3600, ct);
         var now = DateTime.UtcNow;
 
         var session = new UploadSession
@@ -181,16 +188,23 @@ public class UploadSessionService : IUploadSessionService
             });
         }
 
+        // 审计 A-04：暂存目录必须先于 SaveChangesAsync 建好，把路径一起写进 staging_path。
+        // staging_path 这一列建表就有、EF 也映射了，却从来没有人给它赋过值；
+        // 现在它承担「这个会话的暂存目录还需不需要清」这个职责——非空即待清理，
+        // LifecycleExpiryWorker 清完置 null，天然幂等，不必再加一列。
+        // 建目录放在写库之前还有一个附带好处：目录建不出来（盘满、没权限）时
+        // 直接失败，不会留下一条指向不存在目录的会话记录。
+        session.StagingPath = await _storage.EnsureSessionDirectoryAsync(session.Id, ct);
+
         _db.UploadSessions.Add(session);
         await _db.SaveChangesAsync(ct);
 
-        await _storage.EnsureSessionDirectoryAsync(session.Id, ct);
         await _audit.RecordAsync("upload.session.create", AuditResult.Success, "upload_session", session.Id, ct: ct);
 
         _logger.LogInformation("创建上传会话 session={SessionId} candidate={CandidateId} files={Files}",
             session.Id, candidate.Id, session.Files.Count);
 
-        return BuildCreateResponse(session, resumed: false);
+        return BuildCreateResponse(session, resumed: false, sessionTimeout);
     }
 
     public async Task<MissingChunksResponse> GetMissingChunksAsync(Guid clientId, Guid sessionId, Guid fileId, CancellationToken ct = default)
@@ -437,6 +451,17 @@ public class UploadSessionService : IUploadSessionService
             Resumable = WritableStatuses.Contains(session.Status) || session.Status == UploadStatus.Verifying
         };
 
+        // 审计 H-18：整个会话的已收分块一次查回来按文件分组，不再每个文件查一次。
+        // 原先是循环里逐文件 ToListAsync——一个 500 文件的会话就是 500 次数据库往返，
+        // 而这个接口是 Agent 断点续传时必调的第一步。
+        var receivedByFile = await _db.UploadChunks
+            .Where(c => c.UploadFile.UploadSessionId == session.Id && c.Status == UploadChunkStatus.Received)
+            .Select(c => new { c.UploadFileId, c.ChunkIndex })
+            .ToListAsync(ct);
+        var receivedLookup = receivedByFile
+            .GroupBy(c => c.UploadFileId)
+            .ToDictionary(g => g.Key, g => g.Select(c => c.ChunkIndex).ToHashSet());
+
         foreach (var file in files)
         {
             var dto = new UploadFileProgressDto
@@ -452,10 +477,8 @@ public class UploadSessionService : IUploadSessionService
 
             if (file.Status is UploadFileStatus.Pending or UploadFileStatus.Uploading)
             {
-                var received = await _db.UploadChunks
-                    .Where(c => c.UploadFileId == file.Id && c.Status == UploadChunkStatus.Received)
-                    .Select(c => c.ChunkIndex).ToListAsync(ct);
-                var missing = Enumerable.Range(0, file.TotalChunks).Except(received).ToList();
+                var received = receivedLookup.GetValueOrDefault(file.Id) ?? [];
+                var missing = Enumerable.Range(0, file.TotalChunks).Where(i => !received.Contains(i)).ToList();
                 if (missing.Count <= 100)
                     dto.MissingChunks = missing;
             }
@@ -480,7 +503,9 @@ public class UploadSessionService : IUploadSessionService
         session.UpdatedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync(ct);
 
-        // 取消后临时文件按策略保留（由定时清理任务处理，设计书 14.7）
+        // 取消后临时文件按 staging_cleanup_retention_hours 保留一段时间供排障，
+        // 到期由 LifecycleExpiryWorker 清理（审计 A-04）。原注释说的「定时清理任务」
+        // 在写下那句话的时候并不存在，现在是真的了。
         await _audit.RecordAsync("upload.session.cancel", AuditResult.Success, "upload_session", session.Id, ct: ct);
     }
 
@@ -532,14 +557,21 @@ public class UploadSessionService : IUploadSessionService
         return ranges;
     }
 
-    private static CreateUploadSessionResponse BuildCreateResponse(UploadSession session, bool resumed)
+    /// <summary>
+    /// 组装建会话应答。
+    ///
+    /// 审计 A-03：ExpiresAt 原先硬编码 AddSeconds(3600)，是给 Agent 看的装饰——
+    /// 服务端自己既不认这个值也没有过期机制。现在它和 LifecycleExpiryWorker
+    /// 用的是同一个 upload_session_timeout_seconds，两端说的是同一件事。
+    /// </summary>
+    private static CreateUploadSessionResponse BuildCreateResponse(UploadSession session, bool resumed, int timeoutSeconds)
     {
         return new CreateUploadSessionResponse
         {
             UploadSessionId = session.Id,
             Status = resumed ? "resumed" : "created",
             ChunkSizeBytes = session.ChunkSizeBytes,
-            ExpiresAt = session.LastActivityAt?.AddSeconds(3600),
+            ExpiresAt = (session.LastActivityAt ?? session.CreatedAt).AddSeconds(timeoutSeconds),
             Files = session.Files.Select(f => new UploadSessionFileDto
             {
                 UploadFileId = f.Id,

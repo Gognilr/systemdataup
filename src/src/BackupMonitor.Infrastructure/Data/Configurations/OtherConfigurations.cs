@@ -158,6 +158,7 @@ public class NotificationDeliveryConfiguration : IEntityTypeConfiguration<Notifi
         builder.Property(e => e.LastAttemptAt).HasColumnName("last_attempt_at");
         builder.Property(e => e.SentAt).HasColumnName("sent_at");
         builder.Property(e => e.ErrorMessage).HasColumnName("error_message").HasMaxLength(2000);
+        builder.Property(e => e.TitlePrefix).HasColumnName("title_prefix").HasMaxLength(32);
 
         builder.HasIndex(e => e.AlertId).HasDatabaseName("idx_notification_deliveries_alert");
         builder.HasIndex(e => e.Status).HasDatabaseName("idx_notification_deliveries_status");

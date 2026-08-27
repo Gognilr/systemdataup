@@ -8,6 +8,7 @@ using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace BackupMonitor.Infrastructure.Services;
@@ -64,7 +65,7 @@ public class RestoreService : IRestoreService
 
     public RestoreService(
         AppDbContext db,
-        Channel<WorkItem> workChannel,
+        [FromKeyedServices(QueueKeys.Verify)] Channel<WorkItem> workChannel,
         ICurrentContext context,
         IAuditRecorder audit,
         SystemSettingsProvider settings,
@@ -162,7 +163,16 @@ public class RestoreService : IRestoreService
             .FirstOrDefaultAsync(r => r.Id == requestId, ct)
             ?? throw new NotFoundException("恢复请求", requestId);
 
-        return Map(entity);
+        var dto = Map(entity);
+
+        // 审计 H-18：verifying 状态下把队列长度一并给出去。
+        // Channel.Reader.Count 是现成的，取它不需要遍历。这不是精确的「我排第几」——
+        // 队列里可能混着别人的重校验——但「前面还有 N 个」足以把「在排队」
+        // 和「卡住了」区分开，而这正是使用者干等时唯一想知道的事。
+        if (entity.Status == RestoreRequestStatus.Verifying)
+            dto.VerificationQueueLength = _workChannel.Reader.Count;
+
+        return dto;
     }
 
     public async Task<PagedResult<RestoreRequestDto>> GetListAsync(RestoreQuery query, CancellationToken ct = default)

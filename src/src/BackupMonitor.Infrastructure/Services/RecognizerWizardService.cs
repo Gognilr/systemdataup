@@ -86,7 +86,12 @@ public class RecognizerWizardService : IRecognizerWizardService
             {
                 Path = string.IsNullOrWhiteSpace(request.Path) ? null : request.Path.Trim(),
                 MaxDepth = Math.Clamp(request.MaxDepth, 1, 6),
-                MaxEntries = Math.Clamp(request.MaxEntries, 50, 20000)
+                // 审计 D-06：上限从 20000 收到 3000。快照原样进 commands.result_payload，
+                // 一个目录条目序列化约 250 字节，20000 条就是几 MB 一行——
+                // Agent 自己在识别测试那条路径上写过「会把 commands 表撑坏」并限到 50 个文件，
+                // 浏览这条却一直没设限。3000 条正好是本 DTO 的出厂默认值，
+                // 触顶时快照的 Truncated 会如实置位，前端本来就认这个标志。
+                MaxEntries = Math.Clamp(request.MaxEntries, 50, 3000)
             },
             priority: 10,
             ttl: BrowseTtl,

@@ -48,6 +48,10 @@ public class AuthSecurityRegressionTests
         services.AddSingleton(sp => new SystemSettingsProvider(
             sp.GetRequiredService<IServiceScopeFactory>(),
             NullLogger<SystemSettingsProvider>.Instance));
+        // 审计 H-14：撤权要即时生效，AuthService 现在会主动清这个缓存
+        services.AddSingleton(sp => new TokenVersionCache(
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<TokenVersionCache>.Instance));
         return services.BuildServiceProvider();
     }
 
@@ -59,6 +63,7 @@ public class AuthSecurityRegressionTests
             root.GetRequiredService<JwtTokenService>(),
             root.GetRequiredService<SystemSettingsProvider>(),
             root.GetRequiredService<IAuditRecorder>(),
+            root.GetRequiredService<TokenVersionCache>(),
             NullLogger<AuthService>.Instance);
     }
 
@@ -253,6 +258,54 @@ public class AuthSecurityRegressionTests
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var user = await db.Users.AsNoTracking().FirstAsync(u => u.Id == userId);
         Assert.True(user.MustChangePassword);
+    }
+
+    /// <summary>
+    /// 审计 H-14：确认令牌泄露的那一刻，攻击者手上的访问令牌必须立刻失效。
+    ///
+    /// 原先重放检测只吊销刷新令牌——那是有状态的、立刻生效；
+    /// 访问令牌是无状态 JWT，不动 TokenVersion 就得等它自然过期（最长一小时），
+    /// 而这一小时正是最需要立刻切断的时候。改密和登出都做了这一步，
+    /// 唯独安全性最敏感的这一条漏了。
+    /// </summary>
+    [Fact]
+    public async Task 刷新令牌重放检测递增令牌版本并留下审计()
+    {
+        const string password = "Correct-Old-Pw-2026!";
+        await using var provider = BuildServices();
+        await using var scope = provider.CreateAsyncScope();
+        var auth = CreateAuthService(scope);
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var username = $"reuse_{Guid.NewGuid():N}"[..20];
+        var userId = await CreateTestUserAsync(scope, username, password);
+
+        var login = await auth.LoginAsync(
+            new LoginRequest { Username = username, Password = password }, "127.0.0.1", "t");
+        var versionBefore = (await db.Users.AsNoTracking().FirstAsync(u => u.Id == userId)).TokenVersion;
+
+        // 正常轮换一次：旧令牌被标记吊销
+        await auth.RefreshAsync(new RefreshTokenRequest { RefreshToken = login.RefreshToken }, "127.0.0.1", "t");
+
+        // 再用同一个旧令牌——典型的泄露信号
+        var ex = await Assert.ThrowsAsync<BusinessException>(() =>
+            auth.RefreshAsync(new RefreshTokenRequest { RefreshToken = login.RefreshToken }, "127.0.0.1", "t"));
+        Assert.Equal(401, ex.StatusCode);
+
+        var user = await db.Users.AsNoTracking().FirstAsync(u => u.Id == userId);
+        Assert.True(user.TokenVersion > versionBefore, "重放检测必须递增令牌版本，否则已签发的访问令牌仍然全权有效");
+
+        // 缓存必须被清掉，否则新版本号最坏 60 秒后才被中间件看见
+        var cache = scope.ServiceProvider.GetRequiredService<TokenVersionCache>();
+        Assert.Equal(user.TokenVersion, await cache.GetCurrentVersionAsync(userId));
+
+        // 令牌重放是最该留痕的安全事件之一，此前一条审计都没有
+        Assert.True(await db.AuditLogs.AsNoTracking()
+            .AnyAsync(a => a.Action == "auth.token_reuse" && a.ResourceId == userId));
+
+        // 该用户的全部刷新令牌都被吊销
+        Assert.False(await db.RefreshTokens.AsNoTracking()
+            .AnyAsync(t => t.UserId == userId && t.RevokedAt == null));
     }
 }
 

@@ -271,7 +271,7 @@ public class UploadSessionResumeTests : IDisposable
         sc.AddSingleton(sp => new SystemSettingsProvider(
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetRequiredService<ILogger<SystemSettingsProvider>>()));
-        sc.AddSingleton(Channel.CreateUnbounded<WorkItem>());
+        sc.AddKeyedSingleton(QueueKeys.Commit, (_, _) => Channel.CreateUnbounded<WorkItem>());
         sc.AddScoped<IUploadSessionService, UploadSessionService>();
         return sc.BuildServiceProvider();
     }

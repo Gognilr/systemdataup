@@ -340,6 +340,16 @@ public sealed class BackupScannerTests : IDisposable
         Assert.Equal("passed", result.Status);
         Assert.Equal(_root, result.SourceRoot);
     }
+    /// <summary>相对路径没有可当围栏的字面前缀，必须给一条看得懂的拒绝理由。</summary>
+    [Fact]
+    public async Task 相对通配路径被拒绝并说明要绝对路径()
+    {
+        var result = Assert.Single(await ScanPathAsync(
+            Path.Combine("relative", "*"), "multi_file_set", "{}"));
+
+        Assert.Equal("path_not_found", result.Status);
+        Assert.Contains("绝对路径", result.FailureMessage);
+    }
     // ---------- groupBy：一次备份 = 同目录下的一组文件 ----------
 
     /// <summary>

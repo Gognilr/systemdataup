@@ -323,6 +323,7 @@ public sealed record RecognizerRules(
 
     /// <summary>无法从 groupBy 得出分组键的文件的归属。刻意用一个文件名里不可能出现的值。</summary>
     public const string UngroupedKey = "\u0000ungrouped";
+
     /// <summary>某个文件是否被 requiredFiles 点名。</summary>
     public bool IsRequiredFile(string relativePath) =>
         Required.Count == 0 || Required.Any(pattern => MatchesPath(relativePath, pattern));

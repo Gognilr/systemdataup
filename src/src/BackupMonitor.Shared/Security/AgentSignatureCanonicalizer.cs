@@ -7,21 +7,69 @@ namespace BackupMonitor.Shared.Security;
 
 /// <summary>
 /// Agent 指令与配置签名的唯一规范化入口。
-/// v1 使用 Unix 毫秒时间戳和固定字段顺序；字符串字段使用 Base64Url 编码，避免分隔符和空值产生歧义。
+/// 使用 Unix 毫秒时间戳和固定字段顺序；字符串字段使用 Base64Url 编码，避免分隔符和空值产生歧义。
+///
+/// 指令与配置各自带版本号，且**刻意不共用一个常量**：两者的灰度节奏不同。
+/// 指令签名升到 v2（审计 C-01），配置签名仍是 v1——如果共用一个 CurrentVersion，
+/// 「Agent 先于服务端升级」这个发布顺序会让新 Agent 算出 v2 的配置原文、
+/// 而尚未升级的服务端还在签 v1，配置直接验不过，Agent 连配置都拿不到。
 /// </summary>
 public static class AgentSignatureCanonicalizer
 {
-    public const string CurrentVersion = "v1";
+    /// <summary>指令签名当前版本。v2 起把 taskId / candidateBackupSetId / payload 纳入签名范围。</summary>
+    public const string CommandVersion = "v2";
+
+    /// <summary>配置签名版本（未变更）</summary>
+    public const string ConfigVersion = "v1";
+
     private const string NullField = "~";
     private static readonly JsonSerializerOptions LegacyJsonOptions = new(JsonSerializerDefaults.General);
 
+    /// <summary>
+    /// 指令签名原文 v2（审计 C-01）。
+    ///
+    /// v1 只签了 id·nonce·type·clientId·expiresAt——真正决定这条指令做什么的
+    /// taskId / candidateBackupSetId / payload 三个字段全在签名之外。
+    /// 于是能改写响应体的人可以把 upgrade_agent 的 packageUrl 和 sha256 一起换掉，
+    /// Agent 会照攻击者给的哈希校验通过、解压、等待重启切换，而验签全程返回 true。
+    /// 指令签名这套机制存在的全部意义就是防这个。
+    ///
+    /// payload 必须是从库里读回来的那份字符串原文。commands.payload 是 jsonb，
+    /// PostgreSQL 会重排键、规范化空白；签名与验签两端拿到的都是同一份规范化后的文本，
+    /// 中间**绝对不能**再做一次 JsonSerializer 往返——那会产生一份和库里不一样的文本。
+    /// </summary>
     public static byte[] CommandPayload(
         Guid commandId,
         string nonce,
         string commandType,
         Guid clientId,
+        DateTime expiresAt,
+        Guid? taskId,
+        Guid? candidateBackupSetId,
+        string? payload) =>
+        Utf8(CommandVersion + "|" + JoinFields(
+            "command",
+            commandId.ToString("D"),
+            nonce,
+            commandType,
+            clientId.ToString("D"),
+            ToUnixMilliseconds(expiresAt).ToString(CultureInfo.InvariantCulture),
+            taskId?.ToString("D"),
+            candidateBackupSetId?.ToString("D"),
+            payload));
+
+    /// <summary>
+    /// 指令签名原文 v1，供灰度升级窗口验签使用；服务端升级后不再生成此格式。
+    /// 灰度窗口结束后连同 <see cref="LegacyCommandPayload"/> 一并删除，
+    /// 已登记在 docs/系统审查-整改追踪.md——留着它等于把 C-01 这个漏洞以兼容分支的形式养起来。
+    /// </summary>
+    public static byte[] CommandPayloadV1(
+        Guid commandId,
+        string nonce,
+        string commandType,
+        Guid clientId,
         DateTime expiresAt) =>
-        Utf8(CurrentVersion + "|" + JoinFields(
+        Utf8("v1|" + JoinFields(
             "command",
             commandId.ToString("D"),
             nonce,
@@ -29,7 +77,7 @@ public static class AgentSignatureCanonicalizer
             clientId.ToString("D"),
             ToUnixMilliseconds(expiresAt).ToString(CultureInfo.InvariantCulture)));
 
-    /// <summary>兼容上一版本 Agent 的签名原文，供灰度升级窗口验签使用；服务端不再生成此格式。</summary>
+    /// <summary>兼容更早版本 Agent 的签名原文，供灰度升级窗口验签使用；服务端不再生成此格式。</summary>
     public static byte[] LegacyCommandPayload(
         Guid commandId,
         string nonce,
@@ -98,7 +146,7 @@ public static class AgentSignatureCanonicalizer
 
         fields.Add(globalSettings.HeartbeatIntervalSeconds.ToString(CultureInfo.InvariantCulture));
         fields.Add(globalSettings.MaxConcurrentUploads.ToString(CultureInfo.InvariantCulture));
-        return Utf8(CurrentVersion + "|" + JoinFields(fields.ToArray()));
+        return Utf8(ConfigVersion + "|" + JoinFields(fields.ToArray()));
     }
 
     /// <summary>兼容上一版本 DTO JSON 签名，供灰度升级窗口验签使用。</summary>

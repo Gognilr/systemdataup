@@ -27,6 +27,7 @@ public sealed class AgentWorker : BackgroundService
     private readonly AgentStateStore _stateStore;
     private readonly AgentTrayNotificationStore _trayNotifications;
     private readonly AgentConfigStore _configStore;
+    private readonly AgentCandidateFileStore _candidateFiles;
     private readonly AgentApiClient _api;
     private readonly AgentSignatureVerifier _signatures;
     private readonly SystemProbe _probe;
@@ -34,13 +35,38 @@ public sealed class AgentWorker : BackgroundService
     private readonly DirectoryBrowser _browser;
     private readonly InstalledServiceProbe _serviceProbe;
     private readonly ILogger<AgentWorker> _logger;
-    private readonly HashSet<Guid> _activeCommands = [];
+
+    /// <summary>
+    /// 正在执行的指令 ID（审计 B-02）。
+    ///
+    /// 拆循环之后它跨线程了：心跳循环读它组装 ActiveCommands，指令循环写它。
+    /// 原先是 HashSet，单循环时代没问题，现在必须换成并发容器。
+    /// 用 ConcurrentDictionary 当集合（值不用）是因为 .NET 里没有 ConcurrentHashSet。
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, byte> _activeCommands = new();
+
+    /// <summary>
+    /// 已验签的当前配置缓存（审计 B-02）。
+    ///
+    /// LoadVerifiedConfig() 每次都要读文件再做一次 RSA 验签。单循环时代一轮只调几次，
+    /// 拆成三条循环之后每条都要用，反复验签纯属浪费。
+    /// volatile + 整体替换引用：读侧只做一次快照读，不加锁；
+    /// 配置对象本身在替换之后不再被修改，因此读到的引用永远是一份自洽的完整配置。
+    /// </summary>
+    private volatile AgentConfigResponse? _config;
+
+    /// <summary>
+    /// SyncConfigAsync 互斥（审计 B-02）。心跳循环发现 RequiredConfigVersion 更高会调它，
+    /// sync_config 指令也会调它——两边同时写 config.json 会写出半份文件。
+    /// </summary>
+    private readonly SemaphoreSlim _configSync = new(1, 1);
 
     public AgentWorker(
         IOptions<AgentOptions> options,
         AgentStateStore stateStore,
         AgentTrayNotificationStore trayNotifications,
         AgentConfigStore configStore,
+        AgentCandidateFileStore candidateFiles,
         AgentApiClient api,
         AgentSignatureVerifier signatures,
         SystemProbe probe,
@@ -53,6 +79,7 @@ public sealed class AgentWorker : BackgroundService
         _stateStore = stateStore;
         _trayNotifications = trayNotifications;
         _configStore = configStore;
+        _candidateFiles = candidateFiles;
         _api = api;
         _signatures = signatures;
         _probe = probe;
@@ -66,69 +93,230 @@ public sealed class AgentWorker : BackgroundService
     {
         _logger.LogInformation("BackupMonitor Agent {Version} 启动，服务器={Server}", _options.AgentVersion, _options.ServerUrl);
 
-        while (!stoppingToken.IsCancellationRequested)
+        // 注册与首次取证书仍然串行：没有 clientId 和客户端证书，
+        // 下面三条循环里没有一条能发出任何请求。
+        if (!await WaitForRegistrationAsync(stoppingToken))
+        {
+            _logger.LogInformation("BackupMonitor Agent 停止");
+            return;
+        }
+
+        RefreshConfigCache();
+
+        // 审计 F-08：老版本把候选文件清单内嵌在 state.json 里，升级后必须搬出来。
+        // 不搬的话所有候选丢失，已通过预检的备份要重新全量 SHA-256 扫一遍。
+        var migrated = _stateStore.MigrateEmbeddedCandidateFiles(_candidateFiles);
+        if (migrated > 0)
+            _logger.LogInformation("已将 {Count} 个候选的文件清单迁出 state.json", migrated);
+
+        // 审计 B-02：拆成三条独立节奏。
+        //
+        // 原先只有一条顺序循环，心跳、指令执行、计划扫描共用它，而指令执行是 await 到底的：
+        // 传一份 50GB 的备份要几个小时，这几小时里一次心跳都发不出去，
+        // 服务端 SystemWatchdogWorker 按 client_offline_threshold_seconds（默认 300 秒）
+        // 判离线并发 Critical 告警——每一次正经的备份上传都会在 5 分钟后
+        // 把这台正在老实干活的机器判成离线，把离线巡检训练成「狼来了」然后被关掉。
+        //
+        // 刻意不用「在上传循环里插补心跳」代替拆循环：那是止血，
+        // 扫描阶段的长哈希覆盖不到（扫一个大目录同样能超过 5 分钟），
+        // 而且每加一个耗时动作就要记得插一次，迟早会漏。
+        await Task.WhenAll(
+            RunHeartbeatLoopAsync(stoppingToken),
+            RunCommandLoopAsync(stoppingToken),
+            RunScanLoopAsync(stoppingToken));
+
+        _logger.LogInformation("BackupMonitor Agent 停止");
+    }
+
+    /// <summary>注册 + 首次证书安装，成功之前一直重试。返回 false 表示收到停机信号。</summary>
+    private async Task<bool> WaitForRegistrationAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
         {
             try
             {
-                if (_stateStore.Snapshot().ClientId is null)
+                if (_stateStore.Snapshot().ClientId is not null)
                 {
-                    if (!await EnsureRegisteredAsync(stoppingToken))
-                        await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
-                    continue;
+                    await RenewCertificateIfNeededAsync(ct);
+                    return true;
                 }
 
-                await RenewCertificateIfNeededAsync(stoppingToken);
+                if (!await EnsureRegisteredAsync(ct))
+                    await Task.Delay(TimeSpan.FromSeconds(10), ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Agent 注册流程异常");
+                _stateStore.Update(s => s.LastError = ex.Message);
+                if (!await DelayAsync(10, ct))
+                    return false;
+            }
+        }
 
-                var config = LoadVerifiedConfig();
+        return false;
+    }
+
+    /// <summary>
+    /// 心跳循环：按服务端下发的 heartbeat_interval_seconds 走（审计 B-09）。
+    ///
+    /// 原先的 delay 是 Math.Min(heartbeatDelay, CommandPollIntervalSeconds) 再 Clamp 到 2..60，
+    /// 于是服务端配的 heartbeat_interval_seconds 只要大于 10 秒就完全失效——
+    /// 实际心跳量是设计值的 6 倍，而管理员改那个配置根本没有任何效果。
+    /// </summary>
+    private async Task RunHeartbeatLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var delaySeconds = Math.Clamp(_options.HeartbeatIntervalSeconds, 5, 300);
+            try
+            {
+                await RenewCertificateIfNeededAsync(ct);
+
                 var state = _stateStore.Snapshot();
                 var heartbeat = await _api.HeartbeatAsync(
-                    _probe.BuildHeartbeat(state.ConfigVersion, config, _activeCommands), stoppingToken);
+                    _probe.BuildHeartbeat(state.ConfigVersion, _config, _activeCommands.Keys.ToList()), ct);
+
                 ProcessNotifications(heartbeat.Notifications);
 
                 if (heartbeat.CertificateRenewalRequired)
-                    await RenewCertificateIfNeededAsync(stoppingToken, force: true);
+                    await RenewCertificateIfNeededAsync(ct, force: true);
 
                 if (heartbeat.RequiredConfigVersion > state.ConfigVersion)
-                    config = await SyncConfigAsync(stoppingToken) ?? config;
+                    await SyncConfigAsync(ct);
 
-                if (heartbeat.CommandsAvailable || _activeCommands.Count == 0)
-                    await ClaimAndExecuteCommandsAsync(stoppingToken);
-
-                await RunScheduledScansAsync(config, stoppingToken);
-                await RetryPendingRestabilizeScansAsync(config, stoppingToken);
-
-                var heartbeatDelay = heartbeat.HeartbeatIntervalSeconds > 0
-                    ? heartbeat.HeartbeatIntervalSeconds
-                    : _options.HeartbeatIntervalSeconds;
-                await Task.Delay(TimeSpan.FromSeconds(Math.Clamp(Math.Min(heartbeatDelay, _options.CommandPollIntervalSeconds), 2, 60)), stoppingToken);
+                if (heartbeat.HeartbeatIntervalSeconds > 0)
+                    delaySeconds = Math.Clamp(heartbeat.HeartbeatIntervalSeconds, 5, 300);
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 break;
             }
             catch (AgentApiException ex)
             {
-                _logger.LogWarning("Agent API 调用失败 status={Status} code={Code}: {Message}", ex.StatusCode, ex.ErrorCode, ex.Message);
-                _stateStore.Update(s => s.LastError = ex.Message);
+                LogApiFailure(ex);
 
                 // mTLS 形态下 401 意味着服务端没有收到（或不认）本次连接出示的客户端证书。
                 // 本地明明装着证书却被拒，最可能的原因是连接的 TLS 身份与本地证书脱节——
                 // 证书是握手时协商的，池中的旧连接不会因为本地换了证书而改变身份。
-                // 重新握手即可自愈；代价是每 10 秒一次 TLS 握手，可以忽略。
+                // 重新握手即可自愈。放在心跳循环里就够了：连接池是共享的，
+                // 回收一次三条循环都受益，不必每条各判一遍。
                 if (ex.StatusCode == 401 && _stateStore.Snapshot().CertificateThumbprint is not null)
                     _api.RecycleConnections();
 
-                await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+                delaySeconds = 10;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Agent 工作循环异常");
+                _logger.LogError(ex, "Agent 心跳循环异常");
                 _stateStore.Update(s => s.LastError = ex.Message);
-                await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken);
+                delaySeconds = 10;
             }
-        }
 
-        _logger.LogInformation("BackupMonitor Agent 停止");
+            if (!await DelayAsync(delaySeconds, ct))
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 指令循环：按 CommandPollIntervalSeconds 轮询，不携带任何快照（审计 B-09）。
+    ///
+    /// 指令之间仍然串行（MaxItems 不变）。拆的是「心跳 vs 指令」，不是「指令之间」——
+    /// 并发跑多个上传会把源盘 IO 打满，那是另一个问题。
+    /// </summary>
+    private async Task RunCommandLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var delaySeconds = Math.Clamp(_options.CommandPollIntervalSeconds, 2, 60);
+            try
+            {
+                await ClaimAndExecuteCommandsAsync(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (AgentApiException ex)
+            {
+                LogApiFailure(ex);
+                delaySeconds = 10;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Agent 指令循环异常");
+                _stateStore.Update(s => s.LastError = ex.Message);
+                delaySeconds = 10;
+            }
+
+            if (!await DelayAsync(delaySeconds, ct))
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 计划扫描循环。扫一个大目录同样可能跑几分钟，
+    /// 它和指令执行分开是因为两者都是耗时动作，堵在一起就等于没拆。
+    /// </summary>
+    private async Task RunScanLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var delaySeconds = Math.Clamp(_options.CommandPollIntervalSeconds, 5, 60);
+            try
+            {
+                var config = _config;
+                await RunScheduledScansAsync(config, ct);
+                await RetryPendingRestabilizeScansAsync(config, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (AgentApiException ex)
+            {
+                LogApiFailure(ex);
+                delaySeconds = 10;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Agent 计划扫描循环异常");
+                _stateStore.Update(s => s.LastError = ex.Message);
+                delaySeconds = 10;
+            }
+
+            if (!await DelayAsync(delaySeconds, ct))
+                break;
+        }
+    }
+
+    public override void Dispose()
+    {
+        _configSync.Dispose();
+        base.Dispose();
+    }
+
+    private void LogApiFailure(AgentApiException ex)
+    {
+        _logger.LogWarning("Agent API 调用失败 status={Status} code={Code}: {Message}", ex.StatusCode, ex.ErrorCode, ex.Message);
+        _stateStore.Update(s => s.LastError = ex.Message);
+    }
+
+    /// <summary>循环末尾的统一等待。返回 false 表示收到停机信号。</summary>
+    private static async Task<bool> DelayAsync(int seconds, CancellationToken ct)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(seconds), ct);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
     }
 
     private async Task RenewCertificateIfNeededAsync(CancellationToken ct, bool force = false)
@@ -164,25 +352,37 @@ public sealed class AgentWorker : BackgroundService
         if (notifications is null)
             return;
 
-        var seen = _stateStore.Snapshot().SeenNotificationIds;
+        var seen = _stateStore.Snapshot().SeenNotificationIds.ToHashSet();
+        var enqueued = new List<Guid>();
+
         foreach (var notification in notifications)
         {
-            if (notification.Id == Guid.Empty || seen.Contains(notification.Id))
+            if (notification.Id == Guid.Empty || !seen.Add(notification.Id))
                 continue;
 
             if (!_trayNotifications.TryEnqueue(notification))
-                continue;
-
-            _stateStore.Update(state =>
             {
-                if (!state.SeenNotificationIds.Contains(notification.Id))
-                    state.SeenNotificationIds.Add(notification.Id);
+                seen.Remove(notification.Id);   // 没入队就不算见过，下次心跳还要再试
+                continue;
+            }
 
-                if (state.SeenNotificationIds.Count > 500)
-                    state.SeenNotificationIds = state.SeenNotificationIds.TakeLast(500).ToList();
-            });
-            seen.Add(notification.Id);
+            enqueued.Add(notification.Id);
         }
+
+        if (enqueued.Count == 0)
+            return;
+
+        // 审计 F-08：循环外一次 Update。原先每条通知一次，而一次心跳最多带 20 条——
+        // 那就是 20 次「建临时文件 + 打 ACL + 全量写 + Move + 再打一次 ACL」。
+        // 上限截断交给 SaveUnsafe 统一处理，这里不重复一份。
+        _stateStore.Update(state =>
+        {
+            foreach (var id in enqueued)
+            {
+                if (!state.SeenNotificationIds.Contains(id))
+                    state.SeenNotificationIds.Add(id);
+            }
+        });
     }
 
     private async Task<bool> EnsureRegisteredAsync(CancellationToken ct)
@@ -261,25 +461,43 @@ public sealed class AgentWorker : BackgroundService
         return true;
     }
 
+    /// <summary>
+    /// 拉取并落地服务端配置。
+    ///
+    /// 审计 B-02：整段用信号量互斥。心跳循环和 sync_config 指令都会调它，
+    /// 两边同时写 config.json 会写出半份文件，而配置一旦坏掉 Agent 就什么都干不了。
+    /// </summary>
     private async Task<AgentConfigResponse?> SyncConfigAsync(CancellationToken ct)
     {
-        var version = _stateStore.Snapshot().ConfigVersion;
-        var config = await _api.GetConfigAsync(version, ct);
-        if (config is null)
-            return LoadVerifiedConfig();
-
-        var clientId = _stateStore.Snapshot().ClientId;
-        if (clientId is null || !_signatures.VerifyConfig(config, clientId.Value))
-            throw new AgentApiException(498, "服务端配置签名校验失败", "CONFIG_SIGNATURE_INVALID");
-
-        _configStore.Save(config);
-        _stateStore.Update(s =>
+        await _configSync.WaitAsync(ct);
+        try
         {
-            s.ConfigVersion = config.Version;
-            s.LastError = null;
-        });
-        _logger.LogInformation("Agent 配置已同步 version={Version} tasks={Tasks}", config.Version, config.Tasks.Count);
-        return config;
+            var version = _stateStore.Snapshot().ConfigVersion;
+            var config = await _api.GetConfigAsync(version, ct);
+            if (config is null)
+                return RefreshConfigCache();   // 304：本地这份就是最新的
+
+            var clientId = _stateStore.Snapshot().ClientId;
+            if (clientId is null || !_signatures.VerifyConfig(config, clientId.Value))
+                throw new AgentApiException(498, "服务端配置签名校验失败", "CONFIG_SIGNATURE_INVALID");
+
+            _configStore.Save(config);
+            _stateStore.Update(s =>
+            {
+                s.ConfigVersion = config.Version;
+                s.LastError = null;
+            });
+
+            // 整体替换引用：读侧看到的要么是旧的完整配置，要么是新的完整配置，
+            // 不存在「一半新一半旧」的中间态。
+            _config = config;
+            _logger.LogInformation("Agent 配置已同步 version={Version} tasks={Tasks}", config.Version, config.Tasks.Count);
+            return config;
+        }
+        finally
+        {
+            _configSync.Release();
+        }
     }
 
     private async Task ClaimAndExecuteCommandsAsync(CancellationToken ct)
@@ -292,14 +510,14 @@ public sealed class AgentWorker : BackgroundService
 
         foreach (var command in response.Commands)
         {
-            _activeCommands.Add(command.Id);
+            _activeCommands[command.Id] = 0;
             try
             {
                 await ExecuteCommandAsync(command, ct);
             }
             finally
             {
-                _activeCommands.Remove(command.Id);
+                _activeCommands.TryRemove(command.Id, out _);
             }
         }
     }
@@ -639,12 +857,18 @@ public sealed class AgentWorker : BackgroundService
         var stabilityDelaySeconds = Math.Max(1, task.StabilityIntervalSeconds);
         var submitted = 0;
 
+        // 审计 F-08：开头取一次快照，循环里不再反复调 Snapshot()。
+        // Snapshot() 是「序列化再反序列化」的深拷贝，state.json 里有多少东西就走多少字节；
+        // 原先每个扫描结果最多要调两次，一次扫描出十几个业务单元就是几十次深拷贝。
+        // 这份快照只用来读「之前有没有重试记录」，写仍然走 Update，不存在读到脏值的问题。
+        var pending = _stateStore.Snapshot().PendingRestabilizeScans;
+
         foreach (var scan in scans)
         {
             if (scan.Status != "still_changing")
             {
                 // 稳定了（或本来就是别的失败原因）：清掉可能存在的重试记录，按老流程上报。
-                if (_stateStore.Snapshot().PendingRestabilizeScans.ContainsKey(scan.CandidateKey))
+                if (pending.ContainsKey(scan.CandidateKey))
                     _stateStore.Update(s => s.PendingRestabilizeScans.Remove(scan.CandidateKey));
 
                 await SubmitOneScanAsync(task, scan, commandId, ct);
@@ -661,7 +885,7 @@ public sealed class AgentWorker : BackgroundService
                 continue;
             }
 
-            var entry = _stateStore.Snapshot().PendingRestabilizeScans.GetValueOrDefault(scan.CandidateKey);
+            var entry = pending.GetValueOrDefault(scan.CandidateKey);
             if (entry is null)
             {
                 var nextRetry = now.AddSeconds(stabilityDelaySeconds);
@@ -728,6 +952,15 @@ public sealed class AgentWorker : BackgroundService
                 state.PendingRestabilizeScans.Remove(stale);
         });
 
+        // 审计 F-08：候选也跟着任务生命周期清理。ScheduledScans 和 PendingRestabilizeScans
+        // 都早就有这段逻辑，唯独 Candidates 只写不删——任务删掉之后那些候选连同清单文件
+        // 一直留着，state.json 只增不减。liveTaskIds 这里现成，直接复用。
+        //
+        // 删文件放在 Update 之外：PruneCandidates 在锁里只收集 key，
+        // 几十次同步删文件不能攥着那把锁做，三条循环都在等它。
+        foreach (var candidateKey in _stateStore.PruneCandidates(liveTaskIds))
+            _candidateFiles.Delete(candidateKey);
+
         var now = DateTime.UtcNow;
         var dueTaskIds = _stateStore.Snapshot().PendingRestabilizeScans.Values
             .Where(e => e.NextRetryAtUtc <= now)
@@ -787,6 +1020,17 @@ public sealed class AgentWorker : BackgroundService
 
         if (response.CandidateBackupSetId is not null && scan.Status == "passed")
         {
+            // 审计 F-08：清单先落独立文件，再往 state.json 写摘要。
+            // 顺序不能反——先写摘要的话，进程在两步之间挂掉会留下一条
+            // 「有候选、没清单」的记录，上传时才发现，那时已经建过会话了。
+            _candidateFiles.Save(scan.CandidateKey, scan.Files.Select(f => new LocalCandidateFile
+            {
+                RelativePath = f.RelativePath,
+                FullPath = Path.GetFullPath(Path.Combine(scan.SourceRoot, f.RelativePath.Replace('/', Path.DirectorySeparatorChar))),
+                SizeBytes = f.SizeBytes,
+                Sha256 = f.Sha256 ?? string.Empty
+            }).ToList());
+
             _stateStore.Update(s => s.Candidates[scan.CandidateKey] = new LocalCandidateState
             {
                 CandidateBackupSetId = response.CandidateBackupSetId,
@@ -796,13 +1040,6 @@ public sealed class AgentWorker : BackgroundService
                 ManifestHash = scan.ManifestHash ?? string.Empty,
                 TotalFiles = scan.Files.Count,
                 TotalBytes = scan.Files.Sum(f => f.SizeBytes),
-                Files = scan.Files.Select(f => new LocalCandidateFile
-                {
-                    RelativePath = f.RelativePath,
-                    FullPath = Path.GetFullPath(Path.Combine(scan.SourceRoot, f.RelativePath.Replace('/', Path.DirectorySeparatorChar))),
-                    SizeBytes = f.SizeBytes,
-                    Sha256 = f.Sha256 ?? string.Empty
-                }).ToList(),
                 UpdatedAt = DateTime.UtcNow
             });
         }
@@ -832,6 +1069,16 @@ public sealed class AgentWorker : BackgroundService
         if (candidate is null)
             return CommandResult.FromFailure("CANDIDATE_NOT_FOUND", $"本地没有候选集：{candidateId}");
 
+        // 审计 F-08：文件清单不再随 state.json 一起加载，只在真正要传的时候读一次。
+        // 读不出来就明确失败，绝不带着半份清单去建会话——那会传上去一个不完整的备份集。
+        var candidateFiles = _candidateFiles.Load(candidate.CandidateKey);
+        if (candidateFiles.Count == 0)
+        {
+            return CommandResult.FromFailure(
+                "CANDIDATE_FILES_MISSING",
+                $"本地候选文件清单缺失或损坏：{candidate.CandidateKey}，请重新预检");
+        }
+
         var config = LoadVerifiedConfig();
         var task = config?.Tasks.FirstOrDefault(t => t.TaskId == candidate.TaskId);
         var chunkSize = task?.ChunkSizeBytes is >= 4 * 1024 * 1024 and <= 32 * 1024 * 1024
@@ -855,33 +1102,155 @@ public sealed class AgentWorker : BackgroundService
         var bandwidthLimitKbps = ReadInt(command.Payload, "bandwidthLimitKbps") ?? task?.BandwidthLimitKbps;
         var throttle = new ChunkThrottle(bandwidthLimitKbps);
 
-        foreach (var remoteFile in session.Files)
-        {
-            var local = candidate.Files.FirstOrDefault(f => string.Equals(f.RelativePath, remoteFile.RelativePath, StringComparison.OrdinalIgnoreCase));
-            if (local is null || !File.Exists(local.FullPath))
-                return CommandResult.FromFailure("LOCAL_FILE_MISSING", $"本地文件不存在：{remoteFile.RelativePath}");
+        // 审计 A-10：会话一旦建出来，从这里往下的任何失败出口都必须尽力取消它。
+        // 原先源文件缺失那条是直接 return，异常那条一路冒到 ExecuteCommandAsync，
+        // 两条都不碰会话——服务端于是攒下永久 uploading 会话，攒够
+        // max_concurrent_uploads 这台机器就再也传不上去了。
+        // 收在一个 try/catch 里而不是在每个出口前各加一句，是因为后者迟早会漏一个。
+        // 审计 B-15：ReportProgressAsync 服务端和客户端都实现了，AgentWorker 一次都没调过——
+        // 于是「正在传 50GB」这件事在管理端表现为一条什么都不显示的「正在执行」。
+        var totalBytes = Math.Max(1L, candidate.TotalBytes);
+        var progress = new ProgressReporter(_api, _logger, command.Id, totalBytes);
+        long sentBytes = 0;
 
-            var missing = await _api.GetMissingChunksAsync(session.UploadSessionId, remoteFile.UploadFileId, ct);
-            var indexes = ExpandMissing(missing, local.SizeBytes, session.ChunkSizeBytes);
-            foreach (var index in indexes)
+        try
+        {
+            foreach (var remoteFile in session.Files)
             {
-                await UploadChunkWithRetryAsync(session.UploadSessionId, remoteFile.UploadFileId, local.FullPath, index, session.ChunkSizeBytes, throttle, ct);
+                var local = candidateFiles.FirstOrDefault(f => string.Equals(f.RelativePath, remoteFile.RelativePath, StringComparison.OrdinalIgnoreCase));
+                if (local is null || !File.Exists(local.FullPath))
+                {
+                    // 抛而不是 return：让它和分块上传的异常走同一条收尾路径。
+                    // 增量备份场景里「预检通过之后源文件被删/改名」很常见，
+                    // 这是 A-03 僵尸会话最主要的触发源。
+                    throw new UploadAbortedException("LOCAL_FILE_MISSING", $"本地文件不存在：{remoteFile.RelativePath}");
+                }
+
+                var missing = await _api.GetMissingChunksAsync(session.UploadSessionId, remoteFile.UploadFileId, ct);
+                var indexes = ExpandMissing(missing, local.SizeBytes, session.ChunkSizeBytes);
+                foreach (var index in indexes)
+                {
+                    await UploadChunkWithRetryAsync(session.UploadSessionId, remoteFile.UploadFileId, local.FullPath, index, session.ChunkSizeBytes, throttle, ct);
+
+                    // 只累加本次真正传的块。续传时已在服务端的块不在 indexes 里，
+                    // 因此百分比反映的是「这一次要传多少」，不是文件总量——
+                    // 对看进度的人来说这才是有意义的那个数。
+                    sentBytes += Math.Min(session.ChunkSizeBytes, local.SizeBytes - (long)index * session.ChunkSizeBytes);
+                    await progress.ReportAsync(sentBytes, local.RelativePath, ct);
+                }
+
+                await _api.CompleteUploadFileAsync(session.UploadSessionId, remoteFile.UploadFileId, new CompleteUploadFileRequest
+                {
+                    SizeBytes = local.SizeBytes,
+                    Sha256 = local.Sha256
+                }, ct);
             }
 
-            await _api.CompleteUploadFileAsync(session.UploadSessionId, remoteFile.UploadFileId, new CompleteUploadFileRequest
+            var completed = await _api.CompleteUploadSessionAsync(session.UploadSessionId, new CompleteUploadSessionRequest
             {
-                SizeBytes = local.SizeBytes,
-                Sha256 = local.Sha256
+                ManifestHash = candidate.ManifestHash,
+                TotalFiles = candidate.TotalFiles,
+                TotalBytes = candidate.TotalBytes
             }, ct);
+            return CommandResult.FromSuccess("UPLOAD_ACCEPTED", $"上传会话已提交校验：{completed.VerificationOperationId}");
+        }
+        catch (UploadAbortedException ex)
+        {
+            await TryCancelSessionAsync(session.UploadSessionId, ct);
+            return CommandResult.FromFailure(ex.ResultCode, ex.Message);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            await TryCancelSessionAsync(session.UploadSessionId, ct);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 上传进度节流上报器（审计 B-15）。
+    ///
+    /// 必须节流：每块上报一次会把 commands 表写爆——50GB / 8MB = 6400 次 UPDATE，
+    /// 而进度是给人看的，人不需要每 8MB 看一次。
+    /// 两个条件同时满足才发：距上次至少 30 秒，且百分比至少涨了 5 个点。
+    ///
+    /// 上报失败只记 LogDebug 吞掉：它是装饰，让它把一次正在进行的上传搞失败是本末倒置。
+    /// </summary>
+    private sealed class ProgressReporter
+    {
+        private static readonly TimeSpan MinInterval = TimeSpan.FromSeconds(30);
+        private const decimal MinPercentDelta = 5m;
+
+        private readonly AgentApiClient _api;
+        private readonly ILogger _logger;
+        private readonly Guid _commandId;
+        private readonly long _totalBytes;
+        private readonly Stopwatch _clock = Stopwatch.StartNew();
+
+        private TimeSpan _lastReportedAt = TimeSpan.MinValue;
+        private decimal _lastReportedPercent = -MinPercentDelta;
+
+        public ProgressReporter(AgentApiClient api, ILogger logger, Guid commandId, long totalBytes)
+        {
+            _api = api;
+            _logger = logger;
+            _commandId = commandId;
+            _totalBytes = totalBytes;
         }
 
-        var completed = await _api.CompleteUploadSessionAsync(session.UploadSessionId, new CompleteUploadSessionRequest
+        public async Task ReportAsync(long sentBytes, string currentPath, CancellationToken ct)
         {
-            ManifestHash = candidate.ManifestHash,
-            TotalFiles = candidate.TotalFiles,
-            TotalBytes = candidate.TotalBytes
-        }, ct);
-        return CommandResult.FromSuccess("UPLOAD_ACCEPTED", $"上传会话已提交校验：{completed.VerificationOperationId}");
+            var percent = Math.Clamp(Math.Round((decimal)sentBytes * 100 / _totalBytes, 2), 0, 100);
+            if (_clock.Elapsed - _lastReportedAt < MinInterval || percent - _lastReportedPercent < MinPercentDelta)
+                return;
+
+            _lastReportedAt = _clock.Elapsed;
+            _lastReportedPercent = percent;
+
+            try
+            {
+                await _api.ReportProgressAsync(_commandId, new CommandProgressRequest
+                {
+                    Percent = percent,
+                    Stage = "uploading",
+                    Message = currentPath
+                }, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogDebug(ex, "上传进度上报失败 command={CommandId}（不影响上传本身）", _commandId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 上传中止：把「已知原因的失败」变成异常，好让它和意外异常共用同一条收尾路径。
+    /// ResultCode 原样回报给服务端，语义与改造前的 CommandResult.FromFailure 一致。
+    /// </summary>
+    private sealed class UploadAbortedException : Exception
+    {
+        public UploadAbortedException(string resultCode, string message) : base(message) => ResultCode = resultCode;
+
+        public string ResultCode { get; }
+    }
+
+    /// <summary>
+    /// 尽力取消会话。取消失败只记日志——它是收尾动作，
+    /// 让它的异常盖掉真正的失败原因，排障时看到的就会是「取消失败」而不是「文件不存在」。
+    ///
+    /// 服务端仍然必须有 LifecycleExpiryWorker 的超时兜底：客户端可能是被 kill 的，
+    /// 根本没机会执行这一步。两者是纵深关系，不是二选一。
+    /// </summary>
+    private async Task TryCancelSessionAsync(Guid sessionId, CancellationToken ct)
+    {
+        try
+        {
+            await _api.CancelUploadSessionAsync(sessionId, ct);
+            _logger.LogInformation("上传失败，已取消会话 {SessionId}", sessionId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "上传失败后取消会话未成功 {SessionId}（服务端超时巡检会兜底）", sessionId);
+        }
     }
 
     private async Task UploadChunkWithRetryAsync(Guid sessionId, Guid fileId, string path, int chunkIndex, int chunkSize, ChunkThrottle throttle, CancellationToken ct)
@@ -980,6 +1349,17 @@ public sealed class AgentWorker : BackgroundService
             return CommandResult.FromFailure("UPGRADE_PACKAGE_URL_INVALID", "升级包必须使用 HTTP 或 HTTPS 地址");
         }
 
+        // 纵深防御（审计 C-01）：签名覆盖 payload 之后这一条在理论上是冗余的，
+        // 但升级是全系统唯一一条「服务端说什么就执行什么代码」的路径，值得两道锁。
+        // 只比 host:port，不比 scheme——Secure 形态下 nginx 终结 TLS 后回环到 Kestrel，
+        // 两端的 scheme 本来就可能不同。
+        if (!IsSameServerAuthority(packageUri))
+        {
+            return CommandResult.FromFailure(
+                "UPGRADE_PACKAGE_URL_FORBIDDEN",
+                $"升级包地址不在本 Agent 的服务端上：{packageUri.Host}:{packageUri.Port}");
+        }
+
         if (!Regex.IsMatch(expectedHash ?? string.Empty, "^[0-9a-fA-F]{64}$"))
             return CommandResult.FromFailure("UPGRADE_HASH_REQUIRED", "升级包必须提供 64 位 SHA-256");
 
@@ -996,6 +1376,24 @@ public sealed class AgentWorker : BackgroundService
         await File.WriteAllTextAsync(Path.Combine(_options.ExpandedDataDirectory, "pending-update.json"),
             JsonSerializer.Serialize(new { version, packagePath, sha256 = actualHash, stagedAt = DateTime.UtcNow }), ct);
         return CommandResult.FromSuccess("UPGRADE_STAGED", $"升级包已安全解压到 {updateRoot}，将在受控重启时切换");
+    }
+
+    private bool IsSameServerAuthority(Uri packageUri) => IsSameServerAuthority(packageUri, _options.ServerUrl);
+
+    /// <summary>
+    /// 升级包地址是否指向本 Agent 自己的服务端（只比 host:port）。
+    /// serverUrl 解析不出来时一律拒绝——配置坏掉的时候更不该放行任意下载。
+    ///
+    /// 拆成静态方法是为了能单测：整个 AgentWorker 的依赖太重，
+    /// 为一条 host 比对去把它组装出来不划算。
+    /// </summary>
+    public static bool IsSameServerAuthority(Uri packageUri, string? serverUrl)
+    {
+        if (!Uri.TryCreate(serverUrl, UriKind.Absolute, out var serverUri))
+            return false;
+
+        return string.Equals(packageUri.Host, serverUri.Host, StringComparison.OrdinalIgnoreCase)
+               && packageUri.Port == serverUri.Port;
     }
 
     private static IEnumerable<int> ExpandMissing(MissingChunksResponse missing, long size, int chunkSize)
@@ -1177,16 +1575,26 @@ public sealed class AgentWorker : BackgroundService
         }
     }
 
-    private AgentConfigResponse? LoadVerifiedConfig()
+    /// <summary>
+    /// 从磁盘读一次配置并验签，结果写进 <see cref="_config"/> 缓存（审计 B-02）。
+    ///
+    /// 验签是 RSA 运算，三条循环各自反复调没有意义——配置只在 SyncConfigAsync
+    /// 成功之后才会变，那一刻更新缓存就够了。
+    /// </summary>
+    private AgentConfigResponse? RefreshConfigCache()
     {
         var config = _configStore.Load();
         var clientId = _stateStore.Snapshot().ClientId;
-        return config is not null
-               && clientId is not null
-               && _signatures.VerifyConfig(config, clientId.Value)
+        _config = config is not null
+                  && clientId is not null
+                  && _signatures.VerifyConfig(config, clientId.Value)
             ? config
             : null;
+        return _config;
     }
+
+    /// <summary>缓存里的配置；为空时（首次启动、刚注册完）现场读一次。</summary>
+    private AgentConfigResponse? LoadVerifiedConfig() => _config ?? RefreshConfigCache();
 
     private string? ReadRegistrationToken()
     {

@@ -25,6 +25,16 @@ public class NotificationDelivery
 
     public string? ErrorMessage { get; set; }
 
+    /// <summary>
+    /// 标题前缀（审计 G-11）。等级提升补发的那一封带「【已升级】」，
+    /// 让收件人一眼看出这不是同一封警告的重发。
+    ///
+    /// 放在投递记录而不是改 alerts.title：告警标题描述的是「出了什么事」，
+    /// 那件事本身没变，变的只是这一次通知要传达的信息；
+    /// 而且同一条告警可能升级多次，改标题会让前缀越叠越长。
+    /// </summary>
+    public string? TitlePrefix { get; set; }
+
     // 导航属性
     public Alert? Alert { get; set; }
 }

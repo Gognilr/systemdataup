@@ -281,20 +281,34 @@ public class AgentHeartbeatService : IAgentHeartbeatService
             }
         }
 
-        foreach (var disk in disks ?? [])
+        // 审计 B-09：磁盘快照没变时 Agent 不再重复上报（disks 为 null），
+        // 但「快照没变」恰恰意味着盘还是那么满——原先这一整段直接被跳过，
+        // 磁盘告警会因为「没有新数据」而不再评估，也就再不会恢复。
+        // 回落到库里最近一次上报的 ClientDisks，判定依据不变。
+        var evaluated = disks?
+            .Select(d => (d.DriveName, d.IsSourceVolume, d.TotalBytes, d.FreeBytes))
+            .ToList()
+            ?? await _db.ClientDisks
+                .AsNoTracking()
+                .Where(d => d.ClientId == clientId)
+                .Select(d => new ValueTuple<string, bool, long?, long?>(
+                    d.DriveName, d.IsSourceVolume, d.TotalBytes, d.FreeBytes))
+                .ToListAsync(ct);
+
+        foreach (var (driveName, isSourceVolume, totalBytes, freeBytes) in evaluated)
         {
-            if (!disk.IsSourceVolume || disk.TotalBytes is not > 0 || disk.FreeBytes is null)
+            if (!isSourceVolume || totalBytes is not > 0 || freeBytes is null)
                 continue;
 
-            var freePercent = (decimal)disk.FreeBytes.Value / disk.TotalBytes.Value * 100;
-            var alertKey = $"client:{clientId}:resource:disk:{disk.DriveName}";
+            var freePercent = (decimal)freeBytes.Value / totalBytes.Value * 100;
+            var alertKey = $"client:{clientId}:resource:disk:{driveName}";
             if (freePercent <= diskFreeThreshold)
             {
                 await _alerting.RaiseAsync(
                     alertKey,
                     AlertLevel.Warning,
                     "client_resource",
-                    $"客户端源磁盘 {disk.DriveName} 空间不足",
+                    $"客户端源磁盘 {driveName} 空间不足",
                     $"可用 {freePercent:0.##}%（阈值 {diskFreeThreshold}%）",
                     clientId: clientId,
                     ct: ct);

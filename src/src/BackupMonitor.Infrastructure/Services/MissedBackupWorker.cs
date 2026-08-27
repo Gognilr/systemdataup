@@ -88,7 +88,11 @@ public class MissedBackupWorker : BackgroundService
         }
     }
 
-    private async Task RunPassAsync(IServiceScope scope, CancellationToken ct)
+    /// <summary>
+    /// 单轮漏备份巡检。公开而不是私有，是为了让集成测试能确定性地驱动一轮——
+    /// 靠 StartAsync 等首轮跑完再轮询断言，测试会变成对时序的赌博。
+    /// </summary>
+    public async Task RunPassAsync(IServiceScope scope, CancellationToken ct)
     {
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var settings = scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>();
@@ -105,6 +109,15 @@ public class MissedBackupWorker : BackgroundService
                 && t.TaskMode != TaskMode.Paused
                 && t.TaskMode != TaskMode.MonitorOnly)
             .ToListAsync(ct);
+
+        // 审计 G-13：所有任务的 ID，包括上面那条 Where 排除掉的（停用 / 暂停 / 只监控）。
+        // 一个任务先报了 missed，随后被停用或改成只监控，那条严重告警就再也没人恢复——
+        // 而「先把这个任务停掉再说」恰恰是排障时最自然的动作，正好触发它。
+        var allTaskIds = await db.BackupTasks.Select(t => t.Id).ToListAsync(ct);
+
+        // 只有真正走到「比对 LastSuccessAt 与 prevDue」那一步的才算判定过。
+        // 下面四处 continue 一律不算——它们是「这轮没法判定」，不是「判定为正常」。
+        var judgedTaskIds = new HashSet<Guid>();
 
         var raised = 0;
         var recovered = 0;
@@ -137,6 +150,8 @@ public class MissedBackupWorker : BackgroundService
             if (now < deadline)
                 continue;   // 还在宽限期内
 
+            judgedTaskIds.Add(task.Id);
+
             var alertKey = $"task:{task.Id}:missed";
             if (task.LastSuccessAt is null || task.LastSuccessAt < prevDue)
             {
@@ -159,6 +174,15 @@ public class MissedBackupWorker : BackgroundService
                 await alerting.RecoverAsync(alertKey, ct);
                 recovered++;
             }
+        }
+
+        // 审计 G-13：本轮没被判定过的任务，统一恢复它们的漏备份告警。
+        // RecoverAsync 内部有「没有活动告警就直接返回」的前置查询，
+        // 因此对绝大多数任务这只是一次索引扫描，不产生 UPDATE。
+        foreach (var taskId in allTaskIds.Where(id => !judgedTaskIds.Contains(id)))
+        {
+            ct.ThrowIfCancellationRequested();
+            await alerting.RecoverAsync($"task:{taskId}:missed", ct);
         }
 
         if (raised > 0)

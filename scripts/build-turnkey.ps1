@@ -48,6 +48,33 @@ function Invoke-Dotnet {
     }
 }
 
+function Invoke-ResilientCopy {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Destination
+    )
+
+    # 与 Invoke-VerifiedCompress 里那段重试同一个成因，只是发生在拷贝上：
+    # 杀软 / Windows Search 索引器会去扫刚发布出来的大文件（单文件发布的
+    # Setup.exe 有 160MB+），扫描期间它被内存映射，Copy-Item 直接抛
+    # 「The requested operation cannot be performed on a file with a user-mapped section open」。
+    # 这不是构建逻辑的问题，等一会儿就好；但次数是有界的，用尽照样抛错，
+    # 绝不退化成「静默产出缺文件的包」——那正是 $payloadRequired 清单要防的事。
+    $attempts = 5
+    for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+        try {
+            Copy-Item -LiteralPath $Path -Destination $Destination -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($attempt -eq $attempts) {
+                throw "Copy-Item failed after ${attempts} attempts (${Path} -> ${Destination}): $($_.Exception.Message)"
+            }
+            Write-Host "Copy attempt ${attempt}/${attempts} failed (${Destination}): $($_.Exception.Message)"
+            Start-Sleep -Seconds (10 * $attempt)
+        }
+    }
+}
+
 function Invoke-VerifiedCompress {
     param(
         [Parameter(Mandatory = $true)][string[]] $Path,
@@ -62,7 +89,11 @@ function Invoke-VerifiedCompress {
     # 重试是针对一个反复观测到的现象：杀毒软件在扫刚发布/刚解压出来的几千个文件，
     # 期间随机某个文件短时间不可读。这不是构建逻辑的问题，等一会儿就好。
     # 但重试次数是有界的——次数用尽照样抛错，绝不退化成「静默产出坏包」。
-    $attempts = 4
+    # 4 次 / 约 60 秒对 server-payload.zip（220MB+，且就写在仓库目录里）不够：
+    # 在开着 Windows Search 索引的机器上实测连续 5 次构建都耗尽重试后抛错。
+    # 放宽到 6 次 / 约 225 秒。上界仍然存在——用尽照样抛错，
+    # 「绝不退化成静默产出坏包」这条不变。
+    $attempts = 6
     for ($attempt = 1; $attempt -le $attempts; $attempt++) {
         try {
             Compress-Archive -Path $Path -DestinationPath $DestinationPath -CompressionLevel Optimal -Force -ErrorAction Stop
@@ -75,7 +106,7 @@ function Invoke-VerifiedCompress {
             if (Test-Path -LiteralPath $DestinationPath) {
                 Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
             }
-            Start-Sleep -Seconds (10 * $attempt)
+            Start-Sleep -Seconds (15 * $attempt)
         }
     }
 
@@ -262,11 +293,11 @@ Invoke-VerifiedCompress `
         'install-agent.ps1',
         'check-prereq.cmd')
 $clientSetup = Join-Path $agentSetupPublish 'BackupMonitor.Agent.Setup.exe'
-Copy-Item -LiteralPath $clientSetup -Destination (Join-Path $apiPublish 'wwwroot\downloads\BackupMonitor.Agent.Setup.exe') -Force
+Invoke-ResilientCopy -Path $clientSetup -Destination (Join-Path $apiPublish 'wwwroot\downloads\BackupMonitor.Agent.Setup.exe')
 
 # 下载页的另外两个入口：前置运行库和现场自检脚本。两者都要单独可下载——
 # 缺 UCRT 的机器连安装程序都起不来，不可能靠包里的东西自救。
-Copy-Item -LiteralPath $vcRedistCache -Destination (Join-Path $apiPublish "wwwroot\downloads\$($vcredistLock.fileName)") -Force
+Invoke-ResilientCopy -Path $vcRedistCache -Destination (Join-Path $apiPublish "wwwroot\downloads\$($vcredistLock.fileName)")
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\check-prereq.cmd') -Destination (Join-Path $apiPublish 'wwwroot\downloads\check-prereq.cmd') -Force
 
 $migrationFiles = Get-ChildItem -LiteralPath (Join-Path $srcRoot 'database') -Filter '*.sql' -File
@@ -320,8 +351,8 @@ $agentSetup = Join-Path $agentSetupPublish 'BackupMonitor.Agent.Setup.exe'
 if (-not (Test-Path -LiteralPath $serverSetup) -or -not (Test-Path -LiteralPath $agentSetup)) {
     throw 'Final setup publish did not produce both setup executables.'
 }
-Copy-Item -LiteralPath $serverSetup -Destination (Join-Path $distRoot 'BackupMonitor.Server.Setup.exe') -Force
-Copy-Item -LiteralPath $agentSetup -Destination (Join-Path $distRoot 'BackupMonitor.Agent.Setup.exe') -Force
+Invoke-ResilientCopy -Path $serverSetup -Destination (Join-Path $distRoot 'BackupMonitor.Server.Setup.exe')
+Invoke-ResilientCopy -Path $agentSetup -Destination (Join-Path $distRoot 'BackupMonitor.Agent.Setup.exe')
 
 # 前置条件自检脚本必须与安装包同行：目标机器缺 UCRT 时安装程序压根起不来，
 # 只有这个脚本能在双击 exe 之前把问题指出来。
@@ -340,7 +371,7 @@ Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\check-prer
 # 这里只负责摆放，不再重复下载与校验——两处各校验一次的话，迟早会有一处被改漏。
 $prerequisiteRoot = Join-Path $distRoot 'prerequisites'
 New-Item -ItemType Directory -Path $prerequisiteRoot -Force | Out-Null
-Copy-Item -LiteralPath $vcRedistCache -Destination (Join-Path $prerequisiteRoot 'vc_redist.x64.exe') -Force
+Invoke-ResilientCopy -Path $vcRedistCache -Destination (Join-Path $prerequisiteRoot 'vc_redist.x64.exe')
 Copy-Item -LiteralPath (Join-Path $repoRoot 'deploy\PREREQUISITES.md') -Destination (Join-Path $prerequisiteRoot 'README.md') -Force
 "{0}  vc_redist.x64.exe  ({1})" -f $actualVcRedistHash, $vcRedistVersion |
     Set-Content -LiteralPath (Join-Path $prerequisiteRoot 'SHA256SUMS.txt') -Encoding ASCII

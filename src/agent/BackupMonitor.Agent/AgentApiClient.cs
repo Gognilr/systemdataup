@@ -201,12 +201,50 @@ public sealed class AgentApiClient : IDisposable
     public Task<CompleteUploadSessionResponse> CompleteUploadSessionAsync(Guid sessionId, CompleteUploadSessionRequest request, CancellationToken ct) =>
         SendAsync<CompleteUploadSessionResponse>(HttpMethod.Post, $"api/v1/agent/upload-sessions/{sessionId}/complete", request, ct);
 
+    /// <summary>
+    /// 取消上传会话（审计 A-10）。服务端的 cancel 接口一直存在，却从来没有客户端调用者——
+    /// 于是每一次中途失败都在服务端留下一个永不结束的 uploading 会话。
+    /// </summary>
+    public Task CancelUploadSessionAsync(Guid sessionId, CancellationToken ct) =>
+        SendEmptyAsync(HttpMethod.Post, $"api/v1/agent/upload-sessions/{sessionId}/cancel", null, ct);
+
+    /// <summary>
+    /// 升级包下载上限（字节）。升级包整体读进 byte[] 才能算哈希，
+    /// 512MB 已经远大于任何正常的 Agent 包，超过这个量级只可能是配错或被投毒。
+    /// </summary>
+    public const long MaxDownloadBytes = 512L * 1024 * 1024;
+
+    /// <summary>
+    /// 下载并整体读入内存（升级包，需要先算 SHA-256 再落盘）。
+    ///
+    /// 审计 C-01：原先无任何大小限制，一个被改写的 packageUrl 就能让 Agent
+    /// 把内存吃光。Content-Length 只是提前拒绝的快路径——它是对端说的，不能信，
+    /// 因此读取过程中同样逐块累加计数，超限立刻中断。
+    /// </summary>
     public async Task<byte[]> DownloadBytesAsync(string url, CancellationToken ct)
     {
         using var request = CreateRequest(HttpMethod.Get, url);
         using var response = await CurrentClient().SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadAsByteArrayAsync(ct);
+
+        var declared = response.Content.Headers.ContentLength;
+        if (declared > MaxDownloadBytes)
+            throw new AgentApiException((int)response.StatusCode,
+                $"下载内容超过上限：声明 {declared} 字节，上限 {MaxDownloadBytes} 字节", "DOWNLOAD_TOO_LARGE");
+
+        await using var stream = await response.Content.ReadAsStreamAsync(ct);
+        using var buffer = new MemoryStream(declared is > 0 and <= MaxDownloadBytes ? (int)declared.Value : 81920);
+        var chunk = new byte[81920];
+        int read;
+        while ((read = await stream.ReadAsync(chunk, ct)) > 0)
+        {
+            if (buffer.Length + read > MaxDownloadBytes)
+                throw new AgentApiException((int)response.StatusCode,
+                    $"下载内容超过上限 {MaxDownloadBytes} 字节，已中断", "DOWNLOAD_TOO_LARGE");
+            buffer.Write(chunk, 0, read);
+        }
+
+        return buffer.ToArray();
     }
 
     private async Task<T> SendAsync<T>(HttpMethod method, string path, object? body, CancellationToken ct)

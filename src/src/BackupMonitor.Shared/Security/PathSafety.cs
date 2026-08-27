@@ -125,7 +125,25 @@ public static class PathSafety
         }
     }
 
-    /// <summary>清理目录/文件名中的非法字符（服务端生成正式路径用）</summary>
+    /// <summary>组件长度上限（码位，审计 H-17）</summary>
+    private const int MaxComponentLength = 100;
+
+    /// <summary>
+    /// 清理目录/文件名中的非法字符（服务端生成正式路径用）。
+    ///
+    /// 审计 H-17：截断必须发生在收尾净化**之前**。
+    /// 原先的顺序是「替非法字符 → 去 .. → Trim → TrimEnd('.') → 最后截断到 100」，
+    /// 于是截断点恰好落在点或空格上时这层保护就被绕过了：NTFS 写盘时会静默剥掉
+    /// 结尾的点和空格，backup_sets.repository_path 记的路径和磁盘上实际的目录名
+    /// 从此不一致。日常读写因为 Win32 会做同样的规范化而看不出问题，
+    /// 但任何逐字符比对路径的逻辑都会踩到——PathSafety.IsUnderBase 围栏、
+    /// 跨平台迁移、目录审计。IsValidRelativePath 里对客户端提交路径的同一条规则
+    /// 本来就是完整的，只有服务端自己生成路径这条漏了。
+    ///
+    /// 截断按码位而不是 UTF-16 码元：中文在 BMP 内所以现在看不出问题，
+    /// 主机名里出现 emoji 或扩展 B 区汉字时按码元截会切断代理对，
+    /// 留下半个字符——那是个连文件系统都未必接受的名字。
+    /// </summary>
     public static string SanitizePathComponent(string name)
     {
         var invalid = Path.GetInvalidFileNameChars();
@@ -133,13 +151,36 @@ public static class PathSafety
         foreach (var c in name)
             sb.Append(Array.IndexOf(invalid, c) >= 0 ? '_' : c);
 
-        var cleaned = sb.ToString().Replace("..", "_").Trim().TrimEnd('.');
+        var cleaned = TruncateByRunes(sb.ToString().Replace("..", "_"), MaxComponentLength);
+
+        // 截断之后再跑收尾净化：截断点落在点或空格上时，这一步把它清掉。
+        cleaned = cleaned.Trim().TrimEnd('.', ' ');
         if (string.IsNullOrWhiteSpace(cleaned))
             cleaned = "unnamed";
+
         // 服务端生成的目录名同样不能撞上保留设备名（审查 P2-6）：
         // 主机名或任务名恰好叫 CON/NUL 时，Directory.CreateDirectory 会失败或行为异常。
         if (IsReservedDeviceName(cleaned))
-            cleaned = "_" + cleaned;
-        return cleaned.Length > 100 ? cleaned[..100] : cleaned;
+        {
+            // 加前缀可能让长度回到 101。保留名都很短，实际撞不上，
+            // 但长度上限是这个方法对调用方的承诺，不能靠「不会发生」来兑现。
+            cleaned = TruncateByRunes("_" + cleaned, MaxComponentLength).TrimEnd('.', ' ');
+        }
+
+        return cleaned;
+    }
+
+    /// <summary>按码位截断，绝不切断代理对（审计 H-17）</summary>
+    private static string TruncateByRunes(string value, int maxRunes)
+    {
+        var runes = 0;
+        var index = 0;
+        while (index < value.Length && runes < maxRunes)
+        {
+            index += char.IsHighSurrogate(value[index]) && index + 1 < value.Length ? 2 : 1;
+            runes++;
+        }
+
+        return index >= value.Length ? value : value[..index];
     }
 }

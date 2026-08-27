@@ -20,6 +20,17 @@ public sealed class SystemProbe
     private long? _lastNetworkSent;
     private long? _lastNetworkReceived;
 
+    /// <summary>上一次上报的快照摘要（审计 B-09），仅心跳循环单线程访问</summary>
+    private string? _lastSnapshotDigest;
+
+    /// <summary>
+    /// 组装一次心跳。
+    ///
+    /// 审计 B-09：磁盘 / 服务状态 / 用户会话三块算一个稳定摘要，与上次完全相同就整块不发。
+    /// 心跳默认一分钟一次，而这三块在绝大多数时间里一个字节都不会变——
+    /// 每次都带上等于把同一份数据重复写进 client_disks / client_services 几万遍。
+    /// 指标（CPU/内存/网络）本来就每次都不同，不参与摘要。
+    /// </summary>
     public HeartbeatRequest BuildHeartbeat(long configVersion, AgentConfigResponse? config, IReadOnlyCollection<Guid> activeCommands)
     {
         var now = DateTime.UtcNow;
@@ -30,6 +41,14 @@ public sealed class SystemProbe
             .Where(p => !string.IsNullOrWhiteSpace(p))
             .ToList() ?? [];
 
+        var disks = GetDisks(sourceRoots);
+        var services = GetServices(config?.MonitoredServices ?? []);
+        var sessions = GetUserSessions();
+
+        var digest = ComputeSnapshotDigest(disks, services, sessions);
+        var unchanged = _lastSnapshotDigest is not null && _lastSnapshotDigest == digest;
+        _lastSnapshotDigest = digest;
+
         return new HeartbeatRequest
         {
             ClientTime = now,
@@ -37,12 +56,69 @@ public sealed class SystemProbe
             SystemUptimeSeconds = Math.Max(0, Environment.TickCount64 / 1000),
             ConfigVersion = configVersion,
             Metrics = metrics,
-            Disks = GetDisks(sourceRoots),
-            ServiceStates = GetServices(config?.MonitoredServices ?? []),
-            UserSessions = GetUserSessions(),
+            Disks = unchanged ? null : disks,
+            ServiceStates = unchanged ? null : services,
+            UserSessions = unchanged ? null : sessions,
+            SnapshotUnchanged = unchanged,
             ActiveCommands = activeCommands.ToList(),
             ActiveUploads = []
         };
+    }
+
+    /// <summary>
+    /// 三块快照的稳定摘要（审计 B-09）。
+    ///
+    /// 逐字段拼接而不是序列化整个对象：JSON 序列化会把 SampledAt 这类每次都变的字段
+    /// 一起算进去，摘要就永远不相同，这个优化等于没做。
+    /// </summary>
+    private static string ComputeSnapshotDigest(
+        List<HeartbeatDiskDto>? disks,
+        List<HeartbeatServiceStateDto>? services,
+        List<HeartbeatUserSessionDto>? sessions)
+    {
+        // 磁盘可用空间按 64MB 粒度取整：它每次采样都会有几 KB 的抖动，
+        // 按字节比对会让摘要永不相同，而告警阈值是百分比，这个粒度足够。
+        const long freeBytesGranularity = 64L * 1024 * 1024;
+
+        // 分隔符用不会出现在盘符 / 服务名 / 用户名里的控制字符，
+        // 避免「A|B」和「A」+「|B」拼出同一份原文。
+        const char fieldSeparator = (char)1;
+        const char itemSeparator = (char)2;
+        const char sectionSeparator = (char)3;
+
+        var builder = new System.Text.StringBuilder();
+
+        foreach (var disk in (disks ?? []).OrderBy(d => d.DriveName, StringComparer.Ordinal))
+        {
+            builder.Append(disk.DriveName).Append(fieldSeparator)
+                .Append(disk.VolumeLabel).Append(fieldSeparator)
+                .Append(disk.Filesystem).Append(fieldSeparator)
+                .Append(disk.TotalBytes).Append(fieldSeparator)
+                .Append(disk.FreeBytes / freeBytesGranularity).Append(fieldSeparator)
+                .Append(disk.IsSourceVolume ? '1' : '0').Append(itemSeparator);
+        }
+
+        builder.Append(sectionSeparator);
+        foreach (var service in (services ?? []).OrderBy(s => s.ServiceName, StringComparer.Ordinal))
+        {
+            builder.Append(service.ServiceName).Append(fieldSeparator)
+                .Append(service.ActualState).Append(fieldSeparator)
+                .Append(service.StartType).Append(itemSeparator);
+        }
+
+        builder.Append(sectionSeparator);
+        foreach (var session in (sessions ?? []).OrderBy(s => s.SessionId))
+        {
+            builder.Append(session.SessionId).Append(fieldSeparator)
+                .Append(session.Username).Append(fieldSeparator)
+                .Append(session.Domain).Append(fieldSeparator)
+                .Append(session.State).Append(fieldSeparator)
+                .Append(session.IsRemote ? '1' : '0').Append(itemSeparator);
+        }
+
+        return Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(builder.ToString())));
     }
 
     public List<string> GetIpAddresses()

@@ -44,6 +44,10 @@ public class AuthServiceProjectionTests
         services.AddSingleton(sp => new SystemSettingsProvider(
             sp.GetRequiredService<IServiceScopeFactory>(),
             NullLogger<SystemSettingsProvider>.Instance));
+        // 审计 H-14：撤权要即时生效，AuthService 现在会主动清这个缓存
+        services.AddSingleton(sp => new TokenVersionCache(
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            NullLogger<TokenVersionCache>.Instance));
         return services.BuildServiceProvider();
     }
 
@@ -55,6 +59,7 @@ public class AuthServiceProjectionTests
             root.GetRequiredService<JwtTokenService>(),
             root.GetRequiredService<SystemSettingsProvider>(),
             root.GetRequiredService<IAuditRecorder>(),
+            root.GetRequiredService<TokenVersionCache>(),
             NullLogger<AuthService>.Instance);
     }
 

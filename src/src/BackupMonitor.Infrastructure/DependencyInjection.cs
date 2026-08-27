@@ -79,17 +79,24 @@ public static class DependencyInjection
         services.AddScoped<IAgentUpgradeService, AgentUpgradeService>();
         services.AddScoped<IReportService, ReportService>();
 
-        // 校验入库队列与后台工作器
-        services.AddSingleton(Channel.CreateUnbounded<WorkItem>(new UnboundedChannelOptions
-        {
-            SingleReader = true
-        }));
+        // 后台队列与工作器。
+        //
+        // 审计 H-18：入库与校验分成两条队列。原先共享一条 SingleReader 队列顺序处理，
+        // 一次几十 GB 的入库会把后面的备份集重校验和恢复请求校验全部堵住，
+        // 而排队这件事在界面上完全不可见——恢复是有人在界面前等的交互操作。
+        services.AddKeyedSingleton(QueueKeys.Commit, (_, _) =>
+            Channel.CreateUnbounded<WorkItem>(new UnboundedChannelOptions { SingleReader = true }));
+        services.AddKeyedSingleton(QueueKeys.Verify, (_, _) =>
+            Channel.CreateUnbounded<WorkItem>(new UnboundedChannelOptions { SingleReader = true }));
+
         services.AddHostedService<UploadCommitWorker>();
+        services.AddHostedService<VerificationWorker>();
         services.AddHostedService<NotificationDispatchWorker>();
         services.AddHostedService<RetentionCleanupWorker>();
         services.AddHostedService<PartitionMaintenanceWorker>();
         services.AddHostedService<SystemWatchdogWorker>();
         services.AddHostedService<MissedBackupWorker>();
+        services.AddHostedService<LifecycleExpiryWorker>();
 
         return services;
     }

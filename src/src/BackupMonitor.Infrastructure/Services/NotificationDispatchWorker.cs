@@ -41,6 +41,10 @@ public class NotificationDispatchWorker : BackgroundService
     /// <summary>锁 TTL：须大于单轮最坏耗时（50 条 × 15s HTTP 超时 ≈ 12.5 分钟），防止执行中被抢占重复发送</summary>
     private static readonly TimeSpan LockTtl = TimeSpan.FromMinutes(15);
 
+    /// <summary>仍需通知的告警状态，与 AlertingService.ActiveStatuses 同口径（审计 G-12）</summary>
+    private static readonly AlertStatus[] ActiveAlertStatuses =
+        [AlertStatus.Open, AlertStatus.Acknowledged, AlertStatus.InProgress];
+
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(15) };
 
     private static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web);
@@ -127,7 +131,11 @@ public class NotificationDispatchWorker : BackgroundService
             .Include(d => d.Alert)
             .Where(d => d.Status == NotificationStatus.Pending
                         && d.AttemptCount < maxAttempts
-                        && (d.LastAttemptAt == null || d.LastAttemptAt < retryCutoff))
+                        && (d.LastAttemptAt == null || d.LastAttemptAt < retryCutoff)
+                        // 审计 G-12：告警已恢复就别再发了。RecoverAsync 会把待投递置为
+                        // Cancelled，这一条是并发窗口的双保险——恢复发生在本轮取数之后、
+                        // 真正发送之前时，靠的就是它。
+                        && (d.Alert == null || ActiveAlertStatuses.Contains(d.Alert.Status)))
             .OrderBy(d => d.Id)
             .Take(50)
             .ToListAsync(ct);
@@ -224,9 +232,12 @@ public class NotificationDispatchWorker : BackgroundService
             ? (DateTime?)null
             : TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(occurredAtUtc.Value, DateTimeKind.Utc), reportTimezone);
 
-        var subject = $"[备份监控] {delivery.Alert?.Title ?? "系统告警"}";
+        // 审计 G-11：等级提升补发的那一封带「【已升级】」前缀，
+        // 否则收件人看到的是一封和几天前一模一样的邮件，正好会被当成重发忽略掉。
+        var title = delivery.TitlePrefix + (delivery.Alert?.Title ?? "系统告警");
+        var subject = $"[备份监控] {title}";
         var body = new StringBuilder()
-            .AppendLine(delivery.Alert?.Title)
+            .AppendLine(title)
             .AppendLine()
             .AppendLine(delivery.Alert?.Message)
             .AppendLine()
@@ -303,7 +314,7 @@ public class NotificationDispatchWorker : BackgroundService
             throw new InvalidOperationException("webhook 地址无效");
 
         var content = new StringBuilder()
-            .AppendLine($"[备份监控告警] {delivery.Alert?.Title ?? "系统告警"}")
+            .AppendLine($"[备份监控告警] {delivery.TitlePrefix}{delivery.Alert?.Title ?? "系统告警"}")
             .AppendLine($"等级: {delivery.Alert?.Level}")
             .AppendLine($"时间: {delivery.Alert?.LastOccurredAt:yyyy-MM-dd HH:mm:ss} UTC")
             .AppendLine(delivery.Alert?.Message)

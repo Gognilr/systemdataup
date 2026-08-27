@@ -44,6 +44,25 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
 {
     private static readonly TimeSpan DefaultTtl = TimeSpan.FromHours(24);
 
+    /// <summary>result_code 列宽 64（审计 D-06）</summary>
+    private const int MaxResultCodeLength = 64;
+
+    /// <summary>result_message 列宽 2000，留 100 余量（与 UploadCommitWorker 对 ErrorMessage 同口径）</summary>
+    private const int MaxResultMessageLength = 1900;
+
+    /// <summary>
+    /// result_payload 上限（UTF-8 字节）。browse_path 原先最多能返回 20000 个条目，
+    /// 序列化几 MB 一份塞进 commands 表——Agent 自己在识别测试那条路径上写了
+    /// 「会把 commands 表撑坏」的注释并限到 50 个文件，浏览这条却没设限。
+    ///
+    /// 取值 2MB 而不是更小：这是**兜底**上限，不是常规约束。真正管住体量的是
+    /// RecognizerWizardService 那边把条目数封到 3000（一条目录条目序列化约 250 字节，
+    /// 3000 条约 750KB，留了近三倍余量）。兜底值必须明显高于常规上限，
+    /// 否则正常的浏览快照会被替换成摘要，识别向导直接解析不出结构——
+    /// 那不是收口，是把一个撑表问题换成一个功能失效问题。
+    /// </summary>
+    private const int MaxResultPayloadBytes = 2 * 1024 * 1024;
+
     private readonly AppDbContext _db;
     private readonly CommandSigner _signer;
     private readonly IAlertingService _alerting;
@@ -219,16 +238,19 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
         if (command.Status is not (CommandStatus.Claimed or CommandStatus.Running))
             throw new BusinessException("CONFLICT", $"指令当前状态 {EnumMapping.ToSnakeCase(command.Status)} 不允许上报进度", 409);
 
-        command.ResultPayload = JsonSerializer.Serialize(new
+        // 审计 D-06：进度上报同样要收口。Message 来自客户端，长度不受任何约束，
+        // 而 result_payload 是 jsonb——这里虽然是服务端自己序列化的，
+        // 但内容仍是客户端给的，超大 Message 一样能把这张表撑坏。
+        command.ResultPayload = NormalizeResultPayload(JsonSerializer.Serialize(new
         {
             progress = new
             {
                 request.Percent,
                 request.Stage,
-                request.Message,
+                Message = Truncate(request.Message, MaxResultMessageLength),
                 updatedAt = DateTime.UtcNow
             }
-        });
+        }), commandId);
         await _db.SaveChangesAsync(ct);
     }
 
@@ -245,12 +267,66 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
         var now = DateTime.UtcNow;
         command.Status = request.Success ? CommandStatus.Succeeded : CommandStatus.Failed;
         command.CompletedAt = now;
-        command.ResultCode = request.ResultCode;
-        command.ResultMessage = request.ResultMessage;
-        command.ResultPayload = request.Result;
+
+        // 审计 D-06：全部字段在服务端截断，不信客户端。
+        // result_message 是 varchar(2000)，而 EF Core 的 HasMaxLength 只影响建表 DDL、
+        // 运行时不截断。Agent 的失败回报走 ex.Message，一条带完整路径的 IOException
+        // 轻易超过 2000 字节 → PostgreSQL 抛 22001 → 接口 500 → Agent 的 catch 分支
+        // 再报一次、再 500 → 这条指令永远停在 running，正好接上 D-05。
+        command.ResultCode = Truncate(request.ResultCode, MaxResultCodeLength);
+        command.ResultMessage = Truncate(request.ResultMessage, MaxResultMessageLength);
+        command.ResultPayload = NormalizeResultPayload(request.Result, commandId);
         await _db.SaveChangesAsync(ct);
 
         await HandleCompletionSideEffectsAsync(command, ct);
+    }
+
+    /// <summary>按列宽截断，null 原样返回（审计 D-06）</summary>
+    private static string? Truncate(string? value, int maxLength) =>
+        value is null || value.Length <= maxLength ? value : value[..maxLength];
+
+    /// <summary>
+    /// result_payload 收口（审计 D-06）：先判大小再验形，两种情况都只降级不失败。
+    ///
+    /// 指令已经执行完了，坏掉的只是结果的呈现——为此把整条指令判失败，
+    /// 会让「结果太大」表现成「备份失败」，是更糟的谎话。
+    /// 非法 JSON 进 jsonb 列直接 500，同样会把 Agent 逼进「再报一次、再 500」的死循环。
+    /// </summary>
+    private string? NormalizeResultPayload(string? payload, Guid commandId)
+    {
+        if (string.IsNullOrWhiteSpace(payload))
+            return null;
+
+        // 先按字节数判：Length 是 UTF-16 码元数，中文路径下和实际字节数差三倍，
+        // 靠它判断会让「刚好没超」的载荷照样撑爆列。
+        var byteCount = System.Text.Encoding.UTF8.GetByteCount(payload);
+        if (byteCount > MaxResultPayloadBytes)
+        {
+            _logger.LogWarning(
+                "指令 {CommandId} 的结果载荷 {Bytes} 字节超过上限 {Limit}，已替换为摘要",
+                commandId, byteCount, MaxResultPayloadBytes);
+            return JsonSerializer.Serialize(new
+            {
+                truncated = true,
+                originalBytes = byteCount,
+                limitBytes = MaxResultPayloadBytes
+            });
+        }
+
+        try
+        {
+            using var _ = JsonDocument.Parse(payload);
+            return payload;
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, "指令 {CommandId} 的结果载荷不是合法 JSON，已替换为摘要", commandId);
+            return JsonSerializer.Serialize(new
+            {
+                invalidJson = true,
+                preview = payload.Length <= 200 ? payload : payload[..200]
+            });
+        }
     }
 
     /// <summary>指令完成副作用：批次计数、失败告警</summary>

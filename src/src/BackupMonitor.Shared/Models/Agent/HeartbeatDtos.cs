@@ -28,6 +28,16 @@ public class HeartbeatRequest
 
     /// <summary>Agent 侧活动上传会话 ID 列表</summary>
     public List<Guid>? ActiveUploads { get; set; }
+
+    /// <summary>
+    /// 磁盘 / 服务状态 / 用户会话三块快照与上一次心跳完全相同（审计 B-09）。
+    ///
+    /// 为 true 时 Disks / ServiceStates / UserSessions 一律为 null，不重复上报——
+    /// 心跳每分钟一次，而这三块在绝大多数时间里一个字节都不会变。
+    /// 服务端已经是「为 null 就不动库」的语义，唯一需要额外处理的是磁盘告警：
+    /// 它必须回落到库里已有的记录继续判定，否则「快照没变」会变成「不再评估」。
+    /// </summary>
+    public bool SnapshotUnchanged { get; set; }
 }
 
 /// <summary>心跳负载指标</summary>

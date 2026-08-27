@@ -72,6 +72,13 @@ public sealed class ScheduledScanState
     public DateTime? LastRunAtUtc { get; set; }
 }
 
+/// <summary>
+/// 候选备份集在本地的摘要（审计 F-08）。
+///
+/// 文件清单已经挪进 <see cref="AgentCandidateFileStore"/>，这里只留摘要。
+/// 原先清单就躺在这个对象里，而它随 state.json 一起被反复深拷贝和全量落盘——
+/// 一个 5 万文件的任务光这一份就是 10MB 量级的 JSON。
+/// </summary>
 public sealed class LocalCandidateState
 {
     public Guid? CandidateBackupSetId { get; set; }
@@ -81,8 +88,18 @@ public sealed class LocalCandidateState
     public string ManifestHash { get; set; } = string.Empty;
     public int TotalFiles { get; set; }
     public long TotalBytes { get; set; }
-    public List<LocalCandidateFile> Files { get; set; } = [];
     public DateTime UpdatedAt { get; set; }
+
+    /// <summary>
+    /// 仅用于读取旧版本 state.json 的迁移入口（审计 F-08）。
+    ///
+    /// 老版本把整份清单写在这里。升级后必须能把它读出来搬进 AgentCandidateFileStore，
+    /// 否则所有候选丢失、已通过预检的备份要重新扫一遍——一个 5 万文件的任务
+    /// 重扫一次是几十分钟的全量 SHA-256。
+    /// 迁移完成后立即置空，之后写出的 state.json 不再含这个字段。
+    /// 全网 Agent 都升过一遍之后可以删掉它。
+    /// </summary>
+    public List<LocalCandidateFile>? Files { get; set; }
 }
 
 public sealed class LocalCandidateFile
@@ -96,6 +113,9 @@ public sealed class LocalCandidateFile
 public sealed class AgentStateStore
 {
     private const int MaxSeenItems = 500;
+
+    /// <summary>候选条目总量上限（审计 F-08），按 UpdatedAt 淘汰最旧的</summary>
+    private const int MaxCandidates = 200;
     private static readonly byte[] ProtectionEntropy = SHA256.HashData(
         System.Text.Encoding.UTF8.GetBytes("BackupMonitor.Agent.State.v1"));
 
@@ -170,6 +190,67 @@ public sealed class AgentStateStore
         {
             update(_state);
             SaveUnsafe();
+        }
+    }
+
+    /// <summary>
+    /// 淘汰不再属于任何在线任务的候选，并返回要删清单文件的 candidateKey（审计 F-08）。
+    ///
+    /// Candidates 原先只写不删——ScheduledScans 和 PendingRestabilizeScans 都有清理僵尸条目的
+    /// 逻辑，唯独它没有，任务删掉之后那些候选还留在文件里，state.json 只增不减。
+    ///
+    /// 收集在锁里做、删文件在锁外做：删一批文件是几十次同步 IO，
+    /// 攥着这把锁做等于把三条循环全停在那里。
+    /// </summary>
+    public IReadOnlyList<string> PruneCandidates(IReadOnlySet<Guid> liveTaskIds, int maxEntries = MaxCandidates)
+    {
+        lock (_sync)
+        {
+            var removed = _state.Candidates
+                .Where(kv => !liveTaskIds.Contains(kv.Value.TaskId))
+                .Select(kv => kv.Key)
+                .ToList();
+
+            // 再加一道总量闸：CandidateKey 里含有状态段，同一个任务反复扫描会
+            // 不断产生新键，光靠「任务还在不在」是收敛不了的。按 UpdatedAt 淘汰最旧的。
+            var survivors = _state.Candidates
+                .Where(kv => liveTaskIds.Contains(kv.Value.TaskId))
+                .OrderByDescending(kv => kv.Value.UpdatedAt)
+                .ToList();
+            removed.AddRange(survivors.Skip(maxEntries).Select(kv => kv.Key));
+
+            if (removed.Count == 0)
+                return [];
+
+            foreach (var key in removed)
+                _state.Candidates.Remove(key);
+            SaveUnsafe();
+            return removed;
+        }
+    }
+
+    /// <summary>
+    /// 把老格式 state.json 里内嵌的文件清单搬进独立存储（审计 F-08）。
+    /// 返回搬走的候选数量。搬完立即重写一次 state.json，之后就是新格式了。
+    /// </summary>
+    public int MigrateEmbeddedCandidateFiles(AgentCandidateFileStore fileStore)
+    {
+        lock (_sync)
+        {
+            var pending = _state.Candidates
+                .Where(kv => kv.Value.Files is { Count: > 0 })
+                .ToList();
+            if (pending.Count == 0)
+                return 0;
+
+            foreach (var (key, candidate) in pending)
+            {
+                fileStore.Save(key, candidate.Files!);
+                candidate.Files = null;
+            }
+
+            SaveUnsafe();
+            return pending.Count;
         }
     }
 

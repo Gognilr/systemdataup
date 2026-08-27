@@ -19,7 +19,17 @@ public class BackupSet
     /// <summary>关联上传会话</summary>
     public Guid UploadSessionId { get; set; }
 
-    /// <summary>备份集编码（唯一，如 BS-2026-0001）</summary>
+    /// <summary>
+    /// 备份集编码（唯一）。**两种格式并存**：
+    /// 2026-08-27 之前入库的是 <c>BS-yyyy-NNNN</c>（如 BS-2026-0001），
+    /// 之后是 <c>BS-NNNNNN</c>（如 BS-008932）。
+    ///
+    /// 序号一直取自全局序列 backup_set_code_seq，跨年不重置——旧格式里的年份
+    /// 只是「入库那一年」，并不表示「那一年的第几个」，会误导人（审计 E-16）。
+    /// 存量编码不迁移：它们已经写进 manifest.json、审计日志和告警文本，
+    /// 改了会破坏可追溯性，而这正是这个编码存在的理由。
+    /// 因此任何解析这个字段的代码都必须同时认得两种格式，或者干脆别解析。
+    /// </summary>
     public string BackupSetCode { get; set; } = null!;
 
     public BackupSetStatus Status { get; set; } = BackupSetStatus.Verifying;

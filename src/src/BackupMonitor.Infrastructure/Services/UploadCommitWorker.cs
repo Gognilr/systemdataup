@@ -31,6 +31,23 @@ public enum WorkKind
 public record WorkItem(WorkKind Kind, Guid Id);
 
 /// <summary>
+/// 两条后台队列的 DI 键（审计 H-18）。
+///
+/// 原先三类工作项共享一条队列顺序处理，一次几十 GB 的入库会把后面的
+/// 备份集重校验和恢复请求校验全部堵住——「点了恢复之后等了半小时还在校验」，
+/// 而排队这件事在界面上完全不可见。恢复是有人在界面前等的交互操作，
+/// 入库是后台批处理，两者不该共享一条队列。
+/// </summary>
+public static class QueueKeys
+{
+    /// <summary>上传会话校验入库队列，由 <see cref="UploadCommitWorker"/> 消费</summary>
+    public const string Commit = "commit";
+
+    /// <summary>备份集重校验 / 恢复请求校验队列，由 <see cref="VerificationWorker"/> 消费</summary>
+    public const string Verify = "verify";
+}
+
+/// <summary>
 /// 校验入库后台工作器：
 /// 会话完成 → 暂存目录 → 仓库临时提交目录 → 写 manifest → 原子重命名 →
 /// 数据库事务写 backup_sets/backup_files → 会话标记 committed（设计书 24）。
@@ -43,7 +60,7 @@ public class UploadCommitWorker : BackgroundService
     private readonly ILogger<UploadCommitWorker> _logger;
 
     public UploadCommitWorker(
-        Channel<WorkItem> channel,
+        [FromKeyedServices(QueueKeys.Commit)] Channel<WorkItem> channel,
         IServiceScopeFactory scopeFactory,
         ILogger<UploadCommitWorker> logger)
     {
@@ -66,12 +83,12 @@ public class UploadCommitWorker : BackgroundService
                 var agentNotifications = scope.ServiceProvider.GetRequiredService<IAgentNotificationService>();
                 var storage = scope.ServiceProvider.GetRequiredService<IUploadStorage>();
 
+                // 审计 H-18：这条队列现在只走入库。重校验与恢复校验拆去了
+                // VerificationWorker，不再排在几十 GB 的入库后面。
                 if (item.Kind == WorkKind.CommitSession)
                     await CommitSessionAsync(db, alerting, agentNotifications, storage, item.Id, stoppingToken);
-                else if (item.Kind == WorkKind.ReverifyBackupSet)
-                    await ReverifyBackupSetAsync(db, alerting, item.Id, stoppingToken);
                 else
-                    await VerifyRestoreRequestAsync(db, alerting, item.Id, stoppingToken);
+                    _logger.LogWarning("入库队列收到不属于它的工作项 kind={Kind} id={Id}", item.Kind, item.Id);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -103,16 +120,7 @@ public class UploadCommitWorker : BackgroundService
             if (pendingSessions.Count > 0)
                 _logger.LogInformation("重启恢复：{Count} 个待入库会话重新入队", pendingSessions.Count);
 
-            var pendingRestores = await db.RestoreRequests
-                .Where(r => r.Status == RestoreRequestStatus.Verifying)
-                .Select(r => r.Id)
-                .ToListAsync(ct);
-
-            foreach (var id in pendingRestores)
-                await _channel.Writer.WriteAsync(new WorkItem(WorkKind.VerifyRestoreRequest, id), ct);
-
-            if (pendingRestores.Count > 0)
-                _logger.LogInformation("重启恢复：{Count} 个待校验恢复请求重新入队", pendingRestores.Count);
+            // 待校验的恢复请求由 VerificationWorker 自己扫描重入队（审计 H-18）。
         }
         catch (Exception ex)
         {
@@ -120,7 +128,14 @@ public class UploadCommitWorker : BackgroundService
         }
     }
 
-    private async Task CommitSessionAsync(
+    /// <summary>
+    /// 会话校验入库（设计书 13 / 24）。
+    ///
+    /// 公开而不是私有，是为了让集成测试能确定性地驱动一次入库——
+    /// 靠 Channel 投递再等 BackgroundService 消费，测试会变成对时序的赌博，
+    /// 而这条路径上「失败时怎么收场」恰恰是最需要被盯住的部分（审计 E-07）。
+    /// </summary>
+    public async Task CommitSessionAsync(
         AppDbContext db,
         IAlertingService alerting,
         IAgentNotificationService agentNotifications,
@@ -337,14 +352,21 @@ public class UploadCommitWorker : BackgroundService
                     "会话 {SessionId} 入库成功 backupSet={Code} path={Path}",
                     session.Id, backupSet.BackupSetCode, finalPath);
             }
-            catch
+            catch (Exception inner)
             {
                 // 提交之后本不该再走到这里（收尾动作已各自兜住异常）。万一走到了，
                 // 绝不能回滚或删目录：事务已提交、正式目录已就位，那样做就是销毁一次成功的备份。
                 // 之所以留这道闸，是因为原先的写法只靠「对已提交事务调 RollbackAsync 会先抛异常」
                 // 这个实现细节侥幸躲开删除，换个 EF/Npgsql 版本就可能真的删下去。
+                //
+                // 审计 E-07：抛一个可辨认的类型而不是裸 throw。裸 throw 会被外层 catch
+                // 无条件接住后置 Failed + 发 Critical 告警——备份实际是 Available、
+                // 正式目录已就位、文件都在，会话却被记成失败。更麻烦的是
+                // CommandService 的 uploadAcceptedButCommitFailed 分支专门找
+                // 「该候选存在 Failed 会话」，于是会把已经成功的上传指令复位重发，
+                // 客户端把几十 GB 再传一遍。
                 if (committed)
-                    throw;
+                    throw new PostCommitException(inner);
 
                 await dbScope.RollbackAsync(ct);
 
@@ -364,6 +386,22 @@ public class UploadCommitWorker : BackgroundService
                 throw;
             }
         }
+        catch (PostCommitException ex)
+        {
+            // 审计 E-07：备份是成功的——事务已提交、正式目录已就位、备份集是 Available。
+            // 坏掉的只是提交之后的某个收尾动作。绝不改会话状态、绝不告警：
+            // 那会让一次成功的备份在管理端表现为「失败 + 严重告警」，
+            // 并触发上传指令复位重发。
+            _logger.LogError(ex.InnerException ?? ex,
+                "会话 {SessionId} 入库已提交，但提交后的收尾动作失败（备份有效，无需重传）", sessionId);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // 审计 E-07：停机不是失败。会话留在 verifying，
+            // RecoverPendingWorkAsync 会在重启后把它重新入队。
+            _logger.LogInformation("会话 {SessionId} 入库因服务停止中断，重启后将重新入队", sessionId);
+            throw;
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "会话 {SessionId} 校验入库失败", sessionId);
@@ -372,7 +410,11 @@ public class UploadCommitWorker : BackgroundService
             session.ErrorCode = "COMMIT_FAILED";
             session.ErrorMessage = ex.Message.Length > 1900 ? ex.Message[..1900] : ex.Message;
             session.UpdatedAt = DateTime.UtcNow;
-            await db.SaveChangesAsync(ct);
+
+            // 收尾用 CancellationToken.None：走到这里时 ct 可能已经取消
+            // （比如失败原因本身就是停机之外的取消），那样这段收尾自己也会抛，
+            // 会话就永远停在 verifying 而没有任何记录说明为什么。
+            await db.SaveChangesAsync(CancellationToken.None);
 
             await alerting.RaiseAsync(
                 $"session:{session.Id}:commit_failed",
@@ -382,165 +424,38 @@ public class UploadCommitWorker : BackgroundService
                 ex.Message,
                 clientId: client.Id,
                 taskId: task.Id,
-                ct: ct);
+                ct: CancellationToken.None);
         }
     }
 
-    private async Task ReverifyBackupSetAsync(AppDbContext db, IAlertingService alerting, Guid backupSetId, CancellationToken ct)
-    {
-        var backupSet = await db.BackupSets
-            .Include(b => b.Files)
-            .Include(b => b.Client)
-            .FirstOrDefaultAsync(b => b.Id == backupSetId, ct);
-        if (backupSet is null || string.IsNullOrWhiteSpace(backupSet.RepositoryPath))
-            return;
-
-        var allVerified = true;
-        foreach (var file in backupSet.Files)
-        {
-            try
-            {
-                var path = Path.Combine(backupSet.RepositoryPath, file.RepositoryRelativePath.Replace('/', Path.DirectorySeparatorChar));
-                if (!File.Exists(path))
-                {
-                    file.VerificationStatus = VerificationStatus.Failed;
-                    allVerified = false;
-                    continue;
-                }
-
-                string hash;
-                await using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true))
-                {
-                    hash = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(stream, ct)).ToLowerInvariant();
-                }
-
-                file.VerificationStatus = hash == file.Sha256.ToLowerInvariant()
-                    ? VerificationStatus.Verified
-                    : VerificationStatus.Failed;
-                if (file.VerificationStatus == VerificationStatus.Failed)
-                    allVerified = false;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "重校验文件失败 file={FileId}", file.Id);
-                file.VerificationStatus = VerificationStatus.Failed;
-                allVerified = false;
-            }
-        }
-
-        backupSet.Status = allVerified ? BackupSetStatus.Available : BackupSetStatus.VerificationFailed;
-        backupSet.VerifiedAt = DateTime.UtcNow;
-        await db.SaveChangesAsync(ct);
-
-        if (!allVerified)
-        {
-            await alerting.RaiseAsync(
-                $"backup_set:{backupSet.Id}:verify_failed",
-                AlertLevel.Critical,
-                "verification_failed",
-                $"备份 {backupSet.BackupSetCode} 重校验失败",
-                "存在文件缺失或哈希不一致",
-                clientId: backupSet.ClientId,
-                taskId: backupSet.TaskId,
-                backupSetId: backupSet.Id,
-                ct: ct);
-        }
-        else
-        {
-            await alerting.RecoverAsync($"backup_set:{backupSet.Id}:verify_failed", ct);
-        }
-    }
-
-    /// <summary>恢复请求下载前校验（设计书 19.3）：重算备份集全部文件哈希，只读不改动 backup_files</summary>
-    private async Task VerifyRestoreRequestAsync(AppDbContext db, IAlertingService alerting, Guid requestId, CancellationToken ct)
-    {
-        var request = await db.RestoreRequests.FirstOrDefaultAsync(r => r.Id == requestId, ct);
-        if (request is null || request.Status is not RestoreRequestStatus.Verifying)
-            return; // 已处理或状态不符，幂等跳过
-
-        var backupSet = await db.BackupSets.AsNoTracking()
-            .Include(b => b.Files)
-            .FirstOrDefaultAsync(b => b.Id == request.BackupSetId, ct);
-
-        if (backupSet is null || string.IsNullOrWhiteSpace(backupSet.RepositoryPath))
-        {
-            request.Status = RestoreRequestStatus.Failed;
-            request.ErrorMessage = "备份仓库路径缺失，无法完成下载前校验";
-            await db.SaveChangesAsync(ct);
-            return;
-        }
-
-        var failedCount = 0;
-        foreach (var file in backupSet.Files)
-        {
-            try
-            {
-                var path = Path.Combine(backupSet.RepositoryPath, file.RepositoryRelativePath.Replace('/', Path.DirectorySeparatorChar));
-                if (!File.Exists(path))
-                {
-                    failedCount++;
-                    continue;
-                }
-
-                string hash;
-                await using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true))
-                {
-                    hash = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(stream, ct)).ToLowerInvariant();
-                }
-
-                if (hash != file.Sha256.ToLowerInvariant())
-                    failedCount++;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "恢复校验文件失败 file={FileId}", file.Id);
-                failedCount++;
-            }
-        }
-
-        if (failedCount == 0)
-        {
-            request.Status = RestoreRequestStatus.Ready;
-            request.VerifiedAt = DateTime.UtcNow;
-        }
-        else
-        {
-            request.Status = RestoreRequestStatus.Failed;
-            request.ErrorMessage = $"完整性校验失败：{failedCount} 个文件缺失或哈希不一致";
-        }
-        await db.SaveChangesAsync(ct);
-
-        if (failedCount > 0)
-        {
-            await alerting.RaiseAsync(
-                $"restore_request:{request.Id}:verify_failed",
-                AlertLevel.Critical,
-                "restore_verify_failed",
-                $"恢复请求下载前校验失败（备份 {backupSet.BackupSetCode}）",
-                request.ErrorMessage,
-                clientId: backupSet.ClientId,
-                taskId: backupSet.TaskId,
-                backupSetId: backupSet.Id,
-                ct: ct);
-        }
-        else
-        {
-            _logger.LogInformation("恢复请求 {RequestId} 校验通过，备份 {Code} 可下载", request.Id, backupSet.BackupSetCode);
-        }
-    }
-
-    /// <summary>生成备份集编码 BS-yyyy-NNNN（唯一约束冲突时重试）</summary>
     /// <summary>
-    /// 生成备份集编码 BS-yyyy-NNNN（审查 P2-7）。
+    /// 提交之后的收尾动作失败（审计 E-07）。
+    /// 它存在的唯一目的是让外层 catch 能把「备份成功但收尾出错」
+    /// 和「备份真的失败了」区分开——两者的正确处置完全相反。
+    /// </summary>
+    private sealed class PostCommitException : Exception
+    {
+        public PostCommitException(Exception inner)
+            : base("入库事务已提交，提交后的收尾动作失败", inner)
+        {
+        }
+    }
+
+    /// <summary>
+    /// 生成备份集编码 BS-NNNNNN（审查 P2-7 · 审计 E-16）。
     ///
     /// 序号取自数据库序列 backup_set_code_seq（V011）：单调递增、不随删除回落，
     /// 并发下由数据库保证唯一。原先的 COUNT(*)+1 会在保留策略删除历史备份集后
     /// 让计数回落，使新备份集复用已注销的编码，破坏 manifest/审计/告警的可追溯性。
+    ///
+    /// E-16：格式里原本有年份（BS-yyyy-NNNN），但序列是全局的、跨年不重置，
+    /// 于是「2026 年的第 8931 个」实际是「有史以来的第 8931 个，前面贴了个年份」，
+    /// 跨年那一刻直接从 BS-2026-8931 变成 BS-2027-8932，四位补零也早溢出成五位。
+    /// 与其做按年重置（需要复合唯一约束加重试，跨年那一刻仍有并发窗口，
+    /// 而这只是一个展示属性），不如承认它就是全局流水号，把会误导人的年份去掉。
     /// </summary>
     private static async Task<string> GenerateBackupSetCodeAsync(AppDbContext db, CancellationToken ct)
     {
-        var year = DateTime.UtcNow.Year;
-
         await using var command = db.Database.GetDbConnection().CreateCommand();
         command.CommandText = "SELECT nextval('backup_set_code_seq')";
 
@@ -553,7 +468,7 @@ public class UploadCommitWorker : BackgroundService
         try
         {
             var next = Convert.ToInt64(await command.ExecuteScalarAsync(ct));
-            return $"BS-{year}-{next:0000}";
+            return $"BS-{next:000000}";
         }
         finally
         {

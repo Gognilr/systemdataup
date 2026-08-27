@@ -260,8 +260,13 @@ public static class StructureInference
         SnapshotNode source, List<SnapshotNode> yearDirectories, double yearRatio)
     {
         var evidence = new List<string>();
+        // 与下面挑"最新的月"同一条规则：先看有没有内容，再按名字。
+        // 只按名字的话，元旦刚建出来还空着的 2027 会顶掉真正有备份的 2026，
+        // 于是向导对一个它本来看得懂的结构回一句"没能看懂"——而扫描端的通配展开
+        // 按内容时间挑，根本不会选中那个空目录。两边对"最新"的判断不该在这里岔开。
         var latestYear = yearDirectories
-            .OrderByDescending(d => d.Name, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(d => VisibleDirectories(d).Any())
+            .ThenByDescending(d => d.Name, StringComparer.OrdinalIgnoreCase)
             .First();
         evidence.Add(
             $"{source.Name} 下有 {yearDirectories.Count} 个年份目录（{PreviewNames(yearDirectories)}），"

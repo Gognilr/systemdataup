@@ -259,7 +259,14 @@ public enum NotificationStatus
 {
     Pending,
     Sent,
-    Failed
+    Failed,
+
+    /// <summary>
+    /// 已取消（审计 G-12）：告警在这封通知发出去之前就恢复了。
+    /// 派发器只看投递记录自身的状态，不回查告警——没有这一格的时候，
+    /// 一次短暂抖动产生的邮件会在告警早已恢复之后继续重试三轮。
+    /// </summary>
+    Cancelled
 }
 
 /// <summary>重要等级</summary>

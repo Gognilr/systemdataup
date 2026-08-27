@@ -13,6 +13,7 @@ builder.Services.AddSingleton<Microsoft.Extensions.Logging.ILoggerProvider, Back
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentStateStore>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentTrayNotificationStore>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentConfigStore>();
+builder.Services.AddSingleton<BackupMonitor.Agent.AgentCandidateFileStore>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentApiClient>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentSignatureVerifier>();
 builder.Services.AddSingleton<BackupMonitor.Agent.SystemProbe>();

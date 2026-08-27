@@ -44,6 +44,12 @@ public class AuthService : IAuthService
     private readonly JwtTokenService _jwt;
     private readonly SystemSettingsProvider _settings;
     private readonly IAuditRecorder _audit;
+
+    /// <summary>
+    /// 令牌版本缓存（审计 H-14）。它是单例，注入到 scoped 服务里没问题——
+    /// 这里只调 Invalidate，不持有任何请求级状态。
+    /// </summary>
+    private readonly TokenVersionCache _tokenVersions;
     private readonly ILogger<AuthService> _logger;
 
     public AuthService(
@@ -51,12 +57,14 @@ public class AuthService : IAuthService
         JwtTokenService jwt,
         SystemSettingsProvider settings,
         IAuditRecorder audit,
+        TokenVersionCache tokenVersions,
         ILogger<AuthService> logger)
     {
         _db = db;
         _jwt = jwt;
         _settings = settings;
         _audit = audit;
+        _tokenVersions = tokenVersions;
         _logger = logger;
     }
 
@@ -170,9 +178,28 @@ public class AuthService : IAuthService
 
         if (stored.RevokedAt is not null)
         {
-            // 被吊销的令牌再次使用：可能是令牌泄露，吊销该用户全部刷新令牌
-            _logger.LogWarning("检测到已吊销刷新令牌重用 user={UserId}，吊销该用户全部刷新令牌", stored.UserId);
+            // 被吊销的令牌再次使用：这是典型的令牌泄露信号。
+            //
+            // 审计 H-14：原先只吊销刷新令牌，没有 TokenVersion++。
+            // 刷新令牌是有状态的，吊销立刻生效；访问令牌是无状态 JWT，
+            // 不动 TokenVersion 就得等它自然过期——最长一小时。
+            // 也就是说在确认令牌泄露的那一刻，攻击者手上的访问令牌仍然全权有效，
+            // 而这一小时正是最需要立刻切断的时候。改密和登出都做了这一步，
+            // 唯独安全性最敏感的重放检测漏了。
+            _logger.LogWarning("检测到已吊销刷新令牌重用 user={UserId}，吊销该用户全部刷新令牌并作废已签发的访问令牌", stored.UserId);
             await RevokeAllUserTokensAsync(stored.UserId, "token_reuse", ct);
+
+            var compromised = await _db.Users.FirstOrDefaultAsync(u => u.Id == stored.UserId, ct);
+            if (compromised is not null)
+            {
+                compromised.TokenVersion++;
+                await _db.SaveChangesAsync(ct);
+                _tokenVersions.Invalidate(compromised.Id);
+            }
+
+            // 令牌重放是最该留痕的安全事件之一，此前一条审计都没有。
+            await _audit.RecordAsync("auth.token_reuse", AuditResult.Failure, "user", stored.UserId, ct: ct);
+
             throw new BusinessException("UNAUTHORIZED", "刷新令牌已失效，请重新登录", 401);
         }
 
@@ -226,6 +253,11 @@ public class AuthService : IAuthService
             user.TokenVersion++;
 
         await _db.SaveChangesAsync(ct);
+
+        // 审计 H-14：TokenVersionCache.Invalidate 写好了却一处都没被调用，
+        // 于是登出实际要等满 60 秒 TTL 才生效。撤权要即时。
+        if (user is not null)
+            _tokenVersions.Invalidate(user.Id);
     }
 
     public async Task ChangePasswordAsync(Guid userId, ChangePasswordRequest request, CancellationToken ct = default)
@@ -281,6 +313,9 @@ public class AuthService : IAuthService
         user.TokenVersion++;
 
         await _db.SaveChangesAsync(ct);
+
+        // 审计 H-14：同上，不清缓存的话新的 TokenVersion 最坏 60 秒后才被看见。
+        _tokenVersions.Invalidate(user.Id);
 
         // 5. 吊销该用户全部刷新令牌，强制所有会话用新口令重新登录
         await RevokeAllUserTokensAsync(user.Id, "password_changed", ct);

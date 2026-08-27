@@ -164,6 +164,57 @@ public class PathSafetyTests
         Assert.Equal(100, result.Length);
     }
 
+    // ---------- 截断边界（审计 H-17） ----------
+
+    /// <summary>
+    /// 截断点恰好落在点或空格上时，收尾净化必须还能兜住。
+    ///
+    /// 原先的顺序是先净化后截断，于是这两种输入会产出以 '.' / ' ' 结尾的目录名。
+    /// NTFS 写盘时静默剥掉这两个字符，库里记的路径和磁盘上的目录名从此不一致——
+    /// 日常读写看不出来（Win32 做同样的规范化），但逐字符比对路径的逻辑全会踩到。
+    /// </summary>
+    [Theory]
+    [InlineData('.')]
+    [InlineData(' ')]
+    public void SanitizePathComponent_截断点落在点或空格上(char boundary)
+    {
+        // 第 100 个字符正好是分界字符
+        var input = new string('a', 99) + boundary + new string('b', 5);
+
+        var result = PathSafety.SanitizePathComponent(input);
+
+        Assert.Equal(99, result.Length);
+        Assert.DoesNotContain(result[^1], ". ");
+    }
+
+    /// <summary>
+    /// 按码位截断，不能切出半个代理对。中文在 BMP 内所以按码元截也看不出问题，
+    /// 主机名里出现 emoji 或扩展 B 区汉字时才会暴露——留下的是个连文件系统
+    /// 都未必接受的名字。
+    /// </summary>
+    [Fact]
+    public void SanitizePathComponent_不切断代理对()
+    {
+        const string emoji = "\U0001F600";   // 一个码位、两个 UTF-16 码元
+        var input = string.Concat(Enumerable.Repeat(emoji, 150));
+
+        var result = PathSafety.SanitizePathComponent(input);
+
+        Assert.Equal(100, result.EnumerateRunes().Count());
+        Assert.All(result.EnumerateRunes(), r => Assert.Equal(0x1F600, r.Value));
+        Assert.False(char.IsHighSurrogate(result[^1]), "结尾不能是孤立的高代理项");
+    }
+
+    /// <summary>保留名前缀不会把长度顶出上限</summary>
+    [Fact]
+    public void SanitizePathComponent_保留名加前缀后仍不超上限()
+    {
+        var result = PathSafety.SanitizePathComponent("CON");
+
+        Assert.Equal("_CON", result);
+        Assert.True(result.Length <= 100);
+    }
+
     // ---------- Windows 保留设备名（审查 P2-6） ----------
 
     /// <summary>

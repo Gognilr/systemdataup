@@ -65,6 +65,15 @@ public class RestoreRequestDto
     public Guid RequestedBy { get; set; }
 
     public string? RequestedByName { get; set; }
+
+    /// <summary>
+    /// 校验队列里排在本请求之前还有多少个工作项（审计 H-18）。
+    ///
+    /// 只在 verifying 状态下有值。原先「点了恢复之后一直在校验」的时候，
+    /// 界面上完全看不出到底是卡住了还是在排队——这两件事对使用者是
+    /// 完全不同的两种处境，一个该等，一个该报障。
+    /// </summary>
+    public int? VerificationQueueLength { get; set; }
 }
 
 /// <summary>签发下载令牌响应（补充设计：库中只存令牌哈希，明文仅在签发时返回一次）</summary>
