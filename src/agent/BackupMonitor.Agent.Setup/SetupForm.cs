@@ -1,5 +1,6 @@
 ﻿using Microsoft.Win32;
 
+using BackupMonitor.Shared.Discovery;
 using BackupMonitor.Shared.Security;
 
 namespace BackupMonitor.Agent.Setup;
@@ -370,6 +371,7 @@ internal sealed class SetupForm : Form
                 displayName,
                 registrationToken,
                 _expectedFingerprint.Text,
+                SelectedDiscoveredInstanceId(serverUrl),
                 ConfirmServerFingerprintAsync,
                 progress,
                 CancellationToken.None);
@@ -508,6 +510,23 @@ internal sealed class SetupForm : Form
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// 本次安装的目标地址对应的发现实例 ID（方案 C 的锚点来源之一）。
+    ///
+    /// 只有列表里选中的那台、且地址栏没被人再改过时才返回它：选完服务端又手工
+    /// 改了地址，说明用户装的已经不是列表里那台，把上一台的实例 ID 带下去
+    /// 会让安装器拿一个不相干的值去和服务端自报的实例 ID 做比对。
+    /// </summary>
+    private string? SelectedDiscoveredInstanceId(string serverUrl)
+    {
+        if (_discoveredServers.SelectedItem is not DiscoveredServer server)
+            return null;
+
+        return string.Equals(server.ApiAddress.TrimEnd('/'), serverUrl, StringComparison.OrdinalIgnoreCase)
+            ? server.InstanceId
+            : null;
     }
 
     /// <summary>

@@ -39,7 +39,24 @@ public class HttpContextCurrentContext : ICurrentContext
 
     public string? Username => Context?.User?.FindFirst("username")?.Value;
 
-    public string? ClientIp => Context?.Connection.RemoteIpAddress?.ToString();
+    /// <summary>
+    /// 服务端看到的对端地址。
+    ///
+    /// 双栈监听（Kestrel 默认的 IPv6Any）下，IPv4 客户端进来时内核给的是 IPv4 映射地址，
+    /// 直接 ToString() 会把 192.168.1.10 存成 ::ffff:192.168.1.10——
+    /// 审计里按 IP 查对不上，客户端列表的 IP 列也显示成没人认得出的形状。
+    /// 这里把映射地址还原回本来的 IPv4；真正走 IPv6 连上来的原样保留，不做任何猜测。
+    /// </summary>
+    public string? ClientIp
+    {
+        get
+        {
+            var address = Context?.Connection.RemoteIpAddress;
+            if (address is null)
+                return null;
+            return address.IsIPv4MappedToIPv6 ? address.MapToIPv4().ToString() : address.ToString();
+        }
+    }
 
     public string? UserAgent
     {

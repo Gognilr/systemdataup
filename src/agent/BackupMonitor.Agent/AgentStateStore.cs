@@ -19,6 +19,26 @@ public sealed class AgentState
     public string? CertificateThumbprint { get; set; }
     public DateTime? CertificateExpiresAt { get; set; }
     public string? LastError { get; set; }
+
+    /// <summary>
+    /// 本 Agent 认定的服务端实例 ID（LAN 发现应答里的 ServerInstanceId）。
+    ///
+    /// 安装向导发现到哪台服务端就写哪个值。运行期地址失联后重新发现时，
+    /// 它是「这台应答的机器是不是我原来那台服务端」的两个固定锚点之一
+    /// （另一个是 ServerCertificateFingerprint）——发现协议是无认证的明文 UDP，
+    /// 少了这两个比对，同网段任何人广播一个应答就能把全部客户端劫走。
+    /// 为空表示当时是手工填的地址、没见过实例 ID，此时自动重发现一律不做。
+    /// </summary>
+    public string? ServerInstanceId { get; set; }
+
+    /// <summary>
+    /// 运行期重新发现到的服务端地址，优先于 appsettings.json 里的 ServerUrl。
+    ///
+    /// 刻意不回写 appsettings.json：那个文件在 %ProgramFiles% 下、由安装器负责，
+    /// Agent 去改它既要和安装器抢写，又会让「配置文件里写的」和「实际连的」
+    /// 出现两个来源。地址属于运行期状态，和身份一起放在 state.json 里更自洽。
+    /// </summary>
+    public string? ServerUrlOverride { get; set; }
     public Dictionary<string, LocalCandidateState> Candidates { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<Guid> SeenNotificationIds { get; set; } = [];
     public List<string> SeenCommandNonces { get; set; } = [];
@@ -175,6 +195,24 @@ public sealed class AgentStateStore
         }
     }
 
+    public string? ServerInstanceId
+    {
+        get
+        {
+            lock (_sync)
+                return string.IsNullOrWhiteSpace(_state.ServerInstanceId) ? null : _state.ServerInstanceId;
+        }
+    }
+
+    public string? ServerUrlOverride
+    {
+        get
+        {
+            lock (_sync)
+                return string.IsNullOrWhiteSpace(_state.ServerUrlOverride) ? null : _state.ServerUrlOverride;
+        }
+    }
+
     public DateTime? CertificateExpiresAt
     {
         get
@@ -189,6 +227,37 @@ public sealed class AgentStateStore
         lock (_sync)
         {
             update(_state);
+            SaveUnsafe();
+        }
+    }
+
+    /// <summary>
+    /// 丢弃服务端身份，保留机器指纹和身份私钥（方案 B 的自愈落点）。
+    ///
+    /// 保留 MachineId 是这条路径能走通的关键：服务端就是靠同一个 machineId 认出
+    /// 「这是原来那台机器重新来登记」，从而把已判离线的旧身份让位给新申请
+    /// （AgentRegistrationService.SupersedeOfflineClientAsync）。换一个 machineId
+    /// 就变成了一台全新机器，服务端上会多出一条僵尸记录，旧记录永远不会被清掉。
+    ///
+    /// 保留私钥则是为了不让「自愈」变成「换钥匙」：私钥重新生成一次，
+    /// DPAPI 保护数据、公钥、证书链全要跟着换一遍，而这次失联的原因跟私钥无关。
+    ///
+    /// ConfigVersion 必须归零：新服务端（换了空库）的配置版本从头开始，
+    /// 留着旧版本号会让心跳里的 RequiredConfigVersion 永远不大于本地值，
+    /// Agent 就此抱着一份属于旧身份、签名也验不过的配置不放，任务全都跑不起来。
+    /// SeenCommandNonces 反过来要留着——它是重放防护的窗口，清掉只会放宽安全边界。
+    /// </summary>
+    public void ClearIdentity(string reason)
+    {
+        lock (_sync)
+        {
+            _state.ClientId = null;
+            _state.RegistrationId = null;
+            _state.ProtectedCertificatePfx = null;
+            _state.CertificateThumbprint = null;
+            _state.CertificateExpiresAt = null;
+            _state.ConfigVersion = 0;
+            _state.LastError = reason;
             SaveUnsafe();
         }
     }

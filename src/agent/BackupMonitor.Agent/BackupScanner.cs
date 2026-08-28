@@ -99,7 +99,8 @@ public sealed class BackupScanner
             // 位置很关键：必须排在 files.Count == 0 判断之前——分组后为空同样应当走
             // no_new_backup，而不是拿一个空集合往下算 manifest。
             // 分组语义本身在 RecognizerRules 里，与服务端预演共用同一份实现。
-            files = rules.SelectLatestGroup(
+            files = rules.NarrowToOneBackup(
+                task.RecognizerType,
                 files,
                 f => Path.GetRelativePath(selected.Root, f.FullName),
                 f => f.LastWriteTimeUtc).ToList();
@@ -201,43 +202,41 @@ public sealed class BackupScanner
         {
             try
             {
-                var depth = rules.BusinessUnitDepth;
-                var units = Directory.EnumerateDirectories(
-                        source,
-                        "*",
-                        depth <= 1 ? SearchOption.TopDirectoryOnly : SearchOption.AllDirectories)
-                    .Where(p => DirectoryDepth(source, p) == depth)
-                    .Where(p => !rules.IsExcludedDirectory(p))
-                    .Where(p => rules.BatchRegex is null || RecognizerRules.RegexMatches(Path.GetFileName(p), rules.BatchRegex))
-                    .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                    .Select(p =>
+                // 单元的定位规则（按人指定的路径 / 按日期层自适应 / 按固定深度）住在
+                // BusinessUnitResolver 里，与服务端预演共用同一份实现——两侧各写一遍的话，
+                // 向导说会识别出 18 个账套、实际扫描出 3 个，而且没有任何人会发现。
+                var units = BusinessUnitResolver.Resolve(
+                    new DirectoryInfo(source),
+                    rules,
+                    DirectoryNavigator(source));
+
+                // 单元里再取「最新的那个日期目录」。
+                // 只定位到账套而不再往下走的话，CollectFiles 会把所有天的文件混成一份，
+                // 每天换一次 manifest，越滚越大且永远不代表「某一天的那份备份」。
+                // date_leaf 按定义就带这一步（它找的正是「下面是日期目录」的那一层）。
+                var pickLatestChild = rules.UnitLayout is "latest_directory" or "date_leaf";
+
+                return units
+                    .Select(unit =>
                     {
-                        var relative = Path.GetRelativePath(source, p).Replace('\\', '/');
-                        return (Path: p, Unit: (PrecheckBusinessUnitDto?)new PrecheckBusinessUnitDto
+                        var relative = unit.RelativePath;
+                        var dto = (PrecheckBusinessUnitDto?)new PrecheckBusinessUnitDto
                         {
                             // ExternalKey 曾经取叶子目录名，depth≥2 时必然撞车：
                             // 账套001/20260824 与 账套002/20260824 的叶子名都是 20260824，
                             // 而业务单元的唯一键是 (task_id, external_key)——两个账套会被合并成同一个单元。
-                            // 相对路径才是这个单元在源目录下的唯一身份。
+                            // 相对路径才是这个单元在源目录下的唯一身份，混合层级下同样成立：
+                            // ZT001 与 ZT201-ZT216/ZT201 天然不撞键。
                             ExternalKey = relative,
                             DisplayName = relative,
                             SourceRelativePath = relative
-                        });
+                        };
+                        var root = pickLatestChild
+                            ? SelectLatestChildDirectory(unit.Directory.FullName, rules)
+                            : unit.Directory.FullName;
+                        return (Root: root, Unit: dto);
                     })
                     .ToList();
-
-                // U8 这类结构是两层的：账套是业务单元，账套下每天一个备份目录。
-                // 只按 depth 定位到账套的话，CollectFiles 会把所有天的文件混成一份，
-                // 每天换一次 manifest，越滚越大且永远不代表"某一天的那份备份"。
-                // unitLayout=latest_directory 让每个单元内部再取最新的那个子目录。
-                if (rules.UnitLayout == "latest_directory")
-                {
-                    return units
-                        .Select(entry => (Root: SelectLatestChildDirectory(entry.Path, rules), entry.Unit))
-                        .ToList();
-                }
-
-                return units.Select(entry => (entry.Path, entry.Unit)).ToList();
             }
             catch (Exception ex)
             {
@@ -326,8 +325,10 @@ public sealed class BackupScanner
             .OrderBy(f => f.FullName, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        // latest_single_file 通过根目录选择后仍可能收集同目录其他文件；调用方只需要稳定且可上传的集合，
-        // 因此这里保留规则过滤后的集合，避免误删同一备份集中的伴随文件。
+        // 这里只负责「按规则收全」，收敛成一份备份是 NarrowToOneBackup 的事（单一收敛点）。
+        // 原先这里有一句注释说 latest_single_file 会连带收同目录其他文件、且刻意保留——
+        // 那正是让这个识别器名不副实的地方：在堆了 7 天备份的目录上，「取最新的那个文件」
+        // 实际取的是全部 14 个。
         ct.ThrowIfCancellationRequested();
         return files;
     }
@@ -342,6 +343,19 @@ public sealed class BackupScanner
 
         return rules.IsAllowedFile(relative, file.FullName, file.Name, hidden, Path.GetFileName(root));
     }
+
+    /// <summary>把真实文件系统折成 BusinessUnitResolver 需要的四个访问器。</summary>
+    private static BusinessUnitResolver.Navigator<DirectoryInfo> DirectoryNavigator(string source) => new()
+    {
+        ChildDirectories = directory =>
+        {
+            try { return directory.EnumerateDirectories("*", SearchOption.TopDirectoryOnly).ToList(); }
+            catch (Exception) { return []; }
+        },
+        Name = directory => directory.Name,
+        FullPath = directory => directory.FullName,
+        RelativePath = directory => Path.GetRelativePath(source, directory.FullName).Replace('\\', '/')
+    };
 
     /// <summary>通配展开用：某个目录的直接子目录，受 excludeDirectories 约束。</summary>
     private static IEnumerable<DirectoryInfo> SafeEnumerateChildDirectories(string root, RecognizerRules rules)
@@ -403,16 +417,6 @@ public sealed class BackupScanner
         {
             return [];
         }
-    }
-
-    private static int DirectoryDepth(string root, string path)
-    {
-        var relative = Path.GetRelativePath(root, path);
-        if (relative is "." or "")
-            return 0;
-        return relative.Split(
-            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
-            StringSplitOptions.RemoveEmptyEntries).Length;
     }
 
     private static async Task<string> ComputeSha256Async(string path, CancellationToken ct)

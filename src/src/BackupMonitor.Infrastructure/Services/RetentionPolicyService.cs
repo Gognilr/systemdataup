@@ -1,5 +1,6 @@
 using System.Text.Json;
 using BackupMonitor.Core.Entities.Retention;
+using BackupMonitor.Core.Entities.System;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Exceptions;
@@ -17,6 +18,9 @@ public interface IRetentionPolicyService
     Task<RetentionPolicyDto> CreateAsync(RetentionPolicyUpsertDto request, CancellationToken ct = default);
     Task<RetentionPolicyDto> UpdateAsync(Guid id, RetentionPolicyUpsertDto request, CancellationToken ct = default);
     Task DeleteAsync(Guid id, CancellationToken ct = default);
+
+    /// <summary>把该策略设为「新建任务默认」（写 system_settings.default_retention_policy_id）</summary>
+    Task<RetentionPolicyDto> SetDefaultAsync(Guid id, CancellationToken ct = default);
 }
 
 /// <summary>保留策略实现（CRUD；保留清理由定时任务负责，见设计书 25）</summary>
@@ -53,6 +57,69 @@ public class RetentionPolicyService : IRetentionPolicyService
     {
         var raw = await settings.GetStringAsync(DefaultPolicySettingKey, ct);
         return Guid.TryParse(raw, out var id) ? id : null;
+    }
+
+    /// <summary>
+    /// 把某份策略设为「新建任务默认」。
+    ///
+    /// 刻意没有配套的「清除默认」：没有默认策略之后，不选策略的任务会退回「不绑策略」，
+    /// 而这个状态在清理器里等同于永不清理——正是 V027 花力气堵上的坑。
+    /// 真要回到旧行为改一条 SQL 就够了，不值得在界面上留一个自毁开关。
+    /// </summary>
+    public async Task<RetentionPolicyDto> SetDefaultAsync(Guid id, CancellationToken ct = default)
+    {
+        var policy = await _db.RetentionPolicies.AsNoTracking().FirstOrDefaultAsync(p => p.Id == id, ct)
+            ?? throw new NotFoundException("保留策略", id);
+
+        var beforeId = await GetDefaultPolicyIdAsync(_settings, ct);
+        var boundTaskCount = await _db.BackupTasks.CountAsync(t => t.RetentionPolicyId == id, ct);
+
+        // 已经是默认就直接返回：反复点同一行不该在审计里刷出一串「没有变化的变更」
+        if (beforeId == id)
+            return Map(policy, boundTaskCount, id);
+
+        // 改前的策略名必须在这里取。审计里只留 ID 的话，事后翻记录还得反查这个 ID 是谁，
+        // 而它很可能已经被删掉了——改配默认策略正是为了能删掉旧的那份。
+        var beforeName = beforeId is null
+            ? null
+            : await _db.RetentionPolicies.AsNoTracking()
+                .Where(p => p.Id == beforeId.Value)
+                .Select(p => p.Name)
+                .FirstOrDefaultAsync(ct);
+
+        var json = JsonSerializer.Serialize(id.ToString());
+        var row = await _db.SystemSettings.FirstOrDefaultAsync(s => s.SettingKey == DefaultPolicySettingKey, ct);
+        if (row is null)
+        {
+            _db.SystemSettings.Add(new SystemSetting
+            {
+                SettingKey = DefaultPolicySettingKey,
+                SettingValue = json,
+                Encrypted = false,
+                UpdatedBy = _context.UserId
+            });
+        }
+        else
+        {
+            row.SettingValue = json;
+            row.UpdatedBy = _context.UserId;
+        }
+
+        await _db.SaveChangesAsync(ct);
+
+        // SystemSettingsProvider 是单例、缓存 60 秒：不作废的话，刚点完「设为默认」转头建任务
+        // 绑上的还是旧策略，界面上表现为「设置没保存」。
+        _settings.Invalidate();
+
+        // 保留策略决定数据什么时候被删，改配默认策略必须留痕（改前改后的 ID 与名称都记）
+        await _audit.RecordAsync("retention.default_changed", AuditResult.Success, "retention_policy", policy.Id,
+            beforeData: JsonSerializer.Serialize(new { policyId = beforeId, policyName = beforeName }),
+            afterData: JsonSerializer.Serialize(new { policyId = policy.Id, policyName = policy.Name }), ct: ct);
+
+        _logger.LogInformation("新建任务默认保留策略已改为 {PolicyId}({Name})，原为 {BeforePolicyId}({BeforeName})",
+            policy.Id, policy.Name, beforeId, beforeName);
+
+        return Map(policy, boundTaskCount, id);
     }
 
     public async Task<List<RetentionPolicyDto>> GetListAsync(CancellationToken ct = default)

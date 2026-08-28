@@ -26,6 +26,14 @@ const POLL_INTERVAL_MS = 1500;
    等于向导说"全部完整"而第二天真扫报"仍在变化"，那份承诺就作废了。 */
 const STABILITY_INTERVAL_SECONDS = 600;
 
+/* 推断用的抓取深度：源目录(1) → 年/账套(2) → 月/日期(3) → 文件(4)。
+   不设更大，是因为层数一深条目数是乘出来的，很容易顶到 3000 条上限，
+   反而让本来看得懂的结构被标成"没抓全"。真正需要更深时走 DEEP_SCAN_DEPTH 重来一次。 */
+const INFER_DEPTH = 4;
+
+/* 服务端说"我是被深度卡住的"时才用的重试深度（服务端硬上限就是 6）。 */
+const DEEP_SCAN_DEPTH = 6;
+
 /* 对外入口。返回：
      { sourcePath, recognizerType, recognizerConfig, applicationName }  —— 用户确认了方案
      'manual'                                                          —— 用户要自己描述结构
@@ -101,18 +109,20 @@ export function runDirectoryWizard(clientId) {
 
     /* ── 第一步：浏览 ── */
 
-    async function load(path, andInfer = false) {
+    async function load(path, andInfer = false, depthOverride = 0) {
       body(`<div class="hint">正在读取 ${path ? esc(path) : '磁盘列表'}…</div>${skeleton(4)}`);
       footer('');
       try {
         const dispatched = await api(`/api/v1/admin/clients/${clientId}/browse`, {
           method: 'POST',
-          // 确认目录时一律抓满 3 层：这一次是冲着"看懂这个目录"去的，
+          // 确认目录时抓 INFER_DEPTH 层：这一次是冲着"看懂这个目录"去的，
           // 盘根那条省钱的规则（只抓一层）在这里反而会让推断看到一个空目录。
-          // 推断抓 4 层：Backup(1) → 年(2) → 月(3) → 组内文件(4)。抓 3 层时
-        // 年/月分层的文件正好落在第 4 层，推断会看到"月目录是空的"而认不出结构。
-        // 上限是服务端 clamp 的 6；抓不全时 HasGaps 置位，置信度会相应下调并说明。
-        body: { path: path || null, maxDepth: andInfer ? 4 : browseDepth(path), maxEntries: 3000 }
+          // depthOverride 只在服务端回报"我是被深度卡住的"时才传，见 infer()。
+          body: {
+            path: path || null,
+            maxDepth: depthOverride || (andInfer ? INFER_DEPTH : browseDepth(path)),
+            maxEntries: 3000
+          }
         });
         st.commandId = dispatched.commandId;
         const snapshot = await waitForSnapshot(st.commandId, alive, stage => {
@@ -178,14 +188,14 @@ export function runDirectoryWizard(clientId) {
        只发生在"就用这个目录"这一次点击上），再推断。 */
     function needsOwnSnapshot() {
       if (!st.snapshot || st.snapshot.isDriveList || !st.selected) return false;
-      // 与推断请求的 maxDepth 保持一致：手上这份快照浅于 4 层就重抓一次，
+      // 与推断请求的 maxDepth 保持一致：手上这份快照浅于 INFER_DEPTH 层就重抓一次，
       // 否则年/月分层的文件落在第 4 层，推断会把月目录看成空的。
-      return st.selected !== normPath(st.snapshot.root) || (st.snapshot.maxDepth || 0) < 4;
+      return st.selected !== normPath(st.snapshot.root) || (st.snapshot.maxDepth || 0) < INFER_DEPTH;
     }
 
     /* ── 第二步：推断 + 预演 ── */
 
-    async function infer() {
+    async function infer(deepened = false) {
       body(`<div class="hint">正在分析 ${esc(displayPath(st.selected))} 的结构…</div>${skeleton(4)}`);
       footer('');
       try {
@@ -193,6 +203,22 @@ export function runDirectoryWizard(clientId) {
           method: 'POST',
           body: { commandId: st.commandId, path: st.selected }
         });
+
+        /* 只差一层就能看懂时，再抓深一点重来一次。
+
+           默认抓 4 层是有理由的：层数一深，条目数是乘出来的，很容易顶到 3000 条上限，
+           反而让本来看得懂的结构被标成"没抓全"、置信度扣 20 分。所以不能一律调大，
+           而是在服务端确实被深度卡住时才多花这一次往返（约 10 秒）。
+           deepened 这个标志挡住第二次——抓到 6 层还看不懂，就是真的看不懂了。 */
+        const depth = st.snapshot?.maxDepth || 0;
+        if (!deepened && st.proposal.needsDeeperScan && depth < DEEP_SCAN_DEPTH) {
+          body(`<div class="hint">目录比预想的深，正在往下再看两层…</div>${skeleton(4)}`);
+          await load(st.selected, false, DEEP_SCAN_DEPTH);
+          if (!alive()) return;
+          await infer(true);
+          return;
+        }
+
         st.required = new Set(
           (st.proposal.requiredFileCandidates || []).filter(c => c.recommended).map(c => c.pattern));
         renderProposal();
@@ -324,6 +350,12 @@ function nodeHtml(entry, level, st) {
   return html;
 }
 
+/* 必需文件的勾选区。
+
+   分成"默认勾上"和"不作判据"两块，而不是一个平铺列表 —— 后者会让人以为
+   没勾的那些是被漏掉了。真正要传达的是：它们照常备份，只是不参与完整性判定，
+   而且要说清楚为什么（"各账套启用年度不同，附件库个数本来就不一样"）。
+   只把勾去掉不给理由，人只会觉得系统看漏了，然后手动勾上，制造一堆假警报。 */
 function requiredPickerHtml(proposal) {
   const candidates = proposal.requiredFileCandidates || [];
   if (!candidates.length) {
@@ -331,18 +363,37 @@ function requiredPickerHtml(proposal) {
       <p class="hint">这次没有看出固定出现的文件，暂不检查。建任务后可以在任务详情里补上。</p>`;
   }
 
+  const picked = candidates.filter(c => c.recommended);
+  const extras = candidates.filter(c => !c.recommended);
+
   return `<h3>每次备份必须有哪些文件</h3>
     <p class="hint">勾上的文件如果缺了，这次备份就判为不完整，不会入库。</p>
     <div class="filepick">
-      ${candidates.map(c => `
-        <label class="filepick__item">
-          <input type="checkbox" data-required="${esc(c.pattern)}" ${c.recommended ? 'checked' : ''}>
-          <span class="filepick__name">${esc(c.pattern)}</span>
-          <span class="filepick__meta">${c.totalUnits > 1
-            ? `${c.presentIn}/${c.totalUnits} 个备份目录里有`
-            : '在这个备份目录里'} · 约 ${fmtBytes(c.typicalSizeBytes)}</span>
-        </label>`).join('')}
-    </div>`;
+      ${picked.map(candidateHtml).join('')}
+    </div>
+    ${extras.length ? `
+      <p class="hint" style="margin-top:.75rem">下面这些也会照常备份上传，只是不适合拿来判断"这次备份完不完整"：</p>
+      <div class="filepick">${extras.map(candidateHtml).join('')}</div>` : ''}`;
+}
+
+function candidateHtml(c) {
+  // 每个单元里个数不固定时，把区间显示出来——那正是它不能当判据的理由本身。
+  const count = c.countPerUnitMax > 1 || c.countPerUnitMin !== c.countPerUnitMax
+    ? `每个 ${c.countPerUnitMin === c.countPerUnitMax
+        ? c.countPerUnitMin
+        : c.countPerUnitMin + '–' + c.countPerUnitMax} 个 · `
+    : '';
+  const scope = c.totalUnits > 1
+    ? `${c.presentIn}/${c.totalUnits} 个备份目录里有`
+    : '在这个备份目录里';
+
+  return `<label class="filepick__item">
+    <input type="checkbox" data-required="${esc(c.pattern)}" ${c.recommended ? 'checked' : ''}>
+    <span class="filepick__name">${esc(c.pattern)}${
+      c.kind === 'pattern' ? '<span class="tagkind" title="文件名每次不同，按模式认">按模式</span>' : ''}</span>
+    <span class="filepick__meta">${scope} · ${count}约 ${fmtBytes(c.typicalSizeBytes)}</span>
+    ${c.notRecommendedReason ? `<span class="filepick__why">${esc(c.notRecommendedReason)}</span>` : ''}
+  </label>`;
 }
 
 function previewHtml(preview) {

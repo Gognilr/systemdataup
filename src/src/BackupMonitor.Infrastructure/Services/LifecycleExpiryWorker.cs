@@ -56,12 +56,10 @@ public class LifecycleExpiryWorker : BackgroundService
     /// paused 刻意留在里面：它不再是可写状态（待办方案 E 把它从写入白名单里拿掉了），
     /// 但它仍然占着暂存空间和并发额度。有人点了暂停之后忘掉，超时线就是唯一的兜底。
     /// </summary>
-    private static readonly UploadStatus[] WritableStatuses =
-        [UploadStatus.Created, UploadStatus.Uploading, UploadStatus.Paused, UploadStatus.RetryWait];
+    private static readonly UploadStatus[] WritableStatuses = UploadSessionStatuses.Active;
 
     /// <summary>会话终态：这些状态的暂存目录不会再被写，可以清</summary>
-    private static readonly UploadStatus[] TerminalStatuses =
-        [UploadStatus.Committed, UploadStatus.Failed, UploadStatus.Cancelled, UploadStatus.Expired];
+    private static readonly UploadStatus[] TerminalStatuses = UploadSessionStatuses.Terminal;
 
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<LifecycleExpiryWorker> _logger;

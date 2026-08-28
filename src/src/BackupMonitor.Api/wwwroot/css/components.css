@@ -380,12 +380,16 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 
 .filepick{display:flex;flex-direction:column;gap:var(--s-1)}
 .filepick__item{display:flex;align-items:center;gap:var(--s-2);padding:var(--s-1) var(--s-2);
-  border:1px solid var(--border);border-radius:var(--r-md);cursor:pointer}
+  border:1px solid var(--border);border-radius:var(--r-md);cursor:pointer;flex-wrap:wrap}
 .filepick__item:hover{background:var(--surface-sunk)}
 .filepick__item input{width:auto;margin:0}
 .filepick__name{font-family:var(--font-mono);font-size:12px;flex:1;min-width:0;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .filepick__meta{font:var(--t-sm);color:var(--text-muted);white-space:nowrap}
+/* 「为什么没默认勾上」独占一行：它是给人做判断用的，不能被挤成省略号。 */
+.filepick__why{flex-basis:100%;font:var(--t-sm);color:var(--text-muted);padding-left:26px}
+.tagkind{font-family:var(--font-sans);font-size:11px;color:var(--text-muted);
+  border:1px solid var(--border);border-radius:var(--r-sm);padding:0 4px;margin-left:6px}
 
 .pvunit{border:1px solid var(--border);border-radius:var(--r-md);padding:var(--s-2) var(--s-3);
   margin-bottom:var(--s-2)}

@@ -36,6 +36,31 @@ public class AdminClientController : ApiBaseController
         return OkData(result);
     }
 
+    /// <summary>
+    /// 修改客户端的显示名称与所属分组。
+    ///
+    /// 用 PATCH 而不是 PUT：请求体里两个字段都可以不传，语义是"没提到的不动"。
+    /// 换成 PUT 就得让调用方把整个客户端对象回传一遍，而这个对象里绝大多数字段
+    /// （证书、心跳、状态）根本不该由界面决定。
+    /// </summary>
+    [HttpPatch("{clientId:guid}")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.manage")]
+    public async Task<ActionResult<ApiResponse<ClientDetailDto>>> Update(
+        Guid clientId, [FromBody] UpdateClientRequest request, CancellationToken ct)
+    {
+        var result = await _clientService.UpdateAsync(clientId, request, ct);
+        return OkData(result, "客户端信息已更新");
+    }
+
+    /// <summary>客户端分组选项，供"改分组"下拉框使用。</summary>
+    [HttpGet("groups")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.read")]
+    public async Task<ActionResult<ApiResponse<IReadOnlyList<ClientGroupOptionDto>>>> Groups(CancellationToken ct)
+    {
+        var result = await _clientService.GetGroupOptionsAsync(ct);
+        return OkData(result);
+    }
+
     /// <summary>最近自动登记客户端，供待办页追踪局域网免令牌登记。</summary>
     [HttpGet("recent-auto-enrollments")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.read")]

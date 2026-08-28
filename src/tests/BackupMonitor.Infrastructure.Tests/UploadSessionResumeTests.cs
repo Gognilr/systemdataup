@@ -312,9 +312,152 @@ public class UploadSessionResumeTests : IDisposable
             () => UploadChunkAsync(svc, clientId, sessionId, fileId, 1));
         Assert.Equal(409, ex.StatusCode);
 
+        // 错误码要能和「会话状态异常」区分开：Agent 靠它决定是安静停下还是重试。
+        // 共用一个泛化的 UPLOAD_SESSION_CONFLICT 时，Agent 只能一律当成可重试错误，
+        // 于是暂停变成「退避几秒后接着传」。
+        Assert.Equal(UploadSessionService.PausedErrorCode, ex.ErrorCode);
+
         // 已经传上来的块一块都不能少：暂停不是取消
         var missing = await svc.GetMissingChunksAsync(clientId, sessionId, fileId);
         Assert.Equal(new List<int> { 0 }, missing.Received);
+    }
+
+    /// <summary>
+    /// **点了暂停几秒后传输自己又跑起来**的那个缺陷。
+    ///
+    /// 根因不在守卫，而在记录分块的那条裸 SQL：它无条件写 `status = 'uploading'`。
+    /// 管理端把会话置 paused 之后，任何一个已经通过守卫、还在路上的分块落库都会把状态
+    /// 改回去——而 Agent 默认 4 路并行、每块 8MB，点暂停的那一刻几乎必然有在途块。
+    ///
+    /// 所以这里直接调落库那一步，绕过守卫：走公开接口的话写入在守卫处就被挡下，
+    /// 根本到不了出问题的那条 UPDATE，测了也测不到东西。
+    ///
+    /// 两个断言缺一不可：状态不许被改回去，**而已传字节必须照常累加**——
+    /// 那一块确实收到了、确实落在暂存目录里，进度倒退会让恢复后的 missing-chunks
+    /// 与 uploaded_bytes 对不上。
+    /// </summary>
+    [Fact]
+    public async Task 暂停中落库的在途分块不会把状态刷回传输中()
+    {
+        await using var sp = BuildServices();
+        await using var scope = sp.CreateAsyncScope();
+        var (svc, db, clientId, candidateId) = await NewSessionContextAsync(scope);
+
+        var created = await svc.CreateSessionAsync(clientId, CreateRequest(candidateId));
+        var sessionId = created.UploadSessionId;
+        var fileId = created.Files[0].UploadFileId;
+
+        await UploadChunkAsync(svc, clientId, sessionId, fileId, 0);
+        await db.UploadSessions.Where(s => s.Id == sessionId)
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, UploadStatus.Paused));
+
+        var before = await db.UploadSessions.AsNoTracking()
+            .Where(s => s.Id == sessionId).Select(s => s.UploadedBytes).FirstAsync();
+
+        // 模拟一个在守卫之后、暂停之前就已经上路的分块，现在才落库。
+        var concrete = (UploadSessionService)svc;
+        var bytes = ChunkBytes(1);
+        await concrete.RecordReceivedChunkAsync(
+            sessionId, fileId, chunkIndex: 1, offset: ChunkSize, chunkBytes: bytes.Length,
+            expectedHash: ChunkHash(1), serverHash: ChunkHash(1), CancellationToken.None);
+
+        var after = await db.UploadSessions.AsNoTracking()
+            .Where(s => s.Id == sessionId)
+            .Select(s => new { s.Status, s.UploadedBytes })
+            .FirstAsync();
+
+        Assert.Equal(UploadStatus.Paused, after.Status);
+        Assert.Equal(before + bytes.Length, after.UploadedBytes);
+    }
+
+    /// <summary>
+    /// 暂停必须挡住**所有**向前推进的路径，不只是分块写入那一条。
+    ///
+    /// 分块收齐之后暂停的话，完成文件、完成会话这两条路原先都是畅通的——
+    /// 会话会一路走到 verifying 再入库，暂停等于没按。
+    /// </summary>
+    [Fact]
+    public async Task 暂停中不能完成文件也不能完成会话()
+    {
+        await using var sp = BuildServices();
+        Guid clientId = Guid.Empty, candidateId = Guid.Empty, sessionId = Guid.Empty, fileId = Guid.Empty;
+
+        // 第一段「请求」：把三块都传上去，然后管理端把会话暂停。
+        await using (var scope = sp.CreateAsyncScope())
+        {
+            var (svc, db, cId, candId) = await NewSessionContextAsync(scope);
+            clientId = cId;
+            candidateId = candId;
+
+            var created = await svc.CreateSessionAsync(clientId, CreateRequest(candidateId));
+            sessionId = created.UploadSessionId;
+            fileId = created.Files[0].UploadFileId;
+
+            for (var i = 0; i < ChunkCount; i++)
+                await UploadChunkAsync(svc, clientId, sessionId, fileId, i);
+
+            await db.UploadSessions.Where(s => s.Id == sessionId)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, UploadStatus.Paused));
+        }
+
+        // 第二段「请求」：新作用域、新 DbContext——与线上一致。
+        // 同一个作用域里做不了这个断言：会话实体还在变更跟踪里，
+        // ExecuteUpdate 绕过了跟踪器，再查回来拿到的是缓存里那份旧状态。
+        await using var next = sp.CreateAsyncScope();
+        var service = next.ServiceProvider.GetRequiredService<IUploadSessionService>();
+        var database = next.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var fileEx = await Assert.ThrowsAsync<BusinessException>(() =>
+            service.CompleteFileAsync(clientId, sessionId, fileId,
+                new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = FullHash() }));
+        Assert.Equal(UploadSessionService.PausedErrorCode, fileEx.ErrorCode);
+
+        var sessionEx = await Assert.ThrowsAsync<BusinessException>(() =>
+            service.CompleteSessionAsync(clientId, sessionId, new CompleteUploadSessionRequest
+            {
+                TotalFiles = 1,
+                TotalBytes = Payload.Length
+            }));
+        Assert.Equal(UploadSessionService.PausedErrorCode, sessionEx.ErrorCode);
+
+        var status = await database.UploadSessions.AsNoTracking()
+            .Where(s => s.Id == sessionId).Select(s => s.Status).FirstAsync();
+        Assert.Equal(UploadStatus.Paused, status);
+    }
+
+    /// <summary>
+    /// 幂等键命中一个暂停中的会话时不能把它交回给 Agent。
+    ///
+    /// 自动模式下预检每跑一轮就会用 auto-upload:{candidateId} 重下一条上传指令，
+    /// 幂等键命中的正是被暂停的那个会话——照常返回「可续传」等于绕过管理员的暂停。
+    /// </summary>
+    [Fact]
+    public async Task 暂停中的会话不会被幂等键重新交给客户端()
+    {
+        await using var sp = BuildServices();
+        var key = $"auto-upload:{Guid.NewGuid():N}";
+        Guid clientId = Guid.Empty, candidateId = Guid.Empty;
+
+        await using (var scope = sp.CreateAsyncScope())
+        {
+            var (svc, db, cId, candId) = await NewSessionContextAsync(scope);
+            clientId = cId;
+            candidateId = candId;
+
+            var created = await svc.CreateSessionAsync(clientId, CreateRequest(candidateId, key));
+            await db.UploadSessions.Where(s => s.Id == created.UploadSessionId)
+                .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, UploadStatus.Paused));
+        }
+
+        // 新作用域＝下一条上传指令。理由同上一个用例。
+        await using var next = sp.CreateAsyncScope();
+        var service = next.ServiceProvider.GetRequiredService<IUploadSessionService>();
+
+        var ex = await Assert.ThrowsAsync<BusinessException>(
+            () => service.CreateSessionAsync(clientId, CreateRequest(candidateId, key)));
+
+        Assert.Equal(UploadSessionService.PausedErrorCode, ex.ErrorCode);
+        Assert.Equal(409, ex.StatusCode);
     }
 
     /// <summary>

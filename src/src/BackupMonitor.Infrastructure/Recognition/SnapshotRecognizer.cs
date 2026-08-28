@@ -36,7 +36,7 @@ public static class SnapshotRecognizer
 
         foreach (var (root, unitName) in SelectRoots(source, recognizerType, rules))
         {
-            var unit = BuildUnit(source, root, unitName, rules, stabilityIntervalSeconds, capturedAt);
+            var unit = BuildUnit(source, root, unitName, recognizerType, rules, stabilityIntervalSeconds, capturedAt);
             preview.Units.Add(unit);
         }
 
@@ -49,6 +49,7 @@ public static class SnapshotRecognizer
         SnapshotNode source,
         SnapshotNode root,
         string? unitName,
+        string recognizerType,
         RecognizerRules rules,
         int stabilityIntervalSeconds,
         DateTime capturedAt)
@@ -60,9 +61,10 @@ public static class SnapshotRecognizer
             Incomplete = root.HasGaps
         };
 
-        // 与 BackupScanner.ScanAsync 对称的一步，共用 RecognizerRules 里那份分组实现。
-        // 位置同样在 files.Count == 0 判断之前：分组后为空要走 no_new_backup。
-        var files = rules.SelectLatestGroup(
+        // 与 BackupScanner.ScanAsync 对称的一步，共用 RecognizerRules 里那份收敛实现。
+        // 位置同样在 files.Count == 0 判断之前：收敛后为空要走 no_new_backup。
+        var files = rules.NarrowToOneBackup(
+            recognizerType,
             CollectFiles(root, rules).ToList(),
             f => f.Relative,
             f => f.Node.LastModifiedAt ?? DateTime.MinValue).ToList();
@@ -162,21 +164,16 @@ public static class SnapshotRecognizer
 
         if (normalized == "subdirectory_units")
         {
-            var units = source.DirectoriesAtDepth(rules.BusinessUnitDepth)
-                .Where(d => !rules.IsExcludedDirectory(d.FullPath))
-                .Where(d => rules.BatchRegex is null || RecognizerRules.RegexMatches(d.Name, rules.BatchRegex))
-                .OrderBy(d => d.FullPath, StringComparer.OrdinalIgnoreCase)
-                .Select(d => (Node: d, Name: RelativeTo(source.FullPath, d.FullPath)))
+            // 与 BackupScanner 共用 BusinessUnitResolver：单元怎么找只能有一份定义，
+            // 否则向导预演出 18 个账套、真扫出 3 个，而这种分叉没有任何人会发现。
+            var units = BusinessUnitResolver.Resolve(source, rules, SnapshotNavigator(source));
+            var pickLatestChild = rules.UnitLayout is "latest_directory" or "date_leaf";
+
+            return units
+                .Select(u => (
+                    Root: pickLatestChild ? SelectLatestChildDirectory(u.Directory, rules) : u.Directory,
+                    UnitName: (string?)u.RelativePath))
                 .ToList();
-
-            if (rules.UnitLayout == "latest_directory")
-            {
-                return units
-                    .Select(u => (Root: SelectLatestChildDirectory(u.Node, rules), UnitName: (string?)u.Name))
-                    .ToList();
-            }
-
-            return units.Select(u => (u.Node, (string?)u.Name)).ToList();
         }
 
         if (normalized == "latest_directory")
@@ -215,6 +212,15 @@ public static class SnapshotRecognizer
 
         return [(source, null)];
     }
+
+    /// <summary>把目录快照折成 BusinessUnitResolver 需要的四个访问器（与 BackupScanner 那份一一对应）。</summary>
+    public static BusinessUnitResolver.Navigator<SnapshotNode> SnapshotNavigator(SnapshotNode source) => new()
+    {
+        ChildDirectories = node => node.Directories,
+        Name = node => node.Name,
+        FullPath = node => node.FullPath,
+        RelativePath = node => RelativeTo(source.FullPath, node.FullPath)
+    };
 
     private static SnapshotNode SelectLatestChildDirectory(SnapshotNode unitRoot, RecognizerRules rules)
     {

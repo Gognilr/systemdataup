@@ -3,7 +3,7 @@ import { api } from '../api.js';
 import { App, ACTIONS, LOADERS } from '../state.js';
 import {
   $, esc, fmtDT, tableHtml, emptyState, toast, errToast,
-  confirmModal, formModal
+  confirmModal, formModal, actBtn
 } from '../ui.js';
 import { shell, loading } from '../app.js';
 
@@ -17,7 +17,13 @@ LOADERS.retention = async function () {
   const wrap = $('#vwrap'); if (!wrap) return;
   try {
     const list = await api('/api/v1/admin/retention-policies');
-    wrap.innerHTML = tableHtml([
+    const def = (list || []).find(p => p.isDefault);
+    // 「哪份是默认」此前只有行内一个徽标，要先扫完整张表才看得出来。默认策略管着所有
+    // 没单独配过的任务，值得在页顶直接说清楚。
+    const notice = def
+      ? `<div class="notice">新建任务、以及保留策略选「跟随默认」的任务，都按 <strong>${esc(def.name)}</strong> 清理。想换一份，在下面那一行点「设为默认」。</div>`
+      : `<div class="notice warning">当前没有配置默认策略。不选策略的任务将<strong>永不清理</strong>，仓库会一直涨——请在下面挑一份点「设为默认」。</div>`;
+    wrap.innerHTML = notice + tableHtml([
       { l: '策略名', render: r => `<b>${esc(r.name)}</b>${r.isDefault ? ' <span class="status status--ok pill">新建任务默认</span>' : ''}` },
       { l: '最近 N 份', render: r => r.keepLastCount ?? '—' },
       { l: '周版本', render: r => r.keepWeeklyCount ?? '—' },
@@ -27,7 +33,16 @@ LOADERS.retention = async function () {
       { l: '回收站(天)', num: true, k: 'recycleBinDays' },
       { l: '绑定任务数', num: true, render: r => r.boundTaskCount ? `<span class="status status--busy pill">${esc(r.boundTaskCount)}</span>` : '0' },
       { l: '更新时间', render: r => fmtDT(r.updatedAt) },
-      { l: '操作', render: r => `<button class="small" data-ui-action="act" data-view="retention" data-action="edit" data-id="${esc(r.id)}">编辑</button> <button class="small danger" data-ui-action="act" data-view="retention" data-action="del" data-id="${esc(r.id)}">删除</button>` }
+      { l: '操作', render: r => [
+        actBtn({
+          label: '设为默认', view: 'retention', action: 'setdefault', id: r.id,
+          allowed: !r.isDefault,
+          why: '这份已经是新建任务的默认策略',
+          hint: '立即生效：此后新建的任务、以及所有「跟随默认」的任务都按这份策略清理'
+        }),
+        `<button class="small" data-ui-action="act" data-view="retention" data-action="edit" data-id="${esc(r.id)}">编辑</button>`,
+        `<button class="small danger" data-ui-action="act" data-view="retention" data-action="del" data-id="${esc(r.id)}">删除</button>`
+      ].join(' ') }
     ], list, { empty: emptyState('first', { glyph: '◫', title: '暂无保留策略', sub: '为备份任务配置可审计的版本保留规则' }) });
     App.state.retentionItems = list;
   } catch (e) { wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
@@ -70,6 +85,17 @@ ACTIONS['retention:edit'] = async id => {
     await api(`/api/v1/admin/retention-policies/${id}`, { method: 'PUT', body: retentionBody(v) });
     toast('策略已保存', 'ok'); LOADERS.retention();
   }, '保存');
+};
+// 换默认策略不只影响以后新建的任务：所有保留策略留空（= 跟随默认）的任务会立刻改按新策略清理，
+// 所以先说清楚影响面再动手。它不是危险动作——两边都是有效策略，换错了再换回来即可。
+ACTIONS['retention:setdefault'] = async id => {
+  const item = (App.state.retentionItems || []).find(x => x.id === id);
+  if (!await confirmModal(
+    `把「${item ? item.name : '这份策略'}」设为新建任务的默认策略？`
+    + '此后新建的任务默认按它清理；已有任务里保留策略选了「跟随默认」的，下一轮清理起也改按它走；'
+    + '单独配过策略的任务不受影响。')) return;
+  await api(`/api/v1/admin/retention-policies/${id}/set-default`, { method: 'POST' });
+  toast('默认策略已切换', 'ok'); LOADERS.retention();
 };
 ACTIONS['retention:del'] = async id => {
   if (!await confirmModal('删除该保留策略？仍有任务绑定、或它是新建任务的默认策略时会被拒绝（409）。')) return;

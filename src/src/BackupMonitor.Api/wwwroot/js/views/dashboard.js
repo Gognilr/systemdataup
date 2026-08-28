@@ -20,27 +20,44 @@ function dayStatus(value) {
   return DAY_STATUS[value] || DAY_STATUS.no_schedule;
 }
 
-function renderTodoQueue(clientSummary, alertSummary, taskSummary, restoreData) {
-  const pendingClients = byValue(clientSummary.byStatus, 'pending_approval');
-  const criticalAlerts = byValue(alertSummary.byLevel, 'critical');
-  const failedTasks = (taskSummary.matrix || []).filter(row =>
-    row.days?.some(day => day.status === 'failed')).length;
-  const readyRestores = restoreData?.items?.length || 0;
-  const items = [
-    pendingClients && { count: pendingClients, title: '客户端等待审批', detail: '审批后才会签发客户端证书', href: '#/clients' },
-    failedTasks && { count: failedTasks, title: '备份任务需要检查', detail: '最近 14 天存在失败或逾期计划', href: '#/tasks' },
-    readyRestores && { count: readyRestores, title: '恢复请求等待签发', detail: '恢复请求已就绪，等待管理员确认', href: '#/restores' },
-    criticalAlerts && { count: criticalAlerts, title: '严重告警未处理', detail: '请先确认告警，再进入处理流程', href: '#/alerts' }
-  ].filter(Boolean);
+/* ── 待办队列 ──
+   判定规则只在服务端一份（ReportService.GetTodoSummaryAsync），与待办页读同一个端点。
+   此前这里不调它，而是拿四个 summary 端点在浏览器里重算，于是和待办页有四处对不上：
+   自动登记的客户端完全不统计、问题任务按热力图里有没有 failed 日算、
+   严重告警把已确认的也算进来、恢复请求受 pageSize=100 封顶。
+   局域网自动登记形态下第一条必然触发——客户端不需要审批，四项全 0，
+   概览显示「一切正常」而待办页明明列着事项。 */
+// href 指向「能把这件事做完的地方」：审批可以在待办页就地完成，
+// 自动登记更是只有待办聚合算得出来（「最近 7 天 lan_simple 登记」没有对应的列表页筛选）；
+// 其余三类要么只能过去看（任务），要么在专页上还有后续动作可做，仍指向原来的列表页。
+const TODO_SECTIONS = [
+  { key: 'pendingApprovalClients', title: '客户端等待审批', detail: '审批后才会签发客户端证书', href: '#/todo', name: c => c.hostname },
+  { key: 'recentAutoEnrollments', title: '最近自动登记的客户端', detail: '7 天内自动上线，确认是不是预期内的机器', href: '#/todo', name: c => c.hostname },
+  { key: 'problematicTasks', title: '备份任务需要检查', detail: '预检异常，或长时间没扫描且没有成功记录', href: '#/tasks', name: t => t.name },
+  { key: 'readyRestores', title: '恢复请求等待签发', detail: '恢复请求已就绪，等待管理员确认', href: '#/restores', name: r => r.backupSetCode },
+  { key: 'criticalAlerts', title: '严重告警未确认', detail: '严重告警需要先确认，再进入处理流程', href: '#/alerts', name: a => a.title }
+];
 
-  if (!items.length) {
+const todoTotal = summary => TODO_SECTIONS.reduce((n, section) => n + (summary?.[section.key]?.count || 0), 0);
+
+function renderTodoQueue(summary) {
+  const rows = TODO_SECTIONS
+    .map(section => ({ section, count: summary?.[section.key]?.count || 0, items: summary?.[section.key]?.items || [] }))
+    .filter(row => row.count);
+
+  if (!rows.length) {
     return emptyState('ok', { title: '没有待处理事项', sub: `最后检查 ${new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}` });
   }
-  return items.map(item => `<a class="dashboard-todo-item" href="${esc(item.href)}">
-    <span class="todo-count">${esc(item.count)}</span>
-    <span class="todo-copy"><strong>${esc(item.title)}</strong><small>${esc(item.detail)}</small></span>
+  // 服务端一次把 count 和前几条明细都给了，顺手把头两条的名字带出来：
+  // 光一个数字看不出「是哪台机器」，还得点进去才知道该不该管。
+  return rows.map(({ section, count, items }) => {
+    const names = items.slice(0, 2).map(section.name).filter(Boolean).join('、');
+    return `<a class="dashboard-todo-item" href="${esc(section.href)}">
+    <span class="todo-count">${esc(count)}</span>
+    <span class="todo-copy"><strong>${esc(section.title)}</strong><small>${esc(names ? `${names}${count > 2 ? ' 等' : ''}` : section.detail)}</small></span>
     <span aria-hidden="true">→</span>
-  </a>`).join('');
+  </a>`;
+  }).join('');
 }
 
 function renderMatrix(summary) {
@@ -164,18 +181,19 @@ function renderTransfers(rows) {
 export async function vDashboard() {
   $('#app').innerHTML = shell('overview', '概览', loading());
   try {
-    const [clientSummary, backupSummary, alertSummary, taskSummary, restoreData] = await Promise.all([
+    // alert-summary 与 restore-requests?status=ready 此前只是为了在浏览器里凑待办计数，
+    // 待办改读服务端聚合后这两次往返都不再需要，首屏少两次请求。
+    const [clientSummary, backupSummary, taskSummary, todoSummary] = await Promise.all([
       api('/api/v1/admin/reports/client-summary'),
       api('/api/v1/admin/reports/backup-summary'),
-      api('/api/v1/admin/reports/alert-summary'),
       api('/api/v1/admin/reports/task-summary'),
-      api('/api/v1/admin/restore-requests?status=ready&page=1&pageSize=100').catch(() => ({ items: [] }))
+      api('/api/v1/admin/reports/todo-summary')
     ]);
     // 资源列表失败不该把整个概览拖垮——它是附加视图，不是概览的前提。
     const clientResources = await api('/api/v1/admin/clients/resource-overview?limit=50').catch(() => []);
     const transfers = (await api('/api/v1/admin/upload-sessions/active').catch(() => [])) || [];
-    const failedTasks = (taskSummary.matrix || []).filter(row => row.days?.some(day => day.status === 'failed')).length;
-    const todoCount = byValue(clientSummary.byStatus, 'pending_approval') + byValue(alertSummary.byLevel, 'critical') + failedTasks + (restoreData?.items?.length || 0);
+    // 横幅上的「N 项需要关注」与待办页横幅同源，两边不会再各报各的数。
+    const todoCount = todoTotal(todoSummary);
     const online = byValue(clientSummary.byStatus, 'online');
     const offline = byValue(clientSummary.byStatus, 'offline') + byValue(clientSummary.byStatus, 'suspected_offline');
     const lastUpload = taskSummary.lastSuccessfulUploadAt ? `最近入库 ${fmtDT(taskSummary.lastSuccessfulUploadAt)}` : '尚无成功入库记录';
@@ -186,7 +204,7 @@ export async function vDashboard() {
     </div>
     ${renderTransfers(transfers)}
     <div class="dashboard-columns">
-      <section class="card"><div class="dashboard-section-head"><h2>待办队列</h2><a href="#/todo">查看全部 →</a></div><div class="dashboard-todo">${renderTodoQueue(clientSummary, alertSummary, taskSummary, restoreData)}</div></section>
+      <section class="card"><div class="dashboard-section-head"><h2>待办队列</h2><a href="#/todo">查看全部 →</a></div><div class="dashboard-todo">${renderTodoQueue(todoSummary)}</div></section>
       <section class="card">${renderCapacity(taskSummary.capacity, backupSummary.totalBytes, backupSummary.dailyUploads)}</section>
     </div>
     <section class="card"><div class="dashboard-section-head"><h2>客户端资源</h2><small>最近一次心跳 · 告警与内存吃紧的排前</small></div>${renderClientResources(clientResources)}</section>

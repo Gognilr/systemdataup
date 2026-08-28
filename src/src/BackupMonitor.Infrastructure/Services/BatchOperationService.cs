@@ -28,11 +28,7 @@ public class BatchOperationService : IBatchOperationService
     /// </summary>
     private const int BatchItemTimeoutMinutes = 720;
 
-    private static readonly UploadStatus[] ActiveUploadStatuses =
-    [
-        UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading,
-        UploadStatus.Paused, UploadStatus.RetryWait, UploadStatus.Received, UploadStatus.Verifying
-    ];
+    private static readonly UploadStatus[] ActiveUploadStatuses = UploadSessionStatuses.InFlight;
 
     private readonly AppDbContext _db;
     private readonly ICommandDispatcher _commands;

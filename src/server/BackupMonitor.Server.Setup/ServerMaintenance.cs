@@ -1,5 +1,6 @@
 ﻿using System.Net.Http;
 using System.IO.Compression;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.ServiceProcess;
@@ -31,6 +32,39 @@ internal sealed class ServerMaintenance
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
         "BackupMonitor",
         "PostgreSQL");
+
+    /// <summary>
+    /// 配置备份包 (.bmbp) 的内部布局。这些名字发布之后就是对外契约：包是跨机器、跨版本传递的，
+    /// 改名等于让旧包再也导不进来。版本号单独放在 manifest 里，好让不认识新格式的安装器
+    /// 给出「格式版本不匹配」这种能看懂的话，而不是一串「缺少某某文件」。
+    /// </summary>
+    private const int BackupPackageFormatVersion = 1;
+    private const string BackupPackageManifestEntry = "manifest.json";
+    private const string BackupPackageKeyDirectoryName = "keys";
+    private const string BackupPackageKeyPrefix = BackupPackageKeyDirectoryName + "/";
+    private const string BackupPackageDumpDirectoryName = "db";
+    private const string BackupPackageDumpFileName = "backupmonitor.dump";
+    private const string BackupPackageDumpEntry =
+        BackupPackageDumpDirectoryName + "/" + BackupPackageDumpFileName;
+
+    /// <summary>
+    /// 迁移脚本落地的子目录名。它只存在于导入时的临时目录里，不是包内条目——
+    /// 脚本来自本机安装包的 payload，不是备份包带来的，只要不和 keys/db 撞名即可。
+    /// </summary>
+    private const string BackupPackageMigrationDirectoryName = "migrations";
+
+    /// <summary>恢复前自动快照的存放目录，放在数据目录下而不是 %TEMP%：那里已经是收紧过的 ACL。</summary>
+    private const string PreRestoreDumpDirectoryName = "PreRestore";
+
+    /// <summary>
+    /// manifest 缩进输出，是为了让管理员能直接用记事本打开包里的 manifest.json 核对来源；
+    /// 大小写不敏感则是给「包由更旧/更新版本写出」留的余地。
+    /// </summary>
+    private static readonly JsonSerializerOptions ManifestJsonOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNameCaseInsensitive = true
+    };
 
     public async Task ResetAdminPasswordAsync(
         string connectionString,
@@ -246,6 +280,243 @@ internal sealed class ServerMaintenance
         }
 
         await RestartServicesAsync(ct);
+    }
+
+    /// <summary>
+    /// 导出「配置备份包」(.bmbp)：三个密钥文件 + pg_dump 的整库转储 + manifest。
+    ///
+    /// 与密钥包的差别只有一处，但很致命：客户端 mTLS 是拿证书指纹去 client_certificates 表
+    /// 查客户端的。只还原密钥、不还原库，新装出来的空库里查不到记录，客户端每次心跳都是 401，
+    /// 而且永远不会自愈——所以换机恢复必须密钥和库一起走。
+    ///
+    /// 包里不含 Repository / Staging 里的备份文件本体：那是几百 GB 的量级，不该塞进配置包。
+    /// 恢复后 backup_files 会指向这些文件，仓库目录需要管理员另行复制。
+    /// </summary>
+    public async Task ExportBackupPackageAsync(
+        string installDirectory,
+        string dataDirectory,
+        string packagePath,
+        CancellationToken ct)
+    {
+        var keyFiles = GetKeyPackageFiles(dataDirectory);
+        EnsureKeyPackageFilesExist(keyFiles);
+
+        var targetPath = Path.GetFullPath(packagePath);
+        if (keyFiles.Any(file =>
+                string.Equals(file.Path, targetPath, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidOperationException("配置备份包不能覆盖当前 server-secrets.json、client-ca.pfx 或 server-certificate.pfx。");
+        var parent = Path.GetDirectoryName(targetPath)
+            ?? throw new InvalidOperationException("配置备份包目标路径无效。");
+        Directory.CreateDirectory(parent);
+
+        var secrets = await ReadSecretsAsync(Path.Combine(dataDirectory, "server-secrets.json"), ct);
+        var endpoint = ResolveEndpoint(secrets);
+        var schemaVersion = await GetAppliedSchemaVersionAsync(endpoint, ct);
+
+        // 转储先落到数据目录下的临时目录：那里已经是 SYSTEM + Administrators 的收紧 ACL，
+        // 不会在 %TEMP% 里留下一份任何人可读的全库明文。
+        var workDirectory = Path.Combine(dataDirectory, $".backup-package-export-{Guid.NewGuid():N}");
+        SecureFileSystem.CreateDirectory(workDirectory, enforceAcl: true, includeCurrentUser: true);
+        var tempPath = targetPath + $".{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            var dumpPath = Path.Combine(workDirectory, BackupPackageDumpFileName);
+            await new PostgreSqlManager().DumpAsync(
+                Path.Combine(installDirectory, "PostgreSQL"),
+                endpoint,
+                dumpPath,
+                ct);
+            SecureFileSystem.ApplyFileAcl(dumpPath);
+
+            var manifestPath = Path.Combine(workDirectory, BackupPackageManifestEntry);
+            await File.WriteAllTextAsync(
+                manifestPath,
+                JsonSerializer.Serialize(
+                    new BackupPackageManifest
+                    {
+                        FormatVersion = BackupPackageFormatVersion,
+                        ExportedAtUtc = DateTime.UtcNow,
+                        InstanceId = secrets.InstanceId,
+                        ProductVersion = GetProductVersion(),
+                        DatabaseSchemaVersion = schemaVersion,
+                        DatabaseName = endpoint.Database,
+                        IncludesRepositoryFiles = false
+                    },
+                    ManifestJsonOptions),
+                ct);
+
+            using (File.Create(tempPath))
+            {
+            }
+            SecureFileSystem.ApplyFileAcl(tempPath);
+            await using (var output = new FileStream(
+                tempPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None, 1024 * 64, useAsync: true))
+            using (var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: false))
+            {
+                await AddPackageEntryAsync(archive, BackupPackageManifestEntry, manifestPath, ct);
+                foreach (var (entryName, sourcePath) in keyFiles)
+                    await AddPackageEntryAsync(archive, BackupPackageKeyPrefix + entryName, sourcePath, ct);
+                await AddPackageEntryAsync(archive, BackupPackageDumpEntry, dumpPath, ct);
+            }
+
+            File.Move(tempPath, targetPath, true);
+            SecureFileSystem.ApplyFileAcl(targetPath);
+        }
+        finally
+        {
+            TryDelete(tempPath);
+            TryDeleteDirectory(workDirectory);
+        }
+    }
+
+    /// <summary>
+    /// 导入配置备份包，返回恢复前自动导出的快照路径。
+    ///
+    /// 顺序不能改：先校验（含 schema 版本闸门）→ 停 API 但保留 PostgreSQL（restore 要用它）
+    /// → 导出恢复前快照 → 换密钥 → 对齐集群角色口令 → restore → 补迁移 → 起 API。
+    /// 任何一步失败都把密钥和角色口令还原回去；数据库那一侧由 pg_restore 的单事务保证不留半成品。
+    /// </summary>
+    public async Task<string> ImportBackupPackageAsync(
+        string installDirectory,
+        string dataDirectory,
+        string packagePath,
+        CancellationToken ct)
+    {
+        var sourcePath = Path.GetFullPath(packagePath);
+        if (!File.Exists(sourcePath))
+            throw new FileNotFoundException("找不到服务端配置备份包。", sourcePath);
+
+        var postgresRoot = Path.Combine(installDirectory, "PostgreSQL");
+        var postgres = new PostgreSqlManager();
+        var currentSecrets = await ReadSecretsAsync(Path.Combine(dataDirectory, "server-secrets.json"), ct);
+        var currentEndpoint = ResolveEndpoint(currentSecrets);
+
+        var importDirectory = Path.Combine(dataDirectory, $".backup-package-import-{Guid.NewGuid():N}");
+        SecureFileSystem.CreateDirectory(importDirectory, enforceAcl: true, includeCurrentUser: true);
+        string preRestoreDump;
+        try
+        {
+            var manifest = await ExtractAndValidateBackupPackageAsync(sourcePath, importDirectory, ct);
+            var keyDirectory = Path.Combine(importDirectory, BackupPackageKeyDirectoryName);
+            var importedSecrets = await ReadSecretsAsync(
+                Path.Combine(keyDirectory, "server-secrets.json"), ct);
+            var importedEndpoint = ResolveEndpoint(importedSecrets);
+
+            // schema 版本闸门：低于本机可以导，restore 之后补迁移就是了；高于本机必须拒绝——
+            // 缺的是「本安装包里还不存在的迁移脚本」，恢复出来的库会缺表缺列，无处可补。
+            var installerVersion = InstallerPayload.GetLatestMigrationVersion();
+            if (CompareMigrationVersions(manifest.DatabaseSchemaVersion, installerVersion) > 0)
+                throw new InvalidOperationException(
+                    $"备份包的数据库 schema 版本为 {manifest.DatabaseSchemaVersion}，高于当前安装包的 {installerVersion}。"
+                    + "该包来自更新版本的服务端，本安装包没有它需要的迁移脚本。"
+                    + "请先用同版本或更新版本的服务端安装包升级本机，再导入。");
+
+            // 端口取自 secrets，服务端启动后就照它连库；本机集群只监听自己 postgresql.conf 里的
+            // 那个端口。两边不一致时导入完成后必然连不上库，而现象是「客户端一直 401」，很难查。
+            if (importedEndpoint.Port != currentEndpoint.Port)
+                throw new InvalidOperationException(
+                    $"备份包记录的 PostgreSQL 端口为 {importedEndpoint.Port}，本机集群监听 {currentEndpoint.Port}。"
+                    + "请先在本机以相同端口安装服务端，再导入该备份包。");
+
+            await StopServerKeepPostgresAsync(ct);
+            preRestoreDump = await CreatePreRestoreDumpAsync(
+                postgresRoot, dataDirectory, currentEndpoint, importedEndpoint, ct);
+
+            var targets = GetKeyPackageFiles(dataDirectory);
+            var files = GetKeyPackageFiles(keyDirectory);
+            var backups = new List<(string Target, string Backup, bool Existed)>();
+            var rolePasswordsChanged = false;
+            try
+            {
+                foreach (var (_, target) in targets)
+                {
+                    var backup = target + $".{Environment.ProcessId}.{Guid.NewGuid():N}.import-backup";
+                    var existed = File.Exists(target);
+                    if (existed)
+                    {
+                        File.Copy(target, backup, true);
+                        SecureFileSystem.ApplyFileAcl(backup);
+                    }
+                    backups.Add((target, backup, existed));
+                }
+
+                foreach (var (entryName, source) in files)
+                {
+                    var target = targets.First(item => item.EntryName == entryName).Path;
+                    ReplaceProtectedFile(source, target);
+                }
+
+                await AlignRolePasswordsAsync(postgres, currentSecrets, importedSecrets, importedEndpoint, ct);
+                rolePasswordsChanged = true;
+
+                await postgres.RestoreAsync(
+                    postgresRoot,
+                    importedEndpoint,
+                    Path.Combine(importDirectory, BackupPackageDumpDirectoryName, BackupPackageDumpFileName),
+                    ct);
+
+                // 备份包可能来自更旧的服务端：恢复出来的库停在它自己的 schema 版本上，
+                // 差的那几条迁移在这里补齐。管理员口令传 null——V005 早已随备份一起恢复，
+                // 恢复出来的本就该是源机器的管理员口令，这里不该、也不能重设它。
+                var migrationDirectory = Path.Combine(importDirectory, BackupPackageMigrationDirectoryName);
+                await InstallerPayload.ExtractMigrationScriptsAsync(migrationDirectory, ct);
+                await new MigrationRunner().ApplyAsync(
+                    BuildConnectionString(importedEndpoint),
+                    migrationDirectory,
+                    null,
+                    null,
+                    ct);
+            }
+            catch (Exception ex)
+            {
+                foreach (var backup in backups)
+                {
+                    if (backup.Existed && File.Exists(backup.Backup))
+                        ReplaceProtectedFile(backup.Backup, backup.Target);
+                    else if (!backup.Existed && File.Exists(backup.Target))
+                        TryDelete(backup.Target);
+                }
+
+                // 口令还原本身也可能失败（比如集群此刻已经认新口令、而新口令又没写成）。
+                // 这种中间状态必须如实报出来：告诉管理员「都已还原」而实际没还原，
+                // 他会照着这句话去排查别的方向，而真正卡住服务的是登不上库。
+                var rolePasswordsRestored = !rolePasswordsChanged
+                    || await TryRestoreRolePasswordsAsync(postgres, currentSecrets, importedSecrets, currentEndpoint);
+
+                // 失败路径必须把 API 服务重新拉起来。数据库恢复是单事务的，失败时库没被改动，
+                // 密钥也已回滚——整机状态等价于导入之前，没有任何理由让服务停着。
+                // 不这么做的话，一次导入失败就等于一次计划外停机，而提示里还不会提这件事。
+                var serviceRestarted = await TryStartServerServiceAsync();
+
+                throw new InvalidOperationException(
+                    ex.Message
+                    + Environment.NewLine + Environment.NewLine
+                    + (rolePasswordsRestored
+                        ? "导入已回滚：密钥文件和数据库角色口令都已还原为导入前的状态。"
+                        : "导入已回滚密钥文件，但数据库角色口令还原失败——集群此刻可能仍认备份包里的口令。"
+                          + "可重新导入同一个备份包（口令对齐逻辑认得这个中间状态），"
+                          + "或用导入前的密钥包把 server-secrets.json 还原成集群实际认的那套。")
+                    + "数据库恢复是单事务执行的，失败时内容不会被改动；"
+                    + $"确需回退时可使用恢复前自动导出的 {preRestoreDump}。"
+                    + (serviceRestarted
+                        ? string.Empty
+                        : Environment.NewLine + "注意：API 服务未能自动启动，请在维护面板点「启动服务」。"),
+                    ex);
+            }
+            finally
+            {
+                foreach (var (_, backup, _) in backups)
+                    TryDelete(backup);
+            }
+        }
+        finally
+        {
+            TryDeleteDirectory(importDirectory);
+        }
+
+        // 只起 API：PostgreSQL 全程没停过，对着运行中的服务再 sc start 会返回 1056。
+        await StartServerServiceAsync(ct);
+        return preRestoreDump;
     }
 
     public string GetInstalledConnectionString(string installDirectory, string dataDirectory)
@@ -638,27 +909,482 @@ internal sealed class ServerMaintenance
             SecureFileSystem.ApplyFileAcl(target);
         }
 
-        var secretPath = Path.Combine(importDirectory, "server-secrets.json");
+        await ValidateKeyFilesAsync(importDirectory, ct);
+    }
+
+    /// <summary>
+    /// 校验一个目录里的三个密钥文件互相自洽：口令齐全、CA 带私钥、服务端证书能被真正加载。
+    /// 密钥包和配置备份包共用同一套校验——两者放的是同样的三个文件，
+    /// 坏包必须在覆盖现有密钥之前就被拦下。
+    /// </summary>
+    private static async Task ValidateKeyFilesAsync(string directory, CancellationToken ct)
+    {
+        var secretPath = Path.Combine(directory, "server-secrets.json");
         var secrets = JsonSerializer.Deserialize<LocalServerSecrets>(
             await File.ReadAllTextAsync(secretPath, ct),
             new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-            ?? throw new InvalidOperationException("密钥包中的 server-secrets.json 无法读取。");
+            ?? throw new InvalidOperationException("包中的 server-secrets.json 无法读取。");
         if (string.IsNullOrWhiteSpace(secrets.ClientCaPassword)
             || string.IsNullOrWhiteSpace(secrets.ServerCertificatePassword))
-            throw new InvalidOperationException("密钥包中的服务端密钥口令不完整。");
+            throw new InvalidOperationException("包中的服务端密钥口令不完整。");
 
         using (var ca = new X509Certificate2(
-                   Path.Combine(importDirectory, "client-ca.pfx"),
+                   Path.Combine(directory, "client-ca.pfx"),
                    secrets.ClientCaPassword,
                    X509KeyStorageFlags.EphemeralKeySet))
         {
             if (!ca.HasPrivateKey)
-                throw new InvalidOperationException("密钥包中的 client-ca.pfx 不包含私钥。");
+                throw new InvalidOperationException("包中的 client-ca.pfx 不包含私钥。");
         }
 
         using var serverCertificate = ServerCertificateFactory.Load(
-            Path.Combine(importDirectory, "server-certificate.pfx"),
+            Path.Combine(directory, "server-certificate.pfx"),
             secrets.ServerCertificatePassword);
+    }
+
+    /// <summary>
+    /// 配置备份包的 manifest。它不是给人读的说明文件，而是导入侧的两道闸门：
+    /// FormatVersion 决定这个包本安装器还认不认得，DatabaseSchemaVersion 决定恢复出来的库
+    /// 还能不能靠本机 payload 里的迁移脚本补齐。其余字段只用于出问题时人工核对来源。
+    /// </summary>
+    private sealed class BackupPackageManifest
+    {
+        public int FormatVersion { get; set; }
+        public DateTime ExportedAtUtc { get; set; }
+        public string InstanceId { get; set; } = string.Empty;
+        public string ProductVersion { get; set; } = string.Empty;
+        public string DatabaseSchemaVersion { get; set; } = string.Empty;
+        public string DatabaseName { get; set; } = string.Empty;
+
+        /// <summary>
+        /// 恒为 false，但仍然写进包里：它是「本包不含 Repository/Staging 实际备份文件」这条
+        /// 前提的书面记录。将来真做了含数据的包，旧安装器也能凭它拒绝而不是默默少还原一半。
+        /// </summary>
+        public bool IncludesRepositoryFiles { get; set; }
+    }
+
+    private static async Task<LocalServerSecrets> ReadSecretsAsync(string path, CancellationToken ct)
+    {
+        if (!File.Exists(path))
+            throw new FileNotFoundException("找不到服务端内部密钥文件 server-secrets.json。", path);
+
+        return JsonSerializer.Deserialize<LocalServerSecrets>(
+                await File.ReadAllTextAsync(path, ct),
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+            ?? throw new InvalidOperationException($"服务端内部密钥文件无法解析：{path}");
+    }
+
+    /// <summary>
+    /// 由 secrets 推出 pg_dump / pg_restore 的连接目标。
+    ///
+    /// 用应用角色而不是超级用户，是因为 pg_restore 带 --no-owner：恢复出来的对象归执行者所有。
+    /// 用 postgres 执行，全库对象就都归了 postgres，而服务端是以 backup_monitor_app 连库的，
+    /// 结果是恢复「成功」、API 却对每张表都没有权限。归属正确比权限宽松重要。
+    ///
+    /// 口令口径与 LocalServerBootstrap 的默认连接串保持一致，否则安装器和服务端会连到两处去。
+    /// </summary>
+    private static PostgresEndpoint ResolveEndpoint(LocalServerSecrets secrets)
+    {
+        // 外部数据库不在安装器的管辖范围内：它的备份策略、权限和停机窗口都由 DBA 决定，
+        // 安装器既不该 --clean 别人的库，也没有把握能连上它。
+        if (!string.IsNullOrWhiteSpace(secrets.ExplicitConnectionString))
+            throw new InvalidOperationException(
+                "当前服务端配置为使用外部 PostgreSQL 连接串，配置备份包只适用于安装器自带的本机集群。"
+                + "请由数据库管理员用 pg_dump / pg_restore 单独处理该数据库。");
+
+        if (string.IsNullOrEmpty(secrets.PostgresPassword))
+            throw new InvalidOperationException(
+                "server-secrets.json 中没有 PostgreSQL 应用角色口令，无法执行数据库备份或恢复。");
+
+        return new PostgresEndpoint(
+            "127.0.0.1",
+            secrets.PostgresPort > 0 ? secrets.PostgresPort : 55432,
+            "backup_monitor",
+            "backup_monitor_app",
+            secrets.PostgresPassword);
+    }
+
+    /// <summary>
+    /// 超级用户口令：SchemaVersion 1 的旧密钥文件里没有独立字段，那时两个角色共用同一个口令，
+    /// 回落逻辑与 LocalServerBootstrap 相同，避免旧机器导出的包在新机器上对不齐角色口令。
+    /// </summary>
+    private static string ResolveSuperuserPassword(LocalServerSecrets secrets)
+    {
+        var password = !string.IsNullOrEmpty(secrets.PostgresSuperuserPassword)
+            ? secrets.PostgresSuperuserPassword
+            : secrets.PostgresPassword;
+        if (string.IsNullOrEmpty(password))
+            throw new InvalidOperationException(
+                "server-secrets.json 中没有 PostgreSQL 超级用户口令，无法对齐集群角色口令。");
+        return password;
+    }
+
+    private static string BuildConnectionString(PostgresEndpoint endpoint) =>
+        new NpgsqlConnectionStringBuilder
+        {
+            Host = endpoint.Host,
+            Port = endpoint.Port,
+            Username = endpoint.Username,
+            Password = endpoint.Password,
+            Database = endpoint.Database,
+            Timeout = 10,
+            // 补迁移可能要重建索引，180 秒的语句超时是 MigrationRunner 自己的口径，这里给够余量。
+            CommandTimeout = 300,
+            // 维护动作里连库是一次性的，而且中途会改角色口令；连接池留着旧口令的连接只会添乱。
+            Pooling = false
+        }.ConnectionString;
+
+    private static string GetProductVersion()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var informational = assembly
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrWhiteSpace(informational))
+        {
+            // InformationalVersion 常带 "+<commit>" 后缀，对人工核对没有意义，去掉。
+            var plus = informational.IndexOf('+');
+            return plus >= 0 ? informational[..plus] : informational;
+        }
+
+        return assembly.GetName().Version?.ToString() ?? "unknown";
+    }
+
+    /// <summary>
+    /// 读取库里已应用的最高迁移版本。先用 to_regclass 判表在不在，而不是靠捕获 42P01：
+    /// 「库里还没跑过任何迁移」是合法状态（比如刚 initdb 完就导出），不该走异常路径。
+    /// </summary>
+    private static async Task<string> GetAppliedSchemaVersionAsync(
+        PostgresEndpoint endpoint,
+        CancellationToken ct)
+    {
+        await using var connection = new NpgsqlConnection(BuildConnectionString(endpoint));
+        await connection.OpenAsync(ct);
+
+        await using (var exists = new NpgsqlCommand("SELECT to_regclass('public.schema_migrations')", connection))
+        {
+            var table = await exists.ExecuteScalarAsync(ct);
+            if (table is null or DBNull)
+                return string.Empty;
+        }
+
+        await using var latest = new NpgsqlCommand(
+            "SELECT max(version) FROM public.schema_migrations", connection);
+        return await latest.ExecuteScalarAsync(ct) as string ?? string.Empty;
+    }
+
+    /// <summary>
+    /// 比较两个迁移版本号（形如 V029__xxx）。只比 V 后面的序号，不比脚本描述：
+    /// 同一个版本号在不同分支上出现过不同的描述后缀，整串字典序会把它们排出假的先后。
+    /// 空串表示「库里还没有任何迁移」，永远最小。
+    /// </summary>
+    private static int CompareMigrationVersions(string? left, string? right) =>
+        ParseMigrationOrdinal(left).CompareTo(ParseMigrationOrdinal(right));
+
+    private static int ParseMigrationOrdinal(string? version)
+    {
+        if (string.IsNullOrWhiteSpace(version))
+            return -1;
+
+        var text = version.Trim();
+        if (text[0] is not ('V' or 'v'))
+            throw new InvalidOperationException($"无法识别的数据库迁移版本号：{version}");
+
+        var digits = 0;
+        while (digits + 1 < text.Length && char.IsAsciiDigit(text[digits + 1]))
+            digits++;
+        if (digits == 0 || !int.TryParse(
+                text.AsSpan(1, digits),
+                System.Globalization.NumberStyles.None,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var ordinal))
+            throw new InvalidOperationException($"无法识别的数据库迁移版本号：{version}");
+
+        return ordinal;
+    }
+
+    /// <summary>
+    /// 把一个文件按给定条目名写进包。统一 NoCompression：三个密钥文件本来就是高熵内容，
+    /// pg_dump 的 -Fc 转储自带 zlib 压缩，再压一遍只是白烧 CPU 和导出时间。
+    /// </summary>
+    private static async Task AddPackageEntryAsync(
+        ZipArchive archive,
+        string entryName,
+        string sourcePath,
+        CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var entry = archive.CreateEntry(entryName, CompressionLevel.NoCompression);
+        await using var input = new FileStream(
+            sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 64, useAsync: true);
+        await using var entryStream = entry.Open();
+        await input.CopyToAsync(entryStream, ct);
+    }
+
+    /// <summary>
+    /// 解包并校验配置备份包，返回 manifest。
+    ///
+    /// 这一步跑在停服务之前：坏包、错包（比如选成了 .bmkp 密钥包）、版本不匹配的包，
+    /// 都必须在动现有密钥和数据库之前被拦下来，否则一次误操作就要人工收拾两处现场。
+    /// </summary>
+    private static async Task<BackupPackageManifest> ExtractAndValidateBackupPackageAsync(
+        string packagePath,
+        string importDirectory,
+        CancellationToken ct)
+    {
+        using var archive = ZipFile.OpenRead(packagePath);
+        var manifestEntry = FindPackageEntry(archive, BackupPackageManifestEntry)
+            ?? throw new InvalidOperationException(
+                "这不是 BackupMonitor 配置备份包：包内没有 manifest.json。"
+                + "如果选的是密钥包 (.bmkp)，请改用「导入密钥包」。");
+
+        BackupPackageManifest manifest;
+        await using (var manifestStream = manifestEntry.Open())
+        {
+            manifest = await JsonSerializer.DeserializeAsync<BackupPackageManifest>(
+                    manifestStream, ManifestJsonOptions, ct)
+                ?? throw new InvalidOperationException("配置备份包的 manifest.json 无法解析。");
+        }
+
+        if (manifest.FormatVersion != BackupPackageFormatVersion)
+            throw new InvalidOperationException(
+                $"配置备份包的格式版本为 {manifest.FormatVersion}，本安装器只识别 {BackupPackageFormatVersion}。"
+                + "请使用与该备份包配套的服务端安装器。");
+
+        var keyDirectory = Path.Combine(importDirectory, BackupPackageKeyDirectoryName);
+        SecureFileSystem.CreateDirectory(keyDirectory, enforceAcl: true, includeCurrentUser: true);
+        foreach (var (entryName, target) in GetKeyPackageFiles(keyDirectory))
+        {
+            ct.ThrowIfCancellationRequested();
+            var entry = FindPackageEntry(archive, BackupPackageKeyPrefix + entryName)
+                ?? throw new InvalidOperationException(
+                    $"配置备份包缺少 {BackupPackageKeyPrefix}{entryName}。");
+            await ExtractPackageEntryAsync(entry, target, ct);
+        }
+
+        var dumpDirectory = Path.Combine(importDirectory, BackupPackageDumpDirectoryName);
+        SecureFileSystem.CreateDirectory(dumpDirectory, enforceAcl: true, includeCurrentUser: true);
+        var dumpEntry = FindPackageEntry(archive, BackupPackageDumpEntry)
+            ?? throw new InvalidOperationException(
+                $"配置备份包缺少数据库转储 {BackupPackageDumpEntry}。"
+                + "只恢复密钥而不恢复数据库，客户端会因为查不到证书记录而永远 401。");
+        await ExtractPackageEntryAsync(
+            dumpEntry, Path.Combine(dumpDirectory, BackupPackageDumpFileName), ct);
+
+        // 密钥自洽性与密钥包共用同一套校验：包里放的是同样三个文件，坏包的判据也该是同一个。
+        await ValidateKeyFilesAsync(keyDirectory, ct);
+        return manifest;
+    }
+
+    /// <summary>
+    /// 按条目名查找。不同打包工具写出的分隔符不一样（Compress-Archive 写反斜杠），
+    /// 两种都认，与 InstallerPayload 的取法保持一致。
+    /// </summary>
+    private static ZipArchiveEntry? FindPackageEntry(ZipArchive archive, string entryName) =>
+        archive.Entries.FirstOrDefault(entry => string.Equals(
+            entry.FullName.Replace('\\', '/'), entryName, StringComparison.OrdinalIgnoreCase));
+
+    private static async Task ExtractPackageEntryAsync(
+        ZipArchiveEntry entry,
+        string targetPath,
+        CancellationToken ct)
+    {
+        await using (var input = entry.Open())
+        await using (var output = new FileStream(
+            targetPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 64, useAsync: true))
+            await input.CopyToAsync(output, ct);
+
+        // 带上当前用户：pg_restore 是本进程的子进程，落在临时目录里的转储必须能被它读到。
+        SecureFileSystem.ApplyFileAcl(targetPath, enforceAcl: true, includeCurrentUser: true);
+    }
+
+    /// <summary>
+    /// 只停 API，保留 PostgreSQL——恢复过程正要用它执行 pg_restore。
+    /// 必须等到真的 Stopped：服务还活着就一直持着到 backup_monitor 的连接，
+    /// pg_restore 的 DROP 会卡在锁上直到超时。
+    /// </summary>
+    private static async Task StopServerKeepPostgresAsync(CancellationToken ct)
+    {
+        var sc = Path.Combine(Environment.SystemDirectory, "sc.exe");
+        await ProcessRunner.RunAsync(sc, ["stop", ServerServiceName], ct, throwOnError: false);
+        await WaitForServiceStatusAsync(ServerServiceName, ServiceControllerStatus.Stopped, ct, required: false);
+    }
+
+    /// <summary>只启动 API。PostgreSQL 全程没停过，对运行中的服务再 sc start 会返回 1056。</summary>
+    private static async Task StartServerServiceAsync(CancellationToken ct)
+    {
+        var sc = Path.Combine(Environment.SystemDirectory, "sc.exe");
+        await ProcessRunner.RunAsync(sc, ["start", ServerServiceName], ct);
+        await WaitForServiceStatusAsync(ServerServiceName, ServiceControllerStatus.Running, ct);
+    }
+
+    /// <summary>
+    /// 恢复之前先把现场导出一份，返回快照文件的完整路径。
+    ///
+    /// pg_restore 是单事务的，失败不会留下半个库；这份快照防的是另一件事——恢复本身成功了，
+    /// 但导入的根本不是管理员想要的那个包。那时旧库已经被 --clean 掉，没有它就真的回不去。
+    ///
+    /// 两个 endpoint 都要试：正常情况下集群认的是本机 secrets 里的口令；但若上一次导入在
+    /// 对齐角色口令之后失败、回滚口令又没成功，集群此刻认的是备份包里的那一套。
+    /// 分不清就直接失败，等于把人卡在一个自己修不出来的状态里。
+    /// </summary>
+    private static async Task<string> CreatePreRestoreDumpAsync(
+        string postgresRoot,
+        string dataDirectory,
+        PostgresEndpoint currentEndpoint,
+        PostgresEndpoint importedEndpoint,
+        CancellationToken ct)
+    {
+        var endpoint = await ResolveAuthenticatedEndpointAsync(currentEndpoint, importedEndpoint, ct);
+        var directory = Path.Combine(dataDirectory, PreRestoreDumpDirectoryName);
+        SecureFileSystem.CreateDirectory(directory, enforceAcl: true, includeCurrentUser: true);
+        // 时间戳用本地时间：这个文件名是给现场的人读的，UTC 只会让人多算一次时差。
+        var path = Path.Combine(
+            directory,
+            $"pre-restore-{DateTime.Now:yyyyMMdd-HHmmss}.dump");
+        await new PostgreSqlManager().DumpAsync(postgresRoot, endpoint, path, ct);
+        SecureFileSystem.ApplyFileAcl(path);
+        return path;
+    }
+
+    /// <summary>
+    /// 判断本机集群此刻认的是哪一套应用角色口令，返回能连上的那个 endpoint。
+    /// 只把认证失败当作「口令不对」，连不上、库不存在这类问题必须带着原始报错抛出去——
+    /// 把它们一并吞掉，现场看到的就只剩一句笼统的「口令都不对」。
+    /// </summary>
+    private static async Task<PostgresEndpoint> ResolveAuthenticatedEndpointAsync(
+        PostgresEndpoint primary,
+        PostgresEndpoint fallback,
+        CancellationToken ct)
+    {
+        if (await CanAuthenticateAsync(primary, ct))
+            return primary;
+
+        if (!string.Equals(primary.Password, fallback.Password, StringComparison.Ordinal)
+            && await CanAuthenticateAsync(fallback, ct))
+            return fallback;
+
+        throw new InvalidOperationException(
+            "无法用 server-secrets.json 或备份包中的口令连接本机 PostgreSQL 数据库。"
+            + "该集群可能来自另一次安装；安装器不会强行改写它，以免破坏其中的数据。");
+    }
+
+    private static async Task<bool> CanAuthenticateAsync(PostgresEndpoint endpoint, CancellationToken ct)
+    {
+        try
+        {
+            await using var connection = new NpgsqlConnection(BuildConnectionString(endpoint));
+            await connection.OpenAsync(ct);
+            return true;
+        }
+        catch (PostgresException ex) when (
+            ex.SqlState == PostgresErrorCodes.InvalidPassword
+            || ex.SqlState == PostgresErrorCodes.InvalidAuthorizationSpecification)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 把集群的 postgres 与 backup_monitor_app 两个角色的口令改成备份包里的那一套。
+    ///
+    /// 角色口令是集群级对象，不在单库转储里。少了这一步，密钥文件换成源机器的之后，
+    /// 服务端就拿着源机器的口令去连本机集群，启动即认证失败——而现场看到的现象是
+    /// 「客户端一直 401」，几乎查不到这里。
+    ///
+    /// 允许集群已经认备份包口令的情况直接连过去：上一次导入中途失败、口令回滚也没成功时，
+    /// 重试导入不该被卡死在这一步。
+    /// </summary>
+    private static async Task AlignRolePasswordsAsync(
+        PostgreSqlManager postgres,
+        LocalServerSecrets currentSecrets,
+        LocalServerSecrets importedSecrets,
+        PostgresEndpoint importedEndpoint,
+        CancellationToken ct)
+    {
+        var currentSuperuser = ResolveSuperuserPassword(currentSecrets);
+        var importedSuperuser = ResolveSuperuserPassword(importedSecrets);
+        var connectPassword = await ResolveSuperuserPasswordAsync(
+            postgres, importedEndpoint.Port, currentSuperuser, importedSuperuser, ct);
+
+        await postgres.SetRolePasswordsAsync(
+            importedEndpoint.Port,
+            connectPassword,
+            importedSuperuser,
+            importedEndpoint.Password,
+            ct);
+    }
+
+    /// <summary>
+    /// 回滚角色口令：用备份包的超级用户口令连上去（对齐已经生效），改回本机 secrets 的那一套。
+    ///
+    /// 失败只能吞掉——它跑在异常处理路径上，抛出去会把真正的失败原因盖掉。真出现这种情况，
+    /// 管理员的出路是重新导入同一个包（对齐逻辑认得这个中间状态），或者用密钥包把
+    /// server-secrets.json 还原成集群实际认的那一套。
+    /// </summary>
+    /// <returns>true 表示口令确已还原；false 表示还原失败，调用方必须把这件事告诉管理员。</returns>
+    private static async Task<bool> TryRestoreRolePasswordsAsync(
+        PostgreSqlManager postgres,
+        LocalServerSecrets currentSecrets,
+        LocalServerSecrets importedSecrets,
+        PostgresEndpoint currentEndpoint)
+    {
+        try
+        {
+            var currentSuperuser = ResolveSuperuserPassword(currentSecrets);
+            var importedSuperuser = ResolveSuperuserPassword(importedSecrets);
+            var connectPassword = await ResolveSuperuserPasswordAsync(
+                postgres, currentEndpoint.Port, importedSuperuser, currentSuperuser, CancellationToken.None);
+
+            await postgres.SetRolePasswordsAsync(
+                currentEndpoint.Port,
+                connectPassword,
+                currentSuperuser,
+                currentEndpoint.Password,
+                CancellationToken.None);
+            return true;
+        }
+        catch
+        {
+            // 见方法注释：这里的失败不能遮蔽导入本身的报错，但也不能被当作成功——
+            // 调用方拿 false 去改写给管理员看的那句结论。
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 尽力启动 API 服务，启动失败不抛。用在导入失败的回滚路径上：
+    /// 那里正在抛出导入本身的错误，再叠一个「服务起不来」会把真正的原因埋掉。
+    /// </summary>
+    private async Task<bool> TryStartServerServiceAsync()
+    {
+        try
+        {
+            await StartServerServiceAsync(CancellationToken.None);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static async Task<string> ResolveSuperuserPasswordAsync(
+        PostgreSqlManager postgres,
+        int port,
+        string primary,
+        string fallback,
+        CancellationToken ct)
+    {
+        if (await postgres.CanAuthenticateSuperuserAsync(port, primary, ct))
+            return primary;
+
+        if (!string.Equals(primary, fallback, StringComparison.Ordinal)
+            && await postgres.CanAuthenticateSuperuserAsync(port, fallback, ct))
+            return fallback;
+
+        throw new InvalidOperationException(
+            "无法用 server-secrets.json 或备份包中的超级用户口令连接本机 PostgreSQL 集群，"
+            + "无法对齐数据库角色口令。请确认该集群由本安装器创建。");
     }
 
     private static void ReplaceProtectedFile(string source, string target)

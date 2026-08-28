@@ -63,4 +63,19 @@ public class AdminRetentionPolicyController : ApiBaseController
         await _retentionService.DeleteAsync(policyId, ct);
         return OkMessage("保留策略已删除");
     }
+
+    /// <summary>
+    /// 设为「新建任务默认」策略。
+    ///
+    /// 权限与策略的增删改同级（perm:backups.manage）：能改策略内容的人本来就能改到同一批备份的存亡，
+    /// 再为这一个动作单开一项权限没有意义。
+    /// 没有反向的「清除默认」端点——理由见 RetentionPolicyService.SetDefaultAsync。
+    /// </summary>
+    [HttpPost("{policyId:guid}/set-default")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]
+    public async Task<ActionResult<ApiResponse<RetentionPolicyDto>>> SetDefault(Guid policyId, CancellationToken ct)
+    {
+        var result = await _retentionService.SetDefaultAsync(policyId, ct);
+        return OkData(result, "已设为新建任务默认策略");
+    }
 }

@@ -223,11 +223,28 @@ export function runtimeBadge(c) {
 
 /* 客户端 IP 有两种含义，界面上必须分开说，否则人分不清"机器上有这个地址"和"我们在用这个地址"：
    lastRemoteIp 是服务端实际收到心跳的那个对端地址，每次心跳刷新，必然连得通；
-   ipAddresses 是 Agent 自报的本机网卡列表，能看出多网卡和网段，但只在列表变化时才重报。 */
+   ipAddresses 是 Agent 自报的本机网卡列表，能看出多网卡和网段，但只在列表变化时才重报。
+
+   列表里显示的是服务端算好的 ipv4Address：看这一列的人下一步是照着它去 ping、去远程桌面，
+   而对端地址很可能是 fe80:: 链路本地地址（Windows 名称解析常把 Agent 领到 IPv6 上去），
+   那串东西拿到手上什么也做不了。真实对端地址不丢，收进 title 里并说明这个 IPv4 是哪来的。 */
 export function ipCell(c) {
-  const ip = c && c.lastRemoteIp;
-  if (!ip) return '<span class="sub">—</span>';
-  return `<span class="mono">${esc(ip)}</span>`;
+  const peer = (c && c.lastRemoteIp) || '';
+  const v4 = (c && c.ipv4Address) || '';
+  if (!peer && !v4) return '<span class="sub">—</span>';
+
+  // 老数据里对端地址可能还存着 IPv4 映射形式（::ffff:192.168.1.10）——服务端现在会还原，
+  // 但已经写进库的那些不会自己变。判断来源前先按同一形状对齐，免得把它说成"来自网卡列表"。
+  const peerAsV4 = peer.replace(/^::ffff:/i, '');
+  if (!v4)
+    return `<span class="mono" title="服务端最近一次收到心跳的对端地址。这台机器没有报告可用的 IPv4，只能按这个地址找它">${esc(peer)}</span>`;
+  if (!peer)
+    return `<span class="mono" title="来自 Agent 自报的网卡列表。服务端还没有收到过它的心跳">${esc(v4)}</span>`;
+
+  const title = peerAsV4 === v4
+    ? '服务端最近一次收到心跳的对端地址'
+    : `服务端实际收到心跳的对端地址是 ${peer}，照着它找不到这台机器；这里显示的 IPv4 取自 Agent 自报的网卡列表`;
+  return `<span class="mono" title="${esc(title)}">${esc(v4)}</span>`;
 }
 
 export function ipDetailRows(c) {

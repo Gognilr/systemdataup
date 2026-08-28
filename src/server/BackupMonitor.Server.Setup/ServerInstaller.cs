@@ -361,17 +361,22 @@ internal sealed class ServerInstaller
 
     private static async Task ConfigureFirewallAsync(int apiPort, CancellationToken ct)
     {
+        // profile 必须是 any，不能是 private。Windows 的网络位置分类是每台机器各自判定的：
+        // 新装的 Server 会把「无法识别的网络」归为公用，加域的机器归域网络，两种情况下
+        // profile=private 的规则完全不生效。表现是同一网段、同一个客户端，换一台服务器就
+        // 「发现不了」——而且被挡住的不只是 UDP 发现，API 的 TCP 端口一样进不来。
+        // 规则本身已经按端口收窄，这是局域网内网产品，不靠 profile 再收一道。
         var netsh = Path.Combine(Environment.GetEnvironmentVariable("SystemRoot") ?? Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32", "netsh.exe");
         await ProcessRunner.RunAsync(netsh,
             ["advfirewall", "firewall", "delete", "rule", "name=BackupMonitor Server TCP"], ct, throwOnError: false);
         await ProcessRunner.RunAsync(netsh,
             ["advfirewall", "firewall", "add", "rule", "name=BackupMonitor Server TCP",
-              "dir=in", "action=allow", "protocol=TCP", $"localport={apiPort}", "profile=private"], ct);
+              "dir=in", "action=allow", "protocol=TCP", $"localport={apiPort}", "profile=any"], ct);
         await ProcessRunner.RunAsync(netsh,
             ["advfirewall", "firewall", "delete", "rule", "name=BackupMonitor Discovery UDP"], ct, throwOnError: false);
         await ProcessRunner.RunAsync(netsh,
             ["advfirewall", "firewall", "add", "rule", "name=BackupMonitor Discovery UDP",
-              "dir=in", "action=allow", "protocol=UDP", "localport=45808", "profile=private"], ct);
+              "dir=in", "action=allow", "protocol=UDP", "localport=45808", "profile=any"], ct);
     }
 
     private static async Task StartServiceAndWaitAsync(

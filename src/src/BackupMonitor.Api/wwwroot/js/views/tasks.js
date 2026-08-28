@@ -237,11 +237,15 @@ function composeRecognizerConfig(vals) {
 
 async function taskFormFields(initial, template, prefill, client) {
   const policies = await api('/api/v1/admin/retention-policies');
-  // 「不绑定」在服务端清理器里的含义就是「这个任务的备份永远不清理」——写清楚，
-  // 别让人以为它是「用系统默认」。新建任务默认选中标了默认的那份策略。
-  const policyOpts = [{ v: '', t: '（不绑定 —— 永不清理，仓库会一直涨）' }]
-    .concat((policies || []).map(p => ({ v: p.id, t: p.isDefault ? `${p.name}（默认）` : p.name })));
-  const defaultPolicyId = (policies || []).find(p => p.isDefault)?.id || '';
+  // 留空（NULL）现在的含义是「跟随默认策略」，不再是「永不清理」——清理器会自己回落到
+  // 默认策略。选它的好处是：以后在保留策略页换一份默认策略，这个任务跟着一起变；
+  // 挑具体某一份则是把规则钉死在这个任务上。当前默认是哪份要写在选项里，
+  // 不然「跟随默认」等于让人凭空猜自己的备份会留多久。
+  const defaultPolicy = (policies || []).find(p => p.isDefault);
+  const policyOpts = [{
+    v: '',
+    t: defaultPolicy ? `跟随默认（当前：${defaultPolicy.name}）` : '跟随默认（尚未配置默认策略 —— 永不清理）'
+  }].concat((policies || []).map(p => ({ v: p.id, t: p.isDefault ? `${p.name}（默认）` : p.name })));
 
   // 取值优先级：编辑已有任务 → 库里的值；新建 → 向导推断结果 → 模板默认值。
   const v = initial || prefill || (template
@@ -317,9 +321,10 @@ async function taskFormFields(initial, template, prefill, client) {
       hint: '留空表示不限制上传时段。跨天窗口（如 22:00 到次日 06:00）直接这么填就行' },
     { name: 'uploadWindowEnd', label: '上传窗口结束', type: 'time', value: v.uploadWindowEnd || '', advanced: true },
     { name: 'retentionPolicyId', label: '保留策略', type: 'select',
-      value: initial ? (v.retentionPolicyId || '') : (v.retentionPolicyId || defaultPolicyId),
+      value: v.retentionPolicyId || '',
       options: policyOpts, advanced: true,
-      hint: '决定这个任务的旧备份什么时候被清掉。不选就按默认策略走；选「不绑定」则永不清理' },
+      hint: '决定这个任务的旧备份什么时候被清掉。保持「跟随默认」的话，以后在保留策略页换默认策略，这个任务会一起跟着变'
+        + (defaultPolicy ? '' : '。当前系统还没有默认策略，此时「跟随默认」等于不清理，请先去保留策略页设一份') },
     // A3：大小异常判定的三个阈值，此前只在详情页展示、表单里从没有过输入项——
     // 界面上写着「大小限制 1 GB ~ 50 GB」，但没有任何地方能把它填进去。
     { name: 'minTotalBytes', label: '总大小下限', type: 'number', value: v.minTotalBytes ?? '', advanced: true,
@@ -446,7 +451,9 @@ export async function openTaskDrawer(id, viaNav = false) {
       <div class="row"><div class="k">大小限制</div><div class="v">${fmtBytes(d.minTotalBytes)} ~ ${fmtBytes(d.maxTotalBytes)}，文件数 ≥ ${esc(d.minFileCount ?? '—')}</div></div>
       <div class="row"><div class="k">限速 / 分块</div><div class="v">${d.bandwidthLimitKbps ? esc(d.bandwidthLimitKbps) + ' KB/s' : '不限'} / ${fmtBytes(d.chunkSizeBytes)}</div></div>
       <div class="row"><div class="k">重试</div><div class="v">${esc(d.retryCount)} 次，间隔 ${esc(d.retryIntervalSeconds)}s</div></div>
-      <div class="row"><div class="k">保留策略</div><div class="v">${d.retentionPolicyName ? esc(d.retentionPolicyName) : '未绑定（这个任务的备份永不清理）'}</div></div>
+      <div class="row"><div class="k">保留策略</div><div class="v">${d.retentionPolicyName
+        ? esc(d.retentionPolicyName)
+        : '跟随默认<span class="sub">按保留策略页当前设为默认的那份清理，换默认策略这个任务会一起变</span>'}</div></div>
       <div class="row"><div class="k">最近扫描 / 成功</div><div class="v">${fmtDT(d.lastScanAt)} / ${fmtDT(d.lastSuccessAt)}</div></div>
       <div class="row"><div class="k">配置版本</div><div class="v">${esc(d.configVersion)}<span class="sub">每改一次任务配置加一，客户端据此判断要不要重新拉取</span></div></div>
     </div>

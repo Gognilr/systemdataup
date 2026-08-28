@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Text.Json;
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Enums;
@@ -122,6 +122,10 @@ public class AgentRegistrationService : IAgentRegistrationService
                 throw new BusinessException("UNAUTHORIZED", "注册令牌无效或已过期", 401);
             }
 
+            // 被这次注册顶掉的旧身份。留着它是为了把管理员在服务端设过的名字和分组
+            // 继承到新行上——重装一台机器不该让「财务服务器」变回 WIN-8KJ2P3。
+            Client? superseded = null;
+
             // 活跃/待审批实例不能被静默覆盖；旧的 revoked/disabled 身份可重新登记。
             var existing = await _db.Clients
                 .Where(c => c.MachineId == request.MachineId)
@@ -129,11 +133,28 @@ public class AgentRegistrationService : IAgentRegistrationService
                 .FirstOrDefaultAsync(ct);
             if (existing is not null && existing.Status is not (ClientStatus.Revoked or ClientStatus.Disabled))
             {
-                await _audit.RecordAsync("agent.registration", AuditResult.Failure, "client", null,
-                    errorMessage: $"机器指纹已注册 machineId={request.MachineId}", ct: ct);
-                await transaction.CommitAsync(ct);
-                committed = true;
-                throw new BusinessException("CONFLICT", "该机器已注册，请勿重复提交", 409);
+                // 已被 SystemWatchdogWorker 判定掉线的旧身份让位给新注册。
+                //
+                // 这一条堵的是一个死锁：客户端重装后本地身份没了（卸载默认删除 state.json），
+                // 新装的 Agent 只能重新提交注册，而服务端这边旧记录还在，于是永远 409。
+                // Agent 卡在注册这一步，心跳循环根本不会启动，服务端看到的就是一台
+                // 「有证书、从不心跳、疑似离线」的空壳，而且没有任何人工干预就永远好不了。
+                //
+                // 让位只认 Offline：那是服务端自己按 client_offline_threshold_seconds
+                // 确认过的静默，不是客户端一句话。Online / SuspectedOffline 一律拒绝——
+                // 疑似离线只是漏了一次心跳，机器多半还活着，让它被一个自称同 machineId
+                // 的请求顶掉，就等于把「不能静默覆盖活跃实例」这条给废了。
+                if (existing.Status != ClientStatus.Offline)
+                {
+                    await _audit.RecordAsync("agent.registration", AuditResult.Failure, "client", null,
+                        errorMessage: $"机器指纹已注册 machineId={request.MachineId}", ct: ct);
+                    await transaction.CommitAsync(ct);
+                    committed = true;
+                    throw new BusinessException("CONFLICT", "该机器已注册，请勿重复提交", 409);
+                }
+
+                await SupersedeOfflineClientAsync(existing, now, ct);
+                superseded = existing;
             }
 
             if (string.IsNullOrWhiteSpace(request.PublicKey) || !_certificateAuthority.CanParsePublicKey(request.PublicKey))
@@ -149,8 +170,9 @@ public class AgentRegistrationService : IAgentRegistrationService
                 Id = clientId,
                 MachineId = request.MachineId,
                 Hostname = request.Hostname,
-                DisplayName = string.IsNullOrWhiteSpace(request.DisplayName) ? request.Hostname : request.DisplayName!,
-                ClientGroupId = registrationToken?.ClientGroupId,
+                DisplayName = ResolveDisplayName(request, superseded),
+                // 令牌带的分组是这次登记的明确意图，优先；没带才继承旧身份的分组。
+                ClientGroupId = registrationToken?.ClientGroupId ?? superseded?.ClientGroupId,
                 OsName = request.OsName,
                 OsVersion = request.OsVersion,
                 Architecture = request.Architecture,
@@ -242,6 +264,75 @@ public class AgentRegistrationService : IAgentRegistrationService
                 await transaction.RollbackAsync(CancellationToken.None);
             throw;
         }
+    }
+
+    /// <summary>
+    /// 决定重新登记后这台机器在界面上叫什么。
+    /// </summary>
+    /// <remarks>
+    /// 优先级是「Agent 端特意配的名字 &gt; 管理员在服务端改过的名字 &gt; 主机名」。
+    ///
+    /// 判断「有没有人特意起过名字」两处都不能只看字段有没有值：
+    /// Agent 没配 DisplayName 时会把主机名填进去（AgentWorker 提交注册请求处），
+    /// 服务端的 DisplayName 在注册时也是主机名的拷贝。所以两处都以「与 Hostname 不同」
+    /// 作为「被人工命名过」的判据。
+    ///
+    /// 中间那一档是这次改动的要点：管理员起的「财务服务器」必须活过一次卸载重装，
+    /// 否则服务端改名在重装面前形同虚设。而没被改过的名字绝不继承——
+    /// 机器改名后重装，界面上还挂着旧主机名，比什么都不做更让人困惑。
+    /// </remarks>
+    private static string ResolveDisplayName(SubmitRegistrationRequest request, Client? superseded)
+    {
+        var requested = string.IsNullOrWhiteSpace(request.DisplayName) ? request.Hostname : request.DisplayName!;
+        if (!string.Equals(requested, request.Hostname, StringComparison.OrdinalIgnoreCase))
+            return requested;
+
+        if (superseded is not null
+            && !string.Equals(superseded.DisplayName, superseded.Hostname, StringComparison.OrdinalIgnoreCase))
+            return superseded.DisplayName;
+
+        return requested;
+    }
+
+    /// <summary>
+    /// 把已确认掉线的旧身份就地注销，给同一 machine_id 的新注册让出位置。
+    /// </summary>
+    /// <remarks>
+    /// 必须单独 SaveChanges 一次，不能和新客户端的 INSERT 挤在同一批：
+    /// uq_clients_machine_id_active 是 <c>WHERE status NOT IN ('revoked','disabled')</c>
+    /// 的部分唯一索引，即时校验，而 EF 不保证 UPDATE 一定排在 INSERT 前面。
+    /// 调用方已经开了事务，这次中间提交仍然是原子的。
+    /// </remarks>
+    private async Task SupersedeOfflineClientAsync(Client existing, DateTime now, CancellationToken ct)
+    {
+        existing.Status = ClientStatus.Revoked;
+        existing.Notes = $"已被同一台机器的重新登记取代（{now:yyyy-MM-dd HH:mm:ss} UTC）";
+
+        // 旧证书一并吊销：新身份签发之后，旧证书再能通过 mTLS 就是一条无主的入口。
+        var activeCertificates = await _db.ClientCertificates
+            .Where(c => c.ClientId == existing.Id && c.Status == CertificateStatus.Active)
+            .ToListAsync(ct);
+        foreach (var certificate in activeCertificates)
+        {
+            certificate.Status = CertificateStatus.Revoked;
+            certificate.RevokedAt = now;
+            certificate.RevokeReason = "重新登记取代旧身份";
+        }
+
+        await _db.SaveChangesAsync(ct);
+
+        await _audit.RecordAsync("client.superseded", AuditResult.Success, "client", existing.Id,
+            afterData: JsonSerializer.Serialize(new
+            {
+                status = "revoked",
+                reason = "reenrollment",
+                existing.MachineId,
+                revokedCertificates = activeCertificates.Count
+            }), ct: ct);
+
+        _logger.LogInformation(
+            "旧客户端身份 {ClientId}({Hostname}) 已确认掉线，被同一 machineId 的重新登记取代，吊销证书 {Count} 张",
+            existing.Id, existing.Hostname, activeCertificates.Count);
     }
 
     private bool IsAutomaticEnrollmentEnabled() =>

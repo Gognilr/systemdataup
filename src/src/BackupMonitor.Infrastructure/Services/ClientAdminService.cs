@@ -18,6 +18,8 @@ public interface IClientAdminService
 {
     Task<PagedResult<ClientListItemDto>> GetListAsync(ClientQuery query, CancellationToken ct = default);
     Task<ClientDetailDto> GetDetailAsync(Guid clientId, CancellationToken ct = default);
+    Task<IReadOnlyList<ClientGroupOptionDto>> GetGroupOptionsAsync(CancellationToken ct = default);
+    Task<ClientDetailDto> UpdateAsync(Guid clientId, UpdateClientRequest request, CancellationToken ct = default);
     Task<IReadOnlyList<RecentAutoEnrollmentDto>> GetRecentAutomaticEnrollmentsAsync(
         int days = 7, int limit = 20, CancellationToken ct = default);
     Task<CertificateRenewalResponse> RenewCertificateAsync(Guid clientId, CancellationToken ct = default);
@@ -55,11 +57,7 @@ public class ClientAdminService : IClientAdminService
     // 「正在干活」的两种形态：上传会话还没落地，或者指令还没跑完。
     // 上传这一组与 BatchOperationService / BackupTaskService 判定 CLIENT_BUSY 用的是同一组状态——
     // 界面上锁的依据必须和服务端回绝的依据一致，否则会出现「按钮亮着，点了报 409」。
-    private static readonly UploadStatus[] ActiveUploadStatuses =
-    [
-        UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading,
-        UploadStatus.Paused, UploadStatus.RetryWait, UploadStatus.Received, UploadStatus.Verifying
-    ];
+    private static readonly UploadStatus[] ActiveUploadStatuses = UploadSessionStatuses.InFlight;
 
     private static readonly CommandStatus[] RunningCommandStatuses =
         [CommandStatus.Pending, CommandStatus.Claimed, CommandStatus.Running];
@@ -146,6 +144,9 @@ public class ClientAdminService : IClientAdminService
                 c.CertificateExpiresAt,
                 c.LastHeartbeatAt,
                 c.LastRemoteIp,
+                // 自报网卡列表在列表页只为一件事服务：对端地址不是 IPv4 时，从里面挑一个能用的。
+                // 整列 jsonb 拉回来比再发一次查询便宜，也比让界面自己去猜靠谱。
+                c.IpAddresses,
                 c.CreatedAt
             })
             .ToListAsync(ct);
@@ -200,6 +201,7 @@ public class ClientAdminService : IClientAdminService
                 : Math.Max(0, (int)Math.Ceiling((r.CertificateExpiresAt.Value - DateTime.UtcNow).TotalDays)),
             LastHeartbeatAt = r.LastHeartbeatAt,
             LastRemoteIp = r.LastRemoteIp,
+            Ipv4Address = ResolveIpv4(r.LastRemoteIp, r.IpAddresses),
             CreatedAt = r.CreatedAt,
                 ActiveAlertCount = alertCounts.FirstOrDefault(a => a.ClientId == r.Id)?.Count ?? 0,
                 TaskCount = taskCounts.FirstOrDefault(t => t.ClientId == r.Id)?.Count ?? 0,
@@ -232,6 +234,56 @@ public class ClientAdminService : IClientAdminService
         {
             return [];
         }
+    }
+
+    /// <summary>
+    /// 给出这台机器"照着它去连"的 IPv4：对端地址本身是 IPv4 就用它，否则从自报网卡里挑第一个。
+    ///
+    /// 优先对端地址而不是自报列表，是因为它是唯一被证实连得通的那个；
+    /// 只有在它是 IPv6（Windows 名称解析很容易把 Agent 领到 fe80:: 上去）时才需要回落。
+    /// 两者都给不出 IPv4 时返回 null——纯 IPv6 环境是合法的，不该编一个地址出来。
+    /// </summary>
+    private static string? ResolveIpv4(string? lastRemoteIp, string? ipAddressesJson)
+    {
+        if (TryNormalizeIpv4(lastRemoteIp, out var fromPeer))
+            return fromPeer;
+
+        foreach (var candidate in ParseIpAddresses(ipAddressesJson))
+            if (TryNormalizeIpv4(candidate, out var selfReported))
+                return selfReported;
+
+        return null;
+    }
+
+    /// <summary>
+    /// 判定一个地址串是不是"能拿去连"的 IPv4，顺带还原 IPv4 映射形式。
+    ///
+    /// 排掉回环和 169.254 APIPA：前者只对机器自己成立，后者是 DHCP 拿不到地址时的兜底，
+    /// 两个都放进 IP 列，等于给运维一个照着连必然连不上的地址，比留空更糟。
+    /// 老客户端上报的网卡列表里这两类地址都还在（过滤是新版 Agent 才做的），
+    /// 所以这道闸必须留在服务端。
+    /// </summary>
+    private static bool TryNormalizeIpv4(string? value, out string? ipv4)
+    {
+        ipv4 = null;
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        // 自报列表里可能带 %12 这类 IPv6 区域号，IPAddress.TryParse 认得，这里不额外处理。
+        if (!System.Net.IPAddress.TryParse(value.Trim(), out var address))
+            return false;
+
+        if (address.IsIPv4MappedToIPv6)
+            address = address.MapToIPv4();
+        if (address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            return false;
+
+        var bytes = address.GetAddressBytes();
+        if (bytes[0] == 127 || (bytes[0] == 169 && bytes[1] == 254))
+            return false;
+
+        ipv4 = address.ToString();
+        return true;
     }
 
     /// <summary>
@@ -312,6 +364,7 @@ public class ClientAdminService : IClientAdminService
             EnrollmentMode = client.EnrollmentMode,
             LastHeartbeatAt = client.LastHeartbeatAt,
             LastRemoteIp = client.LastRemoteIp,
+            Ipv4Address = ResolveIpv4(client.LastRemoteIp, client.IpAddresses),
             CreatedAt = client.CreatedAt,
             ActiveAlertCount = activeAlertCount,
             TaskCount = taskCount,
@@ -376,6 +429,87 @@ public class ClientAdminService : IClientAdminService
 
             LastMetrics = lastHeartbeat
         };
+    }
+
+    /// <summary>
+    /// 全部客户端分组，供"改分组"下拉框使用。
+    ///
+    /// 分组数量是几十的量级（按机房/科室分），不分页；按名称排序而不是创建时间，
+    /// 因为下拉框里人是照着名字找的。
+    /// </summary>
+    public async Task<IReadOnlyList<ClientGroupOptionDto>> GetGroupOptionsAsync(CancellationToken ct = default)
+        => await _db.ClientGroups.AsNoTracking()
+            .OrderBy(g => g.Name)
+            .Select(g => new ClientGroupOptionDto { Id = g.Id, Name = g.Name, Code = g.Code })
+            .ToListAsync(ct);
+
+    /// <summary>
+    /// 修改客户端的显示名称与所属分组。
+    ///
+    /// 这两项是纯管理端属性：心跳只更新时间偏移、对端 IP、网卡列表和状态，
+    /// 从不回写 DisplayName / ClientGroupId，所以服务端改过的名字不会被 Agent 悄悄覆盖——
+    /// 这是这个接口能成立的前提。主机名不在可改之列：它是机器的自我陈述，
+    /// 改它等于让服务端记录和机器实际情况对不上。
+    /// </summary>
+    public async Task<ClientDetailDto> UpdateAsync(
+        Guid clientId, UpdateClientRequest request, CancellationToken ct = default)
+    {
+        var client = await _db.Clients.FirstOrDefaultAsync(c => c.Id == clientId, ct)
+            ?? throw new NotFoundException("客户端", clientId);
+
+        var before = JsonSerializer.Serialize(new { client.DisplayName, client.ClientGroupId });
+        var changed = false;
+
+        if (request.DisplayNameSpecified)
+        {
+            var displayName = request.DisplayName?.Trim();
+            if (string.IsNullOrEmpty(displayName))
+                throw new ValidationFailedException("显示名称不能为空");
+            // 对齐 clients.display_name varchar(255)：越界让数据库去报，错误信息对管理员没有意义。
+            if (displayName.Length > 255)
+                throw new ValidationFailedException("显示名称不能超过 255 个字符");
+
+            changed |= client.DisplayName != displayName;
+            client.DisplayName = displayName;
+        }
+
+        if (request.ClientGroupIdSpecified)
+        {
+            // 传了一个不存在的分组 ID，靠外键约束去挡会得到一个 500；这里先说清楚。
+            if (request.ClientGroupId is { } groupId
+                && !await _db.ClientGroups.AnyAsync(g => g.Id == groupId, ct))
+                throw new ValidationFailedException($"分组不存在：{groupId}");
+
+            changed |= client.ClientGroupId != request.ClientGroupId;
+            client.ClientGroupId = request.ClientGroupId;
+        }
+
+        if (changed)
+        {
+            try
+            {
+                // RowVersion 是并发令牌，SaveChanges 会带上它。
+                // 这里不要求调用方回传版本号：心跳每 30 秒就会推进一次 row_version，
+                // 拿列表上读到的版本来提交，几乎每次改名都会撞出一个假冲突。
+                await _db.SaveChangesAsync(ct);
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                throw new ConcurrencyConflictException("客户端");
+            }
+
+            // 改名会把"这台机器是谁"的历史线索切断——三个月后翻旧告警的人，
+            // 只有靠这条审计才能把当时的名字和现在的名字对上。
+            await _audit.RecordAsync("client.updated", AuditResult.Success, "client", client.Id,
+                beforeData: before,
+                afterData: JsonSerializer.Serialize(new { client.DisplayName, client.ClientGroupId }),
+                ct: ct);
+
+            _logger.LogInformation("客户端 {ClientId}({Hostname}) 的名称/分组已修改为 {DisplayName}/{GroupId}",
+                client.Id, client.Hostname, client.DisplayName, client.ClientGroupId);
+        }
+
+        return await GetDetailAsync(clientId, ct);
     }
 
     public async Task<IReadOnlyList<RecentAutoEnrollmentDto>> GetRecentAutomaticEnrollmentsAsync(

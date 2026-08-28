@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization.Metadata;
 using BackupMonitor.Shared.Models.Admin;
+using BackupMonitor.Shared.Recognition;
 
 namespace BackupMonitor.Infrastructure.Recognition;
 
@@ -87,39 +88,75 @@ public static class StructureInference
                 evidence, required, dateDirectories);
         }
 
-        // 情形二：这一层是业务单元层，单元下面还有日期层 —— 账套001\20260825\…
-        var unitsWithDateChildren = directories
-            .Where(d => HasDateChildren(d))
-            .ToList();
-        var unitDateRatio = (double)unitsWithDateChildren.Count / directories.Count;
+        // 情形二：下面是业务单元，单元里按日期建目录 —— 账套001\20260825\…
+        //
+        // 这里刻意不数「第一层里有几个带日期子目录」，而是先把**单元集合**解出来。
+        // 原因是单元不一定都在同一层：
+        //
+        //   D:\自动备份\
+        //     ├── ZT001\20260822\…          ← 单元在第 1 层
+        //     └── ZT201-ZT216\ZT201\20260828\…  ← 单元在第 2 层，中间那层只是分组容器
+        //
+        // 按第一层数的话，2/3 的目录带日期子目录，勉强过线，于是 ZT201-ZT216 被当成
+        // 一个单元：摘要说「3 个业务单元」、必需文件只考察了 2 个 leaf、预演又列出 3 个，
+        // 同一份推断里三个数字来自三段独立代码。落地之后更糟——扫描时那个「单元」
+        // 取到的是 ZT216，把它底下 7 天的文件混成一份备份判 passed，
+        // 而 ZT201–ZT215 这 15 个账套压根不在监控范围内，且没有任何提示。
+        //
+        // 所以单元集合是这一分支唯一的事实来源：摘要说几个、必需文件考察几个、
+        // 预演跑几个，全部由它派生，结构上不可能再对不上。
+        var units = ResolveUnits(source);
+        var unitsWithDates = units.Where(u => u.HasDateChildren).ToList();
+        var unitDateRatio = units.Count == 0 ? 0 : (double)unitsWithDates.Count / units.Count;
 
         if (unitDateRatio >= DateLayerThreshold)
         {
-            var leaves = unitsWithDateChildren
-                .Select(d => VisibleDirectories(d)
-                    .Where(c => LooksLikeDate(c.Name))
-                    .OrderByDescending(c => c.Name, StringComparer.OrdinalIgnoreCase)
-                    .First())
+            var leaves = unitsWithDates.Select(u => u.Leaf).ToList();
+            var depths = units.Select(u => u.Depth).Distinct().OrderBy(d => d).ToList();
+            var containers = units
+                .Where(u => u.Depth > 1)
+                .Select(u => u.RelativePath[..u.RelativePath.LastIndexOf('/')])
+                .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
-            evidence.Add($"{source.Name} 下有 {directories.Count} 个子目录（{PreviewNames(directories)}）");
-            evidence.Add($"其中 {unitsWithDateChildren.Count} 个的下一层是日期目录，结构彼此一致");
+            evidence.Add($"{source.Name} 下一共找到 {units.Count} 个业务单元（{PreviewNames(units.Select(u => u.Node).ToList())}）");
+            if (containers.Count > 0)
+            {
+                evidence.Add(
+                    $"{string.Join("、", containers)} 自己不是业务单元，只是把单元分了组——"
+                    + $"真正的单元是它下面那一层，共 {units.Count(u => u.Depth > 1)} 个");
+            }
+
+            evidence.Add($"其中 {unitsWithDates.Count} 个的下一层是日期目录，结构彼此一致");
             var newestLeaf = leaves.OrderByDescending(l => l.Name, StringComparer.OrdinalIgnoreCase).FirstOrDefault();
             if (newestLeaf is not null)
                 evidence.Add($"最新的日期目录是 {newestLeaf.Name}");
 
             var required = InferRequiredFiles(leaves, evidence);
-            var config = new JsonObject
+
+            // 单元都在同一层时把深度写死，只有层级不齐才用自适应。
+            // 能说死的就说死：写死的深度不会猜错，date_leaf 会。
+            var config = new JsonObject();
+            if (depths.Count == 1)
             {
-                ["businessUnitDepth"] = 1,
-                ["unitLayout"] = "latest_directory"
-            };
+                config["businessUnitDepth"] = depths[0];
+                config["unitLayout"] = "latest_directory";
+            }
+            else
+            {
+                config["unitLayout"] = "date_leaf";
+            }
+
             AddRequired(config, required);
+
+            var layoutNote = depths.Count == 1
+                ? ""
+                : $"（单元分布在第 {string.Join("、", depths)} 层，按结构自动认，不按固定层数）";
 
             return Build(
                 source, "subdirectory_units", config,
                 confidence: unitDateRatio >= 0.9 ? 92 : 74,
-                summary: $"{source.Name} 下有 {directories.Count} 个业务单元（{PreviewNames(directories)}），"
+                summary: $"{source.Name} 下有 {units.Count} 个业务单元（{PreviewNames(units.Select(u => u.Node).ToList())}）{layoutNote}，"
                          + $"每个单元按日期建目录"
                          + (newestLeaf is not null ? $"，最新的是 {newestLeaf.Name}" : "")
                          + DescribeRequired(required),
@@ -203,6 +240,40 @@ public static class StructureInference
                          + $"（{string.Join("、", paired.Extensions)}），共 {paired.GroupCount} 组，"
                          + $"每次只认最新的一组：{paired.NewestGroupName}",
                 evidence, paired.Candidates, [source]);
+        }
+
+        // 再问一句"是不是每天一组、每组好几个库"——排在扩展名判定之前，理由同上。
+        //
+        // D:\数据库备份\ 是这一种：没有日期子目录，14 个 .bak 全平铺着，日期写在文件名里。
+        //   beeServer_backup_2026_08_22_000004_2256969.bak      5 MB
+        //   dzwl_product_backup_2026_08_22_000004_4679193.bak   1.5 GB
+        // 同一天的两个文件才构成一次完整备份，14 个 = 7 天 × 2 个库。
+        //
+        // 按 basename 分组认不出来（14 个名字互不相同），落到扩展名分支就成了
+        // "堆着 14 个 .bak，取最新的那个"——而 latest_single_file 又会把整个目录收进来，
+        // 于是每次扫描把 7 天的历史全算一遍哈希、每次上传 10.59GB 而不是 1.5GB，
+        // 且"今天某个库没转储出来"永远不会被发现。
+        var dated = DetectDatedFileSets(files);
+        if (dated is not null)
+        {
+            evidence.Add($"{source.Name} 里有 {files.Count} 个文件，文件名里都带日期，按日期可以分成 {dated.GroupCount} 组");
+            evidence.Add($"每组固定由 {dated.Patterns.Count} 个文件构成：{FileNamePattern.Describe(dated.Patterns)}");
+            evidence.Add($"最新的一组是 {dated.NewestGroupKey}（{PreviewNames(dated.NewestGroupFiles)}）");
+
+            var datedConfig = new JsonObject
+            {
+                ["recursive"] = false,
+                ["groupBy"] = dated.GroupRegex
+            };
+            AddRequired(datedConfig, dated.Candidates);
+
+            return Build(
+                source, "multi_file_set", datedConfig,
+                confidence: dated.Ratio >= 0.9 ? 82 : 70,
+                summary: $"{source.Name} 里每天一组备份，每组 {dated.Patterns.Count} 个"
+                         + $"（{FileNamePattern.Describe(dated.Patterns)}），共 {dated.GroupCount} 组，"
+                         + $"每次只认最新的一组：{dated.NewestGroupKey}",
+                evidence, dated.Candidates, [source]);
         }
 
         var byExtension = files
@@ -347,28 +418,14 @@ public static class StructureInference
     }
 
     /// <summary>
-    /// 目录名是不是一个年份：整个名字只有 4 位数字，且落在 1990–2100。
-    ///
-    /// 与 LooksLikeDate 并列而不是去放宽它的 6 位数字下限——那个下限正是用来把
-    /// ZT001、账套001 挡在外面的。要求"整个名字只有数字"同样是刻意的：
-    /// 2026年、08月 这类一律认不出来，宁可交给人选模板，也不要认错。
+    /// 日期名判定已下沉到 Shared.Recognition.DateName，让 Agent 也能执行同一套语义。
+    /// 这里留三个转发是给既有调用点和测试用的，判定本身只有那一份。
     /// </summary>
-    public static bool LooksLikeYear(string? name) =>
-        IsAllAsciiDigits(name)
-        && name!.Length == 4
-        && int.TryParse(name, out var year)
-        && year is >= 1990 and <= 2100;
+    public static bool LooksLikeYear(string? name) => DateName.LooksLikeYear(name);
 
-    /// <summary>目录名是不是月或日：整个名字只有 1–2 位数字，且落在 1–31。</summary>
-    public static bool LooksLikeMonthOrDay(string? name) =>
-        IsAllAsciiDigits(name)
-        && name!.Length is 1 or 2
-        && int.TryParse(name, out var value)
-        && value is >= 1 and <= 31;
+    public static bool LooksLikeMonthOrDay(string? name) => DateName.LooksLikeMonthOrDay(name);
 
-    /// <summary>全角数字（０８）不算——它几乎一定不是备份程序建出来的目录。</summary>
-    private static bool IsAllAsciiDigits(string? name) =>
-        !string.IsNullOrEmpty(name) && name.All(char.IsAsciiDigit);
+    public static bool LooksLikeDate(string name) => DateName.LooksLikeDate(name);
 
     /// <summary>
     /// 一个目录里"成对文件"的观察结果：一份备份由同名的若干个文件构成。
@@ -408,7 +465,7 @@ public static class StructureInference
         if (ratio < PairedFileThreshold)
             return null;
 
-        // 扩展名的"每组都出现"用 RequiredThreshold，与 BuildCandidates 同一把尺子。
+        // 扩展名的"每组都出现"用 RequiredThreshold，与 InferRequiredFiles 同一把尺子。
         var stats = new Dictionary<string, (int Count, long Size)>(StringComparer.OrdinalIgnoreCase);
         foreach (var group in paired)
         {
@@ -454,6 +511,130 @@ public static class StructureInference
             newest.ToList());
     }
 
+    /// <summary>
+    /// 一个平铺目录里「每天一组、每组若干个库」的观察结果。不成立时 DetectDatedFileSets 返回 null。
+    /// </summary>
+    private sealed record DatedFileSet(
+        int GroupCount,
+        double Ratio,
+        IReadOnlyList<string> Patterns,
+        string GroupRegex,
+        List<RequiredFileCandidateDto> Candidates,
+        string NewestGroupKey,
+        IReadOnlyList<SnapshotNode> NewestGroupFiles);
+
+    /// <summary>
+    /// 判断「一次备份 = 同一天的那几个文件」：按文件名里的日期分组，用归一化模式描述组成员。
+    ///
+    /// 四道关，任何一道不过就返回 null 交回原路径——宁可认不出来交给人选，也不要认错：
+    ///
+    ///   1. 每个文件都要能取到日期，取不到的说明这批文件不是这个结构；
+    ///   2. 至少两组，一组谈不上"分组"；
+    ///   3. 多数组的成员模式集合要一致，否则每天备的东西都不一样，凑不出"一次完整备份"的定义；
+    ///   4. 模式必须 ≥2 个。只有 1 个模式是"单库每天一份"，那是 latest_single_file 的场景，
+    ///      在这里认下来会把既有行为改坏。
+    ///
+    /// 最后还要把生成的 groupBy 正则在样本上验一遍。不验的后果不是报错而是**静默退化**：
+    /// RecognizerRules.GroupKeyOf 对匹配不上的文件是"归入未分组并保留"，
+    /// 一条写坏的正则会安静地等价于不分组，回到今天这个错误结果。
+    /// </summary>
+    private static DatedFileSet? DetectDatedFileSets(IReadOnlyList<SnapshotNode> files)
+    {
+        if (files.Count < 2)
+            return null;
+
+        var tokens = files
+            .Select(f => (File: f, Token: FileNamePattern.ExtractDateToken(f.Name)))
+            .ToList();
+        if (tokens.Any(t => t.Token is null))
+            return null;
+
+        var groups = tokens
+            .GroupBy(t => t.Token!, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (groups.Count < 2)
+            return null;
+
+        var patternSets = groups.ToDictionary(
+            g => g.Key,
+            g => g.Select(x => FileNamePattern.Normalize(x.File.Name))
+                  .Distinct(StringComparer.OrdinalIgnoreCase)
+                  .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                  .ToList(),
+            StringComparer.OrdinalIgnoreCase);
+
+        // 出现得最多的那一套成员模式就是"每次备份应该长什么样"。
+        // 平局时按模式数多的优先，再按字典序——保证结果稳定而不依赖枚举顺序（R1 的教训）。
+        var dominant = patternSets.Values
+            .GroupBy(set => string.Join('|', set), StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count())
+            .ThenByDescending(g => g.First().Count)
+            .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+            .First();
+
+        var ratio = (double)dominant.Count() / groups.Count;
+        if (ratio < PairedFileThreshold)
+            return null;
+
+        var patterns = dominant.First();
+        if (patterns.Count < 2)
+            return null;
+
+        var groupRegex = FileNamePattern.BuildDateGroupRegex(files[0].Name);
+        if (groupRegex is null || !FileNamePattern.Validate(groupRegex, files.Select(f => f.Name)))
+            return null;
+
+        var threshold = (int)Math.Ceiling(groups.Count * RequiredThreshold);
+        var candidates = patterns
+            .Select(pattern =>
+            {
+                var matching = files
+                    .Where(f => string.Equals(FileNamePattern.Normalize(f.Name), pattern, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                var presentIn = patternSets.Count(kv => kv.Value.Contains(pattern, StringComparer.OrdinalIgnoreCase));
+                var perGroup = groups
+                    .Select(g => g.Count(x => string.Equals(
+                        FileNamePattern.Normalize(x.File.Name), pattern, StringComparison.OrdinalIgnoreCase)))
+                    .Where(count => count > 0)
+                    .ToList();
+
+                return new RequiredFileCandidateDto
+                {
+                    Pattern = pattern,
+                    Kind = "pattern",
+                    PresentIn = presentIn,
+                    TotalUnits = groups.Count,
+                    CountPerUnitMin = perGroup.Count == 0 ? 0 : perGroup.Min(),
+                    CountPerUnitMax = perGroup.Count == 0 ? 0 : perGroup.Max(),
+                    TypicalSizeBytes = matching.Count == 0 ? 0 : matching.Max(f => f.SizeBytes),
+                    Recommended = presentIn >= threshold,
+                    NotRecommendedReason = presentIn >= threshold
+                        ? null
+                        : $"只出现在 {presentIn}/{groups.Count} 组里"
+                };
+            })
+            .OrderByDescending(c => c.TypicalSizeBytes)
+            .ToList();
+
+        if (!candidates.Any(c => c.Recommended))
+            return null;
+
+        // 时间相同时按组名倒序，保证结果稳定而不依赖枚举顺序。
+        var newest = groups
+            .OrderByDescending(g => g.Max(x => x.File.LastModifiedAt ?? DateTime.MinValue))
+            .ThenByDescending(g => g.Key, StringComparer.OrdinalIgnoreCase)
+            .First();
+
+        return new DatedFileSet(
+            groups.Count,
+            ratio,
+            patterns,
+            groupRegex,
+            candidates,
+            newest.Key,
+            newest.Select(x => x.File).ToList());
+    }
+
     private static List<string> DistinctExtensions(IEnumerable<SnapshotNode> files) =>
         files.Select(f => Extension(f.Name))
             .Where(e => !string.IsNullOrEmpty(e))
@@ -468,10 +649,24 @@ public static class StructureInference
     }
 
     /// <summary>
-    /// 从若干个"备份目录"里找出每次都出现的文件。
+    /// 从若干个「备份目录」里找出每次都出现的文件，分三档给出。
     ///
-    /// 先按文件名精确统计；如果文件名里带日期（db_20260825.bak 这类），
-    /// 没有任何文件名能重复出现，就退一步按扩展名统计。
+    /// 原先只有两档：**精确比文件名**，或者（精确名一个都没达标时）退一步**比扩展名**。
+    /// 中间那一档缺失，后果是名字带年份、序号的文件在候选里直接消失——
+    /// 用友 U8 的 UFFile_001_2022.dat…UFFile_001_2026.dat 在界面上连一行提示都看不到，
+    /// 使用者盯着这几个文件，得不到任何关于它们算不算数的说法。
+    ///
+    /// 三档：
+    ///   1. 固定名必需  —— 精确文件名在 ≥90% 的单元里出现（UFDATA.BAK）
+    ///   2. 模式必需    —— 归一化后的模式在 ≥90% 的单元里出现，**且各单元里的个数一致**
+    ///   3. 附带文件    —— 其余，列出来但不勾选，并说明为什么
+    ///
+    /// 第 2 档那个「个数一致」的条件是这套判断的关键，来自一条领域事实：
+    /// U8 的 UFFile 是按**年度**分的附件库，各账套的**启用年度不同**——
+    /// 2022 年起用的账套有 5 个，2024 年起用的只有 3 个，两者都是完整备份。
+    /// 个数在单元之间波动是这个结构的正常形态，不是缺失信号，拿它当判据只会制造假警报。
+    /// 反过来，个数一致的模式（每天恰好一个的 *_backup_*.bak）才是可靠的判据：
+    /// 少一个就是真的少了一个库。
     /// </summary>
     private static List<RequiredFileCandidateDto> InferRequiredFiles(
         IReadOnlyList<SnapshotNode> leaves, List<string> evidence)
@@ -486,29 +681,106 @@ public static class StructureInference
         if (leafFiles.Count == 0)
             return [];
 
+        var totalUnits = leafFiles.Count;
+        var threshold = totalUnits == 1 ? 1 : (int)Math.Ceiling(totalUnits * RequiredThreshold);
+
+        // ── 第一档：精确文件名 ──
         var byName = CountAcross(leafFiles, f => f.Name);
-        var candidates = BuildCandidates(byName, leafFiles.Count, exact: true);
+        var exact = byName
+            .Where(kv => kv.Value.Count >= threshold)
+            .OrderByDescending(kv => kv.Value.Count)
+            .ThenByDescending(kv => kv.Value.Size)
+            .Select(kv => new RequiredFileCandidateDto
+            {
+                Pattern = kv.Key,
+                Kind = "exact",
+                PresentIn = kv.Value.Count,
+                TotalUnits = totalUnits,
+                TypicalSizeBytes = kv.Value.Size,
+                CountPerUnitMin = 1,
+                CountPerUnitMax = 1,
+                Recommended = true
+            })
+            .ToList();
 
-        if (candidates.Count == 0)
-        {
-            var byExtension = CountAcross(leafFiles, f => Extension(f.Name) is { Length: > 0 } ext ? "*" + ext : f.Name);
-            candidates = BuildCandidates(byExtension, leafFiles.Count, exact: false);
-            if (candidates.Count > 0)
-                evidence.Add("文件名每次都不一样（带日期），改按扩展名认");
-        }
+        var exactNames = exact.Select(c => c.Pattern).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        if (candidates.Count > 0)
-        {
-            var names = string.Join("、", candidates.Where(c => c.Recommended).Select(c => c.Pattern));
-            if (!string.IsNullOrEmpty(names))
-                evidence.Add($"考察的 {leafFiles.Count} 个备份目录里，每一个都有：{names}");
+        // ── 第二档：归一化模式，只考察没被第一档盖住的文件 ──
+        var patterns = CountPatterns(leafFiles, exactNames);
+        var pattern = patterns
+            .OrderByDescending(kv => kv.Value.PresentIn)
+            .ThenByDescending(kv => kv.Value.Size)
+            .Select(kv =>
+            {
+                var stable = kv.Value.CountMin == kv.Value.CountMax;
+                var present = kv.Value.PresentIn >= threshold;
+                return new RequiredFileCandidateDto
+                {
+                    Pattern = kv.Key,
+                    Kind = "pattern",
+                    PresentIn = kv.Value.PresentIn,
+                    TotalUnits = totalUnits,
+                    TypicalSizeBytes = kv.Value.Size,
+                    CountPerUnitMin = kv.Value.CountMin,
+                    CountPerUnitMax = kv.Value.CountMax,
+                    Recommended = present && stable,
+                    NotRecommendedReason = !present
+                        ? $"只出现在 {kv.Value.PresentIn}/{totalUnits} 个备份目录里"
+                        : stable
+                            ? null
+                            : $"各备份目录里的个数不一样（{kv.Value.CountMin}–{kv.Value.CountMax} 个），"
+                              + "不能作为完整性判据；文件本身照常上传"
+                };
+            })
+            .ToList();
 
-            var partial = candidates.Where(c => !c.Recommended).ToList();
-            foreach (var item in partial)
-                evidence.Add($"{item.Pattern} 只出现在 {item.PresentIn}/{item.TotalUnits} 个备份目录里，没有默认勾选");
-        }
+        var candidates = exact.Concat(pattern).Take(16).ToList();
+
+        var recommended = candidates.Where(c => c.Recommended).Select(c => c.Pattern).ToList();
+        if (recommended.Count > 0)
+            evidence.Add($"考察的 {totalUnits} 个备份目录里，每一个都有：{string.Join("、", recommended)}");
+
+        foreach (var item in candidates.Where(c => !c.Recommended))
+            evidence.Add($"{item.Pattern}：{item.NotRecommendedReason}，没有默认勾选");
 
         return candidates;
+    }
+
+    /// <summary>
+    /// 按归一化模式统计：这个模式出现在多少个单元里，以及**每个单元里有几个**。
+    /// 个数的最小/最大值是第二档能不能当判据的依据，见 InferRequiredFiles 的说明。
+    /// </summary>
+    private static Dictionary<string, (int PresentIn, int CountMin, int CountMax, long Size)> CountPatterns(
+        List<List<SnapshotNode>> leafFiles, HashSet<string> alreadyCovered)
+    {
+        var result = new Dictionary<string, (int PresentIn, int CountMin, int CountMax, long Size)>(
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (var files in leafFiles)
+        {
+            var perUnit = new Dictionary<string, (int Count, long Size)>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in files)
+            {
+                if (alreadyCovered.Contains(file.Name))
+                    continue;
+                var key = FileNamePattern.Normalize(file.Name);
+                perUnit[key] = perUnit.TryGetValue(key, out var seen)
+                    ? (seen.Count + 1, Math.Max(seen.Size, file.SizeBytes))
+                    : (1, file.SizeBytes);
+            }
+
+            foreach (var (key, value) in perUnit)
+            {
+                result[key] = result.TryGetValue(key, out var existing)
+                    ? (existing.PresentIn + 1,
+                       Math.Min(existing.CountMin, value.Count),
+                       Math.Max(existing.CountMax, value.Count),
+                       Math.Max(existing.Size, value.Size))
+                    : (1, value.Count, value.Count, value.Size);
+            }
+        }
+
+        return result;
     }
 
     private static Dictionary<string, (int Count, long Size)> CountAcross(
@@ -531,34 +803,6 @@ public static class StructureInference
         }
 
         return result;
-    }
-
-    private static List<RequiredFileCandidateDto> BuildCandidates(
-        Dictionary<string, (int Count, long Size)> counts, int totalUnits, bool exact)
-    {
-        // 只在多个单元之间才谈"每次都出现"；单个单元时无从判断稳定性，
-        // 但仍把文件列出来供人勾选——那是他自己的目录，他认得。
-        var floor = totalUnits == 1 ? 1 : Math.Max(2, (int)Math.Ceiling(totalUnits * 0.5));
-        var candidates = counts
-            .Where(kv => kv.Value.Count >= floor)
-            .OrderByDescending(kv => kv.Value.Count)
-            .ThenByDescending(kv => kv.Value.Size)
-            .Take(12)
-            .Select(kv => new RequiredFileCandidateDto
-            {
-                Pattern = kv.Key,
-                PresentIn = kv.Value.Count,
-                TotalUnits = totalUnits,
-                TypicalSizeBytes = kv.Value.Size,
-                Recommended = totalUnits == 1 || kv.Value.Count >= Math.Ceiling(totalUnits * RequiredThreshold)
-            })
-            .ToList();
-
-        // 精确文件名模式下，如果一个都没达到推荐线，说明文件名不稳定，交给扩展名兜底。
-        if (exact && !candidates.Any(c => c.Recommended))
-            return [];
-
-        return candidates;
     }
 
     private static void AddRequired(JsonObject config, IReadOnlyList<RequiredFileCandidateDto> required)
@@ -601,6 +845,9 @@ public static class StructureInference
 
         return new RecognizerProposalDto
         {
+            // 抓得不全 + 没看懂 = 很可能只是深度不够，值得再抓深一点重试一次。
+            // 抓得不全但结论已经清楚（置信度够高）时不必重来：多一次往返换不到新信息。
+            NeedsDeeperScan = source.HasGaps && confidence < 70,
             SourcePath = sourcePathOverride ?? source.FullPath,
             RecognizerType = recognizerType,
             RecognizerConfig = config.ToJsonString(ConfigJson),
@@ -635,57 +882,47 @@ public static class StructureInference
         return null;
     }
 
-    private static bool HasDateChildren(SnapshotNode directory)
-    {
-        var children = VisibleDirectories(directory).ToList();
-        if (children.Count == 0)
-            return false;
-        var dateChildren = children.Count(c => LooksLikeDate(c.Name));
-        return (double)dateChildren / children.Count >= DateLayerThreshold;
-    }
+    /// <summary>
+    /// 一个业务单元候选：目录本身、它相对源目录的路径（就是将来的 external_key）、
+    /// 它在第几层、下面是不是日期目录、以及它这次的采集根（最新的日期目录）。
+    /// </summary>
+    private sealed record UnitCandidate(
+        SnapshotNode Node, string RelativePath, int Depth, bool HasDateChildren, SnapshotNode Leaf);
 
     /// <summary>
-    /// 目录名是否像一个日期或时间戳。
+    /// 把源目录下的业务单元解出来——**这一分支唯一的事实来源**。
     ///
-    /// 判据是"抽掉非数字后能不能读成一个合理的日期"，而不是穷举格式：
-    /// 20260825、2026-08-25、2026_08_25、20260825_0136、财务20260825 都要认出来，
-    /// 而 ZT001、账套001 这类必须认不出来（它们只有 3 位数字）。
+    /// 定位规则与 Agent 真扫时共用 BusinessUnitResolver，所以「向导说有 18 个账套」
+    /// 和「实际扫描出 18 个账套」是同一段代码算出来的，不可能分叉。
+    ///
+    /// 深度上限取 4：源目录 → 分组容器 → 单元 → 日期目录。再深的结构快照本身也抓不到
+    /// （向导抓 4 层），继续下探只会在 DepthLimited 的空目录上打转。
     /// </summary>
-    public static bool LooksLikeDate(string name)
+    private static List<UnitCandidate> ResolveUnits(SnapshotNode source)
     {
-        if (string.IsNullOrWhiteSpace(name))
-            return false;
+        var rules = RecognizerRules.Empty() with { UnitLayout = "date_leaf" };
+        return BusinessUnitResolver
+            .Resolve(source, rules, SnapshotRecognizer.SnapshotNavigator(source), maxDepth: 4)
+            .Select(unit =>
+            {
+                var children = VisibleDirectories(unit.Directory).ToList();
+                var dateChildren = children
+                    .Where(c => LooksLikeDate(c.Name))
+                    .OrderByDescending(c => c.Name, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
 
-        var digits = new string(name.Where(char.IsDigit).ToArray());
-        if (digits.Length is < 6 or > 20)
-            return false;
+                // 判据与 BusinessUnitResolver 停下来的判据一致：**多数**子目录像日期。
+                // 用「至少有一个」会把「10 个业务子目录里混进 1 个 20260825」也算成单元。
+                var isDateLayer = DateName.IsDateLayer(children.Select(c => c.Name).ToList());
 
-        // 名字里字母（含中文）太多就不是日期目录了，是带编号的业务名。
-        if (name.Count(char.IsLetter) > 8)
-            return false;
-
-        if (digits.Length >= 8
-            && int.TryParse(digits.AsSpan(0, 4), out var year)
-            && int.TryParse(digits.AsSpan(4, 2), out var month)
-            && int.TryParse(digits.AsSpan(6, 2), out var day)
-            && year is >= 1990 and <= 2100
-            && month is >= 1 and <= 12
-            && day is >= 1 and <= 31)
-        {
-            return true;
-        }
-
-        if (digits.Length is 6 or 7
-            && int.TryParse(digits.AsSpan(0, 2), out _)
-            && int.TryParse(digits.AsSpan(2, 2), out var shortMonth)
-            && int.TryParse(digits.AsSpan(4, 2), out var shortDay)
-            && shortMonth is >= 1 and <= 12
-            && shortDay is >= 1 and <= 31)
-        {
-            return true;
-        }
-
-        return false;
+                return new UnitCandidate(
+                    unit.Directory,
+                    unit.RelativePath,
+                    unit.Depth,
+                    isDateLayer,
+                    isDateLayer ? dateChildren[0] : unit.Directory);
+            })
+            .ToList();
     }
 
     private static IEnumerable<SnapshotNode> VisibleDirectories(SnapshotNode node) =>

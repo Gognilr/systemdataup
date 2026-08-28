@@ -7,6 +7,18 @@ using Npgsql;
 
 namespace BackupMonitor.Server.Setup;
 
+/// <summary>
+/// pg_dump / pg_restore 的连接目标。口令单独作为字段而不是拼进连接串，是为了在调用处
+/// 一眼看出它只经 PGPASSWORD 传递：子进程的命令行对本机所有用户可见（任务管理器、WMI），
+/// 把口令写进 -W/--password 之类的参数等于公开它。
+/// </summary>
+internal sealed record PostgresEndpoint(
+    string Host,
+    int Port,
+    string Database,
+    string Username,
+    string Password);
+
 internal sealed class PostgreSqlManager
 {
     public const string ServiceName = "BackupMonitor.PostgreSQL";
@@ -95,6 +107,137 @@ internal sealed class PostgreSqlManager
         await WaitForConnectionAsync(port, postgresPassword, ct);
         await EnsureDatabaseAndRoleAsync(port, postgresPassword, applicationPassword, ct);
     }
+
+    /// <summary>
+    /// 把整个业务库导出成 -Fc 自定义格式，供配置备份包和恢复前的现场快照使用。
+    ///
+    /// --no-owner / --no-privileges：换机恢复时目标集群的角色是新装出来的，转储里带上源机器的
+    /// 角色名只会让 restore 报一片 "role does not exist"；业务库里所有对象都归 backup_monitor_app，
+    /// 由谁执行 restore 就归谁，反而正是我们要的。
+    /// --no-password：无人值守场景下绝不能弹交互式口令提示——那会让子进程挂在那里等到超时。
+    /// </summary>
+    public async Task DumpAsync(
+        string postgresRoot,
+        PostgresEndpoint endpoint,
+        string outputPath,
+        CancellationToken ct)
+    {
+        var pgDump = Path.Combine(postgresRoot, "bin", "pg_dump.exe");
+        if (!File.Exists(pgDump))
+            throw new FileNotFoundException(
+                $"服务端安装目录缺少 pg_dump.exe：{postgresRoot}", pgDump);
+
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
+        await ProcessRunner.RunAsync(
+            pgDump,
+            ["--host", endpoint.Host,
+             "--port", endpoint.Port.ToString(System.Globalization.CultureInfo.InvariantCulture),
+             "--username", endpoint.Username,
+             "--dbname", endpoint.Database,
+             "--format", "custom",
+             "--no-owner",
+             "--no-privileges",
+             "--no-password",
+             "--file", outputPath],
+            ct,
+            BuildPasswordEnvironment(endpoint));
+    }
+
+    /// <summary>
+    /// 从 -Fc 转储恢复业务库。三个开关都是必需的：
+    /// --clean --if-exists 先删掉目标库里新装出来的空表，否则恢复过程全是 "already exists"；
+    /// --single-transaction 让恢复要么整体成功、要么一行不改——半个库比不恢复更难收拾，
+    /// 有了它，导入失败时只需回滚密钥文件，数据库自身不需要靠 pre-restore 快照兜底。
+    /// </summary>
+    public async Task RestoreAsync(
+        string postgresRoot,
+        PostgresEndpoint endpoint,
+        string dumpPath,
+        CancellationToken ct)
+    {
+        var pgRestore = Path.Combine(postgresRoot, "bin", "pg_restore.exe");
+        if (!File.Exists(pgRestore))
+            throw new FileNotFoundException(
+                $"服务端安装目录缺少 pg_restore.exe：{postgresRoot}", pgRestore);
+
+        await ProcessRunner.RunAsync(
+            pgRestore,
+            ["--host", endpoint.Host,
+             "--port", endpoint.Port.ToString(System.Globalization.CultureInfo.InvariantCulture),
+             "--username", endpoint.Username,
+             "--dbname", endpoint.Database,
+             "--clean",
+             "--if-exists",
+             "--no-owner",
+             "--no-privileges",
+             "--single-transaction",
+             "--no-password",
+             dumpPath],
+            ct,
+            BuildPasswordEnvironment(endpoint));
+    }
+
+    /// <summary>
+    /// 试探某个超级用户口令能否连上本机集群。
+    ///
+    /// 导入配置备份包时必须先弄清「现在的口令是哪一个」：备份包里的 secrets 是源机器的，
+    /// 本机集群仍然认自己 initdb 时生成的那一套，两者必然不同。认证以外的失败（服务没起来、
+    /// 端口不通）照常抛出，不能被当成「口令不对」吞掉。
+    /// </summary>
+    public async Task<bool> CanAuthenticateSuperuserAsync(int port, string password, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(password))
+            return false;
+
+        try
+        {
+            await using var connection = new NpgsqlConnection(
+                BuildConnectionString(port, "postgres", password, "postgres"));
+            await connection.OpenAsync(ct);
+            return true;
+        }
+        catch (PostgresException ex) when (IsAuthenticationFailure(ex))
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 把本机集群的超级用户口令和应用角色口令改成给定的一套。
+    ///
+    /// 导入配置备份包时不做这一步，等于「装了一把别人家的钥匙」：server-secrets.json 换成了
+    /// 源机器的，集群却仍认本机 initdb 生成的旧口令，服务端一启动就连不上库；更麻烦的是下次
+    /// 运行安装器会撞上 ExistingClusterPasswordMismatch，现象看起来像备份包坏了。
+    /// 角色口令是集群级对象，不在单库转储里，只能这样单独对齐。
+    /// </summary>
+    public async Task SetRolePasswordsAsync(
+        int port,
+        string superuserPassword,
+        string newSuperuserPassword,
+        string newApplicationPassword,
+        CancellationToken ct)
+    {
+        await using var root = new NpgsqlConnection(
+            BuildConnectionString(port, "postgres", superuserPassword, "postgres"));
+        await OpenSuperuserConnectionAsync(root, ct);
+
+        var superuserLiteral = await QuoteLiteralAsync(root, newSuperuserPassword, ct);
+        await using (var superuser = new NpgsqlCommand(
+            $"ALTER ROLE postgres WITH PASSWORD {superuserLiteral}", root))
+            await superuser.ExecuteNonQueryAsync(ct);
+
+        var applicationLiteral = await QuoteLiteralAsync(root, newApplicationPassword, ct);
+        await using var application = new NpgsqlCommand(
+            $"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'backup_monitor_app') THEN CREATE ROLE backup_monitor_app LOGIN PASSWORD {applicationLiteral}; ELSE ALTER ROLE backup_monitor_app WITH LOGIN PASSWORD {applicationLiteral}; END IF; END $$;",
+            root);
+        await application.ExecuteNonQueryAsync(ct);
+    }
+
+    private static IReadOnlyDictionary<string, string?> BuildPasswordEnvironment(PostgresEndpoint endpoint) =>
+        new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["PGPASSWORD"] = endpoint.Password
+        };
 
     private static void Configure(string dataDirectory, int port)
     {

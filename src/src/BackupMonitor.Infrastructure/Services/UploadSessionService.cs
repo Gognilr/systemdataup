@@ -35,19 +35,17 @@ public interface IUploadSessionService
 public class UploadSessionService : IUploadSessionService
 {
     /// <summary>
-    /// 允许写入分块的状态。paused 刻意不在里面（待办方案 E）——
-    /// 它此前被列在这里，于是「暂停」置成了 paused 却拦不住客户端继续写，
-    /// 这个状态等于只是个标签。暂停必须真的能停住写入，后面的按钮才有意义。
+    /// 管理端暂停了这次传输时返回的错误码。
+    ///
+    /// 与泛化的 UPLOAD_SESSION_CONFLICT 分开是必需的，不是为了错误信息好看：
+    /// Agent 要据此把「管理员按了暂停」和「会话状态异常」区别对待——前者应当安静地
+    /// 停下并等待恢复指令，后者才是需要重试或告警的故障。两者共用一个码时，
+    /// Agent 只能一律当成可重试错误，于是暂停变成「退避几秒后接着传」。
     /// </summary>
-    private static readonly UploadStatus[] WritableStatuses =
-        [UploadStatus.Created, UploadStatus.Uploading, UploadStatus.RetryWait];
+    public const string PausedErrorCode = "UPLOAD_SESSION_PAUSED";
 
-    /// <summary>
-    /// 占着并发额度与暂存空间的状态。暂停中的会话仍然占着这两样，
-    /// 因此并发上限的判定要算上它——否则暂停一个就能再开一个，暂存目录会被撑爆。
-    /// </summary>
-    private static readonly UploadStatus[] ActiveStatuses =
-        [UploadStatus.Created, UploadStatus.Uploading, UploadStatus.Paused, UploadStatus.RetryWait];
+    private static readonly UploadStatus[] WritableStatuses = UploadSessionStatuses.Writable;
+    private static readonly UploadStatus[] ActiveStatuses = UploadSessionStatuses.Active;
 
     private readonly AppDbContext _db;
     private readonly IUploadStorage _storage;
@@ -88,6 +86,12 @@ public class UploadSessionService : IUploadSessionService
                 .FirstOrDefaultAsync(s => s.IdempotencyKey == request.IdempotencyKey && s.ClientId == clientId, ct);
             if (existing is not null)
             {
+                // 暂停中的会话不交回去。自动模式下预检每跑一轮就会用
+                // auto-upload:{candidateId} 重下一条上传指令，幂等键命中的正是这一条；
+                // 照常返回「可续传」等于绕过管理员的暂停，把会话又塞回 Agent 手里。
+                if (existing.Status == UploadStatus.Paused)
+                    throw new BusinessException(PausedErrorCode, "这次传输已被管理员暂停，恢复后会从断点继续", 409);
+
                 if (existing.Status is not (UploadStatus.Failed or UploadStatus.Cancelled or UploadStatus.Expired))
                 {
                     var existingTimeout = await _settings.GetIntAsync(LifecycleExpiryWorker.SessionTimeoutKey, LifecycleExpiryWorker.DefaultSessionTimeoutSeconds, ct);
@@ -289,6 +293,8 @@ public class UploadSessionService : IUploadSessionService
 
         if (ctx.SessionClientId != clientId)
             throw new BusinessException("FORBIDDEN", "会话不属于当前客户端", 403);
+        if (ctx.SessionStatus == UploadStatus.Paused)
+            throw new BusinessException(PausedErrorCode, "这次传输已被管理员暂停，恢复后会从断点继续", 409);
         if (!WritableStatuses.Contains(ctx.SessionStatus))
             throw new BusinessException("UPLOAD_SESSION_CONFLICT", $"会话状态 {EnumMapping.ToSnakeCase(ctx.SessionStatus)} 不允许写入", 409);
 
@@ -348,7 +354,7 @@ public class UploadSessionService : IUploadSessionService
     /// 单块成本与已传块数无关，且并发上传多块时也是正确的——
     /// 增量在数据库里做，不存在应用层「读-改-写」的丢更新问题。
     /// </summary>
-    private async Task RecordReceivedChunkAsync(
+    internal async Task RecordReceivedChunkAsync(
         Guid sessionId, Guid fileId, int chunkIndex, long offset, int chunkBytes,
         string expectedHash, string serverHash, CancellationToken ct)
     {
@@ -356,8 +362,9 @@ public class UploadSessionService : IUploadSessionService
         var received = EnumMapping.ToSnakeCase(UploadChunkStatus.Received);
         var fileUploading = EnumMapping.ToSnakeCase(UploadFileStatus.Uploading);
         var sessionUploading = EnumMapping.ToSnakeCase(UploadStatus.Uploading);
+        var sessionPaused = EnumMapping.ToSnakeCase(UploadStatus.Paused);
 
-        // 两处细节决定这条语句在并发下对不对，都不是随手能省的：
+        // 三处细节决定这条语句在并发下对不对，都不是随手能省的：
         //
         // 一、`xmax = 0` 是 PostgreSQL 判定「这一行是刚插入的还是被冲突更新的」的标准写法：
         //     新插入的行 xmax 为 0，被 DO UPDATE 命中的行 xmax 是当前事务号。
@@ -375,6 +382,16 @@ public class UploadSessionService : IUploadSessionService
         //     COALESCE 兜住 `f` 一行都没更新的情况（文件 id 不存在）：
         //     少了它 `uploaded_bytes + NULL` 会把整列写成 NULL，
         //     而这一列是进度和续传判定的依据。
+        //
+        // 三、status 那一列必须**条件**写回 uploading，不能无条件赋值。
+        //     这里原先是一句 `status = 'uploading'`，而它是「点了暂停几秒后传输自己
+        //     又跑起来」的根因：管理端把会话置 paused 之后，任何一个已经通过写入校验、
+        //     还在路上的分块落库，都会把状态改回 uploading——而 Agent 默认 4 路并行、
+        //     每块 8MB，点暂停的那一刻几乎必然有在途块。于是暂停从未真正生效过一次。
+        //
+        //     字节数与 last_activity_at 仍然照常累加：这一块确实收到了、确实落在暂存
+        //     目录里，进度不能倒退，否则恢复后 missing-chunks 与 uploaded_bytes 会对不上。
+        //     被保护的只有状态本身。
         await _db.Database.ExecuteSqlInterpolatedAsync($"""
             WITH ins AS (
                 INSERT INTO upload_chunks (
@@ -404,7 +421,7 @@ public class UploadSessionService : IUploadSessionService
             )
             UPDATE upload_sessions SET
                 uploaded_bytes   = uploaded_bytes + COALESCE((SELECT bytes FROM f), 0),
-                status           = {sessionUploading},
+                status           = CASE WHEN status = {sessionPaused} THEN status ELSE {sessionUploading} END,
                 last_activity_at = {now},
                 updated_at       = {now}
             WHERE id = {sessionId}
@@ -415,6 +432,11 @@ public class UploadSessionService : IUploadSessionService
     {
         var session = await LoadOwnedSessionAsync(clientId, sessionId, ct);
         var file = await LoadOwnedFileAsync(clientId, sessionId, fileId, ct);
+
+        // 暂停中不许继续推进。分块写入被拦住了，但若暂停发生在最后一块之后，
+        // 这条路径仍然畅通——会话会一路走到 verifying 再入库，暂停等于没按。
+        if (session.Status == UploadStatus.Paused)
+            throw new BusinessException(PausedErrorCode, "这次传输已被管理员暂停，恢复后会从断点继续", 409);
 
         if (file.Status is UploadFileStatus.Verified or UploadFileStatus.Received)
         {
@@ -482,6 +504,11 @@ public class UploadSessionService : IUploadSessionService
     public async Task<CompleteUploadSessionResponse> CompleteSessionAsync(Guid clientId, Guid sessionId, CompleteUploadSessionRequest request, CancellationToken ct = default)
     {
         var session = await LoadOwnedSessionAsync(clientId, sessionId, ct);
+
+        // 与 CompleteFileAsync 同一个理由：暂停必须挡住所有向前推进的路径，
+        // 而不只是分块写入那一条。
+        if (session.Status == UploadStatus.Paused)
+            throw new BusinessException(PausedErrorCode, "这次传输已被管理员暂停，恢复后会从断点继续", 409);
 
         if (session.Status is UploadStatus.Verifying or UploadStatus.Verified or UploadStatus.Committed)
         {

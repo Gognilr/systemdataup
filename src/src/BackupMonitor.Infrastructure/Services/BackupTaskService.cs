@@ -58,11 +58,7 @@ public class BackupTaskService : IBackupTaskService
     private static readonly AlertStatus[] ActiveAlertStatuses =
         [AlertStatus.Open, AlertStatus.Acknowledged, AlertStatus.InProgress];
 
-    private static readonly UploadStatus[] ActiveUploadStatuses =
-    [
-        UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading,
-        UploadStatus.Paused, UploadStatus.RetryWait, UploadStatus.Received, UploadStatus.Verifying
-    ];
+    private static readonly UploadStatus[] ActiveUploadStatuses = UploadSessionStatuses.InFlight;
 
     /// <summary>
     /// B5/B4：最近预检状态里"不算问题"的取值——通过、没有新备份、还没扫描过（含从未扫描）。
@@ -110,23 +106,10 @@ public class BackupTaskService : IBackupTaskService
         if (duplicate)
             throw new BusinessException("DUPLICATE_TASK_NAME", $"该客户端已存在同名任务：{request.Name}", 409);
 
-        // V027：没选保留策略就绑默认策略。「不绑定」在清理器里的含义是「这个任务的备份永远不清理」——
-        // 而它此前是新建任务的默认值，结果就是仓库无限增长。想要永不清理仍然可以在建完之后显式解绑。
-        var retentionPolicyId = request.RetentionPolicyId;
-        if (retentionPolicyId is null)
-        {
-            retentionPolicyId = await RetentionPolicyService.GetDefaultPolicyIdAsync(_settings, ct);
-
-            // 默认策略被删掉或配错了不该让「建任务」整个失败——退回不绑定，并留下痕迹。
-            // 显式指定的策略不走这里：那种情况该报 404（见 ApplyEditableFields）。
-            if (retentionPolicyId is not null
-                && !await _db.RetentionPolicies.AnyAsync(p => p.Id == retentionPolicyId.Value, ct))
-            {
-                _logger.LogWarning("默认保留策略 {PolicyId} 不存在，新任务将不绑定保留策略", retentionPolicyId);
-                retentionPolicyId = null;
-            }
-        }
-
+        // 不选保留策略就真的留 NULL。V027 曾在这里把默认策略 ID 抄一份写进任务，那是为了堵住
+        // 「留空 = 永不清理」这个反向默认值；现在清理器读到 NULL 会自己回落到默认策略（F2），
+        // 兜底拷贝就没必要了——而且它有害：拷进去之后再改默认策略，存量任务纹丝不动，
+        // 「默认」变成了建任务那一刻的一次性快照。留 NULL 才能让默认策略持续生效。
         var task = new BackupTask { Id = Guid.NewGuid(), ClientId = request.ClientId };
         ApplyEditableFields(task, request.Name, request.ApplicationName, request.SourcePath,
             request.RecognizerType, request.TaskMode, request.Enabled, request.Priority,
@@ -134,7 +117,7 @@ public class BackupTaskService : IBackupTaskService
             request.ScheduleTimezone, request.RandomDelayMinutes, request.StabilityIntervalSeconds,
             request.MaxStabilityWaitSeconds, request.MinTotalBytes, request.MaxTotalBytes,
             request.MinFileCount, request.BandwidthLimitKbps, request.ChunkSizeBytes,
-            request.RetryCount, request.RetryIntervalSeconds, retentionPolicyId,
+            request.RetryCount, request.RetryIntervalSeconds, request.RetentionPolicyId,
             request.RecognizerConfig, request.AlertConfig);
 
         task.ConfigVersion = 1;

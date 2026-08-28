@@ -12,6 +12,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- 「暂停不能被在途分块刷回 uploading」这条不变量，只有直接调到落库那一步才盯得住：
+         走公开接口的话，写入在守卫处就被挡下，根本到不了出问题的那条 UPDATE。 -->
+    <InternalsVisibleTo Include="BackupMonitor.Infrastructure.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="8.0.11" />
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="7.1.2" />

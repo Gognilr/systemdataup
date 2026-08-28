@@ -130,6 +130,20 @@ public sealed class SystemProbe
                 System.Text.Encoding.UTF8.GetBytes(builder.ToString())));
     }
 
+    /// <summary>
+    /// 本机自报的网卡地址（审计 D1）。
+    ///
+    /// 只留「别的机器真能拿它连上来」的地址：fe80:: 链路本地、fec0:: 站点本地和
+    /// 169.254/16 APIPA 全部滤掉。它们要么带 %12 这样的作用域后缀、离开本网段就无意义，
+    /// 要么根本是「没拿到 DHCP」的症状——留在列表里只会让详情抽屉里那一串没法看，
+    /// 也让「客户端 IP」这一列显示出运维根本用不上的值。
+    ///
+    /// IPv4 排在 IPv6 前面：界面取的是第一个地址，而这套产品实际部署的局域网里
+    /// 能让人照着敲进 mstsc 的永远是 IPv4。
+    ///
+    /// 过滤会改变 <see cref="ComputeSnapshotDigest"/> 的输入，升级后的首次心跳
+    /// 必然因摘要变化重报一次完整快照——这是预期行为，只发生一次。
+    /// </summary>
     public List<string> GetIpAddresses()
     {
         try
@@ -138,8 +152,10 @@ public sealed class SystemProbe
                 .Where(n => n.OperationalStatus == OperationalStatus.Up)
                 .SelectMany(n => n.GetIPProperties().UnicastAddresses)
                 .Select(a => a.Address)
-                .Where(a => a.AddressFamily is System.Net.Sockets.AddressFamily.InterNetwork or System.Net.Sockets.AddressFamily.InterNetworkV6)
-                .Where(a => !IPAddress.IsLoopback(a))
+                .Where(IsReportableAddress)
+                // OrderBy 是稳定排序：同族内部仍是原来的枚举顺序，这里只把 IPv4 整体提前，
+                // 不去猜「哪块网卡更重要」——那是另一个问题，猜错比不猜更糟。
+                .OrderBy(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? 0 : 1)
                 .Select(a => a.ToString())
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
@@ -148,6 +164,24 @@ public sealed class SystemProbe
         {
             return [];
         }
+    }
+
+    private static bool IsReportableAddress(IPAddress address)
+    {
+        if (address.AddressFamily is not (System.Net.Sockets.AddressFamily.InterNetwork
+            or System.Net.Sockets.AddressFamily.InterNetworkV6))
+            return false;
+
+        if (IPAddress.IsLoopback(address))
+            return false;
+
+        if (address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6)
+            return !address.IsIPv6LinkLocal && !address.IsIPv6SiteLocal;
+
+        // 169.254/16：DHCP 失败后 Windows 自己配上去的 APIPA 地址，
+        // 它出现本身就说明这块网卡没接入网络。
+        var bytes = address.GetAddressBytes();
+        return bytes.Length != 4 || bytes[0] != 169 || bytes[1] != 254;
     }
 
     private HeartbeatMetricsDto BuildMetrics(Process process, DateTime now)

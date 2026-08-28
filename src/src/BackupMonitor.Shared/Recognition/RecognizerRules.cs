@@ -23,9 +23,16 @@ public sealed record RecognizerRules(
     string? BatchRegex,
     int BusinessUnitDepth = 1,
     string? UnitLayout = null,
-    string? GroupBy = null)
+    string? GroupBy = null,
+    List<string>? BusinessUnitPathPatterns = null)
 {
-    public static RecognizerRules Empty() => new([], [], [], [], true, null, 1, null, null);
+    /// <summary>
+    /// 人自己指定的业务单元位置（相对源目录的通配，如 `ZT0*`、`ZT201-ZT216/*`）。
+    /// 非空时优先于 unitLayout 与 businessUnitDepth——他指的地方一定比系统猜的准。
+    /// </summary>
+    public List<string> BusinessUnitPaths { get; } = BusinessUnitPathPatterns ?? [];
+
+    public static RecognizerRules Empty() => new([], [], [], [], true, null, 1, null, null, []);
 
     /// <summary>
     /// 识别规则里所有被承认的键名。
@@ -40,7 +47,8 @@ public sealed record RecognizerRules(
         "excludePatterns", "excludes",
         "excludeDirectories", "excludeDirs",
         "requiredFiles", "requiredPatterns", "required",
-        "recursive", "businessUnitDepth", "unitLayout", "batchRegex", "groupBy"
+        "recursive", "businessUnitDepth", "unitLayout", "batchRegex", "groupBy",
+        "businessUnitPaths"
     ];
 
     /// <summary>
@@ -139,6 +147,7 @@ public sealed record RecognizerRules(
             result.Required.AddRange(ReadStrings(root, "requiredFiles"));
             result.Required.AddRange(ReadStrings(root, "requiredPatterns"));
             result.Required.AddRange(ReadStrings(root, "required"));
+            result.BusinessUnitPaths.AddRange(ReadStrings(root, "businessUnitPaths"));
 
             if (root.TryGetProperty("recursive", out var recursive)
                 && (recursive.ValueKind == JsonValueKind.True || recursive.ValueKind == JsonValueKind.False))
@@ -283,6 +292,39 @@ public sealed record RecognizerRules(
     }
 
     /// <summary>
+    /// 收集完文件之后，把它们收敛成「一份备份」的唯一入口。
+    ///
+    /// 现在有两件事挂在这个位置：latest_single_file 只保留最新的那一个文件，
+    /// groupBy 只保留最新的那一组。两侧（Agent 真扫 / 服务端预演）都必须调它，
+    /// 否则向导算出来的一份备份和实际传上去的一份备份不是同一批文件。
+    ///
+    /// latest_single_file 为什么要在这里补一刀：这个识别器此前**名不副实**。
+    /// SelectRoots 只用「最新」挑出那个文件所在的**目录**，随后照常收集整个目录，
+    /// 于是「取最新的那个文件」实际行为是「取那个目录里的全部文件」。
+    /// 在一个堆了 7 天备份的目录上，后果是每次扫描把 14 个文件全部读一遍算 SHA-256、
+    /// 每次上传 10.59GB 而不是 1.5GB，而且 manifest 每天都变。
+    /// </summary>
+    public IReadOnlyList<T> NarrowToOneBackup<T>(
+        string? recognizerType,
+        IReadOnlyList<T> files,
+        Func<T, string> relativePathOf,
+        Func<T, DateTime> lastWriteOf)
+    {
+        if (string.Equals(recognizerType?.Trim(), "latest_single_file", StringComparison.OrdinalIgnoreCase)
+            && files.Count > 1)
+        {
+            // 时间相同时按路径倒序，保证结果稳定而不依赖枚举顺序——与 SelectLatestGroup 同一条教训。
+            var newest = files
+                .OrderByDescending(lastWriteOf)
+                .ThenByDescending(relativePathOf, StringComparer.OrdinalIgnoreCase)
+                .First();
+            return [newest];
+        }
+
+        return SelectLatestGroup(files, relativePathOf, lastWriteOf);
+    }
+
+    /// <summary>
     /// 一个文件的分组键。
     ///
     /// - "basename"：去掉扩展名的文件名（致远 OA 的 NAME.zip + NAME.properties）；
@@ -324,9 +366,19 @@ public sealed record RecognizerRules(
     /// <summary>无法从 groupBy 得出分组键的文件的归属。刻意用一个文件名里不可能出现的值。</summary>
     public const string UngroupedKey = "\u0000ungrouped";
 
-    /// <summary>某个文件是否被 requiredFiles 点名。</summary>
+    /// <summary>
+    /// 某个文件是否被 requiredFiles 点名。
+    ///
+    /// 没配 requiredFiles 时返回 false，而不是 true。这一行原先是
+    /// `Required.Count == 0 || …`，于是「一条必需文件都没配」被当成「每个文件都必需」——
+    /// 向导界面上一边写着「这次没有看出固定出现的文件，暂不检查」，一边给下面
+    /// 14 个文件全挂上「必需」角标，同一个事实在同一屏里自相矛盾。
+    ///
+    /// 判定逻辑不受影响：HasMissingRequired 在 Required 为空时本来就返回 false，
+    /// 这个标志只用于 CandidateFile.IsRequired 这个展示字段。
+    /// </summary>
     public bool IsRequiredFile(string relativePath) =>
-        Required.Count == 0 || Required.Any(pattern => MatchesPath(relativePath, pattern));
+        Required.Count > 0 && Required.Any(pattern => MatchesPath(relativePath, pattern));
 
     /// <summary>规则要求的文件是否有缺失。</summary>
     public bool HasMissingRequired(IEnumerable<string> relativePaths)

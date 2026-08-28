@@ -165,6 +165,8 @@ LOADERS.clients = async function () {
           allowed: caps.canDispatch, why: caps.whyDispatch, hint: caps.whyDispatch
         });
         const more = actMenu([
+          // 改名和改分组不看状态：它们只动服务端自己的记录，离线甚至已注销的机器也该能整理。
+          actBtn({ label: '重命名 / 改分组', view: 'clients', action: 'edit', id: r.id, small: false }),
           caps.canEnable
             ? actBtn({ label: '启用', view: 'clients', action: 'enable', id: r.id, cls: 'primary', small: false })
             : actBtn({ label: '禁用', view: 'clients', action: 'disable', id: r.id, allowed: caps.canDisable, why: caps.whyDisable, small: false }),
@@ -245,6 +247,29 @@ ACTIONS['clients:reject'] = async id => {
     await api(`/api/v1/admin/clients/${id}/reject`, { method: 'POST', body: { reason: v.reason || null } });
     toast('已拒绝该注册请求', 'ok'); LOADERS.clients();
   }, '拒绝');
+};
+/* 重命名 / 改分组。名字和分组是纯服务端属性——心跳只回写时间偏移、对端 IP、网卡列表和状态，
+   从不碰这两项，所以改完不会被下一次心跳冲掉，重装（supersede 重新登记）也会继承过去。
+   当前值现取详情而不是拿列表行里的：这个动作一天用不了几次，多一次请求换"改的是最新值"。 */
+ACTIONS['clients:edit'] = async id => {
+  const [d, groups] = await Promise.all([
+    api(`/api/v1/admin/clients/${id}`),
+    // 分组读不到不该把改名也一起挡掉——退化成只有「不分组」一个选项，名字照样能改。
+    api('/api/v1/admin/clients/groups').catch(() => [])
+  ]);
+  const options = [{ v: '', t: '不分组' }].concat((groups || []).map(g => ({ v: g.id, t: g.name })));
+  formModal(`重命名 / 改分组：${clientName(d)}`, [
+    { name: 'displayName', label: '显示名称', type: 'text', required: true, value: d.displayName,
+      hint: `只改界面上的称呼，主机名（${d.hostname}）不变；客户端重启、重装后这个名字都保留` },
+    { name: 'clientGroupId', label: '分组', type: 'select', value: d.clientGroupId || '', options,
+      hint: options.length > 1 ? '' : '还没有建过任何客户端分组，暂时只能选「不分组」' }
+  ], async v => {
+    await api(`/api/v1/admin/clients/${id}`, { method: 'PATCH', body: {
+      displayName: v.displayName,
+      clientGroupId: v.clientGroupId || null
+    } });
+    toast('已保存', 'ok'); LOADERS.clients();
+  }, '保存');
 };
 ACTIONS['clients:disable'] = async id => {
   formModal('禁用客户端', [{ name: 'reason', label: '禁用原因', type: 'text', placeholder: '可选' }], async v => {

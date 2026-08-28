@@ -1,5 +1,6 @@
 using BackupMonitor.Agent;
 using BackupMonitor.Infrastructure.Recognition;
+using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Models.Agent;
 using BackupMonitor.Shared.Recognition;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -62,6 +63,29 @@ public sealed class RecognizerWizardTests : IDisposable
     }
 
     private SnapshotNode Snapshot(int maxDepth = 3) => SnapshotNode.FromSnapshot(Browse(maxDepth: maxDepth));
+
+    /// <summary>
+    /// 拿推断出来的方案，在真实文件系统上跑一遍 Agent 的扫描。
+    ///
+    /// 「向导说会识别出什么，实际扫描就必须识别出什么」是这个模块的硬约束，
+    /// 所以新结构的用例一律断言到这一步，而不是只断言推断出来的那段 JSON 好看。
+    /// </summary>
+    private static List<BackupScanResult> Scan(RecognizerProposalDto proposal)
+    {
+        var scanner = new BackupScanner(NullLogger<BackupScanner>.Instance);
+        return scanner.ScanAsync(new AgentTaskConfigDto
+        {
+            TaskId = Guid.NewGuid(),
+            Name = "按推断方案实扫",
+            ApplicationName = proposal.SuggestedApplicationName ?? "test",
+            SourcePath = proposal.SourcePath.Replace('/', Path.DirectorySeparatorChar),
+            RecognizerType = proposal.RecognizerType,
+            TaskMode = "automatic",
+            Enabled = true,
+            RecognizerConfig = proposal.RecognizerConfig,
+            StabilityIntervalSeconds = 0
+        }, CancellationToken.None).GetAwaiter().GetResult();
+    }
 
     // ---------- 目录快照 ----------
 
@@ -198,8 +222,16 @@ public sealed class RecognizerWizardTests : IDisposable
         Assert.Equal("latest_single_file", proposal.RecognizerType);
     }
 
+    /// <summary>
+    /// 文件名每天不同（带日期）时，不能什么都不推荐。
+    ///
+    /// 这里原先断言的是退回到 *.bak / *.trn ——按扩展名统计是当时唯一的兜底手段。
+    /// 现在中间多了一档「归一化模式」，同一批文件收敛成 db_*.bak / log_*.trn，
+    /// 比扩展名更精确：*.bak 会把任何一个 .bak 都算作到场，db_*.bak 不会。
+    /// 断言跟着改成新的期望，测试的本意（不能干脆什么都不推荐）没有变。
+    /// </summary>
     [Fact]
-    public void 文件名每天不同时退回按扩展名认必需文件()
+    public void 文件名每天不同时按归一化模式认必需文件()
     {
         foreach (var day in new[] { "20260823", "20260824", "20260825" })
         {
@@ -210,9 +242,11 @@ public sealed class RecognizerWizardTests : IDisposable
         var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
         var recommended = proposal.RequiredFileCandidates.Where(c => c.Recommended).Select(c => c.Pattern).ToList();
 
-        // 精确文件名一个都不重复，必须退一步按扩展名统计，而不是干脆什么都不推荐。
-        Assert.Contains("*.bak", recommended);
-        Assert.Contains("*.trn", recommended);
+        Assert.Contains("db_*.bak", recommended);
+        Assert.Contains("log_*.trn", recommended);
+        Assert.All(
+            proposal.RequiredFileCandidates.Where(c => c.Recommended),
+            c => Assert.Equal("pattern", c.Kind));
     }
 
     [Fact]
@@ -786,5 +820,271 @@ public sealed class RecognizerWizardTests : IDisposable
         Assert.False(rules.HasMissingRequired(["20260825/UFDATA.BAK"]));
         Assert.True(rules.HasMissingRequired(["20260825/other.bak"]));
         Assert.True(rules.IsRequiredFile("sub/UFDATA.BAK"));
+    }
+
+    /// <summary>
+    /// 没配 requiredFiles 时不能把所有文件都标成「必需」。
+    ///
+    /// 这一行原先是 `Required.Count == 0 || …`，于是向导界面上一边写着
+    /// 「这次没有看出固定出现的文件，暂不检查」，一边给下面 14 个文件全挂上「必需」角标。
+    /// </summary>
+    [Fact]
+    public void 没有必需文件时不把所有文件标成必需()
+    {
+        var rules = RecognizerRules.Parse("{}");
+
+        Assert.False(rules.IsRequiredFile("db.bak"));
+        Assert.False(rules.HasMissingRequired(["db.bak"]));
+    }
+
+    // ---------- 混合层级的业务单元 ----------
+
+    /// <summary>
+    /// 真实目录：D:\自动备份\ 下 ZT001、ZT002 是账套（第 1 层），
+    /// 而 ZT201-ZT216 只是个分组容器，真正的账套是它下面那 16 个（第 2 层）。
+    ///
+    /// businessUnitDepth 是全树统一深度，任何取值都覆盖不了它：取 1 会把 ZT201-ZT216
+    /// 整个当成一个单元（于是 16 个账套里 15 个不在监控范围内，且 ZT216 的 7 天备份
+    /// 被混成一份判 passed）；取 2 又会把 ZT001 的日期目录当成单元。
+    /// </summary>
+    private void BuildMixedDepthLayout()
+    {
+        foreach (var unit in new[] { "ZT001", "ZT002" })
+        foreach (var day in new[] { "20260827", "20260828" })
+        {
+            Write($@"{unit}\{day}\UFDATA.BAK", new string('x', 2048));
+            Write($@"{unit}\{day}\UfErpAct.Lst", "unit-list");
+        }
+
+        for (var i = 201; i <= 216; i++)
+        foreach (var day in new[] { "20260827", "20260828" })
+        {
+            Write($@"ZT201-ZT216\ZT{i}\{day}\UFDATA.BAK", new string('x', 2048));
+            Write($@"ZT201-ZT216\ZT{i}\{day}\UfErpAct.Lst", "unit-list");
+        }
+    }
+
+    [Fact]
+    public void 层级不齐时把分组容器下面那层认成业务单元()
+    {
+        BuildMixedDepthLayout();
+
+        var proposal = StructureInference.Infer(Snapshot(maxDepth: 5), DateTime.UtcNow);
+
+        Assert.Equal("subdirectory_units", proposal.RecognizerType);
+
+        // 深度写不死，必须落到自适应那条规则上。
+        var rules = RecognizerRules.Parse(proposal.RecognizerConfig);
+        Assert.Equal("date_leaf", rules.UnitLayout);
+
+        // 摘要里的数必须是真实的单元数：2 + 16 = 18，而不是第一层的 3 个。
+        Assert.Contains("18 个业务单元", proposal.Summary, StringComparison.Ordinal);
+        Assert.Contains(proposal.Evidence,
+            e => e.Contains("ZT201-ZT216", StringComparison.Ordinal)
+                 && e.Contains("不是业务单元", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 向导说 18 个，实际扫描就必须扫出 18 个——这条一致性是整个向导的立论点。
+    /// 特别要盯住 ZT201–ZT215：按老规则它们一个都不会出现在结果里，而且毫无提示。
+    /// </summary>
+    [Fact]
+    public void 层级不齐时预演与实际扫描都给出十八个单元()
+    {
+        BuildMixedDepthLayout();
+
+        var snapshot = Browse(maxDepth: 5);
+        var proposal = StructureInference.Infer(SnapshotNode.FromSnapshot(snapshot), snapshot.CapturedAt);
+        var rules = RecognizerRules.Parse(proposal.RecognizerConfig);
+
+        var preview = SnapshotRecognizer.Preview(
+            SnapshotNode.FromSnapshot(snapshot), proposal.RecognizerType, rules,
+            stabilityIntervalSeconds: 0, snapshot.CapturedAt, snapshot.DeniedPaths, snapshot.Truncated);
+
+        Assert.Equal(18, preview.Units.Count);
+        Assert.Equal(18, preview.PassedCount);
+        Assert.Contains(preview.Units, u => u.BusinessUnit == "ZT001");
+        Assert.Contains(preview.Units, u => u.BusinessUnit == "ZT201-ZT216/ZT201");
+        Assert.Contains(preview.Units, u => u.BusinessUnit == "ZT201-ZT216/ZT215");
+
+        // 每个单元只取最新的那个日期目录，不能把两天混成一份。
+        Assert.All(preview.Units, u => Assert.Equal(2, u.TotalFiles));
+
+        var scans = Scan(proposal);
+        Assert.Equal(18, scans.Count);
+        Assert.Equal(
+            preview.Units.Select(u => u.BusinessUnit).OrderBy(x => x, StringComparer.Ordinal),
+            scans.Select(s => s.BusinessUnit?.ExternalKey).OrderBy(x => x, StringComparer.Ordinal));
+    }
+
+    // ---------- 名字带年份的附件库 ----------
+
+    /// <summary>
+    /// U8 的 UFFile_{账套}_{年度}.dat 是按年度分的附件库，各账套的**启用年度不同**——
+    /// 2022 年起用的有 5 个，2024 年起用的只有 3 个，两者都是完整备份。
+    ///
+    /// 所以这个模式必须「被看见但不被勾选」：看不见（现状）等于向导对这几个文件失语；
+    /// 勾上则会在每一个启用年度较晚的账套上制造假警报。
+    /// </summary>
+    [Fact]
+    public void 个数随账套变化的附件库列出来但不当判据()
+    {
+        var startYears = new[] { 2022, 2023, 2024 };
+        for (var i = 0; i < startYears.Length; i++)
+        {
+            var unit = $"ZT{i + 1:000}";
+            Write($@"{unit}\20260828\UFDATA.BAK", new string('x', 2048));
+            Write($@"{unit}\20260828\UfErpAct.Lst", "unit-list");
+            for (var year = startYears[i]; year <= 2026; year++)
+                Write($@"{unit}\20260828\UFFile_{i + 1:000}_{year}.dat", new string('x', 512));
+        }
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+        var candidate = Assert.Single(
+            proposal.RequiredFileCandidates.Where(c => c.Pattern.StartsWith("UFFile", StringComparison.Ordinal)));
+
+        Assert.Equal("pattern", candidate.Kind);
+        Assert.False(candidate.Recommended);
+        Assert.Equal(3, candidate.CountPerUnitMin);
+        Assert.Equal(5, candidate.CountPerUnitMax);
+        Assert.Contains("个数不一样", candidate.NotRecommendedReason!);
+
+        // 不当判据 ≠ 不备份：它不进 requiredFiles，但照常被采集。
+        var rules = RecognizerRules.Parse(proposal.RecognizerConfig);
+        Assert.DoesNotContain(rules.Required, p => p.StartsWith("UFFile", StringComparison.Ordinal));
+        Assert.Contains("UFDATA.BAK", rules.Required);
+
+        var files = Scan(proposal).Single(s => s.BusinessUnit?.ExternalKey == "ZT001").Files;
+        Assert.Equal(5, files.Count(f => f.RelativePath.StartsWith("UFFile", StringComparison.Ordinal)));
+    }
+
+    // ---------- 平铺目录里每天一组多个库 ----------
+
+    /// <summary>
+    /// 真实目录：D:\数据库备份\ 没有日期子目录，14 个 .bak 全平铺着，日期写在文件名里。
+    /// 同一天的 beeServer + dzwl_product 才构成一次完整备份，14 个 = 7 天 × 2 个库。
+    ///
+    /// 按老规则这里会判成 latest_single_file，而那个识别器又会把整个目录收进来，
+    /// 于是「一次备份」= 7 天的全部历史，每次上传 10.59GB 而不是 1.5GB。
+    /// </summary>
+    private void BuildFlatDatedDumps()
+    {
+        for (var day = 22; day <= 28; day++)
+        {
+            Write($"beeServer_backup_2026_08_{day}_000004_{2256969 + day}.bak", new string('x', 1024));
+            Write($"dzwl_product_backup_2026_08_{day}_000004_{4679193 + day}.bak", new string('x', 8192));
+        }
+    }
+
+    [Fact]
+    public void 平铺目录里按文件名日期分组认出每天一组两个库()
+    {
+        BuildFlatDatedDumps();
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        Assert.Equal("multi_file_set", proposal.RecognizerType);
+
+        var rules = RecognizerRules.Parse(proposal.RecognizerConfig);
+        Assert.False(rules.Recursive);
+        Assert.NotNull(rules.GroupBy);
+        Assert.Contains("beeServer_backup_*.bak", rules.Required);
+        Assert.Contains("dzwl_product_backup_*.bak", rules.Required);
+
+        Assert.Contains("每天一组", proposal.Summary, StringComparison.Ordinal);
+        Assert.Contains("2026_08_28", proposal.Summary, StringComparison.Ordinal);
+
+        // 一次备份 = 最新那天的 2 个文件，不是全部 14 个。
+        var scan = Assert.Single(Scan(proposal));
+        Assert.Equal(2, scan.Files.Count);
+        Assert.All(scan.Files, f => Assert.Contains("2026_08_28", f.RelativePath, StringComparison.Ordinal));
+    }
+
+    /// <summary>某天某个库没转储出来时，那一组就该判缺文件——这正是要告警的情况。</summary>
+    [Fact]
+    public void 最新一组少一个库时判为缺必需文件()
+    {
+        BuildFlatDatedDumps();
+
+        // 规则要在目录还健康的时候推断出来——真实世界里也是这个顺序：
+        // 先按正常的目录建任务，之后某一天某个库没转储出来。
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+        File.Delete(Path.Combine(_root, "beeServer_backup_2026_08_28_000004_2256997.bak"));
+
+        var scan = Assert.Single(Scan(proposal));
+        Assert.Equal("required_file_missing", scan.Status);
+        Assert.Single(scan.Files);
+    }
+
+    /// <summary>
+    /// 自适应猜错时的逃生门：人直接指出单元在哪，通配写相对源目录的路径。
+    ///
+    /// 自适应没有手动覆盖就是死局，所以这条路必须真的通。
+    /// 同时盯住一个容易静默失效的点：businessUnitPaths 是解析期往列表里 AddRange 的，
+    /// 而 Parse 内部用 `with` 复制了好几次记录——复制没保住这个列表的话，
+    /// 表现是配置写了却完全不生效，且没有任何报错。
+    /// </summary>
+    [Fact]
+    public void 人工指定的单元路径优先于自适应()
+    {
+        BuildMixedDepthLayout();
+
+        var config = """{"businessUnitPaths":["ZT201-ZT216/ZT20*"],"requiredFiles":["UFDATA.BAK"]}""";
+        var rules = RecognizerRules.Parse(config);
+
+        // 解析结果要挺过 Parse 内部的多次 with 复制。
+        Assert.Equal(["ZT201-ZT216/ZT20*"], rules.BusinessUnitPaths);
+        Assert.Empty(RecognizerRules.FindUnknownKeys(config));
+
+        var snapshot = Browse(maxDepth: 5);
+        var preview = SnapshotRecognizer.Preview(
+            SnapshotNode.FromSnapshot(snapshot), "subdirectory_units", rules,
+            stabilityIntervalSeconds: 0, snapshot.CapturedAt, snapshot.DeniedPaths, snapshot.Truncated);
+
+        // ZT201–ZT209 共 9 个，ZT001/ZT002 与 ZT210+ 都不在通配里。
+        Assert.Equal(9, preview.Units.Count);
+        Assert.All(preview.Units, u => Assert.StartsWith("ZT201-ZT216/ZT20", u.BusinessUnit!, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// 一个今天没跑出备份的账套，必须照常出现在结果里并判「没有备份」，
+    /// 而不是从单元列表里消失——「没备份」表现为「没这个账套」是最坏的一种静默。
+    /// </summary>
+    [Fact]
+    public void 还没有备份的账套仍然是一个单元()
+    {
+        BuildMixedDepthLayout();
+        Directory.CreateDirectory(Path.Combine(_root, "ZT201-ZT216", "ZT217"));
+
+        var snapshot = Browse(maxDepth: 5);
+        var rules = RecognizerRules.Parse("""{"unitLayout":"date_leaf","requiredFiles":["UFDATA.BAK"]}""");
+        var preview = SnapshotRecognizer.Preview(
+            SnapshotNode.FromSnapshot(snapshot), "subdirectory_units", rules,
+            stabilityIntervalSeconds: 0, snapshot.CapturedAt, snapshot.DeniedPaths, snapshot.Truncated);
+
+        var empty = Assert.Single(preview.Units.Where(u => u.BusinessUnit == "ZT201-ZT216/ZT217"));
+        Assert.Equal("no_new_backup", empty.Status);
+        Assert.Equal(19, preview.Units.Count);
+    }
+
+    /// <summary>
+    /// latest_single_file 必须名副其实：只取最新的那一个文件。
+    ///
+    /// 它此前只用「最新」挑出那个文件所在的**目录**，随后照常收集整个目录——
+    /// 于是「取最新的那个」实际取的是全部。在堆了 7 天备份的目录上，
+    /// 后果是每次扫描把全部文件读一遍算 SHA-256、每次上传整个目录。
+    /// </summary>
+    [Fact]
+    public void 最新单文件只收一个文件()
+    {
+        for (var day = 21; day <= 25; day++)
+            Write($"db_202608{day}.bak", new string('x', 4096));
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+        Assert.Equal("latest_single_file", proposal.RecognizerType);
+
+        var scan = Assert.Single(Scan(proposal));
+        var file = Assert.Single(scan.Files);
+        Assert.Equal("db_20260825.bak", file.RelativePath);
     }
 }

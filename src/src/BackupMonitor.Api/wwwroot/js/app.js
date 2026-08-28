@@ -81,7 +81,16 @@ export const loading = () => skeleton(5);
 
 /* ── 动作分发 / 分页 / 排序 / 批量 ── */
 App.act = async function (view, action, id) {
-  const fn = ACTIONS[view + ':' + action];
+  // 动作在视图模块求值时才注册，而视图是按路由懒加载的（见下方 VIEW_LOADERS）：
+  // 待办页只加载了 todo.js，点上面的「签发」时 restores.js 根本没进来，
+  // 于是所有跨页动作都必然落到「暂不可用」——只有先逛过那一页才碰巧能用。
+  // 查不到就按 view 名把对应模块拉进来再试一次（动态 import 有缓存，重试不额外下载），
+  // 以后再加跨页按钮也不用记得手工 import。
+  let fn = ACTIONS[view + ':' + action];
+  if (!fn && VIEW_LOADERS[view]) {
+    try { await VIEW_LOADERS[view](); } catch (e) { errToast(e); return; }
+    fn = ACTIONS[view + ':' + action];
+  }
   if (!fn) { toast('该动作暂不可用', 'err'); return; }
   try { await fn(id); }
   catch (e) { errToast(e); }

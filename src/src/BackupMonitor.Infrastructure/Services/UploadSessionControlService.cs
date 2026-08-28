@@ -27,16 +27,8 @@ public interface IUploadSessionControlService
 
 public class UploadSessionControlService : IUploadSessionControlService
 {
-    /// <summary>能被暂停的状态：还在传或等着传的</summary>
-    private static readonly UploadStatus[] PausableStatuses =
-        [UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading, UploadStatus.RetryWait];
-
-    /// <summary>能被取消的状态：还没入库的都算</summary>
-    private static readonly UploadStatus[] CancellableStatuses =
-    [
-        UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading,
-        UploadStatus.Paused, UploadStatus.RetryWait, UploadStatus.Received
-    ];
+    private static readonly UploadStatus[] PausableStatuses = UploadSessionStatuses.Pausable;
+    private static readonly UploadStatus[] CancellableStatuses = UploadSessionStatuses.Cancellable;
 
     private readonly AppDbContext _db;
     private readonly ICommandDispatcher _commands;

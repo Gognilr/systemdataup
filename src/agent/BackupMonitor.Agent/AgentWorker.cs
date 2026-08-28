@@ -1,12 +1,14 @@
 ﻿using System.Buffers;
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using BackupMonitor.Shared.Discovery;
 using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Models.Agent;
 using BackupMonitor.Shared.Scheduling;
@@ -61,6 +63,63 @@ public sealed class AgentWorker : BackgroundService
     /// </summary>
     private readonly SemaphoreSlim _configSync = new(1, 1);
 
+    /// <summary>
+    /// LAN 发现的客户端一侧（方案 C）。无状态、只在地址失联时用一次，直接 new 即可，
+    /// 不值得为它进 DI 容器。
+    /// </summary>
+    private readonly LanDiscoveryClient _discovery = new();
+
+    /// <summary>
+    /// 连续多少次 CLIENT_IDENTITY_UNKNOWN 之后判定「服务端已经不认识本机身份」（方案 B）。
+    /// 按默认 60 秒心跳算约 5 分钟。取这个量级是为了不让一次偶发的错认引发重新登记——
+    /// 重新登记的代价是服务端上多出一条待审批/新客户端记录，比多等几分钟贵得多。
+    /// </summary>
+    private const int IdentityUnknownThreshold = 5;
+
+    /// <summary>
+    /// 连续多少次连接层失败之后跑一次 LAN 发现（方案 C）。
+    /// 连接层失败的退避是 10 秒，5 次约 1 分钟——服务端重启、网线松一下都撑得过去，
+    /// 真正搬了家才会走到发现这一步。
+    /// </summary>
+    private const int ConnectFailureThreshold = 5;
+
+    /// <summary>
+    /// 心跳循环里的两个连续失败计数（方案 B / C）。
+    ///
+    /// 刻意只由心跳循环读写，不加锁也不做成字段以外的东西：指令循环和扫描循环
+    /// 同样会撞上 401 和连不上，但让三条循环各记一份、又共同触发同一个动作，
+    /// 只会让「连续 5 次」变成一个谁也说不清的数字。判定权集中在心跳这一条上，
+    /// 它的节奏最稳定，也是唯一一条一定会周期性发请求的循环。
+    /// </summary>
+    private int _identityUnknownStreak;
+
+    private int _connectFailureStreak;
+
+    /// <summary>
+    /// 本进程是否已经向服务端问过一次实例 ID（方案 C 的锚点）。
+    ///
+    /// 只问一次是为了不给每一次心跳都搭一个额外请求。旧版本服务端不返回实例 ID，
+    /// 这种情况下重启 Agent 会再问一次——服务端升级之后总能补上。
+    /// </summary>
+    private bool _serverInstanceProbed;
+
+    /// <summary>
+    /// 身份自愈的信号（方案 B）。心跳循环判定身份已失效时取消它，
+    /// 三条循环随之退出，外层重新走注册流程。
+    /// </summary>
+    private CancellationTokenSource? _identityLost;
+
+    /// <summary>「无法重新登记」只报一次。这个分支每轮心跳都会走到，逐次记录会把日志刷满。</summary>
+    private bool _reenrollBlockedReported;
+
+    /// <summary>
+    /// 本机现在还能不能重新登记。自动登记（LAN Turnkey）随时可以；
+    /// Secure 模式必须有一次性注册令牌，而它在首次注册成功后就被删了，
+    /// 除非管理员重新放了一份，否则清掉身份也换不回新证书。
+    /// </summary>
+    private bool CanReenroll() =>
+        _options.AutomaticEnrollment || File.Exists(_options.ExpandedRegistrationTokenPath);
+
     public AgentWorker(
         IOptions<AgentOptions> options,
         AgentStateStore stateStore,
@@ -91,17 +150,7 @@ public sealed class AgentWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("BackupMonitor Agent {Version} 启动，服务器={Server}", _options.AgentVersion, _options.ServerUrl);
-
-        // 注册与首次取证书仍然串行：没有 clientId 和客户端证书，
-        // 下面三条循环里没有一条能发出任何请求。
-        if (!await WaitForRegistrationAsync(stoppingToken))
-        {
-            _logger.LogInformation("BackupMonitor Agent 停止");
-            return;
-        }
-
-        RefreshConfigCache();
+        _logger.LogInformation("BackupMonitor Agent {Version} 启动，服务器={Server}", _options.AgentVersion, _api.ServerUrl);
 
         // 审计 F-08：老版本把候选文件清单内嵌在 state.json 里，升级后必须搬出来。
         // 不搬的话所有候选丢失，已通过预检的备份要重新全量 SHA-256 扫一遍。
@@ -109,21 +158,51 @@ public sealed class AgentWorker : BackgroundService
         if (migrated > 0)
             _logger.LogInformation("已将 {Count} 个候选的文件清单迁出 state.json", migrated);
 
-        // 审计 B-02：拆成三条独立节奏。
+        // 外层循环只为方案 B 的身份自愈存在。
         //
-        // 原先只有一条顺序循环，心跳、指令执行、计划扫描共用它，而指令执行是 await 到底的：
-        // 传一份 50GB 的备份要几个小时，这几小时里一次心跳都发不出去，
-        // 服务端 SystemWatchdogWorker 按 client_offline_threshold_seconds（默认 300 秒）
-        // 判离线并发 Critical 告警——每一次正经的备份上传都会在 5 分钟后
-        // 把这台正在老实干活的机器判成离线，把离线巡检训练成「狼来了」然后被关掉。
-        //
-        // 刻意不用「在上传循环里插补心跳」代替拆循环：那是止血，
-        // 扫描阶段的长哈希覆盖不到（扫一个大目录同样能超过 5 分钟），
-        // 而且每加一个耗时动作就要记得插一次，迟早会漏。
-        await Task.WhenAll(
-            RunHeartbeatLoopAsync(stoppingToken),
-            RunCommandLoopAsync(stoppingToken),
-            RunScanLoopAsync(stoppingToken));
+        // 原先注册是一次性的：拿到 clientId 和证书之后就永远进三条循环，
+        // 再也回不到注册流程。服务端换空库之后，本机证书在服务端查无此记录，
+        // 心跳每一次都 401，而 Agent 唯一会做的事是回收连接重试——
+        // 重试无限次且永远不会成功，只能靠人登到每一台客户机上重装。
+        // 现在心跳循环确认身份确实没了会取消 _identityLost，三条循环一起退出，
+        // 转回来重新登记（machineId 和私钥保留，服务端靠 machineId 让位旧记录）。
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            // 注册与首次取证书仍然串行：没有 clientId 和客户端证书，
+            // 下面三条循环里没有一条能发出任何请求。
+            if (!await WaitForRegistrationAsync(stoppingToken))
+                break;
+
+            RefreshConfigCache();
+
+            using var identityLost = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            _identityLost = identityLost;
+            _identityUnknownStreak = 0;
+            _connectFailureStreak = 0;
+
+            // 审计 B-02：拆成三条独立节奏。
+            //
+            // 原先只有一条顺序循环，心跳、指令执行、计划扫描共用它，而指令执行是 await 到底的：
+            // 传一份 50GB 的备份要几个小时，这几小时里一次心跳都发不出去，
+            // 服务端 SystemWatchdogWorker 按 client_offline_threshold_seconds（默认 300 秒）
+            // 判离线并发 Critical 告警——每一次正经的备份上传都会在 5 分钟后
+            // 把这台正在老实干活的机器判成离线，把离线巡检训练成「狼来了」然后被关掉。
+            //
+            // 刻意不用「在上传循环里插补心跳」代替拆循环：那是止血，
+            // 扫描阶段的长哈希覆盖不到（扫一个大目录同样能超过 5 分钟），
+            // 而且每加一个耗时动作就要记得插一次，迟早会漏。
+            await Task.WhenAll(
+                RunHeartbeatLoopAsync(identityLost.Token),
+                RunCommandLoopAsync(identityLost.Token),
+                RunScanLoopAsync(identityLost.Token));
+
+            _identityLost = null;
+            if (stoppingToken.IsCancellationRequested)
+                break;
+
+            // 只有身份自愈会走到这里：三条循环全退了而停机信号没来。
+            _logger.LogWarning("本机身份已在服务端失效，正在重新登记后恢复运行。");
+        }
 
         _logger.LogInformation("BackupMonitor Agent 停止");
     }
@@ -131,6 +210,8 @@ public sealed class AgentWorker : BackgroundService
     /// <summary>注册 + 首次证书安装，成功之前一直重试。返回 false 表示收到停机信号。</summary>
     private async Task<bool> WaitForRegistrationAsync(CancellationToken ct)
     {
+        var identityConflictReported = false;
+
         while (!ct.IsCancellationRequested)
         {
             try
@@ -143,15 +224,38 @@ public sealed class AgentWorker : BackgroundService
 
                 if (!await EnsureRegisteredAsync(ct))
                     await Task.Delay(TimeSpan.FromSeconds(10), ct);
+                identityConflictReported = false;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 return false;
             }
+            catch (AgentApiException ex) when (ex.StatusCode == 409)
+            {
+                // 服务端仍持有本机的活动身份。典型成因是重装：卸载默认删除本地身份，
+                // 新装的 Agent 只能重新提交注册，而服务端那条旧记录还没被判掉线。
+                // 服务端确认旧身份掉线后会自动让位，这里只需要安静地等。
+                //
+                // 刻意只在状态变化时记一条：这个分支会一直重试到服务端让位为止，
+                // 每轮打一次堆栈的话，几分钟就能把日志刷满，真正的错误反而翻不出来。
+                _stateStore.Update(s => s.LastError = ex.Message);
+                if (!identityConflictReported)
+                {
+                    _logger.LogWarning(
+                        "服务端仍持有本机的活动身份（{Message}）。等待服务端判定旧身份掉线后自动重新登记；"
+                        + "若长时间不恢复，可在服务端「客户端」页面禁用旧记录。",
+                        ex.Message);
+                    identityConflictReported = true;
+                }
+
+                if (!await DelayAsync(30, ct))
+                    return false;
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Agent 注册流程异常");
                 _stateStore.Update(s => s.LastError = ex.Message);
+                identityConflictReported = false;
                 if (!await DelayAsync(10, ct))
                     return false;
             }
@@ -180,6 +284,13 @@ public sealed class AgentWorker : BackgroundService
                 var heartbeat = await _api.HeartbeatAsync(
                     _probe.BuildHeartbeat(state.ConfigVersion, _config, _activeCommands.Keys.ToList()), ct);
 
+                // 就在这里归零，不放到本轮末尾：心跳本身通了就证明身份和地址都没问题，
+                // 而后面的配置同步、证书续签各有各的失败方式，让它们的失败去
+                // 拖住一次早就该归零的计数，攒够 5 次就是一次凭空的重新登记。
+                _identityUnknownStreak = 0;
+                _connectFailureStreak = 0;
+                _reenrollBlockedReported = false;
+
                 ProcessNotifications(heartbeat.Notifications);
 
                 if (heartbeat.CertificateRenewalRequired)
@@ -190,6 +301,10 @@ public sealed class AgentWorker : BackgroundService
 
                 if (heartbeat.HeartbeatIntervalSeconds > 0)
                     delaySeconds = Math.Clamp(heartbeat.HeartbeatIntervalSeconds, 5, 300);
+
+                // 心跳通了才去记服务端实例 ID：这条连接的对端证书已经过指纹固定，
+                // 从它拿回来的实例 ID 才有资格当作日后地址重发现的锚点。
+                await EnsureServerInstanceRecordedAsync(ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -199,14 +314,22 @@ public sealed class AgentWorker : BackgroundService
             {
                 LogApiFailure(ex);
 
-                // mTLS 形态下 401 意味着服务端没有收到（或不认）本次连接出示的客户端证书。
-                // 本地明明装着证书却被拒，最可能的原因是连接的 TLS 身份与本地证书脱节——
-                // 证书是握手时协商的，池中的旧连接不会因为本地换了证书而改变身份。
-                // 重新握手即可自愈。放在心跳循环里就够了：连接池是共享的，
-                // 回收一次三条循环都受益，不必每条各判一遍。
-                if (ex.StatusCode == 401 && _stateStore.Snapshot().CertificateThumbprint is not null)
-                    _api.RecycleConnections();
+                // 能抛出 AgentApiException 就说明 TLS 已经建好、服务端把响应写回来了——
+                // 也就是说地址是对的。地址重发现的计数必须在这里清零，
+                // 否则一台正常应答 4xx/5xx 的服务端会被误判成「搬走了」，
+                // 客户端跑去广播域里另找一台。
+                _connectFailureStreak = 0;
 
+                if (ex.StatusCode == 401 && HandleUnauthorized(ex))
+                    break;
+
+                delaySeconds = 10;
+            }
+            catch (Exception ex) when (IsConnectFailure(ex))
+            {
+                // 连接层失败：DNS 解析不出来、连接被拒、连接超时。
+                // 与上面的 4xx/5xx 严格分开——只有这一类才可能是「服务端换地址了」。
+                await HandleConnectFailureAsync(ex, ct);
                 delaySeconds = 10;
             }
             catch (Exception ex)
@@ -218,6 +341,283 @@ public sealed class AgentWorker : BackgroundService
 
             if (!await DelayAsync(delaySeconds, ct))
                 break;
+        }
+    }
+
+    /// <summary>
+    /// 处理心跳收到的 401（方案 B）。返回 true 表示已经触发身份自愈，心跳循环该退出了。
+    ///
+    /// 401 在 mTLS 形态下有好几种完全不同的成因，处置方式互相冲突，
+    /// 必须按服务端给的 error.code 分开走：认错了就重新登记，被禁用了就安静趴着。
+    /// 服务端不给 code（旧版本，或者根本没走到证书校验那一步）时一律按
+    /// 「握手身份脱节」处理——那是这条路径上最常见也最无害的一种。
+    /// </summary>
+    private bool HandleUnauthorized(AgentApiException ex)
+    {
+        switch (ex.ErrorCode)
+        {
+            case AgentAuthFailureCodes.ClientDisabled:
+                // 这条分支是整个方案 B 里最要紧的一条：管理员刚把这台机器禁用，
+                // 客户端要是自己重新登记转回来，等于「禁用」这个按钮在客户端面前不作数。
+                // 计数归零、不清身份、不重新登记，只留一条说得清的日志——
+                // 恢复的办法是管理员在服务端重新启用，而不是客户端自己想办法。
+                _identityUnknownStreak = 0;
+                _logger.LogWarning(
+                    "本客户端已被服务端禁用或注销（{Message}）。Agent 将保持在线重试但不会重新登记；"
+                    + "需要恢复请在服务端「客户端」页面重新启用这台机器。",
+                    ex.Message);
+                return false;
+
+            case AgentAuthFailureCodes.CertificateRevoked:
+            case AgentAuthFailureCodes.CertificateExpired:
+                // 身份记录还在服务端，只是这张证书不能用了。重新登记既解决不了问题，
+                // 又会在服务端多出一条重复记录；续签走的是 RenewCertificateIfNeededAsync。
+                _identityUnknownStreak = 0;
+                _logger.LogWarning(
+                    "本机客户端证书已被服务端拒绝（code={Code}）：{Message}。等待证书续签，不会重新登记。",
+                    ex.ErrorCode, ex.Message);
+                return false;
+
+            case AgentAuthFailureCodes.ClientPendingApproval:
+                _identityUnknownStreak = 0;
+                _logger.LogWarning("本客户端尚未通过审批，等待服务端审批后自动恢复。");
+                return false;
+
+            case AgentAuthFailureCodes.IdentityUnknown:
+                // Secure 模式重新登记要出示一次性注册令牌，而它在首次注册成功后就被删掉了
+                // （EnsureRegisteredAsync → ClearRegistrationToken）。这种部署下清身份等于把
+                // 「连不上」升级成「连不上而且回不去」：本地证书没了，新的又申请不到，
+                // 只会每 10 秒刷一条注册失败。保持现状至少证书还在，管理员补一份令牌就能立刻恢复。
+                if (!CanReenroll())
+                {
+                    _identityUnknownStreak = 0;
+                    if (!_reenrollBlockedReported)
+                    {
+                        _reenrollBlockedReported = true;
+                        _logger.LogError(
+                            "服务端不认识本机身份，但当前部署要求一次性注册令牌且本地已无令牌，无法自动重新登记。"
+                            + "请在服务端签发注册令牌并放到 {TokenPath}，或先确认服务端的本机记录是不是被误删了。",
+                            _options.ExpandedRegistrationTokenPath);
+                    }
+
+                    _api.RecycleConnections();
+                    return false;
+                }
+
+                _identityUnknownStreak++;
+                _logger.LogWarning(
+                    "服务端不认识本机的客户端证书（第 {Count}/{Threshold} 次）。"
+                    + "常见原因是服务端换过空库；连续达到阈值后本机会清除服务端身份并重新登记。",
+                    _identityUnknownStreak, IdentityUnknownThreshold);
+
+                if (_identityUnknownStreak < IdentityUnknownThreshold)
+                {
+                    // 阈值之前仍然回收一次连接：万一只是连接身份脱节，这一步就能自愈，
+                    // 计数也就永远走不到阈值——重新登记是最后手段，不是第一手段。
+                    _api.RecycleConnections();
+                    return false;
+                }
+
+                // 只清服务端身份，machineId 与身份私钥留着（见 AgentStateStore.ClearIdentity）：
+                // 服务端正是靠同一个 machineId 认出「这是原来那台机器」，
+                // 把已判离线的旧记录让位给新申请（AgentRegistrationService.SupersedeOfflineClientAsync）。
+                _stateStore.ClearIdentity($"服务端连续 {_identityUnknownStreak} 次不认可本机身份，已清除并重新登记");
+                _identityUnknownStreak = 0;
+
+                // 卸下证书是必须的：注册端点虽然匿名，但连接池里那条连接握手时
+                // 出示的是刚作废的旧证书，服务端仍会按旧身份看待它。
+                _api.DetachCertificate();
+
+                _logger.LogWarning(
+                    "已清除本机在服务端的身份（保留机器指纹与私钥），即将重新登记。"
+                    + "注意：这条路径恢复的是连接，不是配置——服务端若是空库，备份任务与计划需要重新配置。");
+
+                // 让指令循环和扫描循环也停下来：拿着一个已经作废的身份继续领指令、
+                // 交扫描结果，只会刷出一串同样的 401，还可能把一次正在跑的上传拖到超时才失败。
+                _identityLost?.Cancel();
+                return true;
+
+            default:
+                // 包括 CLIENT_CERTIFICATE_MISSING 和无 code 的旧服务端。
+                // 连接的 TLS 身份与本地证书脱节：证书是握手时协商的，
+                // 池中的旧连接不会因为本地换了证书而改变身份，重新握手即可自愈。
+                if (_stateStore.Snapshot().CertificateThumbprint is not null)
+                    _api.RecycleConnections();
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// 这个异常是不是「连接层失败」——DNS 解析失败 / 连接被拒 / 连接超时（方案 C）。
+    ///
+    /// 判定必须严：只有连 TLS 都没建起来才可能是「服务端搬家了」。
+    /// 已经握上手再返回 4xx/5xx 的，恰恰证明地址是对的。
+    ///
+    /// 刻意不把 TLS 握手失败（SecureConnectionError）算进来：服务端换一次证书
+    /// 也长这样，而那种情况下满广播域找一遍同样找不到能通过指纹校验的机器，
+    /// 白扫一轮不说，日志里还多一条会让人误判的「正在重新发现服务端」。
+    /// 也不把 HttpClient 级别的整体超时算进来：那更可能是服务端在慢，不是不在。
+    /// </summary>
+    private static bool IsConnectFailure(Exception ex)
+    {
+        for (var current = ex; current is not null; current = current.InnerException)
+        {
+            if (current is HttpRequestException http
+                && http.HttpRequestError is HttpRequestError.NameResolutionError or HttpRequestError.ConnectionError)
+                return true;
+
+            // 自定义 ConnectCallback 抛出的 SocketException 会被包一层，
+            // 老运行时上 HttpRequestError 也可能是 Unknown，这里兜一道。
+            if (current is SocketException socket
+                && socket.SocketErrorCode is SocketError.HostNotFound or SocketError.NoData
+                    or SocketError.ConnectionRefused or SocketError.TimedOut
+                    or SocketError.HostUnreachable or SocketError.NetworkUnreachable)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>连接层失败的累计与处置（方案 C）。</summary>
+    private async Task HandleConnectFailureAsync(Exception ex, CancellationToken ct)
+    {
+        _connectFailureStreak++;
+        _stateStore.Update(s => s.LastError = ex.Message);
+        _logger.LogWarning(
+            "连接不到服务端 {Server}（第 {Count}/{Threshold} 次）：{Message}",
+            _api.ServerUrl, _connectFailureStreak, ConnectFailureThreshold, ex.Message);
+
+        if (_connectFailureStreak < ConnectFailureThreshold)
+            return;
+
+        // 无论这一轮找没找到，计数都归零。归零不是「问题解决了」，而是给下一轮
+        // 再攒够 N 次连接失败的时间——否则一旦越过阈值，之后每 10 秒就要往
+        // 整个广播域里灌一轮 UDP 探测，服务端只是重启一下就能被刷成一场小风暴。
+        _connectFailureStreak = 0;
+        await TryRediscoverServerAddressAsync(ct);
+    }
+
+    /// <summary>
+    /// 跑一次 LAN 发现，找回搬了家的服务端（方案 C）。
+    ///
+    /// 接受一个候选必须同时满足两个条件：应答里的实例 ID 与本地记录一致，
+    /// 且 TLS 指纹与本地固定值一致。缺任何一个都不切——发现协议是无认证的明文 UDP，
+    /// 同网段任何人都能广播一个应答，只靠其中一个条件就能把全部客户端劫走：
+    /// 实例 ID 在应答里是明文（抄一份即可），而只验指纹的话，攻击者虽然伪造不了证书，
+    /// 却能把客户端引到同一套 PKI 里的另一台服务端上去。
+    /// </summary>
+    private async Task<bool> TryRediscoverServerAddressAsync(CancellationToken ct)
+    {
+        var expectedInstanceId = _stateStore.ServerInstanceId;
+        if (expectedInstanceId is null)
+        {
+            _logger.LogWarning(
+                "本机没有记录服务端实例 ID，不做自动地址重发现。"
+                + "缺了这个锚点，任何应答都无法证明自己就是原来那台服务端；请手工核对服务端地址。");
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(_options.ServerCertificateFingerprint))
+        {
+            _logger.LogWarning(
+                "本机没有固定服务端证书指纹（Agent:ServerCertificateFingerprint 为空），不做自动地址重发现。");
+            return false;
+        }
+
+        var currentUrl = _api.ServerUrl.TrimEnd('/');
+        _logger.LogInformation("正在扫描局域网寻找服务端实例 {InstanceId}…", expectedInstanceId);
+
+        IReadOnlyList<DiscoveredServer> candidates;
+        try
+        {
+            candidates = await _discovery.DiscoverAsync(TimeSpan.FromSeconds(10), ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "局域网发现失败，继续按原地址重试。");
+            return false;
+        }
+
+        foreach (var candidate in candidates)
+        {
+            if (!string.Equals(candidate.InstanceId, expectedInstanceId, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "拒绝候选服务端 {Address}：实例 ID {Actual} 与本机记录的 {Expected} 不一致。",
+                    candidate.ApiAddress, candidate.InstanceId, expectedInstanceId);
+                continue;
+            }
+
+            var address = candidate.ApiAddress.TrimEnd('/');
+            if (string.Equals(address, currentUrl, StringComparison.OrdinalIgnoreCase))
+                continue;   // 就是当前这个地址，换过去也还是连不上
+
+            if (!await _api.ProbeServerAddressAsync(address, ct))
+            {
+                // 实例 ID 对得上但证书指纹对不上，正是伪造应答该有的样子——必须留痕。
+                _logger.LogWarning(
+                    "拒绝候选服务端 {Address}：实例 ID 匹配但 TLS 证书指纹校验未通过（或该地址连不上）。",
+                    address);
+                continue;
+            }
+
+            // 只写 state.json，不回写 appsettings.json：那个文件归安装器管，
+            // 两边都写会让「配置里写的」和「实际连的」出现两个来源。
+            _stateStore.Update(s => s.ServerUrlOverride = address);
+            _api.ChangeServerAddress(address);
+            _logger.LogWarning(
+                "服务端地址已从 {Old} 切换到 {New}（实例 ID 与 TLS 指纹均已校验通过），下次启动直接使用新地址。",
+                currentUrl, address);
+            return true;
+        }
+
+        _logger.LogWarning(
+            "局域网内没有找到实例 ID 与 TLS 指纹都匹配的服务端（共收到 {Count} 个应答），继续按原地址 {Server} 重试。",
+            candidates.Count, currentUrl);
+        return false;
+    }
+
+    /// <summary>
+    /// 把服务端实例 ID 记进 state.json（方案 C 的前置）。
+    ///
+    /// 已经有值就什么都不做——它是「我该连哪一台」的锚点，一旦落地就不该被
+    /// 后来连上的任何一台服务端改写，否则被劫持一次锚点就跟着变了。
+    /// 换服务端是重装 Agent 的事。
+    /// </summary>
+    private async Task EnsureServerInstanceRecordedAsync(CancellationToken ct)
+    {
+        if (_serverInstanceProbed || _stateStore.ServerInstanceId is not null)
+            return;
+
+        _serverInstanceProbed = true;
+        try
+        {
+            var bootstrap = await _api.GetBootstrapAsync(ct);
+            if (string.IsNullOrWhiteSpace(bootstrap.ServerInstanceId))
+            {
+                _logger.LogInformation(
+                    "服务端未提供实例 ID（多半是较旧的服务端版本），本机暂不启用自动地址重发现。");
+                return;
+            }
+
+            var instanceId = bootstrap.ServerInstanceId;
+            _stateStore.Update(s => s.ServerInstanceId = instanceId);
+            _logger.LogInformation("已记录服务端实例 ID {InstanceId}，自动地址重发现已可用。", instanceId);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            _serverInstanceProbed = false;
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // 拿不到就算了，绝不能让它影响心跳——它只是让自动地址重发现可用，
+            // 不影响任何现有功能。下次进程重启会再试一次。
+            _logger.LogDebug(ex, "读取服务端实例 ID 失败，本次跳过。");
         }
     }
 
@@ -1095,16 +1495,19 @@ public sealed class AgentWorker : BackgroundService
             ? task.ChunkSizeBytes
             : 8 * 1024 * 1024;
 
-        var session = await _api.CreateUploadSessionAsync(new CreateUploadSessionRequest
+        // 建会话这一步也可能撞上暂停：自动模式下预检每跑一轮就会重下一条上传指令，
+        // 幂等键命中的正是那个被管理员暂停的会话，服务端会拒绝把它交回来。
+        // 与下面传输过程中撞上暂停走同一条收尾路径，不能让它冒成一次「上传失败」。
+        CreateUploadSessionResponse session;
+        try
         {
-            CandidateBackupSetId = candidate.CandidateBackupSetId!.Value,
-            CommandId = command.Id,
-            TotalFiles = candidate.TotalFiles,
-            TotalBytes = candidate.TotalBytes,
-            ChunkSizeBytes = chunkSize,
-            ManifestHash = candidate.ManifestHash,
-            IdempotencyKey = candidate.CandidateKey
-        }, ct);
+            session = await CreateUploadSessionAsync(candidate, command, chunkSize, ct);
+        }
+        catch (AgentApiException ex) when (ex.ErrorCode == PausedSessionErrorCode)
+        {
+            _logger.LogInformation("候选 {CandidateKey} 的上传会话正处于管理员暂停中，本次不传，等恢复指令。", candidate.CandidateKey);
+            return CommandResult.FromFailure(PausedUploadResultCode, "这次传输已被管理员暂停，恢复后会从断点继续");
+        }
 
         // 限速值优先取指令 payload 里的 bandwidthLimitKbps（服务端三处下发口径之一），
         // 回退到任务配置的 BandwidthLimitKbps；整个上传会话共用一个节流器实例，
@@ -1219,6 +1622,17 @@ public sealed class AgentWorker : BackgroundService
             }, ct);
             return CommandResult.FromSuccess("UPLOAD_ACCEPTED", $"上传会话已提交校验：{completed.VerificationOperationId}");
         }
+        // 管理员按了暂停：这是一次人为操作的正常结局，不是故障。
+        //
+        // 刻意**不**调 TryInterruptSessionAsync：服务端对 paused 会话本来就忽略中断请求，
+        // 而且这次传输没有出任何问题——暂存目录和已传分块原样留着，恢复时从缺哪块传哪块继续。
+        // 往会话上盖一个 retry_wait + 错误信息，只会让「传输中」页面显示成一次失败。
+        catch (AgentApiException ex) when (ex.ErrorCode == PausedSessionErrorCode)
+        {
+            _logger.LogInformation(
+                "上传会话 {SessionId} 已被管理员暂停，本次停止发送，已传分块保留等待恢复。", session.UploadSessionId);
+            return CommandResult.FromFailure(PausedUploadResultCode, "这次传输已被管理员暂停，恢复后会从断点继续");
+        }
         catch (UploadAbortedException ex)
         {
             await TryInterruptSessionAsync(session.UploadSessionId, ex.ResultCode, ex.Message, ct);
@@ -1325,6 +1739,45 @@ public sealed class AgentWorker : BackgroundService
         public string ResultCode { get; }
     }
 
+    /// <summary>服务端在会话被管理员暂停时返回的错误码（与 UploadSessionService.PausedErrorCode 一致）。</summary>
+    private const string PausedSessionErrorCode = "UPLOAD_SESSION_PAUSED";
+
+    /// <summary>
+    /// 因暂停而收工时回报的结果码（与 CommandService.PausedUploadResultCode 一致）。
+    /// 服务端据此不把它算作一次上传故障——人按的暂停不该变成告警中心里的一条红字。
+    /// </summary>
+    private const string PausedUploadResultCode = "UPLOAD_PAUSED";
+
+    /// <summary>
+    /// 重试解决不了的服务端拒绝。
+    ///
+    /// 这些是**语义**拒绝：会话被暂停、候选过期、候选被新候选替代、清单对不上、
+    /// 块本身非法。它们不会因为等两秒再试一次就变成允许，重试三轮只是白白多等
+    /// 六秒并把日志刷满。原先这里对所有 AgentApiException 一律重试，代价不止于此——
+    /// 撞上暂停时它会退避后重来，而只要有任何一路的在途分块把会话状态刷回可写，
+    /// 重试就会成功，于是「暂停」变成了「顿一下接着传」。
+    /// </summary>
+    private static readonly HashSet<string> NonRetryableUploadErrorCodes = new(StringComparer.Ordinal)
+    {
+        PausedSessionErrorCode,
+        "CANDIDATE_EXPIRED", "CANDIDATE_CHANGED", "CANDIDATE_ALREADY_ARCHIVED",
+        "MANIFEST_MISMATCH", "CHUNK_INVALID", "FILE_HASH_MISMATCH",
+        "UPLOAD_NOT_PERMITTED", "FORBIDDEN"
+    };
+
+    private Task<CreateUploadSessionResponse> CreateUploadSessionAsync(
+        LocalCandidateState candidate, CommandDto command, int chunkSize, CancellationToken ct) =>
+        _api.CreateUploadSessionAsync(new CreateUploadSessionRequest
+        {
+            CandidateBackupSetId = candidate.CandidateBackupSetId!.Value,
+            CommandId = command.Id,
+            TotalFiles = candidate.TotalFiles,
+            TotalBytes = candidate.TotalBytes,
+            ChunkSizeBytes = chunkSize,
+            ManifestHash = candidate.ManifestHash,
+            IdempotencyKey = candidate.CandidateKey
+        }, ct);
+
     /// <summary>
     /// 尽力把会话标记为「中断、可续传」，而不是取消它（待办方案 E）。
     ///
@@ -1387,6 +1840,11 @@ public sealed class AgentWorker : BackgroundService
                     // 节流放在上传成功之后而不是之前：失败重试的那几次不重复计费。
                     await throttle.AfterChunkAsync(length, ct);
                     return;
+                }
+                // 语义拒绝不重试，直接抛出去让上层收尾。见 NonRetryableUploadErrorCodes 的注释。
+                catch (AgentApiException ex) when (ex.ErrorCode is not null && NonRetryableUploadErrorCodes.Contains(ex.ErrorCode))
+                {
+                    throw;
                 }
                 catch (Exception ex) when (ex is AgentApiException or HttpRequestException)
                 {
@@ -1520,7 +1978,9 @@ public sealed class AgentWorker : BackgroundService
         return CommandResult.FromSuccess("UPGRADE_STAGED", $"升级包已安全解压到 {updateRoot}，将在受控重启时切换");
     }
 
-    private bool IsSameServerAuthority(Uri packageUri) => IsSameServerAuthority(packageUri, _options.ServerUrl);
+    // 比的是当前生效的地址而不是 appsettings.json 里那一份：地址重发现（方案 C）
+    // 改过地址之后，升级包地址是新服务端下发的，拿旧地址去比会把每一次升级都拦下来。
+    private bool IsSameServerAuthority(Uri packageUri) => IsSameServerAuthority(packageUri, _api.ServerUrl);
 
     /// <summary>
     /// 升级包地址是否指向本 Agent 自己的服务端（只比 host:port）。

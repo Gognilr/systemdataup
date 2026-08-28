@@ -101,6 +101,18 @@ public class RecognizerProposalDto
     /// <summary>推荐的应用名称（从文件特征猜，例如出现 UFDATA.BAK 时给 "用友 U8"）。</summary>
     public string? SuggestedApplicationName { get; set; }
 
+    /// <summary>
+    /// 这次没看懂，而且原因很可能是快照抓得不够深——界面应当再抓深一点重试一次。
+    ///
+    /// 存在的理由：向导默认只抓 4 层，因为层数一深条目数是乘出来的，很容易顶到
+    /// 3000 条上限，反而让本来看得懂的结构变得不可靠。所以深度不能一律调大，
+    /// 而要在**确实被深度卡住时**才多花这一次往返。
+    ///
+    /// 不做这件事的话，表现是向导对一个只差一层就能看懂的结构回一句「没能看懂」，
+    /// 而人在资源管理器里明明看得见东西。
+    /// </summary>
+    public bool NeedsDeeperScan { get; set; }
+
     /// <summary>按这条规则在快照上跑出来的结果。</summary>
     public RecognizerPreviewDto? Preview { get; set; }
 }
@@ -110,14 +122,35 @@ public class RequiredFileCandidateDto
 {
     public string Pattern { get; set; } = null!;
 
+    /// <summary>
+    /// `exact`：每次的文件名都一样（UFDATA.BAK）。
+    /// `pattern`：文件名每次不同，但归一化后的模式稳定（UFFile_*.dat）。
+    /// 界面据此说明这一条是怎么认出来的——不说清楚，人无从判断该不该勾。
+    /// </summary>
+    public string Kind { get; set; } = "exact";
+
     /// <summary>出现在多少个备份目录里。</summary>
     public int PresentIn { get; set; }
 
     /// <summary>一共考察了多少个备份目录。</summary>
     public int TotalUnits { get; set; }
 
-    /// <summary>是否默认勾选（出现率达到阈值）。</summary>
+    /// <summary>单个备份目录里，命中这条模式的文件最少有几个。</summary>
+    public int CountPerUnitMin { get; set; } = 1;
+
+    /// <summary>单个备份目录里，命中这条模式的文件最多有几个。</summary>
+    public int CountPerUnitMax { get; set; } = 1;
+
+    /// <summary>是否默认勾选。</summary>
     public bool Recommended { get; set; }
+
+    /// <summary>
+    /// 没有默认勾选的原因，直接显示给人看。
+    ///
+    /// 「没勾」和「为什么没勾」是两件事：只把勾去掉，使用者只会觉得系统漏了；
+    /// 说清楚「各账套启用年度不同，个数本来就不一样，不能当判据」，他才能自己决定要不要勾上。
+    /// </summary>
+    public string? NotRecommendedReason { get; set; }
 
     public long TypicalSizeBytes { get; set; }
 }

@@ -18,7 +18,8 @@ internal sealed record AgentBootstrap(
     bool AutomaticEnrollment,
     string DeploymentMode,
     string? ServerCertificateFingerprint,
-    string? ServerCertificatePem);
+    string? ServerCertificatePem,
+    string? ServerInstanceId);
 
 /// <summary>
 /// 无 PowerShell 依赖的客户端安装逻辑。安装器本身由 UAC manifest 请求管理员权限，
@@ -76,6 +77,9 @@ internal sealed class AgentInstaller
         var certificatePem = data.TryGetProperty("serverCertificatePem", out var pem)
             ? pem.GetString()
             : null;
+        var serverInstanceId = data.TryGetProperty("serverInstanceId", out var instance)
+            ? instance.GetString()
+            : null;
         if (string.IsNullOrWhiteSpace(publicKey))
             throw new InvalidOperationException("服务端没有提供 Agent 指令签名公钥，请检查服务端密钥配置。");
 
@@ -107,7 +111,8 @@ internal sealed class AgentInstaller
             automaticEnrollment,
             deploymentMode,
             certificateFingerprint,
-            certificatePem);
+            certificatePem,
+            serverInstanceId);
     }
 
     public async Task InstallAsync(
@@ -115,6 +120,7 @@ internal sealed class AgentInstaller
         string displayName,
         string registrationToken,
         string? expectedServerFingerprint,
+        string? discoveredServerInstanceId,
         Func<string, Task<bool>> confirmServerFingerprintAsync,
         IProgress<InstallProgress> progress,
         CancellationToken ct)
@@ -130,6 +136,25 @@ internal sealed class AgentInstaller
             bootstrap.ServerCertificateFingerprint,
             expectedServerFingerprint,
             confirmServerFingerprintAsync);
+
+        // 局域网发现应答自报的实例 ID，与这条已核对过指纹的 HTTPS 连接自报的实例 ID，
+        // 必须是同一个。对不上意味着「用户在列表里选的那台」和「真正应答的那台」
+        // 不是一台机器——发现协议是无认证的明文 UDP，这正是伪造应答该有的样子。
+        // 装下去的后果是客户端把一个错误的实例 ID 当成日后地址重发现的锚点。
+        if (!string.IsNullOrWhiteSpace(discoveredServerInstanceId)
+            && !string.IsNullOrWhiteSpace(bootstrap.ServerInstanceId)
+            && !string.Equals(discoveredServerInstanceId, bootstrap.ServerInstanceId, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "局域网发现到的服务端实例 ID 与该地址实际应答的实例 ID 不一致，已中止安装。"
+                + Environment.NewLine
+                + $"发现应答：{discoveredServerInstanceId}"
+                + Environment.NewLine
+                + $"实际应答：{bootstrap.ServerInstanceId}"
+                + Environment.NewLine
+                + "请改为手工填写服务端地址后重试。");
+        }
+
         if (!bootstrap.AutomaticEnrollment && string.IsNullOrWhiteSpace(registrationToken))
             throw new InvalidOperationException("当前服务端是 Secure 模式，请在“高级选项”中填写注册令牌。");
         var packageUri = ResolvePackageUri(baseUrl, bootstrap.AgentPackagePath);
@@ -176,6 +201,11 @@ internal sealed class AgentInstaller
                     displayName,
                     dataDir,
                     registrationToken);
+
+                // 优先用 HTTPS 引导接口返回的实例 ID：它来自一条指纹已被核对过的连接，
+                // 而发现应答是任何人都能广播的明文 UDP。只有旧版本服务端不返回它时
+                // 才退回发现到的值——那时至少还有 TLS 指纹这一道锚点。
+                WriteInitialAgentState(dataDir, bootstrap.ServerInstanceId ?? discoveredServerInstanceId);
 
                 progress.Report(new InstallProgress("正在注册 Windows 服务…", 86));
                 CreateService(installDir);
@@ -457,6 +487,50 @@ internal sealed class AgentInstaller
         agent["DataDirectory"] = dataDir;
         File.WriteAllText(settingsPath, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), new UTF8Encoding(false));
         WriteProtectedRegistrationToken(dataDir, registrationToken);
+    }
+
+    /// <summary>
+    /// 把服务端实例 ID 预写进 state.json（方案 C 的前置）。
+    ///
+    /// Agent 自己在首次心跳成功后也会问一次并记下来，这里再写一遍是为了让锚点
+    /// 从第一次连接之前就存在：安装这一刻的连接是用户带外核对过指纹的，
+    /// 可信度高于运行期任何一次自动获取。
+    ///
+    /// 必须在既有 state.json 上做合并而不是覆盖：「修复安装」时那个文件里
+    /// 存着本机的客户端身份、私钥和证书，整份重写等于把这台机器变成一台新客户端，
+    /// 服务端上会多出一条僵尸记录。
+    /// </summary>
+    private static void WriteInitialAgentState(string dataDir, string? serverInstanceId)
+    {
+        if (string.IsNullOrWhiteSpace(serverInstanceId))
+            return;
+
+        var statePath = Path.Combine(dataDir, "state.json");
+        JsonObject state;
+        try
+        {
+            state = File.Exists(statePath)
+                ? JsonNode.Parse(File.ReadAllText(statePath)) as JsonObject ?? new JsonObject()
+                : new JsonObject();
+        }
+        catch (JsonException)
+        {
+            // 读不出来的状态文件按「没有」处理，与 Agent 自身的 LoadState 一致。
+            state = new JsonObject();
+        }
+
+        state["serverInstanceId"] = serverInstanceId;
+
+        // 上一次运行期重发现出来的地址不能留：它指向的是搬家前后的某台机器，
+        // 而这次安装用户明确选了一个地址（已写进 appsettings.json）。
+        // 留着的话 Agent 启动后仍会优先用那个旧地址，表现成「装完还是连不上」。
+        state.Remove("serverUrlOverride");
+
+        File.WriteAllText(
+            statePath,
+            state.ToJsonString(new JsonSerializerOptions { WriteIndented = true }),
+            new UTF8Encoding(false));
+        SecureFileSystem.ApplyFileAcl(statePath);
     }
 
     private static void WriteProtectedRegistrationToken(string dataDir, string token)

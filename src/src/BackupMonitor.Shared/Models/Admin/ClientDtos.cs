@@ -1,4 +1,5 @@
-﻿using BackupMonitor.Shared.Models;
+﻿using System.Text.Json.Serialization;
+using BackupMonitor.Shared.Models;
 
 namespace BackupMonitor.Shared.Models.Admin;
 
@@ -45,6 +46,17 @@ public class ClientListItemDto
     /// 而且必然是真正连得通的那个——列表里放一串地址既挤又要人自己猜。
     /// </summary>
     public string? LastRemoteIp { get; set; }
+
+    /// <summary>
+    /// 这台机器"应该按哪个地址去找"的 IPv4。
+    ///
+    /// 对端地址不一定是 IPv4：Windows 的名称解析常把服务端解析成 fe80:: 链路本地地址，
+    /// 于是 Agent 走 IPv6 连上来，<see cref="LastRemoteIp"/> 就成了一串既不能 ping
+    /// 也不能远程桌面的东西。IP 列存在的意义是"我照着它去连那台机器"，
+    /// 所以这里给出可用的 IPv4：对端地址本身是 IPv4 就是它，否则回落到自报网卡里的第一个 IPv4。
+    /// 纯 IPv6 环境下为空，界面此时仍显示对端地址而不是"—"。
+    /// </summary>
+    public string? Ipv4Address { get; set; }
 
     public DateTime CreatedAt { get; set; }
     public int ActiveAlertCount { get; set; }
@@ -184,6 +196,62 @@ public class ClientUserSessionDto
     public bool IsRemote { get; set; }
     public DateTime? LogonAt { get; set; }
     public DateTime SampledAt { get; set; }
+}
+
+/// <summary>
+/// 修改客户端的显示名称与所属分组。
+///
+/// 两个字段都是可选的，语义靠"传没传"区分而不是靠值：
+/// 字段缺省表示不改这一项，<c>clientGroupId</c> 显式传 null 表示把机器移出分组。
+/// 少了这个区分，"只改名字"就会顺手把分组清掉。
+/// System.Text.Json 只在 JSON 里出现该属性时才调用 setter，
+/// 下面两个 Specified 标志正是靠这一点记录"调用方到底提没提这个字段"。
+/// </summary>
+public class UpdateClientRequest
+{
+    private string? _displayName;
+    private Guid? _clientGroupId;
+
+    /// <summary>新的显示名称；不传表示不改。</summary>
+    public string? DisplayName
+    {
+        get => _displayName;
+        set
+        {
+            _displayName = value;
+            DisplayNameSpecified = true;
+        }
+    }
+
+    /// <summary>新的分组；不传表示不改，显式传 null 表示移出分组。</summary>
+    public Guid? ClientGroupId
+    {
+        get => _clientGroupId;
+        set
+        {
+            _clientGroupId = value;
+            ClientGroupIdSpecified = true;
+        }
+    }
+
+    [JsonIgnore]
+    public bool DisplayNameSpecified { get; private set; }
+
+    [JsonIgnore]
+    public bool ClientGroupIdSpecified { get; private set; }
+}
+
+/// <summary>
+/// 分组选项，只给"改分组"这类下拉框用。
+///
+/// 客户端列表里的 clientGroupName 只能告诉你当前这一页出现过哪些分组，
+/// 拿它当候选集会漏掉所有还没有机器的分组。
+/// </summary>
+public class ClientGroupOptionDto
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = null!;
+    public string Code { get; set; } = null!;
 }
 
 /// <summary>禁用客户端请求（设计书 15.4）</summary>

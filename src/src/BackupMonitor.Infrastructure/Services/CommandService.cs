@@ -57,6 +57,12 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
     private const int MaxResultMessageLength = 1900;
 
     /// <summary>
+    /// Agent 因「管理员暂停了这次传输」而退出时回报的结果码。
+    /// 与 AgentWorker 侧的同名常量必须一致——它是一次人为操作的正常结局，不是故障。
+    /// </summary>
+    public const string PausedUploadResultCode = "UPLOAD_PAUSED";
+
+    /// <summary>
     /// result_payload 上限（UTF-8 字节）。browse_path 原先最多能返回 20000 个条目，
     /// 序列化几 MB 一份塞进 commands 表——Agent 自己在识别测试那条路径上写了
     /// 「会把 commands 表撑坏」的注释并限到 50 个文件，浏览这条却没设限。
@@ -366,8 +372,14 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
             }
         }
 
-        // 失败告警（预检/上传指令）
+        // 失败告警（预检/上传指令）。
+        //
+        // UPLOAD_PAUSED 排除在外：那是管理员自己在「传输中」页面按的暂停，
+        // Agent 收到 409 后安静退出，指令以失败收场是实现细节。把它报成一条
+        // 「上传失败」告警，等于用户每按一次暂停就给自己制造一条故障——
+        // 告警中心的可信度就是这么被磨没的。
         if (command.Status == CommandStatus.Failed &&
+            !string.Equals(command.ResultCode, PausedUploadResultCode, StringComparison.Ordinal) &&
             command.CommandType is CommandType.PrecheckTask or CommandType.PrecheckAll or CommandType.UploadCandidate)
         {
             var category = command.CommandType == CommandType.UploadCandidate ? "upload_failed" : "precheck_failed";

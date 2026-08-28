@@ -330,16 +330,31 @@ public class RetentionCleanupWorker : BackgroundService
         // 暂停该任务本轮回收并升级为严重告警。设错策略的典型后果就是「某任务全部备份集一次性进回收站」，
         // 这道闸把它挡在回收站之前——回收站还能捞回来，但没有理由让它先发生。
         var breakerPercent = Math.Clamp(await settings.GetIntAsync(RecycleBreakerPercentKey, 50, ct), 1, 100);
+
+        // retention_policy_id 为空的含义已经改成「跟随默认策略」，不再是「永不清理」。
+        // 「字段为空 = 永远不动它的备份」这种隐式语义是 V027 那次事故的根源：任务表单里这一项
+        // 折叠在高级选项中、默认留空，于是照默认值建出来的任务全都不清理、仓库无限增长。
+        // 现在的回落链是：任务自己的策略 → 默认策略 → 都没有才跳过。
+        var defaultPolicyId = await RetentionPolicyService.GetDefaultPolicyIdAsync(settings, ct);
+        var defaultPolicy = defaultPolicyId is null
+            ? null
+            : await db.RetentionPolicies.FirstOrDefaultAsync(p => p.Id == defaultPolicyId.Value, ct);
+
+        if (defaultPolicyId is not null && defaultPolicy is null)
+            _logger.LogWarning("默认保留策略 {PolicyId} 不存在，跟随默认的任务本轮不做保留计算", defaultPolicyId);
+
         var tasks = await db.BackupTasks
             .Include(t => t.RetentionPolicy)
-            .Where(t => t.RetentionPolicyId != null)
             .ToListAsync(ct);
 
         var count = 0;
         foreach (var task in tasks)
         {
             ct.ThrowIfCancellationRequested();
-            var policy = task.RetentionPolicy;
+
+            // 没绑策略且系统也没有默认策略，才是真正的「不清理」——
+            // 想要这个效果的正道是配一份份数留大的显式策略，而不是靠这里的空值。
+            var policy = task.RetentionPolicy ?? defaultPolicy;
             if (policy is null)
                 continue;
 

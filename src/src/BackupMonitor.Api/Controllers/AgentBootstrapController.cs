@@ -49,7 +49,14 @@ public sealed class AgentBootstrapController : ApiBaseController
                 DeploymentMode = deploymentMode,
                 AutomaticEnrollment = _configuration.GetValue("LanMode:AutomaticEnrollment", false),
                 ServerCertificateFingerprint = serverCertificateFingerprint,
-                ServerCertificatePem = serverCertificatePem
+                ServerCertificatePem = serverCertificatePem,
+
+                // 实例 ID 不是机密：它只是一个随机 GUID，用来回答「你还是不是原来那台」。
+                // 不在这里返回的话，Agent 运行期就只能从明文 UDP 发现应答里取，
+                // 而那正是要防的那条通道——锚点和被校验的对象出自同一处等于没校验。
+                // Secure 模式下 Server:InstanceId 可能没配，此时返回 null，
+                // 客户端会因为缺锚点而拒绝一切自动地址切换（宁可不切）。
+                ServerInstanceId = _configuration["Server:InstanceId"]
             });
         }
         catch (InvalidOperationException ex)

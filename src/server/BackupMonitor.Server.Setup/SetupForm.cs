@@ -24,6 +24,8 @@ internal sealed class SetupForm : Form
     private readonly Button _repairPermissions = new();
     private readonly Button _exportKeyPackage = new();
     private readonly Button _importKeyPackage = new();
+    private readonly Button _exportBackupPackage = new();
+    private readonly Button _importBackupPackage = new();
     private readonly Button _uninstall = new();
     private readonly ServerMaintenance _maintenance = new();
     private readonly string _installDirectory = ServerMaintenance.DefaultInstallDirectory;
@@ -133,6 +135,8 @@ internal sealed class SetupForm : Form
         _repairPermissions.Text = "修复文件权限";
         _exportKeyPackage.Text = "导出密钥包";
         _importKeyPackage.Text = "导入密钥包";
+        _exportBackupPackage.Text = "导出配置备份";
+        _importBackupPackage.Text = "导入配置备份";
         foreach (var button in new[]
         {
             _resetPassword,
@@ -144,6 +148,8 @@ internal sealed class SetupForm : Form
             _repairPermissions,
             _exportKeyPackage,
             _importKeyPackage,
+            _exportBackupPackage,
+            _importBackupPackage,
             _openWeb,
             _diagnostics,
             _uninstall
@@ -168,6 +174,8 @@ internal sealed class SetupForm : Form
         _repairPermissions.Click += async (_, _) => await RepairPermissionsAsync();
         _exportKeyPackage.Click += async (_, _) => await ExportKeyPackageAsync();
         _importKeyPackage.Click += async (_, _) => await ImportKeyPackageAsync();
+        _exportBackupPackage.Click += async (_, _) => await ExportBackupPackageAsync();
+        _importBackupPackage.Click += async (_, _) => await ImportBackupPackageAsync();
         _uninstall.Click += async (_, _) => await UninstallAsync();
         _maintenancePanel.Enabled = ServerInstaller.IsInstalled();
         root.Controls.Add(_maintenancePanel, 0, 7);
@@ -509,6 +517,98 @@ internal sealed class SetupForm : Form
             await _maintenance.ImportKeyPackageAsync(_dataDirectory, dialog.FileName, CancellationToken.None);
             _status.Text = "服务端密钥包已导入，服务已重启。";
             MessageBox.Show(this, _status.Text, "导入完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "导入失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    /// <summary>
+    /// 导出配置备份包。与密钥包的差别要在文案里说清楚：这个包能把客户端一起带走，
+    /// 但它带走的只是「配置与身份」，不含仓库里的备份文件本体。
+    /// </summary>
+    private async Task ExportBackupPackageAsync()
+    {
+        if (!ServerInstaller.IsInstalled())
+            return;
+
+        using var dialog = new SaveFileDialog
+        {
+            Filter = "BackupMonitor 配置备份包 (*.bmbp)|*.bmbp|所有文件 (*.*)|*.*",
+            FileName = $"BackupMonitor-backup-{DateTime.Now:yyyyMMdd-HHmmss}.bmbp",
+            AddExtension = true,
+            OverwritePrompt = true
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        SetBusy(true);
+        try
+        {
+            await _maintenance.ExportBackupPackageAsync(
+                _installDirectory, _dataDirectory, dialog.FileName, CancellationToken.None);
+            _status.Text = "配置备份包已导出（含服务端密钥与整库转储）；该文件包含敏感密钥，请仅保存到受控位置。"
+                + "包内不含 Repository 与 Staging 中的备份文件本体，需另行复制。";
+            MessageBox.Show(this, _status.Text, "导出完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "导出失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    private async Task ImportBackupPackageAsync()
+    {
+        if (!ServerInstaller.IsInstalled())
+            return;
+
+        using var dialog = new OpenFileDialog
+        {
+            Filter = "BackupMonitor 配置备份包 (*.bmbp)|*.bmbp|所有文件 (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false
+        };
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        var confirm = MessageBox.Show(
+            this,
+            "导入会替换当前服务端 secrets、客户端 CA、HTTPS 证书，并用备份包中的转储覆盖整个数据库。"
+            + "本机现有的任务、计划、客户端和历史记录都将被备份包中的内容取代。\n\n"
+            + "恢复前会自动导出一份当前数据库快照。是否继续？",
+            "确认导入配置备份包",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning);
+        if (confirm != DialogResult.Yes)
+            return;
+
+        SetBusy(true);
+        try
+        {
+            var preRestoreDump = await _maintenance.ImportBackupPackageAsync(
+                _installDirectory, _dataDirectory, dialog.FileName, CancellationToken.None);
+            _status.Text = "配置备份包已导入，服务已重启。";
+            // 这句必须留在导入成功的提示里：只恢复库不恢复仓库，backup_files 会指向一堆
+            // 不存在的文件，而现场直到有人去做恢复时才会发现。
+            MessageBox.Show(
+                this,
+                "配置备份包已导入，服务已重启。已安装的客户端无需重装即可恢复连接。\n\n"
+                + "重要：备份包不含仓库(Repository)和暂存区(Staging)中的实际备份文件，"
+                + "这两个目录需要管理员从原服务器另行复制到本机数据目录下；"
+                + "在复制完成之前，数据库中的备份记录会指向不存在的文件。\n\n"
+                + $"恢复前的数据库快照已保存到：\n{preRestoreDump}",
+                "导入完成",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
         }
         catch (Exception ex)
         {

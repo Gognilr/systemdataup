@@ -22,11 +22,7 @@ public interface IUploadProgressService
 public class UploadProgressService : IUploadProgressService
 {
     /// <summary>与 ClientAdminService.ActiveUploadStatuses 保持一致：界面上「在传」的口径只能有一个。</summary>
-    private static readonly UploadStatus[] ActiveStatuses =
-    [
-        UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading,
-        UploadStatus.Paused, UploadStatus.RetryWait, UploadStatus.Received, UploadStatus.Verifying
-    ];
+    private static readonly UploadStatus[] ActiveStatuses = UploadSessionStatuses.InFlight;
 
     /// <summary>
     /// 卡死判定的下限。低于这个值会把「正在传一个大分块」误报成卡死——
