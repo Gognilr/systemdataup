@@ -12,7 +12,7 @@ export async function vRegistrationTokens() {
       <div class="spacer"></div>
       <button class="primary" id="rt_create">创建注册令牌</button>
     </div>
-    <div class="card"><div class="tip">明文令牌只在创建成功时显示一次；服务端数据库只保存 SHA-256 哈希。Agent 安装时将该令牌作为一次性注册凭据。</div></div>
+    <div class="card"><div class="tip">令牌原文只在刚创建时显示一次，服务器不会再显示第二次——请当场复制保存。装客户端时填这个令牌，用过即失效。</div></div>
     <div id="rt_wrap">${loading()}</div>`);
   $('#rt_inactive').onchange = ev => { st.includeInactive = ev.target.checked; LOADERS.registrationTokens(); };
   $('#rt_create').addEventListener('click', createToken);

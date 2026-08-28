@@ -440,3 +440,38 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 .xfer-bar{height:6px;border-radius:99px;background:var(--surface-sunk);overflow:hidden;min-width:120px;margin-bottom:2px}
 .xfer-bar span{display:block;height:100%;background:var(--accent);border-radius:inherit;transition:width .4s ease}
 .xfer-bar.is-stalled span{background:var(--warn)}
+
+/* ── 备份计划的任务编组器 ──
+   计划的全部意义在于「谁先谁后」，所以顺序必须一眼看见、并且能改。
+   上半区是已选顺序（带 ↑↓），下半区是可选池；已经属于别的计划的任务置灰。 */
+.planpick{border:1px solid var(--border);border-radius:var(--r-2);overflow:hidden}
+.planpick-head{display:flex;align-items:baseline;gap:var(--s-2);padding:var(--s-1) var(--s-2);background:var(--surface-sunk);border-bottom:1px solid var(--border);border-top:1px solid var(--border)}
+.planpick-head:first-child{border-top:0}
+.planpick-chosen{list-style:decimal;margin:0;padding:var(--s-2) var(--s-2) var(--s-2) calc(var(--s-4) + var(--s-2));max-height:200px;overflow-y:auto}
+.planpick-chosen li{display:flex;align-items:center;gap:var(--s-2);padding:2px 0}
+.planpick-pool{max-height:260px;overflow-y:auto}
+.planpick-row{display:flex;align-items:center;gap:var(--s-2);padding:var(--s-1) var(--s-2);border-bottom:1px solid var(--border);cursor:pointer}
+.planpick-row:last-child{border-bottom:0}
+.planpick-row:hover{background:var(--surface-sunk)}
+.planpick-row.is-disabled{cursor:not-allowed;color:var(--text-muted)}
+.planpick-name{flex:1;display:flex;flex-direction:column;line-height:1.3}
+.planpick-name small{color:var(--text-muted);font:var(--t-sm)}
+.planpick-ops{display:flex;gap:var(--s-1)}
+.weekpick{display:flex;flex-wrap:wrap;gap:var(--s-2)}
+.weekpick label{display:inline-flex;align-items:center;gap:4px}
+
+/* ── 恢复下载的逐文件清单 ──
+   大备份集不该劝人下整包 ZIP：整包边打包边写出，没有 Content-Length，中断不能续。
+   单文件下载支持 Range，因此清单是「6GB 下到一半断了怎么办」的实际答案。 */
+.dl-list{max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--r-2)}
+.dl-row{display:flex;align-items:center;gap:var(--s-2);padding:var(--s-1) var(--s-2);border-bottom:1px solid var(--border)}
+.dl-row:last-child{border-bottom:0}
+.dl-row:hover{background:var(--surface-sunk)}
+.dl-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+.dl-size{color:var(--text-muted);font:var(--t-sm);white-space:nowrap}
+
+/* ── 免令牌登记窗口 ──
+   「当前窗口什么时候关」和「再开 N 分钟」是两件事，此前挤在一行里，
+   按钮上的 30 分钟与显示出来的 24 小时窗口对不上，看起来像功能失效。 */
+.enroll-window{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s-2);margin-top:var(--s-2)}
+.enroll-window .hint{flex-basis:100%;margin:0}

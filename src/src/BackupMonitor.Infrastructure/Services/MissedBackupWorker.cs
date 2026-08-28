@@ -163,7 +163,7 @@ public class MissedBackupWorker : BackgroundService
                     task.ImportanceLevel >= ImportanceLevel.High ? AlertLevel.Critical : AlertLevel.Warning,
                     "backup_missed",
                     $"任务 {task.Name} 未按计划产生备份",
-                    $"计划时间 {localDue:yyyy-MM-dd HH:mm}（{tz.Id}），已超过 {graceMinutes} 分钟宽限期仍无成功入库",
+                    $"按计划应该在 {localDue:yyyy-MM-dd HH:mm}（{tz.Id}）备份，已经多等了 {graceMinutes} 分钟，仍然没有备份成功",
                     clientId: task.ClientId,
                     taskId: task.Id,
                     ct: ct);

@@ -185,7 +185,9 @@ public class UploadCommitWorker : BackgroundService
                 Directory.Delete(commitTemp, recursive: true);
             Directory.CreateDirectory(commitTemp);
 
-            // 复制暂存文件到提交目录
+            // 暂存文件进仓库：同卷 NTFS 建硬链接，否则复制
+            var linkedFiles = 0;
+            var copiedFiles = 0;
             foreach (var file in session.Files)
             {
                 var relativePath = file.RelativePath.Replace('/', Path.DirectorySeparatorChar);
@@ -193,10 +195,33 @@ public class UploadCommitWorker : BackgroundService
                     ?? throw new BusinessException("INVALID_REQUEST", $"非法相对路径 {file.RelativePath}", 400);
 
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+
+                // 同卷 NTFS 时用硬链接代替整份复制：6GB 备份的入库耗时从「6GB 读 + 6GB 写」
+                // 降到一次元数据操作。暂存文件仍然在（链接计数为 2），提交失败还能重试——
+                // 这正是它优于 File.Move 的地方。跨卷或非 NTFS 时 TryCreate 返回 false，
+                // 落到下面原来的复制路径，行为与之前完全一致。
+                var stagedPath = await storage.GetStagedFilePathAsync(session.Id, file.Id, ct);
+                if (HardLink.TryCreate(stagedPath, target))
+                {
+                    linkedFiles++;
+                    continue;
+                }
+
                 await using var source = await storage.OpenStagedFileAsync(session.Id, file.Id, ct);
-                await using var destination = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, useAsync: true);
-                await source.CopyToAsync(destination, ct);
+                // 入库是把整份暂存文件顺序复制进仓库（6GB 备份 = 6GB 读 + 6GB 写）。
+                // 80KB 默认缓冲对这个量级太小，1MB + SequentialScan 让两端的预读/回写
+                // 都能成批下发。源流的缓冲在 OpenStagedFileAsync 里一并调过了。
+                await using var destination = new FileStream(
+                    target, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                    bufferSize: 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                await source.CopyToAsync(destination, 1024 * 1024, ct);
+                copiedFiles++;
             }
+
+            if (linkedFiles > 0)
+                _logger.LogInformation(
+                    "会话 {SessionId} 入库：{Linked} 个文件走硬链接（同卷），{Copied} 个文件复制",
+                    session.Id, linkedFiles, copiedFiles);
 
             // manifest.json（架构书 12 存储目录规范）
             var uploadedAt = session.CompletedAt ?? DateTime.UtcNow;
@@ -420,7 +445,7 @@ public class UploadCommitWorker : BackgroundService
                 $"session:{session.Id}:commit_failed",
                 AlertLevel.Critical,
                 "upload_commit_failed",
-                $"上传会话入库失败（任务 {task.Name}）",
+                $"备份已传完，但存入备份库时失败（任务 {task.Name}）",
                 ex.Message,
                 clientId: client.Id,
                 taskId: task.Id,

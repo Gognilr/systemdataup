@@ -305,6 +305,14 @@ public class UploadCommitClosureTests : IDisposable
     private sealed class CancelDuringOpenStorage(ServiceProvider sp, CancellationTokenSource cts) : DelegatingStorage(sp)
     {
         public override Task<Stream> OpenStagedFileAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default)
+            => Cancel<Stream>();
+
+        // 入库优先走硬链接（同卷 NTFS）时根本不会打开暂存流，
+        // 注入点必须覆盖两条路径，否则同卷部署下这次「停机」注入不进去。
+        public override Task<string> GetStagedFilePathAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default)
+            => Cancel<string>();
+
+        private Task<T> Cancel<T>()
         {
             cts.Cancel();
             throw new OperationCanceledException(cts.Token);
@@ -315,6 +323,11 @@ public class UploadCommitClosureTests : IDisposable
     private sealed class ThrowingStorage(ServiceProvider sp, Exception failure) : DelegatingStorage(sp)
     {
         public override Task<Stream> OpenStagedFileAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default)
+            => throw failure;
+
+        // 入库优先走硬链接（同卷 NTFS），走不到 OpenStagedFileAsync。
+        // 注入点因此要覆盖两条路径，否则「暂存读不出来」这个故障在同卷部署上根本注入不进去。
+        public override Task<string> GetStagedFilePathAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default)
             => throw failure;
     }
 
@@ -334,6 +347,7 @@ public class UploadCommitClosureTests : IDisposable
         public Task<string> ComputeFileHashAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default) => Inner.ComputeFileHashAsync(sessionId, uploadFileId, ct);
         public Task<(bool Exists, long Length)> GetStagedFileInfoAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default) => Inner.GetStagedFileInfoAsync(sessionId, uploadFileId, ct);
         public virtual Task<Stream> OpenStagedFileAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default) => Inner.OpenStagedFileAsync(sessionId, uploadFileId, ct);
+        public virtual Task<string> GetStagedFilePathAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default) => Inner.GetStagedFilePathAsync(sessionId, uploadFileId, ct);
         public Task CleanupSessionAsync(Guid sessionId, CancellationToken ct = default) => Inner.CleanupSessionAsync(sessionId, ct);
     }
 }

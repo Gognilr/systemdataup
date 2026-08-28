@@ -176,6 +176,14 @@ public class BackupTaskDetailDto : BackupTaskListItemDto
     public int RetryIntervalSeconds { get; set; }
     public Guid? RetentionPolicyId { get; set; }
     public string? RetentionPolicyName { get; set; }
+
+    /// <summary>
+    /// 该任务所属的备份计划（V028）。非空时它的扫描计划不再下发给客户端，
+    /// 改由计划按顺序驱动——界面据此把「扫描计划」置灰并说明原因。
+    /// </summary>
+    public Guid? PlanId { get; set; }
+    public string? PlanName { get; set; }
+
     public string RecognizerConfig { get; set; } = "{}";
     public string? AlertConfig { get; set; }
     public DateTime CreatedAt { get; set; }

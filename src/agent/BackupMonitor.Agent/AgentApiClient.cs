@@ -209,6 +209,14 @@ public sealed class AgentApiClient : IDisposable
         SendEmptyAsync(HttpMethod.Post, $"api/v1/agent/upload-sessions/{sessionId}/cancel", null, ct);
 
     /// <summary>
+    /// 中断上传会话：这次传挂了，但会话与暂存留着，下次接着传。
+    /// 取消会让服务端把会话作废、暂存随后被清，下一次只能从 0 开始——
+    /// 6GB 的备份传到 90% 断一次就得重来一遍，这个代价没有理由付。
+    /// </summary>
+    public Task InterruptUploadSessionAsync(Guid sessionId, InterruptUploadSessionRequest request, CancellationToken ct) =>
+        SendEmptyAsync(HttpMethod.Post, $"api/v1/agent/upload-sessions/{sessionId}/interrupt", request, ct);
+
+    /// <summary>
     /// 升级包下载上限（字节）。升级包整体读进 byte[] 才能算哈希，
     /// 512MB 已经远大于任何正常的 Agent 包，超过这个量级只可能是配错或被投毒。
     /// </summary>

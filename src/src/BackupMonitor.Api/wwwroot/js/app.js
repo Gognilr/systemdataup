@@ -30,14 +30,14 @@ export const NAV_GROUPS = [
     ['overview', '概览', '⌂'], ['transfers', '传输中', '⇅'], ['todo', '待办', '○'], ['alerts', '告警', '▲']
   ] },
   { key: 'fleet', label: '机群', items: [
-    ['clients', '客户端', '◉'], ['tasks', '备份任务', '▣']
+    ['clients', '客户端', '◉'], ['tasks', '备份任务', '▣'], ['plans', '备份计划', '≣']
   ] },
   { key: 'data', label: '数据', items: [
     ['backups', '备份集', '▤'], ['restores', '恢复', '↺']
   ] },
   { key: 'manage', label: '管理', items: [
     ['settings', '存储设置', '⚙'], ['retention', '保留策略', '◫'], ['notifications', '通知', '✉'],
-    ['upgrades', 'Agent 升级', '↑'], ['job-history', '作业历史', '◷'], ['audit', '审计日志', '≡']
+    ['upgrades', '客户端升级', '↑'], ['job-history', '运行记录', '◷'], ['audit', '审计日志', '≡']
   ] }
 ];
 const NAV_ITEMS = NAV_GROUPS.flatMap(g => g.items.map(([key, label, icon]) => ({ key, label, icon, group: g.label })));
@@ -461,6 +461,7 @@ const VIEW_LOADERS = {
   overview: () => import('./views/dashboard.js'), todo: () => import('./views/todo.js'),
   transfers: () => import('./views/transfers.js'),
   clients: () => import('./views/clients.js'), 'registration-tokens': () => import('./views/registration-tokens.js'), tasks: () => import('./views/tasks.js'),
+  plans: () => import('./views/plans.js'),
   backups: () => import('./views/backups.js'), restores: () => import('./views/restores.js'),
   alerts: () => import('./views/alerts.js'), notifications: () => import('./views/notifications.js'),
   audit: () => import('./views/audit.js'), retention: () => import('./views/retention.js'),
@@ -468,7 +469,7 @@ const VIEW_LOADERS = {
   settings: () => import('./views/settings.js')
 };
 const VIEW_EXPORTS = {
-  overview: 'vDashboard', transfers: 'vTransfers', todo: 'vTodo', clients: 'vClients', tasks: 'vTasks', backups: 'vBackups',
+  overview: 'vDashboard', transfers: 'vTransfers', todo: 'vTodo', clients: 'vClients', tasks: 'vTasks', plans: 'vPlans', backups: 'vBackups',
   restores: 'vRestores', alerts: 'vAlerts', notifications: 'vNotifications', audit: 'vAudit',
   'registration-tokens': 'vRegistrationTokens',
   retention: 'vRetention', 'job-history': 'vJobHistory', upgrades: 'vUpgrades',

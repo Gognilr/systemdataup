@@ -7,6 +7,12 @@ import {
 } from '../ui.js';
 import { shell, loading } from '../app.js';
 
+/* 队列里每一项的状态（V028 起批量上传走顺序执行队列，排队中的项也要看得见） */
+const QUEUE_TEXT = {
+  pending: '排队中', running: '执行中', succeeded: '完成', failed: '失败',
+  timeout: '等超时', skipped: '跳过', cancelled: '已取消'
+};
+
 export async function vJobHistory() {
   App.state.jobHistory = App.state.jobHistory || { page: 1, pageSize: 10, totalCount: 0 };
   const st = App.state.jobHistory;
@@ -23,7 +29,9 @@ LOADERS.jobHistory = async function () {
       { l: '批次', render: r => `<b>${esc(r.name || shortId(r.id))}</b>` },
       { l: '状态', render: r => status('batch_status', r.status) },
       { l: '进度', num: true, render: r => `${esc(r.succeededItems)} 成功 / ${esc(r.failedItems)} 失败 / 共 ${esc(r.totalItems)}` },
-      { l: '并发', num: true, render: r => `${esc(r.maxConcurrentClients)} 客户端 × ${esc(r.maxConcurrentPerClient)}` },
+      // V028 起这个数字真的会限流：批次投进顺序执行队列，它就是队列并发度。
+      // 「× 每客户端 1」那半截删掉了——Agent 天生串行执行指令，那个值填几都一样。
+      { l: '同时几台', num: true, render: r => `${esc(r.maxConcurrentClients)} 台` },
       { l: '创建人', k: 'createdByName' }, { l: '创建时间', render: r => fmtDT(r.createdAt) },
       { l: '完成时间', render: r => fmtDT(r.completedAt) },
       { l: '操作', render: r => `<button class="small" data-ui-action="act" data-view="job-history" data-action="detail" data-id="${esc(r.id)}">详情</button>` }
@@ -37,10 +45,14 @@ ACTIONS['job-history:detail'] = async id => {
       <div class="row"><div class="k">状态</div><div class="v">${status('batch_status', d.status)}</div></div>
       <div class="row"><div class="k">进度</div><div class="v">${esc(d.succeededItems)} 成功 / ${esc(d.failedItems)} 失败 / 共 ${esc(d.totalItems)}</div></div>
     </div>${tableHtml([
-      { l: '候选备份集', render: r => `<span class="mono">${shortId(r.candidateBackupSetId)}</span>` },
-      { l: '候选键', render: r => `<span class="mono">${esc(r.candidateKey)}</span>` },
-      { l: '客户端', k: 'clientHostname' }, { l: '指令状态', render: r => esc(r.commandStatus || '—') },
-      { l: '上传会话', render: r => esc(r.uploadSessionStatus || '—') }
+      { l: '这次备份', render: r => `<span class="mono">${shortId(r.candidateBackupSetId)}</span>` },
+      { l: '识别标识', render: r => `<span class="mono">${esc(r.candidateKey)}</span>` },
+      { l: '客户端', k: 'clientHostname' },
+      // 排队中的项此前在这张表里根本不存在（没有指令就查不到），并发闸的效果也就无从观察
+      { l: '排队', render: r => esc(QUEUE_TEXT[r.queueStatus] || r.queueStatus || '—') },
+      { l: '检查状态', render: r => (r.commandStatus ? status('command_status', r.commandStatus) : '—') },
+      { l: '上传状态', render: r => (r.uploadSessionStatus ? status('upload_status', r.uploadSessionStatus) : '—') },
+      { l: '说明', render: r => esc(r.message || '') }
     ], d.items, { empty: '<div class="empty">批次为空</div>' })}`, { wide: true });
   } catch (e) { errToast(e); }
 };

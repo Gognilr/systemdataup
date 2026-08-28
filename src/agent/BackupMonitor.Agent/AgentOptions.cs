@@ -22,6 +22,19 @@ public sealed class AgentOptions
     public bool EnforceAcl { get; set; } = true;
     public int MaxUploadRetries { get; set; } = 3;
 
+    /// <summary>
+    /// 单个文件同时在途的分块数（1–16，超出范围会被夹回）。
+    ///
+    /// 为什么默认 4：一块的周期里真正占用网络的只有传输那一小段，其余都在
+    /// 读盘、算哈希、等服务端写盘落库。串行（=1）时链路利用率只有个位数百分比，
+    /// 4 路基本能把千兆填满，再往上收益递减、而客户端内存占用（每路一个分块缓冲）
+    /// 和服务端并发压力是线性涨的。
+    ///
+    /// 要控制上传对网络的影响，用任务上的 BandwidthLimitKbps，那是服务端下发的、
+    /// 管理员可见可调的口径；这个值是客户端本地的性能参数，不该拿来当限速用。
+    /// </summary>
+    public int MaxParallelChunks { get; set; } = 4;
+
     /// <summary>本地文件日志保留天数。出问题的机器常在客户现场，日志得留得住又不能撑爆磁盘。</summary>
     public int LogRetentionDays { get; set; } = 14;
 

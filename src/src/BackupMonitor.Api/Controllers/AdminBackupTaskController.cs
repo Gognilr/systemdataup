@@ -113,6 +113,18 @@ public class AdminBackupTaskController : ApiBaseController
     }
 
     /// <summary>
+    /// 最近一次识别测试的结果。等待窗口只有一分钟，而关掉对话框之后客户端照样会把它跑完——
+    /// 这个接口让那次结果还能被找回来，而不是只能重测一遍。从未测过时 data 为 null。
+    /// </summary>
+    [HttpGet("{taskId:guid}/test-recognition/latest")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.read")]
+    public async Task<ActionResult<ApiResponse<CommandResultDto?>>> LatestTestRecognition(Guid taskId, CancellationToken ct)
+    {
+        var result = await _taskService.GetLatestRecognitionTestAsync(taskId, ct);
+        return OkData(result);
+    }
+
+    /// <summary>
     /// 查询识别测试（或任意指令）的执行结果。
     /// 识别测试是异步的：指令下发后要等 Agent 领走并执行，界面据此轮询。
     /// </summary>

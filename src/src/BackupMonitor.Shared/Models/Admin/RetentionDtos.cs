@@ -33,6 +33,9 @@ public class RetentionPolicyDto
 
     /// <summary>引用该策略的备份任务数量</summary>
     public int BoundTaskCount { get; set; }
+
+    /// <summary>是否为「新建任务默认绑定」的那份策略（system_settings.default_retention_policy_id）</summary>
+    public bool IsDefault { get; set; }
 }
 
 /// <summary>
@@ -61,13 +64,18 @@ public class RetentionPolicyUpsertDto : IValidatableObject
     [Range(1, int.MaxValue, ErrorMessage = "keepYearlyCount 必须大于 0")]
     public int? KeepYearlyCount { get; set; }
 
-    /// <summary>最短保留天数。下限 1——0 意味着备份集一入库即可被清理。</summary>
-    [Range(1, 36500, ErrorMessage = "minimumRetentionDays 必须在 1~36500 之间")]
-    public int MinimumRetentionDays { get; set; } = 30;
+    /// <summary>
+    /// 最短保留天数：不满该天数的备份集一律不回收。默认 0（V027）——
+    /// 它是一条会覆盖「保留最近 N 份」的规则，原来的默认值 30 意味着每天备份的任务
+    /// 实际上会攒到 30 份以上，配了「只留 3 份」也没用。下限保持 0：
+    /// 此时仍有至少一条 Keep*Count 规则兜底（见 Validate），不存在「一入库即可被清理」。
+    /// </summary>
+    [Range(0, 36500, ErrorMessage = "minimumRetentionDays 必须在 0~36500 之间")]
+    public int MinimumRetentionDays { get; set; }
 
     /// <summary>回收区保留天数。下限 1——0 意味着进回收站的下一轮就物理删除，等于没有回收站。</summary>
     [Range(1, 3650, ErrorMessage = "recycleBinDays 必须在 1~3650 之间")]
-    public int RecycleBinDays { get; set; } = 30;
+    public int RecycleBinDays { get; set; } = 7;
 
     /// <summary>跨字段校验：至少要有一条 Keep*Count 规则，否则 GFS 保留集恒为空。</summary>
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)

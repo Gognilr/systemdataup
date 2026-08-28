@@ -367,6 +367,12 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
             for (var i = 0; i < 4; i++)
                 setIds.Add(await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-3), now));
 
+            // 这个任务此前被清理过（有一份已物理删除的历史备份集）。
+            // 没有这一份的话会命中「首次清理豁免」——那条豁免测的是另一件事，
+            // 见「首次清理豁免熔断」。deleted 不参与 GFS 计算，不影响上面的 100%。
+            await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-90), now,
+                status: BackupSetStatus.Deleted);
+
             await db.SaveChangesAsync();
         }
 
@@ -396,6 +402,65 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
                 await db.AuditLogs.AsNoTracking()
                     .AnyAsync(a => a.Action == "retention.recycle" && setIds.Contains(a.ResourceId!.Value)),
                 "熔断后不得写出任何回收审计——不做部分回收");
+        }
+    }
+
+    /// <summary>
+    /// 首次清理豁免：一个从没被清理过的任务，第一次配上保留策略时必然是一次大比例回收
+    /// （攒了 4 份、只留 1 份 = 75%）。熔断挡的是「策略配错了」，不该把这个最常见的
+    /// 第一次也挡掉——否则「配了策略仍然一份不删」。回收仍然先进回收站，可撤销。
+    /// </summary>
+    [Fact]
+    public async Task 首次清理豁免熔断()
+    {
+        await SetRecycleBreakerPercentAsync(50);
+
+        var now = DateTime.UtcNow;
+        Guid taskId, newestId;
+        var oldIds = new List<Guid>();
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var policy = new RetentionPolicy
+            {
+                Id = Guid.NewGuid(),
+                Name = $"it3-firstpass-{Guid.NewGuid():N}",
+                KeepLastCount = 1,
+                MinimumRetentionDays = 0,
+                RecycleBinDays = 7,
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+            (var clientId, taskId) = await SeedClientAndTaskAsync(db, policy, now);
+
+            newestId = await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-1), now);
+            for (var i = 2; i <= 4; i++)
+                oldIds.Add(await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-i), now));
+
+            await db.SaveChangesAsync();
+        }
+
+        await RunWorkerUntilAsync(async () =>
+        {
+            await using var scope = _services.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            return await db.BackupSets.AsNoTracking()
+                .CountAsync(s => oldIds.Contains(s.Id) && s.Status == BackupSetStatus.RecycleBin) == oldIds.Count;
+        });
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            Assert.Equal(BackupSetStatus.Available, await StatusAsync(db, newestId));
+            foreach (var id in oldIds)
+                Assert.Equal(BackupSetStatus.RecycleBin, await StatusAsync(db, id));
+
+            Assert.False(
+                await db.Alerts.AsNoTracking()
+                    .AnyAsync(a => a.Category == "retention_breaker_tripped" && a.TaskId == taskId),
+                "首次清理不该报熔断告警");
         }
     }
 

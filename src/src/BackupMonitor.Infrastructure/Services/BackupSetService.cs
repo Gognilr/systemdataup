@@ -29,6 +29,18 @@ public interface IBackupSetService
 
     /// <summary>解除隔离，恢复为可用状态</summary>
     Task UnquarantineAsync(Guid backupSetId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 删除（D）：移入回收站而不是直接物理删除，误删还能捞回来。
+    /// 守卫与保留清理完全一致——已锁定 / 有活动保留锁 / 有进行中的恢复请求，一律拒绝。
+    /// </summary>
+    Task RecycleAsync(Guid backupSetId, CancellationToken ct = default);
+
+    /// <summary>从回收站还原为可用</summary>
+    Task RestoreFromRecycleBinAsync(Guid backupSetId, CancellationToken ct = default);
+
+    /// <summary>立即彻底删除（只能对回收站里的备份集执行，物理删除仓库目录，不可撤销）</summary>
+    Task PurgeAsync(Guid backupSetId, CancellationToken ct = default);
 }
 
 /// <summary>备份查询实现（列表/详情/文件/锁定/解锁/重校验）</summary>
@@ -54,6 +66,7 @@ public class BackupSetService : IBackupSetService
     private readonly Channel<WorkItem> _workChannel;
     private readonly ICurrentContext _context;
     private readonly IAuditRecorder _audit;
+    private readonly IUploadStorage _storage;
     private readonly ILogger<BackupSetService> _logger;
 
     public BackupSetService(
@@ -61,12 +74,14 @@ public class BackupSetService : IBackupSetService
         [FromKeyedServices(QueueKeys.Verify)] Channel<WorkItem> workChannel,
         ICurrentContext context,
         IAuditRecorder audit,
+        IUploadStorage storage,
         ILogger<BackupSetService> logger)
     {
         _db = db;
         _workChannel = workChannel;
         _context = context;
         _audit = audit;
+        _storage = storage;
         _logger = logger;
     }
 
@@ -315,6 +330,107 @@ public class BackupSetService : IBackupSetService
         await _audit.RecordAsync("backup.unquarantine", AuditResult.Success, "backup_set", set.Id, ct: ct);
 
         _logger.LogInformation("备份 {BackupSetId}({Code}) 已解除隔离", set.Id, set.BackupSetCode);
+    }
+
+    // ---------- 删除 / 回收站（待办方案 D） ----------
+
+    /// <summary>回收站默认保留天数：备份集所属任务没绑保留策略时用它</summary>
+    private const int DefaultRecycleBinDays = 7;
+
+    public async Task RecycleAsync(Guid backupSetId, CancellationToken ct = default)
+    {
+        var set = await _db.BackupSets
+            .Include(s => s.RetentionLocks)
+            .Include(s => s.Task).ThenInclude(t => t.RetentionPolicy)
+            .FirstOrDefaultAsync(s => s.Id == backupSetId, ct)
+            ?? throw new NotFoundException("备份版本", backupSetId);
+
+        if (set.Status is BackupSetStatus.RecycleBin or BackupSetStatus.Deleted)
+            throw new BusinessException("CONFLICT", "该备份集已经在回收站里或已删除", 409);
+
+        await EnsureRemovableAsync(set, ct);
+
+        var now = DateTime.UtcNow;
+        var days = set.Task?.RetentionPolicy?.RecycleBinDays ?? DefaultRecycleBinDays;
+        var previousStatus = set.Status;
+
+        set.Status = BackupSetStatus.RecycleBin;
+        set.RetentionUntil = now.AddDays(days);
+        await _db.SaveChangesAsync(ct);
+
+        await _audit.RecordAsync("backup.recycle", AuditResult.Success, "backup_set", set.Id,
+            beforeData: JsonSerializer.Serialize(new { Status = EnumMapping.ToSnakeCase(previousStatus) }),
+            afterData: JsonSerializer.Serialize(new { set.BackupSetCode, retentionUntil = set.RetentionUntil }), ct: ct);
+
+        _logger.LogInformation("备份 {Code} 已移入回收站，{Days} 天内可还原（保留至 {Until:yyyy-MM-dd}）",
+            set.BackupSetCode, days, set.RetentionUntil);
+    }
+
+    public async Task RestoreFromRecycleBinAsync(Guid backupSetId, CancellationToken ct = default)
+    {
+        var set = await _db.BackupSets.FirstOrDefaultAsync(s => s.Id == backupSetId, ct)
+            ?? throw new NotFoundException("备份版本", backupSetId);
+
+        if (set.Status != BackupSetStatus.RecycleBin)
+            throw new BusinessException("CONFLICT", "只有回收站里的备份集才能还原", 409);
+
+        set.Status = BackupSetStatus.Available;
+        set.RetentionUntil = null;
+        await _db.SaveChangesAsync(ct);
+
+        await _audit.RecordAsync("backup.restore_from_recycle_bin", AuditResult.Success, "backup_set", set.Id,
+            afterData: JsonSerializer.Serialize(new { set.BackupSetCode }), ct: ct);
+
+        _logger.LogInformation("备份 {Code} 已从回收站还原", set.BackupSetCode);
+    }
+
+    public async Task PurgeAsync(Guid backupSetId, CancellationToken ct = default)
+    {
+        var set = await _db.BackupSets
+            .Include(s => s.RetentionLocks)
+            .FirstOrDefaultAsync(s => s.Id == backupSetId, ct)
+            ?? throw new NotFoundException("备份版本", backupSetId);
+
+        // 「立即彻底删除」只对回收站开放：要腾空间的人先把它删进回收站，再决定要不要真删。
+        // 这一步不可撤销，不该有从「可用」一键直达的路径。
+        if (set.Status != BackupSetStatus.RecycleBin)
+            throw new BusinessException("CONFLICT", "只有回收站里的备份集才能彻底删除", 409);
+
+        await EnsureRemovableAsync(set, ct);
+
+        var repositoryRoot = await _storage.GetRepositoryRootAsync(ct);
+        if (!RepositoryDirectory.DeleteUnderRoot(set.RepositoryPath, repositoryRoot))
+            _logger.LogWarning("备份集 {Code} 仓库目录不存在，只做逻辑删除：{Path}", set.BackupSetCode, set.RepositoryPath);
+
+        set.Status = BackupSetStatus.Deleted;
+        await _db.SaveChangesAsync(ct);
+
+        await _audit.RecordAsync("backup.purge", AuditResult.Success, "backup_set", set.Id,
+            afterData: JsonSerializer.Serialize(new { set.BackupSetCode, set.RepositoryPath }), ct: ct);
+
+        _logger.LogInformation("备份 {Code} 已彻底删除：{Path}", set.BackupSetCode, set.RepositoryPath);
+    }
+
+    /// <summary>
+    /// 能不能删。三条守卫与 RetentionCleanupWorker 判的是同一件事——
+    /// 自动清理不敢删的东西，人在界面上点一下也不该能删掉。
+    /// </summary>
+    private async Task EnsureRemovableAsync(BackupSet set, CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+
+        if (set.Locked)
+            throw new BusinessException("CONFLICT", "该备份集已被锁定，先解锁再删除", 409);
+
+        if (set.RetentionLocks.Any(l => l.Active && (l.ExpiresAt == null || l.ExpiresAt > now)))
+            throw new BusinessException("CONFLICT", "该备份集上有生效中的保留锁，先解除保留锁再删除", 409);
+
+        var restoring = await _db.RestoreRequests.AnyAsync(r => r.BackupSetId == set.Id
+            && (r.Status == RestoreRequestStatus.Verifying
+                || r.Status == RestoreRequestStatus.Downloading
+                || (r.Status == RestoreRequestStatus.Ready && r.DownloadExpiresAt != null)), ct);
+        if (restoring)
+            throw new BusinessException("CONFLICT", "该备份集正在被恢复下载，等这次恢复结束再删除", 409);
     }
 
     /// <summary>重新校验（设计书 18.6，异步：入后台校验队列）</summary>

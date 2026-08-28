@@ -92,18 +92,60 @@ export async function openRestoreDrawer(id, viaNav = false) {
 }
 ACTIONS['restores:detail'] = async id => openRestoreDrawer(id);
 
+/* 超过这个体量就别劝人下 ZIP 了：整包是边打包边写出的，没有 Content-Length、
+   中断不能续，6GB 下到一半断了就得重来。逐文件下载支持 Range，断了能接着下。 */
+const BIG_SET_BYTES = 2 * 1024 * 1024 * 1024;
+const BIG_SET_FILES = 50;
+
 ACTIONS['restores:token'] = async id => {
   if (!await confirmModal('签发新下载令牌？签发后旧令牌立即失效，明文令牌仅显示这一次。')) return;
   const d = await api(`/api/v1/admin/restore-requests/${id}/download-token`, { method: 'POST' });
   const url = location.origin + d.downloadUrl;
+
+  // 文件清单是「大集合怎么下」的全部答案，但拿不到也不该挡住 ZIP 链接
+  let files = [];
+  try {
+    const detail = await api(`/api/v1/admin/restore-requests/${id}`);
+    files = await api(`/api/v1/admin/backups/${detail.backupSetId}/files`) || [];
+  } catch { files = []; }
+
+  const totalBytes = files.reduce((n, f) => n + Number(f.sizeBytes || 0), 0);
+  const big = totalBytes >= BIG_SET_BYTES || files.length >= BIG_SET_FILES;
+  const fileUrl = f => `${url}?path=${encodeURIComponent(f.relativePath)}`;
+  const allLinks = files.map(fileUrl).join('\n');
+
+  const zipBlock = `
+    <div class="frow"><label>整包 ZIP${big ? '（这个集合偏大，不建议）' : ''}</label>
+      <input readonly value="${esc(url)}" data-ui-action="select-self" class="mono">
+      <div class="hint">边打包边下发，没有总大小，<b>中断不能续传</b>——断了要从头再来。</div>
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:12px">
+      <a class="primary" style="padding:var(--s-1) var(--s-3);border-radius:var(--r-md);color:var(--accent-fg);background:var(--accent)" href="${esc(url)}" target="_blank">打开 ZIP 下载</a>
+      <button data-ui-action="copy" data-copy-value="${esc(url)}">复制 ZIP 链接</button>
+    </div>`;
+
+  const fileBlock = files.length ? `
+    <div class="frow"><label>逐个文件下载${big ? '（推荐）' : ''}</label>
+      <div class="hint">每个文件都支持断点续传（Range）：断了接着下，不用从头开始。
+        整份 ${esc(files.length)} 个文件 · ${fmtBytes(totalBytes)}。</div>
+    </div>
+    <div style="display:flex;gap:10px;margin-bottom:10px">
+      <button data-ui-action="copy" data-copy-value="${esc(allLinks)}">复制全部链接（一行一个）</button>
+    </div>
+    <div class="dl-list">${files.map(f => `
+      <div class="dl-row">
+        <span class="dl-name mono" title="${esc(f.relativePath)}">${esc(f.relativePath)}</span>
+        <span class="dl-size">${fmtBytes(f.sizeBytes)}</span>
+        <a class="small" href="${esc(fileUrl(f))}" target="_blank">下载</a>
+        <button class="small" data-ui-action="copy" data-copy-value="${esc(fileUrl(f))}">复制</button>
+      </div>`).join('')}</div>`
+    : '<p class="hint">取不到文件清单（可能没有查看备份集的权限）。单文件下载：在 URL 后追加 <span class="mono">?path=相对路径</span>。</p>';
+
   openModal('下载令牌已签发', `
-    <p style="margin-bottom:10px">有效期至 <b>${fmtDT(d.expiresAt)}</b>。整套备份集下载（ZIP）：</p>
-    <div class="frow"><input readonly value="${esc(url)}" data-ui-action="select-self" class="mono"></div>
-    <p style="margin:10px 0;color:var(--text-muted);font:var(--t-sm)">单文件下载：在 URL 后追加 <span class="mono">?path=相对路径</span>（支持 Range 断点续传）。</p>
-    <div style="display:flex;gap:10px">
-      <a class="primary" style="padding:var(--s-1) var(--s-3);border-radius:var(--r-md);color:var(--accent-fg);background:var(--accent)" href="${esc(url)}" target="_blank">打开下载</a>
-      <button data-ui-action="copy" data-copy-value="${esc(url)}">复制链接</button>
-    </div>`);
+    <p style="margin-bottom:10px">有效期至 <b>${fmtDT(d.expiresAt)}</b>。明文令牌只显示这一次。</p>
+    ${big ? fileBlock + '<hr style="margin:14px 0;border:0;border-top:1px solid var(--border)">' + zipBlock
+          : zipBlock + '<hr style="margin:14px 0;border:0;border-top:1px solid var(--border)">' + fileBlock}`,
+    { wide: true });
   LOADERS.restores();
 };
 

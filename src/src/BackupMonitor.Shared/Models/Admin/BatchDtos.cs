@@ -42,11 +42,12 @@ public class CreateUploadBatchRequest
 
     public string? Name { get; set; }
 
+    /// <summary>
+    /// 同时最多几台客户端在传。V028 起这个值真的会限流：批次投进顺序执行队列，
+    /// 它就是队列的并发度。此前它只是存下来给历史页显示，没有任何调度逻辑读它。
+    /// </summary>
     [Range(1, 50)]
     public int MaxConcurrentClients { get; set; } = 2;
-
-    [Range(1, 10)]
-    public int MaxConcurrentPerClient { get; set; } = 1;
 
     public int? TemporaryBandwidthLimitKbps { get; set; }
 
@@ -66,7 +67,6 @@ public class UploadBatchDto
     public string Status { get; set; } = null!;
 
     public int MaxConcurrentClients { get; set; }
-    public int MaxConcurrentPerClient { get; set; }
     public int? BandwidthLimitKbps { get; set; }
     public int TotalItems { get; set; }
     public int SucceededItems { get; set; }
@@ -88,4 +88,9 @@ public class UploadBatchItemDto
     public string? CommandStatus { get; set; }
     public Guid? UploadSessionId { get; set; }
     public string? UploadSessionStatus { get; set; }
+
+    /// <summary>队列里的状态：pending（排队中）/ running / succeeded / failed / timeout / skipped / cancelled</summary>
+    public string? QueueStatus { get; set; }
+
+    public string? Message { get; set; }
 }

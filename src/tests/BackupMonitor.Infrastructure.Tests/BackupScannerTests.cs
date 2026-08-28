@@ -38,22 +38,88 @@ public sealed class BackupScannerTests : IDisposable
     private async Task<BackupScanResult> ScanAsync(string recognizerType, string recognizerConfig) =>
         Assert.Single(await ScanAllAsync(recognizerType, recognizerConfig));
 
-    private async Task<List<BackupScanResult>> ScanAllAsync(string recognizerType, string recognizerConfig)
+    private async Task<BackupScanResult> ScanForTestAsync(string recognizerType, string recognizerConfig) =>
+        Assert.Single(await ScanAllAsync(recognizerType, recognizerConfig, testOnly: true));
+
+    private async Task<List<BackupScanResult>> ScanAllAsync(string recognizerType, string recognizerConfig, bool testOnly = false)
     {
         var scanner = new BackupScanner(NullLogger<BackupScanner>.Instance);
-        return await scanner.ScanAsync(new AgentTaskConfigDto
-        {
-            TaskId = Guid.NewGuid(),
-            Name = "扫描测试",
-            ApplicationName = "SQLServer",
-            SourcePath = _root,
-            RecognizerType = recognizerType,
-            TaskMode = "automatic",
-            Enabled = true,
-            RecognizerConfig = recognizerConfig,
-            // 稳定观察窗口设为 0：测试刚写完文件，否则一律返回 still_changing。
-            StabilityIntervalSeconds = 0
-        }, CancellationToken.None);
+        var task = TaskConfig(recognizerType, recognizerConfig);
+        return testOnly
+            ? await scanner.ScanForTestAsync(task, CancellationToken.None)
+            : await scanner.ScanAsync(task, CancellationToken.None);
+    }
+
+    private AgentTaskConfigDto TaskConfig(string recognizerType, string recognizerConfig) => new()
+    {
+        TaskId = Guid.NewGuid(),
+        Name = "扫描测试",
+        ApplicationName = "SQLServer",
+        SourcePath = _root,
+        RecognizerType = recognizerType,
+        TaskMode = "automatic",
+        Enabled = true,
+        RecognizerConfig = recognizerConfig,
+        // 稳定观察窗口设为 0：测试刚写完文件，否则一律返回 still_changing。
+        StabilityIntervalSeconds = 0
+    };
+
+    /// <summary>
+    /// 识别测试（试扫）不算 SHA-256。
+    ///
+    /// 这不是性能优化的锦上添花：识别测试的等待窗口只有一分钟，而全量哈希要把每个文件
+    /// 整读一遍——几 GB 的备份光哈希就能吃掉整个窗口，界面除了「等待超时」什么都给不出。
+    /// 哈希在这条路径上没有任何用处：界面只显示文件名、大小、是否必需。
+    /// </summary>
+    [Fact]
+    public async Task 试扫不计算哈希()
+    {
+        WriteFile("full.bak");
+
+        var result = await ScanForTestAsync("multi_file_set", "{}");
+
+        Assert.Equal("passed", result.Status);
+        var file = Assert.Single(result.Files);
+        Assert.Equal("full.bak", file.RelativePath);
+        Assert.Null(file.Sha256);
+        Assert.Null(file.QuickHash);
+    }
+
+    /// <summary>
+    /// 试扫的结果不能长得像一份能入库的候选：manifestHash / candidateKey 一律留空，
+    /// 且带着 IsTestScan 标记——上报路径据此当场拒绝，而不是产生一个哈希为空的候选备份集。
+    /// </summary>
+    [Fact]
+    public async Task 试扫结果不带候选标识()
+    {
+        WriteFile("full.bak");
+
+        var result = await ScanForTestAsync("multi_file_set", "{}");
+
+        Assert.True(result.IsTestScan);
+        Assert.Null(result.ManifestHash);
+        Assert.Null(result.QuickFingerprint);
+        Assert.Equal(string.Empty, result.CandidateKey);
+    }
+
+    /// <summary>
+    /// 试扫和正式扫描必须挑中同一批文件——否则「看看会备份哪些文件」这个功能就是在撒谎。
+    /// 两者共用同一套遍历与识别逻辑，这条测试钉的是「以后也别拆开」。
+    /// </summary>
+    [Fact]
+    public async Task 试扫与正式扫描识别出同样的文件()
+    {
+        WriteFile("full.bak");
+        WriteFile("full.trn");
+        WriteFile("full.tmp");           // 默认应被滤掉的半成品
+
+        var real = await ScanAsync("multi_file_set", "{}");
+        var test = await ScanForTestAsync("multi_file_set", "{}");
+
+        Assert.Equal(real.Status, test.Status);
+        Assert.Equal(
+            real.Files.Select(f => f.RelativePath).OrderBy(p => p),
+            test.Files.Select(f => f.RelativePath).OrderBy(p => p));
     }
 
     /// <summary>

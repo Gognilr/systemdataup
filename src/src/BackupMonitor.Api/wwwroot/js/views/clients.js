@@ -72,8 +72,24 @@ async function loadDeploymentStatus() {
     const d = await api('/api/v1/admin/deployment-status');
     const dbOk = d.databaseStatus === 'healthy';
     const autoText = d.automaticEnrollment ? '局域网自动登记已启用' : 'Secure 模式：需要注册令牌';
+
+    // 窗口本身一直是生效的，但界面此前把两件事混成了一句话：按钮写「开放登记 30 分钟」，
+    // 旁边显示的却是安装默认的 24 小时窗口——两个数字对不上，管理员自然怀疑它没生效。
+    // 现在分开说：当前窗口什么时候关（以及这个时间是哪来的），和「再开 N 分钟」这个动作。
+    const minutes = d.enrollmentExtendMinutes || 30;
+    const windowText = !d.enrollmentOpenUntilUtc
+      ? '<span class="status status--off pill">未开放</span>'
+      : (d.enrollmentWindowOpen
+        ? `<span class="status status--ok pill">开放中</span> 到期 ${fmtDT(d.enrollmentOpenUntilUtc)}${d.enrollmentWindowIsInstallDefault ? '（安装默认窗口，没人开过）' : ''}`
+        : `<span class="status status--off pill">已关闭</span> 于 ${fmtDT(d.enrollmentOpenUntilUtc)} 到期`);
     const openButton = d.automaticEnrollment
-      ? `<button class="button" id="open-enrollment-window">开放登记 30 分钟</button><span class="text-muted">当前窗口：${d.enrollmentOpenUntilUtc ? fmtDT(d.enrollmentOpenUntilUtc) : '已关闭'}</span>`
+      ? `<div class="enroll-window">
+           <div><span class="text-muted">免令牌登记窗口：</span>${windowText}</div>
+           <button class="button" id="open-enrollment-window">再开放 ${esc(minutes)} 分钟</button>
+           <div class="hint">这个窗口只管一件很窄的事：<b>新机器不带令牌</b>的局域网登记。
+             已注册的客户端走 mTLS 证书，带令牌注册的机器走令牌校验，两者都不受它影响——
+             窗口关着不会让任何已有客户端断掉。</div>
+         </div>`
       : '';
     wrap.innerHTML = `<div class="dashboard-section-head"><h2>部署状态</h2><small>${d.checkedAtUtc ? fmtDT(d.checkedAtUtc) : ''}</small></div>
       <div class="deployment-status-grid">
@@ -82,7 +98,8 @@ async function loadDeploymentStatus() {
         <div><span>数据库状态</span><strong class="status status--${dbOk ? 'ok' : 'err pill'}">${dbOk ? '正常' : esc(d.databaseStatus || '未知')}</strong></div>
         <div><span>客户端安装包</span><strong>${esc(d.clientInstallerVersion || '未知')}</strong></div>
       </div>
-      <p class="text-muted deployment-mode">${esc(autoText)} · 部署模式：${esc(d.deploymentMode || 'Secure')} ${openButton}</p>`;
+      <p class="text-muted deployment-mode">${esc(autoText)} · 部署模式：${esc(d.deploymentMode || 'Secure')}</p>
+      ${openButton}`;
     const openWindowButton = $('#open-enrollment-window');
     if (openWindowButton) openWindowButton.addEventListener('click', App.openEnrollmentWindow);
   } catch (e) {
@@ -93,7 +110,7 @@ async function loadDeploymentStatus() {
 App.openEnrollmentWindow = async function () {
   try {
     const result = await api('/api/v1/admin/deployment-status/enrollment-window', { method: 'POST' });
-    toast(`自动登记已开放至 ${fmtDT(result.enrollmentOpenUntilUtc)}`, 'ok');
+    toast(`免令牌登记窗口已开放至 ${fmtDT(result.enrollmentOpenUntilUtc)}（只影响新机器）`, 'ok');
     await loadDeploymentStatus();
   } catch (e) {
     toast(e.message || '无法开放自动登记窗口', 'err');
@@ -170,14 +187,15 @@ LOADERS.clients = async function () {
 /* §5.2 批量动作：选中行后工具条变形出现（逐条调用既有端点，无需后端改动）*/
 App.batchActs = App.batchActs || {};
 App.batchActs.clients = [
-  { t: '批量预检', primary: true, bulk: true,
+  { t: '立即备份', primary: true, bulk: true,
     fn: async ids => {
       const d = await api('/api/v1/admin/operations/precheck-batches', { method: 'POST', body: {
         scope: { clientIds: ids }, onlyEnabled: true
       } });
-      toast(`已下发 ${d.dispatchedCommands} 条预检指令，跳过 ${d.skippedTasks} 个任务`, 'ok');
+      toast(`已让 ${d.dispatchedCommands} 个任务开始备份，另有 ${d.skippedTasks} 个跳过（未启用或客户端不可用）`, 'ok');
     } },
-  { t: '批量上传', bulk: true, fn: ids => openClientUploadBatch(ids) },
+  // 这条走的是「我已经知道要传哪一份」的路子，日常不该用到——日常用上面的「立即备份」。
+  { t: '按编号补传（高级）', bulk: true, fn: ids => openClientUploadBatch(ids) },
   { t: '刷新指标', fn: id => api(`/api/v1/admin/clients/${id}/refresh-metrics`, { method: 'POST' }) },
   { t: '禁用', fn: id => api(`/api/v1/admin/clients/${id}/disable`, { method: 'POST', body: { reason: '批量禁用' } }) },
   { t: '注销', danger: true,
@@ -190,10 +208,11 @@ App.batchActs.clients = [
  */
 function openClientUploadBatch(clientIds) {
   return new Promise(resolve => {
-    const ov = openModal('从选中客户端创建批量上传', `
-      <p class="text-muted">已选中 ${clientIds.length} 台客户端。请粘贴这些客户端预检产生的候选备份集 ID，每行一个。</p>
-      <div class="frow"><label>候选备份集 ID *</label><textarea id="cb_candidate_ids" class="mono" placeholder="每行一个 GUID"></textarea></div>
-      <div class="form-grid"><div class="frow"><label>批次名称</label><input id="cb_name" placeholder="可选"></div><div class="frow"><label>并发客户端数</label><input id="cb_cc" type="number" min="1" max="50" value="2"></div></div>
+    const ov = openModal('按编号补传', `
+      <p class="text-muted">日常备份请用「立即备份」，不需要用到这里。这一项是给「已经检查过、但当时没传成功，现在想指定几份补传」的情况用的。</p>
+      <p class="text-muted">已选中 ${clientIds.length} 台客户端。编号可以在「运行记录」页的「这次备份」一列里找到，一行一个。</p>
+      <div class="frow"><label>备份编号 *</label><textarea id="cb_candidate_ids" class="mono" placeholder="一行一个，形如 3f2a1c9e-…"></textarea></div>
+      <div class="form-grid"><div class="frow"><label>批次名称</label><input id="cb_name" placeholder="可选"></div><div class="frow"><label>同时传几台</label><input id="cb_cc" type="number" min="1" max="50" value="2"><div class="hint">其余的排队等着，前一台传完才放下一台</div></div></div>
       <div class="frow inline"><label><input type="checkbox" id="cb_skip_busy" checked> 跳过有活动上传的客户端</label></div>`, { okText: '创建批量上传' });
     let settled = false;
     const finish = value => { if (settled) return; settled = true; closeModal(); resolve(value); };
@@ -201,7 +220,7 @@ function openClientUploadBatch(clientIds) {
     ov.addEventListener('click', ev => { if (ev.target === ov) finish(false); }, { once: true });
     ov.querySelector('[data-ok]').addEventListener('click', async () => {
       const ids = $('#cb_candidate_ids').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-      if (!ids.length) { toast('请填写至少一个候选备份集 ID', 'err'); return; }
+      if (!ids.length) { toast('请至少填一个备份编号', 'err'); return; }
       const btn = ov.querySelector('[data-ok]'); btn.disabled = true;
       try {
         const d = await api('/api/v1/admin/operations/upload-batches', { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: {

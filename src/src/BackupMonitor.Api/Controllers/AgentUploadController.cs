@@ -86,6 +86,18 @@ public class AgentUploadController : ApiBaseController
         return OkData(result);
     }
 
+    /// <summary>
+    /// 中断会话（待办方案 E）：这次传失败了，但会话与暂存留着，下次从缺哪块传哪块接着传。
+    /// Agent 此前遇到异常一律调 cancel，于是「断网能续传，出错不能续传」。
+    /// </summary>
+    [HttpPost("{sessionId:guid}/interrupt")]
+    public async Task<ActionResult<ApiResponse>> InterruptSession(
+        Guid sessionId, [FromBody] InterruptUploadSessionRequest request, CancellationToken ct)
+    {
+        await _sessionService.InterruptSessionAsync(ClientIdentity, sessionId, request, ct);
+        return OkMessage("会话已标记为可续传");
+    }
+
     /// <summary>取消会话（14.7，已入库会话禁止取消）</summary>
     [HttpPost("{sessionId:guid}/cancel")]
     public async Task<ActionResult<ApiResponse>> CancelSession(Guid sessionId, CancellationToken ct)

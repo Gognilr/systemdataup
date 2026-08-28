@@ -40,7 +40,12 @@ public class ExceptionHandlingMiddleware
             await WriteErrorAsync(context, 409, "CONFLICT", "数据已被其他操作修改，请刷新后重试");
             return;
         }
-        catch (DbUpdateException ex) when (IsForeignKeyViolation(ex, out var constraint))
+        // DbUpdateException 只包住 SaveChanges 抛出的冲突；ExecuteDelete/ExecuteUpdate
+        // 走的是原始 ADO 通道，抛出来的就是裸的 PostgresException，此前正好从这个
+        // catch 旁边漏过去，落进下面的兜底 500 里——外键冲突是最需要说清楚的一类错误，
+        // 却偏偏在最容易发生的那条路径上变成了「服务器内部错误，请稍后重试」。
+        catch (Exception ex) when (ex is DbUpdateException or PostgresException
+                                   && IsForeignKeyViolation(ex, out var constraint))
         {
             // 外键冲突是「这条记录还被别处引用着」，属于业务冲突而不是服务器故障。
             // 兜底成 500 的话，界面只会显示「服务器内部错误，请稍后重试」——
@@ -82,7 +87,8 @@ public class ExceptionHandlingMiddleware
     private static bool IsForeignKeyViolation(Exception exception, out string constraint)
     {
         constraint = "unknown";
-        for (var current = exception.InnerException; current is not null; current = current.InnerException)
+        // 从异常自身开始，而不是从 InnerException——裸的 PostgresException 没有内层。
+        for (var current = exception; current is not null; current = current.InnerException)
         {
             if (current is not PostgresException { SqlState: PostgresErrorCodes.ForeignKeyViolation } postgres)
                 continue;

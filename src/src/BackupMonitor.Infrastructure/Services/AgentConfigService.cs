@@ -63,6 +63,13 @@ public class AgentConfigService : IAgentConfigService
             .OrderBy(t => t.Priority).ThenBy(t => t.CreatedAt)
             .ToListAsync(ct);
 
+        // 进了备份计划的任务由服务端计划驱动，它自己的扫描计划不再下发——
+        // 两者都留着的话，同一个任务一天会跑两次（一次 Agent 按 cron 触发，一次计划驱动）。
+        var plannedTaskIds = await _db.BackupPlanItems
+            .Where(i => i.Task.ClientId == clientId)
+            .Select(i => i.TaskId)
+            .ToListAsync(ct);
+
         var services = await _db.MonitoredServiceDefinitions
             .Where(d => d.ClientId == clientId && d.Enabled)
             .OrderBy(d => d.ServiceName)
@@ -85,7 +92,7 @@ public class AgentConfigService : IAgentConfigService
                 RecognizerType = EnumMapping.ToSnakeCase(t.RecognizerType),
                 TaskMode = EnumMapping.ToSnakeCase(t.TaskMode),
                 Enabled = t.Enabled,
-                ScanSchedule = t.ScanSchedule,
+                ScanSchedule = plannedTaskIds.Contains(t.Id) ? null : t.ScanSchedule,
                 ScheduleTimezone = t.ScheduleTimezone,
                 StabilityIntervalSeconds = t.StabilityIntervalSeconds,
                 MaxStabilityWaitSeconds = t.MaxStabilityWaitSeconds,

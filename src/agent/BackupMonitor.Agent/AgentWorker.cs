@@ -694,13 +694,16 @@ public sealed class AgentWorker : BackgroundService
 
     /// <summary>
     /// 识别测试专用的稳定等待：人在对话框前等结果，不能像计划扫描那样跨主循环轮次重试，
-    /// 但也不能对着 maxStabilityWaitSeconds（可能配了 10 分钟）傻等——
-    /// 因此在 min(maxStabilityWaitSeconds, 60s) 内同步重试，超时就把仍在变化的原因写清楚。
+    /// 但也不能对着 maxStabilityWaitSeconds（可能配了 10 分钟）傻等。
+    ///
+    /// 上限是 15 秒，不是 60 秒：界面等一条指令的死线就是 60 秒，等待窗口和死线一样长
+    /// 等于保证超时——人什么都看不到，只能猜是不是离线了。等不到就如实回报
+    /// still_changing，「文件还在写」本身就是一条有用的结论，比一句「等待超时」强。
     /// </summary>
     private async Task<List<BackupScanResult>> ScanWithSyncRestabilizeAsync(AgentTaskConfigDto task, CancellationToken ct)
     {
-        var scans = await _scanner.ScanAsync(task, ct);
-        var maxWaitSeconds = Math.Min(Math.Max(task.MaxStabilityWaitSeconds, 0), 60);
+        var scans = await _scanner.ScanForTestAsync(task, ct);
+        var maxWaitSeconds = Math.Min(Math.Max(task.MaxStabilityWaitSeconds, 0), 15);
         if (maxWaitSeconds <= 0 || !scans.Any(s => s.Status == "still_changing"))
             return scans;
 
@@ -714,7 +717,7 @@ public sealed class AgentWorker : BackgroundService
 
             var delaySeconds = Math.Min(stabilityDelaySeconds, remaining);
             await Task.Delay(TimeSpan.FromSeconds(delaySeconds), ct);
-            scans = await _scanner.ScanAsync(task, ct);
+            scans = await _scanner.ScanForTestAsync(task, ct);
         }
 
         if (stopwatch.Elapsed.TotalSeconds >= maxWaitSeconds)
@@ -1001,6 +1004,12 @@ public sealed class AgentWorker : BackgroundService
 
     private async Task SubmitOneScanAsync(AgentTaskConfigDto task, BackupScanResult scan, Guid? commandId, CancellationToken ct)
     {
+        // 试扫结果没有 SHA-256、没有 manifestHash，上报上去就是一个哈希为空的候选备份集——
+        // 上传时才会发现清单对不上。识别测试的两条路径今天都不经过这里，这一刀是为了
+        // 「以后有人图省事把试扫接到上报路径上」那一天：让它当场炸，而不是悄悄产生坏数据。
+        if (scan.IsTestScan)
+            throw new InvalidOperationException($"试扫结果不能上报为预检结果 task={task.Name} root={scan.SourceRoot}");
+
         var response = await _api.SubmitPrecheckAsync(task.TaskId, new SubmitPrecheckResultRequest
         {
             CommandId = commandId,
@@ -1058,7 +1067,8 @@ public sealed class AgentWorker : BackgroundService
         ManifestHash = scan.ManifestHash,
         FailureCode = scan.FailureCode,
         FailureMessage = failureMessage,
-        Files = scan.Files
+        Files = scan.Files,
+        IsTestScan = scan.IsTestScan
     };
 
     private async Task<CommandResult> ExecuteUploadAsync(CommandDto command, CancellationToken ct)
@@ -1130,16 +1140,69 @@ public sealed class AgentWorker : BackgroundService
 
                 var missing = await _api.GetMissingChunksAsync(session.UploadSessionId, remoteFile.UploadFileId, ct);
                 var indexes = ExpandMissing(missing, local.SizeBytes, session.ChunkSizeBytes);
-                foreach (var index in indexes)
-                {
-                    await UploadChunkWithRetryAsync(session.UploadSessionId, remoteFile.UploadFileId, local.FullPath, index, session.ChunkSizeBytes, throttle, ct);
 
-                    // 只累加本次真正传的块。续传时已在服务端的块不在 indexes 里，
-                    // 因此百分比反映的是「这一次要传多少」，不是文件总量——
-                    // 对看进度的人来说这才是有意义的那个数。
-                    sentBytes += Math.Min(session.ChunkSizeBytes, local.SizeBytes - (long)index * session.ChunkSizeBytes);
-                    await progress.ReportAsync(sentBytes, local.RelativePath, ct);
+                // 分块并行发送（原先是严格串行的 foreach）。
+                //
+                // 串行的代价：一块的完整周期是「读盘 → 算哈希 → HTTP 往返 →
+                // 服务端写盘+落库 → 应答回来」，这中间网卡基本是空的。
+                // 8MB 在千兆网上只占 0.07 秒，而固定开销远大于此——
+                // 换句话说串行时链路利用率只有个位数百分比，这跟磁盘快不快没关系，
+                // 是「等一个来回才敢发下一个」这件事本身造成的。
+                //
+                // 并行 N 路让「等上一块被处理」和「发下一块」重叠起来。服务端本来就支持：
+                // 同一文件多块并发写、各块偏移互不重叠（见 UploadStorage.WriteChunkAsync），
+                // 分块记录按 (file, index) upsert、计数在数据库侧增量累加，并发落库都是安全的。
+                var queue = new System.Collections.Concurrent.ConcurrentQueue<int>(indexes);
+                var parallel = Math.Clamp(_options.MaxParallelChunks, 1, 16);
+                using var failFast = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                Exception? firstFailure = null;
+
+                async Task RunSenderAsync()
+                {
+                    while (queue.TryDequeue(out var index))
+                    {
+                        try
+                        {
+                            failFast.Token.ThrowIfCancellationRequested();
+                            await UploadChunkWithRetryAsync(
+                                session.UploadSessionId, remoteFile.UploadFileId, local.FullPath,
+                                index, session.ChunkSizeBytes, throttle, failFast.Token);
+
+                            // 只累加本次真正传的块。续传时已在服务端的块不在 indexes 里，
+                            // 因此百分比反映的是「这一次要传多少」，不是文件总量——
+                            // 对看进度的人来说这才是有意义的那个数。
+                            var chunkLength = Math.Min(
+                                session.ChunkSizeBytes,
+                                local.SizeBytes - (long)index * session.ChunkSizeBytes);
+                            var total = Interlocked.Add(ref sentBytes, chunkLength);
+                            await progress.ReportAsync(total, local.RelativePath, failFast.Token);
+                        }
+                        catch (OperationCanceledException) when (failFast.IsCancellationRequested && !ct.IsCancellationRequested)
+                        {
+                            // 另一路已经失败、把大家一起叫停了，本路不是自己出错。
+                            // 不记录，好让真正的失败原因原样冒出去——否则最终抛出的
+                            // 会是一个「已取消」，既掩盖病因，又绕过外层那条
+                            // 「非取消才收尾取消会话」的 catch，留下僵尸会话。
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            // 只留第一个真实失败，并立刻叫停其余几路：
+                            // 一块传不上去，剩下的大概率也传不上去，继续传纯属浪费带宽。
+                            Interlocked.CompareExchange(ref firstFailure, ex, null);
+                            failFast.Cancel();
+                            return;
+                        }
+                    }
                 }
+
+                await Task.WhenAll(Enumerable.Range(0, parallel).Select(_ => RunSenderAsync()));
+
+                // 外层取消优先：那意味着整个 Agent 正在停机，
+                // 不该被包装成「这次上传失败了」。
+                ct.ThrowIfCancellationRequested();
+                if (firstFailure is not null)
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(firstFailure).Throw();
 
                 await _api.CompleteUploadFileAsync(session.UploadSessionId, remoteFile.UploadFileId, new CompleteUploadFileRequest
                 {
@@ -1158,12 +1221,12 @@ public sealed class AgentWorker : BackgroundService
         }
         catch (UploadAbortedException ex)
         {
-            await TryCancelSessionAsync(session.UploadSessionId, ct);
+            await TryInterruptSessionAsync(session.UploadSessionId, ex.ResultCode, ex.Message, ct);
             return CommandResult.FromFailure(ex.ResultCode, ex.Message);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            await TryCancelSessionAsync(session.UploadSessionId, ct);
+            await TryInterruptSessionAsync(session.UploadSessionId, "UPLOAD_ERROR", ex.Message, ct);
             throw;
         }
     }
@@ -1211,6 +1274,13 @@ public sealed class AgentWorker : BackgroundService
             _totalBytes = totalBytes;
         }
 
+        /// <summary>
+        /// 节流状态的互斥锁。分块改为并行发送后，多个上传线程会同时调 ReportAsync，
+        /// 而「读 _lastReportedAt → 判断 → 写回」是个读-改-写序列，不锁就会有多路
+        /// 同时判定放行，把本该 30 秒一次的上报打成一串。
+        /// </summary>
+        private readonly object _gate = new();
+
         public async Task ReportAsync(long sentBytes, string currentPath, CancellationToken ct)
         {
             // try 包住整个方法体，而不是只包那次 HTTP 调用。
@@ -1219,12 +1289,16 @@ public sealed class AgentWorker : BackgroundService
             // 结果是一个纯展示功能整整挡住了备份主链路。
             try
             {
-                var percent = Math.Clamp(Math.Round((decimal)sentBytes * 100 / _totalBytes, 2), 0, 100);
-                if (_clock.Elapsed - _lastReportedAt < MinInterval || percent - _lastReportedPercent < MinPercentDelta)
-                    return;
+                decimal percent;
+                lock (_gate)
+                {
+                    percent = Math.Clamp(Math.Round((decimal)sentBytes * 100 / _totalBytes, 2), 0, 100);
+                    if (_clock.Elapsed - _lastReportedAt < MinInterval || percent - _lastReportedPercent < MinPercentDelta)
+                        return;
 
-                _lastReportedAt = _clock.Elapsed;
-                _lastReportedPercent = percent;
+                    _lastReportedAt = _clock.Elapsed;
+                    _lastReportedPercent = percent;
+                }
 
                 await _send(new CommandProgressRequest
                 {
@@ -1252,22 +1326,29 @@ public sealed class AgentWorker : BackgroundService
     }
 
     /// <summary>
-    /// 尽力取消会话。取消失败只记日志——它是收尾动作，
-    /// 让它的异常盖掉真正的失败原因，排障时看到的就会是「取消失败」而不是「文件不存在」。
+    /// 尽力把会话标记为「中断、可续传」，而不是取消它（待办方案 E）。
     ///
+    /// 取消的代价：会话置 cancelled、暂存随后被清、幂等键被释放，下一次上传只能从 0 开始。
+    /// 于是「断网」能续传（会话还活着），「出错」不能续传——6GB 传到 90% 出一次错就全部重来。
+    /// 中断则把会话停在 retry_wait：状态仍可写、暂存仍在，同一候选的下一条上传指令
+    /// 凭幂等键拿回这个会话，从缺哪块传哪块接着传。
+    ///
+    /// 标记失败只记日志——它是收尾动作，让它的异常盖掉真正的失败原因，
+    /// 排障时看到的就会是「收尾失败」而不是「文件不存在」。
     /// 服务端仍然必须有 LifecycleExpiryWorker 的超时兜底：客户端可能是被 kill 的，
     /// 根本没机会执行这一步。两者是纵深关系，不是二选一。
     /// </summary>
-    private async Task TryCancelSessionAsync(Guid sessionId, CancellationToken ct)
+    private async Task TryInterruptSessionAsync(Guid sessionId, string? code, string? message, CancellationToken ct)
     {
         try
         {
-            await _api.CancelUploadSessionAsync(sessionId, ct);
-            _logger.LogInformation("上传失败，已取消会话 {SessionId}", sessionId);
+            await _api.InterruptUploadSessionAsync(sessionId,
+                new InterruptUploadSessionRequest { ErrorCode = code, ErrorMessage = message }, ct);
+            _logger.LogInformation("上传失败，会话 {SessionId} 已标记为可续传（暂存保留）", sessionId);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "上传失败后取消会话未成功 {SessionId}（服务端超时巡检会兜底）", sessionId);
+            _logger.LogWarning(ex, "上传失败后标记会话可续传未成功 {SessionId}（服务端超时巡检会兜底）", sessionId);
         }
     }
 
@@ -1367,13 +1448,25 @@ public sealed class AgentWorker : BackgroundService
             return delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
         }
 
+        /// <summary>
+        /// 累计字节数的互斥锁。分块并行发送后多路会同时到达这里，
+        /// `_sentBytes += bytes` 不是原子操作，不锁会漏计——而漏计的表现是限速偏松，
+        /// 也就是「限了速但没限住」，恰好是最不容易被发现的那种故障。
+        /// </summary>
+        private readonly object _gate = new();
+
         public async Task AfterChunkAsync(int bytes, CancellationToken ct)
         {
             if (_bytesPerSecond <= 0)
                 return;
 
-            _sentBytes += bytes;
-            var delay = ComputeDelay(_bytesPerSecond, _sentBytes, _clock.Elapsed);
+            TimeSpan delay;
+            lock (_gate)
+            {
+                _sentBytes += bytes;
+                delay = ComputeDelay(_bytesPerSecond, _sentBytes, _clock.Elapsed);
+            }
+
             if (delay > TimeSpan.Zero)
                 await Task.Delay(delay, ct);
         }

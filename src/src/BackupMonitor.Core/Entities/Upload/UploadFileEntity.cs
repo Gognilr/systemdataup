@@ -10,8 +10,13 @@ public class UploadFileEntity
 
     public Guid UploadSessionId { get; set; }
 
-    /// <summary>对应预检阶段的候选文件</summary>
-    public Guid CandidateFileId { get; set; }
+    /// <summary>
+    /// 对应预检阶段的候选文件。可空：候选清单会被下一次预检整体替换，
+    /// 而已经传过的 upload_files 必须留着（它自带 relative_path / size / sha256，
+    /// 不依赖这个引用）。此前这里是 NOT NULL + RESTRICT，结果是任何一个
+    /// 传过一次的候选再也预检不了——删清单撞外键，接口 500，任务就此卡死。
+    /// </summary>
+    public Guid? CandidateFileId { get; set; }
 
     /// <summary>相对路径（会话内唯一）</summary>
     public string RelativePath { get; set; } = null!;
@@ -39,6 +44,6 @@ public class UploadFileEntity
 
     // 导航属性
     public UploadSession UploadSession { get; set; } = null!;
-    public Backup.CandidateFile CandidateFile { get; set; } = null!;
+    public Backup.CandidateFile? CandidateFile { get; set; }
     public ICollection<UploadChunk> Chunks { get; set; } = [];
 }

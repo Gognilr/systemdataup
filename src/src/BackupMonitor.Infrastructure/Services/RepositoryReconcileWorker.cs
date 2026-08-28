@@ -196,7 +196,7 @@ public class RepositoryReconcileWorker : BackgroundService
             AlertKey,
             AlertLevel.Warning,
             "storage",
-            $"仓库发现 {orphans.Count} 个无数据库记录的目录（共 {FormatBytes(totalBytes)}）",
+            $"备份库里有 {orphans.Count} 个查无记录的目录（共 {FormatBytes(totalBytes)}）",
             message,
             ct: ct);
 

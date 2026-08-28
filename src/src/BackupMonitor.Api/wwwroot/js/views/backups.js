@@ -16,10 +16,19 @@ export async function vBackups() {
       <select id="f_status"><option value="">全部状态</option>${optsOf(L.backup_set_status).map(o => `<option value="${o.v}" ${st.status === o.v ? 'selected' : ''}>${o.t}</option>`).join('')}</select>
       <input id="f_kw" placeholder="关键字" value="${esc(st.keyword)}">
       <button class="primary" data-ui-action="loader" data-loader="backups">查询</button>
+      <div class="spacer"></div>
+      <button id="f_recycle">${st.status === 'recycle_bin' ? '← 回到全部备份集' : '回收站'}</button>
     </div>
     <div id="backup-summary-chips" class="filter-chips" aria-label="备份集状态分布"></div>
     <div id="vwrap">${loading()}</div>`);
   $('#f_status').onchange = () => { st.status = $('#f_status').value; st.page = 1; LOADERS.backups(); };
+  // 回收站不是一个独立的页面，它就是「状态 = 回收站」这一档；给一个直达按钮，
+  // 因为「删掉的东西去哪了」是删除之后第一个会问的问题。
+  $('#f_recycle').onclick = () => {
+    st.status = st.status === 'recycle_bin' ? '' : 'recycle_bin';
+    st.page = 1;
+    vBackups();
+  };
   $('#f_kw').onkeydown = ev => { if (ev.key === 'Enter') { st.keyword = ev.target.value.trim(); st.page = 1; LOADERS.backups(); } };
   api('/api/v1/admin/reports/backup-summary').then(summary => {
     const wrap = $('#backup-summary-chips');
@@ -47,7 +56,10 @@ LOADERS.backups = async function () {
       { l: '客户端 / 任务', render: r => `${esc(r.clientHostname)}<span class="sub">${esc(r.taskName)}</span>` },
       { l: '应用', k: 'applicationName' },
       { l: '状态', k: 'status', sort: true, render: r => status('backup_set_status', r.status) },
-      { l: '业务时间', k: 'backupBusinessTime', sort: true, render: r => relTime(r.backupBusinessTime) },
+      // 「3 天前」回答不了「这份是不是周二那次」——精确时间当主行，相对时间降为副行。
+      // 此前精确值只藏在鼠标悬停的 title 里，等于没有。
+      { l: '业务时间', k: 'backupBusinessTime', sort: true,
+        render: r => `${esc(fmtDT(r.backupBusinessTime))}<span class="sub">${relTime(r.backupBusinessTime)}</span>` },
       { l: '大小', k: 'totalBytes', sort: true, num: true, render: r => `${esc(r.totalFiles)} 个文件 / ${fmtBytes(r.totalBytes)}` },
       { l: '锁定', render: r => r.locked ? '<span class="status status--wait pill">已锁定</span>' : '—' },
       { l: '保留至', k: 'retentionUntil', sort: true, render: r => relTime(r.retentionUntil) },
@@ -64,6 +76,13 @@ LOADERS.backups = async function () {
           b.push(`<button class="small danger" data-ui-action="act" data-view="backups" data-action="quarantine" data-id="${esc(r.id)}">隔离</button>`);
         else if (r.status === 'quarantined')
           b.push(`<button class="small primary" data-ui-action="act" data-view="backups" data-action="unquarantine" data-id="${esc(r.id)}">解除隔离</button>`);
+        // 删除走回收站，不是物理删除；回收站里的行给「还原」和「立即彻底删除」两条路
+        if (r.status === 'recycle_bin') {
+          b.push(`<button class="small primary" data-ui-action="act" data-view="backups" data-action="restore-recycled" data-id="${esc(r.id)}">还原</button>`);
+          b.push(`<button class="small danger" data-ui-action="act" data-view="backups" data-action="purge" data-id="${esc(r.id)}">立即彻底删除</button>`);
+        } else if (r.status !== 'deleted' && !r.locked) {
+          b.push(`<button class="small danger" data-ui-action="act" data-view="backups" data-action="recycle" data-id="${esc(r.id)}">删除</button>`);
+        }
         return b.join(' ') || '—';
       } }
     ], data.items, { empty }) + pagerHtml('backups', st);
@@ -104,6 +123,39 @@ ACTIONS['backups:unquarantine'] = async id => {
   await api(`/api/v1/admin/backups/${id}/unquarantine`, { method: 'POST' });
   toast('已解除隔离', 'ok'); LOADERS.backups();
 };
+ACTIONS['backups:recycle'] = async id => {
+  if (!await confirmModal('把这份备份集移进回收站？到期前都可以还原，到期后才真正从磁盘删除。')) return;
+  try {
+    await api(`/api/v1/admin/backups/${id}/recycle`, { method: 'POST' });
+    toast('已移入回收站', 'ok'); LOADERS.backups();
+  } catch (e) { errToast(e); }
+};
+ACTIONS['backups:restore-recycled'] = async id => {
+  if (!await confirmModal('把这份备份集从回收站还原为可用？')) return;
+  try {
+    await api(`/api/v1/admin/backups/${id}/restore-from-recycle-bin`, { method: 'POST' });
+    toast('已还原', 'ok'); LOADERS.backups();
+  } catch (e) { errToast(e); }
+};
+ACTIONS['backups:purge'] = async id => {
+  // 这一步不可撤销，所以问得直白些：它删的是磁盘上的那份文件
+  if (!await confirmModal('立即彻底删除？磁盘上的备份文件会被真正删掉，删完无法找回。')) return;
+  try {
+    await api(`/api/v1/admin/backups/${id}/purge`, { method: 'POST' });
+    toast('已彻底删除', 'ok'); LOADERS.backups();
+  } catch (e) { errToast(e); }
+};
+ACTIONS['backups:copy-path'] = async () => {
+  const path = App.state.backupDetailPath || '';
+  if (!path) return;
+  try {
+    await navigator.clipboard.writeText(path);
+    toast('路径已复制，粘到资源管理器地址栏就能打开', 'ok');
+  } catch {
+    // 非安全上下文（http 访问）下 clipboard API 不可用，退回选中让人自己复制
+    toast('浏览器不允许自动复制，请手动选中路径复制', 'err');
+  }
+};
 ACTIONS['backups:restore'] = async id => createRestore(id);
 function createRestore(backupSetId) {
   formModal('创建恢复请求', [
@@ -121,6 +173,7 @@ export async function vBackupDetail(id) {
   $('#app').innerHTML = shell('backups', '备份集详情', loading());
   try {
     const d = await api(`/api/v1/admin/backups/${id}`);
+    App.state.backupDetailPath = d.repositoryPath || '';
     $('#view').innerHTML = `
     <div class="toolbar"><a href="#/backups">← 返回备份集列表</a><div class="spacer"></div>
       ${d.status === 'available' ? `<button class="primary" data-ui-action="act" data-view="backups" data-action="restore" data-id="${esc(d.id)}">发起恢复</button>
@@ -130,6 +183,12 @@ export async function vBackupDetail(id) {
       ${d.status === 'available' || d.status === 'verification_failed'
         ? `<button class="danger" data-ui-action="act" data-view="backups" data-action="quarantine" data-id="${esc(d.id)}">隔离</button>`
         : (d.status === 'quarantined' ? `<button class="primary" data-ui-action="act" data-view="backups" data-action="unquarantine" data-id="${esc(d.id)}">解除隔离</button>` : '')}
+      ${d.status === 'recycle_bin'
+        ? `<button class="primary" data-ui-action="act" data-view="backups" data-action="restore-recycled" data-id="${esc(d.id)}">还原</button>
+           <button class="danger" data-ui-action="act" data-view="backups" data-action="purge" data-id="${esc(d.id)}">立即彻底删除</button>`
+        : (d.status !== 'deleted' && !d.locked
+          ? `<button class="danger" data-ui-action="act" data-view="backups" data-action="recycle" data-id="${esc(d.id)}">删除</button>`
+          : '')}
     </div>
     <div class="card"><b class="mono">${esc(d.backupSetCode)}</b> ${status('backup_set_status', d.status)}
       ${d.locked ? '<span class="status status--wait pill">已锁定</span>' : ''}
@@ -140,7 +199,11 @@ export async function vBackupDetail(id) {
         <div class="row"><div class="k">上传时间</div><div class="v">${fmtDT(d.uploadedAt)}</div></div>
         <div class="row"><div class="k">规模</div><div class="v">${esc(d.totalFiles)} 个文件 · ${fmtBytes(d.totalBytes)}</div></div>
         <div class="row"><div class="k">校验时间</div><div class="v">${fmtDT(d.verifiedAt)}</div></div>
-        <div class="row"><div class="k">仓库路径</div><div class="v mono">${esc(d.repositoryPath || '—')}</div></div>
+        <!-- 浏览器打不开服务器上的资源管理器，也点不开 file:// 链接（Chrome/Edge 一律拦截）。
+             能做的是把路径原样交到手里：复制出来粘到资源管理器地址栏就行；
+             把仓库根做成只读 SMB 共享之后，这个路径直接就是 \\服务器\repo\… 的形式。 -->
+        <div class="row"><div class="k">仓库路径</div><div class="v mono">${esc(d.repositoryPath || '—')}
+          ${d.repositoryPath ? ' <button class="small" data-ui-action="act" data-view="backups" data-action="copy-path">复制路径</button>' : ''}</div></div>
         <div class="row"><div class="k">清单 SHA-256</div><div class="v mono">${esc(d.manifestSha256 || '—')}</div></div>
         <div class="row"><div class="k">保留至</div><div class="v">${fmtDT(d.retentionUntil)}</div></div>
       </div></div>

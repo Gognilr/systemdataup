@@ -1,4 +1,4 @@
-using BackupMonitor.Shared.Security;
+﻿using BackupMonitor.Shared.Security;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Security.Cryptography;
@@ -168,6 +168,13 @@ public class AgentPrecheckService : IAgentPrecheckService
             candidate.BusinessUnitId = unit.Id;
         }
 
+        // 清单是否真的变了，必须在覆盖 ManifestHash 之前判断。
+        var manifestUnchanged =
+            !isNew
+            && !string.IsNullOrWhiteSpace(candidate.ManifestHash)
+            && string.Equals(candidate.ManifestHash, request.ManifestHash, StringComparison.OrdinalIgnoreCase)
+            && candidate.TotalFiles == request.TotalFiles;
+
         candidate.SourceRoot = request.SourceRoot;
         candidate.BackupBusinessTime = request.BackupBusinessTime;
         candidate.PrecheckStatus = status;
@@ -180,8 +187,13 @@ public class AgentPrecheckService : IAgentPrecheckService
         candidate.FailureMessage = failureMessage;
         candidate.UpdatedAt = now;
 
-        // 文件清单全量替换
-        if (status == PrecheckStatus.Passed && request.Files is not null)
+        // 文件清单全量替换。
+        //
+        // manifestUnchanged 时整段跳过：同一份备份被重复扫到是常态（cron 每天扫、
+        // 人再点一次「下发预检」），而重复扫到的清单逐字节相同——删掉几千行再原样插回去，
+        // 除了搅动 WAL 什么都没做。更要紧的是 candidate_files 会被 upload_files 引用，
+        // 每次重建都在给「引用已被删掉的行」制造机会。
+        if (status == PrecheckStatus.Passed && request.Files is not null && !manifestUnchanged)
         {
             if (!isNew)
                 await _db.Set<CandidateFile>().Where(f => f.CandidateBackupSetId == candidate.Id).ExecuteDeleteAsync(ct);
@@ -241,7 +253,7 @@ public class AgentPrecheckService : IAgentPrecheckService
                 $"task:{task.Id}:precheck:size_abnormal",
                 task.ImportanceLevel >= ImportanceLevel.High ? AlertLevel.Critical : AlertLevel.Warning,
                 "size_abnormal",
-                $"任务 {task.Name} 备份大小异常",
+                $"任务 {task.Name} 的备份大小不对",
                 failureMessage,
                 clientId: clientId,
                 taskId: task.Id,
@@ -254,7 +266,7 @@ public class AgentPrecheckService : IAgentPrecheckService
                 $"task:{task.Id}:precheck:{EnumMapping.ToSnakeCase(status)}",
                 status == PrecheckStatus.Failed ? AlertLevel.Warning : AlertLevel.Notice,
                 "precheck_failed",
-                $"任务 {task.Name} 预检未通过：{EnumMapping.ToSnakeCase(status)}",
+                $"任务 {task.Name} 的备份没通过检查：{PlainText.Of(status)}",
                 failureMessage,
                 clientId: clientId,
                 taskId: task.Id,

@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Security.Cryptography;
 using BackupMonitor.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -44,6 +45,12 @@ public interface IUploadStorage
 
     /// <summary>读取暂存文件流（提交入库用）</summary>
     Task<Stream> OpenStagedFileAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 暂存文件的绝对路径。入库时若暂存与仓库在同一个 NTFS 卷上，
+    /// 可以直接建硬链接而不是整份复制（见 UploadCommitWorker），因此需要路径而不只是流。
+    /// </summary>
+    Task<string> GetStagedFilePathAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default);
 
     /// <summary>尽力清理会话暂存目录（失败仅记日志）</summary>
     Task CleanupSessionAsync(Guid sessionId, CancellationToken ct = default);
@@ -173,6 +180,15 @@ public class UploadStorage : IUploadStorage
         }
     }
 
+    /// <summary>
+    /// 分块读写缓冲大小。
+    ///
+    /// 80KB 是 .NET 的历史默认值，对 4–32MB 的分块意味着每块上百次读写往返。
+    /// 1MB 在实测里把纯写吞吐从 437MB/s 抬到 686MB/s，而分块下限是 4MB，
+    /// 一块至少还能填满四个缓冲，不存在「缓冲比数据还大」的浪费。
+    /// </summary>
+    private const int ChunkIoBufferBytes = 1024 * 1024;
+
     public async Task<(string Hash, long BytesWritten)> WriteChunkAsync(
         Guid sessionId, Guid uploadFileId, int chunkIndex, long offset, Stream data, CancellationToken ct = default)
     {
@@ -183,26 +199,47 @@ public class UploadStorage : IUploadStorage
         // 原先以 FileShare.Read 打开，第二个并发写入直接抛 IOException；
         // 且 useAsync:false 配合 WriteAsync 会阻塞线程池线程。
         // 各分块写入区间由 offset 严格划分且互不重叠，允许并发写是安全的。
-        //
-        // 审查 P1-6：分块被应答为「已接收」时必须真正落盘，否则断电后
-        // 客户端认为已传完、服务端却少了数据——WriteThrough 绕过系统写缓存。
         await using var fileStream = new FileStream(
             path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite,
-            bufferSize: 81920, FileOptions.Asynchronous | FileOptions.WriteThrough);
+            bufferSize: ChunkIoBufferBytes, FileOptions.Asynchronous);
         fileStream.Seek(offset, SeekOrigin.Begin);
 
         using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        var buffer = new byte[81920];
+        var buffer = ArrayPool<byte>.Shared.Rent(ChunkIoBufferBytes);
         long bytesWritten = 0;
-        int read;
-        while ((read = await data.ReadAsync(buffer, ct)) > 0)
+        try
         {
-            sha.AppendData(buffer, 0, read);
-            await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
-            bytesWritten += read;
+            int read;
+            // Rent 可能给回更大的数组，只用申请的那一段，避免把池里的旧字节算进哈希。
+            while ((read = await data.ReadAsync(buffer.AsMemory(0, ChunkIoBufferBytes), ct)) > 0)
+            {
+                sha.AppendData(buffer, 0, read);
+                await fileStream.WriteAsync(buffer.AsMemory(0, read), ct);
+                bytesWritten += read;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
 
-        await fileStream.FlushAsync(ct);
+        // 审查 P1-6：分块被应答为「已接收」时必须真正落盘，否则断电后
+        // 客户端认为已传完、服务端却少了数据。这条要求不变，变的是达成方式。
+        //
+        // 原先用 FileOptions.WriteThrough，代价是**每一次 Write 都是一次持久化写**：
+        // 8MB 分块 / 80KB 缓冲 = 每块 100 次。裸盘上单次 0.3–3ms 还能忍，
+        // 但在虚拟磁盘（PVE/ESXi）、ZFS 无 SLOG、Ceph 这类环境里单次能到 15–30ms，
+        // 乘以 100 就是 1.5–3 秒/块——于是整条链路的速度由存储的同步写延迟决定，
+        // 而不是由网络或数据量决定。现场表现就是千兆内网只跑出 3.7MB/s。
+        //
+        // 改成「正常缓冲写 + 收尾一次 FlushFileBuffers」：落盘保证完全等价
+        // （应答发出前数据已在盘上），但持久化操作从每块 100 次降到 1 次。
+        // 慢存储的单次延迟仍然存在，只是不再被乘以 100——这才是环境无关的写法。
+        //
+        // 只能同步调用：FlushAsync 不做 flushToDisk，.NET 没有异步版 FlushFileBuffers。
+        // 每块一次，代价可接受；同文件并发写时各 handle 刷的是同一个文件，是安全的超集。
+        fileStream.Flush(flushToDisk: true);
+
         return (Convert.ToHexString(sha.GetCurrentHash()).ToLowerInvariant(), bytesWritten);
     }
 
@@ -211,7 +248,11 @@ public class UploadStorage : IUploadStorage
         var dir = await GetSessionDirectoryAsync(sessionId, ct);
         var path = Path.Combine(dir, $"{uploadFileId:N}.part");
 
-        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
+        // 整文件复核要顺序读完整个暂存文件（6GB 备份就是 6GB 读）。
+        // 1MB 缓冲 + SequentialScan 让预读真正起作用，比 80KB 默认值快一大截。
+        await using var stream = new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            ChunkIoBufferBytes, FileOptions.Asynchronous | FileOptions.SequentialScan);
         var hash = await SHA256.HashDataAsync(stream, ct);
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
@@ -227,7 +268,16 @@ public class UploadStorage : IUploadStorage
     {
         var dir = await GetSessionDirectoryAsync(sessionId, ct);
         var path = Path.Combine(dir, $"{uploadFileId:N}.part");
-        return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
+        // 入库时要把整份暂存文件顺序读出来复制进仓库，同样吃预读。
+        return new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.Read,
+            ChunkIoBufferBytes, FileOptions.Asynchronous | FileOptions.SequentialScan);
+    }
+
+    public async Task<string> GetStagedFilePathAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default)
+    {
+        var dir = await GetSessionDirectoryAsync(sessionId, ct);
+        return Path.Combine(dir, $"{uploadFileId:N}.part");
     }
 
     public async Task CleanupSessionAsync(Guid sessionId, CancellationToken ct = default)

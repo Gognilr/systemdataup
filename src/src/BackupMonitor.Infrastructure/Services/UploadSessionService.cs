@@ -19,12 +19,34 @@ public interface IUploadSessionService
     Task<CompleteUploadSessionResponse> CompleteSessionAsync(Guid clientId, Guid sessionId, CompleteUploadSessionRequest request, CancellationToken ct = default);
     Task<UploadSessionStatusResponse> GetSessionStatusAsync(Guid clientId, Guid sessionId, CancellationToken ct = default);
     Task CancelSessionAsync(Guid clientId, Guid sessionId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 这次传挂了，但别把会话作废（待办方案 E）。
+    ///
+    /// Agent 原先遇到异常一律调 cancel，会话置 cancelled、暂存随后被清，
+    /// 下次只能从 0 开始——也就是「断网能续传，出错不能续传」。
+    /// 这里把会话停在 retry_wait：状态仍然可写、暂存仍然在，
+    /// 同一候选的下一条上传指令凭幂等键拿回这个会话，从缺哪块传哪块继续。
+    /// </summary>
+    Task InterruptSessionAsync(Guid clientId, Guid sessionId, InterruptUploadSessionRequest request, CancellationToken ct = default);
 }
 
 /// <summary>上传会话实现</summary>
 public class UploadSessionService : IUploadSessionService
 {
+    /// <summary>
+    /// 允许写入分块的状态。paused 刻意不在里面（待办方案 E）——
+    /// 它此前被列在这里，于是「暂停」置成了 paused 却拦不住客户端继续写，
+    /// 这个状态等于只是个标签。暂停必须真的能停住写入，后面的按钮才有意义。
+    /// </summary>
     private static readonly UploadStatus[] WritableStatuses =
+        [UploadStatus.Created, UploadStatus.Uploading, UploadStatus.RetryWait];
+
+    /// <summary>
+    /// 占着并发额度与暂存空间的状态。暂停中的会话仍然占着这两样，
+    /// 因此并发上限的判定要算上它——否则暂停一个就能再开一个，暂存目录会被撑爆。
+    /// </summary>
+    private static readonly UploadStatus[] ActiveStatuses =
         [UploadStatus.Created, UploadStatus.Uploading, UploadStatus.Paused, UploadStatus.RetryWait];
 
     private readonly AppDbContext _db;
@@ -68,7 +90,7 @@ public class UploadSessionService : IUploadSessionService
             {
                 if (existing.Status is not (UploadStatus.Failed or UploadStatus.Cancelled or UploadStatus.Expired))
                 {
-                    var existingTimeout = await _settings.GetIntAsync(LifecycleExpiryWorker.SessionTimeoutKey, 3600, ct);
+                    var existingTimeout = await _settings.GetIntAsync(LifecycleExpiryWorker.SessionTimeoutKey, LifecycleExpiryWorker.DefaultSessionTimeoutSeconds, ct);
                     return BuildCreateResponse(existing, resumed: true, existingTimeout);
                 }
 
@@ -123,7 +145,7 @@ public class UploadSessionService : IUploadSessionService
         // 并发与空间
         var maxConcurrent = await _settings.GetIntAsync("max_concurrent_uploads", 2, ct);
         var activeSessions = await _db.UploadSessions
-            .CountAsync(s => s.ClientId == clientId && WritableStatuses.Contains(s.Status), ct);
+            .CountAsync(s => s.ClientId == clientId && ActiveStatuses.Contains(s.Status), ct);
         if (activeSessions >= maxConcurrent)
             throw new BusinessException("UPLOAD_SESSION_CONFLICT", $"客户端活动上传已达上限（{maxConcurrent}）", 409);
 
@@ -135,7 +157,7 @@ public class UploadSessionService : IUploadSessionService
         // 审计 A-03：这个值原先取出来就没再用过（编译器不报 CS0219，因为它来自方法调用），
         // 于是「会话超时」这件事从头到尾没有任何人执行。现在它有两个真实用途：
         // 下面返回给 Agent 的 ExpiresAt，以及 LifecycleExpiryWorker 的过期判定基准。
-        var sessionTimeout = await _settings.GetIntAsync(LifecycleExpiryWorker.SessionTimeoutKey, 3600, ct);
+        var sessionTimeout = await _settings.GetIntAsync(LifecycleExpiryWorker.SessionTimeoutKey, LifecycleExpiryWorker.DefaultSessionTimeoutSeconds, ct);
         var now = DateTime.UtcNow;
 
         var session = new UploadSession
@@ -237,35 +259,62 @@ public class UploadSessionService : IUploadSessionService
     public async Task<UploadChunkResponse> UploadChunkAsync(
         Guid clientId, Guid sessionId, Guid fileId, int chunkIndex, long offset, string expectedHash, Stream data, CancellationToken ct = default)
     {
-        var session = await LoadOwnedSessionAsync(clientId, sessionId, ct);
-        if (!WritableStatuses.Contains(session.Status))
-            throw new BusinessException("UPLOAD_SESSION_CONFLICT", $"会话状态 {EnumMapping.ToSnakeCase(session.Status)} 不允许写入", 409);
+        // 一次投影查询同时取回会话与文件的校验字段。
+        //
+        // 原先是 LoadOwnedSessionAsync + LoadOwnedFileAsync 两次 SELECT，而后者内部
+        // 又会把会话再查一遍——每块三次查询，且都进变更跟踪。这条路径每块都要走，
+        // 跟踪实体纯属浪费：真正要改的字段最后由一条 SQL 直接更新。
+        var ctx = await _db.UploadFiles.AsNoTracking()
+            .Where(f => f.Id == fileId)
+            .Select(f => new
+            {
+                f.UploadSessionId,
+                f.TotalChunks,
+                f.SizeBytes,
+                SessionClientId = f.UploadSession.ClientId,
+                SessionStatus = f.UploadSession.Status,
+                SessionChunkSize = f.UploadSession.ChunkSizeBytes
+            })
+            .FirstOrDefaultAsync(ct);
 
-        var file = await LoadOwnedFileAsync(clientId, sessionId, fileId, ct);
+        // 查不到文件、或文件不属于这个会话：走回原来的两步路径，
+        // 让「会话不存在 / 会话不属于本客户端 / 文件不存在」这三种错误
+        // 仍然按原有的顺序和错误码抛出。异常路径多一次查询无所谓。
+        if (ctx is null || ctx.UploadSessionId != sessionId)
+        {
+            await LoadOwnedSessionAsync(clientId, sessionId, ct);
+            await LoadOwnedFileAsync(clientId, sessionId, fileId, ct);
+            throw new NotFoundException("上传文件", fileId);
+        }
+
+        if (ctx.SessionClientId != clientId)
+            throw new BusinessException("FORBIDDEN", "会话不属于当前客户端", 403);
+        if (!WritableStatuses.Contains(ctx.SessionStatus))
+            throw new BusinessException("UPLOAD_SESSION_CONFLICT", $"会话状态 {EnumMapping.ToSnakeCase(ctx.SessionStatus)} 不允许写入", 409);
 
         // 块序号校验
-        if (chunkIndex < 0 || chunkIndex >= file.TotalChunks)
-            throw new BusinessException("CHUNK_INVALID", $"块序号 {chunkIndex} 超出范围（0..{file.TotalChunks - 1}）", 400);
+        if (chunkIndex < 0 || chunkIndex >= ctx.TotalChunks)
+            throw new BusinessException("CHUNK_INVALID", $"块序号 {chunkIndex} 超出范围（0..{ctx.TotalChunks - 1}）", 400);
 
         // 偏移校验
-        var expectedOffset = (long)chunkIndex * session.ChunkSizeBytes;
+        var expectedOffset = (long)chunkIndex * ctx.SessionChunkSize;
         if (offset != expectedOffset)
             throw new BusinessException("CHUNK_INVALID", $"块偏移 {offset} 与期望 {expectedOffset} 不符", 400);
 
         if (string.IsNullOrWhiteSpace(expectedHash))
             throw new BusinessException("CHUNK_INVALID", "缺少 X-Chunk-SHA256", 400);
 
-        var (serverHash, chunkBytes) = await _storage.WriteChunkAsync(sessionId, file.Id, chunkIndex, offset, data, ct);
+        var (serverHash, chunkBytes) = await _storage.WriteChunkAsync(sessionId, fileId, chunkIndex, offset, data, ct);
 
         // 审查 P1-1：块长度必须与块序号推出的期望值一致。
         // 原先只校验偏移与哈希，不校验长度——非末块传一个短块即可在暂存文件里留下空洞，
         // 而空洞位置的字节是 0，块自身的哈希仍然自洽，只有整文件哈希才会发现。
         // 在这里拦住可以让错误停在出问题的那一块，而不是整份传完再报。
-        var isLastChunk = chunkIndex == file.TotalChunks - 1;
-        var expectedChunkBytes = isLastChunk ? file.SizeBytes - offset : session.ChunkSizeBytes;
+        var isLastChunk = chunkIndex == ctx.TotalChunks - 1;
+        var expectedChunkBytes = isLastChunk ? ctx.SizeBytes - offset : ctx.SessionChunkSize;
         if (chunkBytes != expectedChunkBytes)
         {
-            await MarkFileFailedAsync(file, "CHUNK_INVALID", ct);
+            await MarkFileFailedAsync(fileId, "CHUNK_INVALID", ct);
             throw new BusinessException(
                 "CHUNK_INVALID",
                 $"块长度错误（块 {chunkIndex}：期望 {expectedChunkBytes} 字节，实际 {chunkBytes} 字节）", 400);
@@ -273,52 +322,93 @@ public class UploadSessionService : IUploadSessionService
 
         if (!string.Equals(serverHash, expectedHash, StringComparison.OrdinalIgnoreCase))
         {
-            await MarkFileFailedAsync(file, "CHUNK_HASH_MISMATCH", ct);
+            await MarkFileFailedAsync(fileId, "CHUNK_HASH_MISMATCH", ct);
             throw new BusinessException("CHUNK_HASH_MISMATCH", $"分块哈希错误（块 {chunkIndex}）", 409);
         }
 
-        var now = DateTime.UtcNow;
-
-        // upsert 分块记录（以实际写入字节数为块大小）
-        var chunk = await _db.UploadChunks.FirstOrDefaultAsync(c => c.UploadFileId == file.Id && c.ChunkIndex == chunkIndex, ct);
-        if (chunk is null)
-        {
-            chunk = new UploadChunk
-            {
-                Id = Guid.NewGuid(),
-                UploadFileId = file.Id,
-                ChunkIndex = chunkIndex
-            };
-            _db.UploadChunks.Add(chunk);
-        }
-        chunk.OffsetBytes = offset;
-        chunk.SizeBytes = (int)chunkBytes;
-        chunk.ExpectedHash = expectedHash;
-        chunk.ServerHash = serverHash;
-        chunk.Status = UploadChunkStatus.Received;
-        chunk.ReceivedAt = now;
-
-        file.Status = UploadFileStatus.Uploading;
-        session.Status = UploadStatus.Uploading;
-        session.LastActivityAt = now;
-        session.UpdatedAt = now;
-
-        // 先持久化分块记录，确保后续聚合查询包含本次分块
-        await _db.SaveChangesAsync(ct);
-
-        file.UploadedChunks = await _db.UploadChunks
-            .CountAsync(c => c.UploadFileId == file.Id && c.Status == UploadChunkStatus.Received, ct);
-        file.UploadedBytes = await _db.UploadChunks
-            .Where(c => c.UploadFileId == file.Id && c.Status == UploadChunkStatus.Received)
-            .SumAsync(c => (long)c.SizeBytes, ct);
-        // 会话级按分块粒度汇总，避免依赖尚未保存的 file.UploadedBytes
-        session.UploadedBytes = await _db.UploadChunks
-            .Where(c => c.UploadFile.UploadSessionId == session.Id && c.Status == UploadChunkStatus.Received)
-            .SumAsync(c => (long)c.SizeBytes, ct);
-
-        await _db.SaveChangesAsync(ct);
+        await RecordReceivedChunkAsync(sessionId, fileId, chunkIndex, offset, (int)chunkBytes, expectedHash, serverHash, ct);
 
         return new UploadChunkResponse { Received = true, ChunkIndex = chunkIndex, ServerHash = serverHash };
+    }
+
+    /// <summary>
+    /// 把「这一块已收到」这件事落库：分块记录 upsert + 文件级与会话级计数推进，
+    /// 全部在**一条语句、一个事务**里完成。
+    ///
+    /// 为什么值得写成裸 SQL：原先这一步是 5 次往返 + 2 次事务提交
+    /// （SELECT 分块 → SaveChanges → COUNT → SUM → 带 join 的 SUM → SaveChanges）。
+    /// 两次提交就是两次 WAL fsync，而 fsync 正是慢存储上最贵的操作——
+    /// 和写穿一样，它在虚拟磁盘 / ZFS 无 SLOG 环境里会被放大十几倍。
+    ///
+    /// 更要命的是那两个 SUM 是全量聚合：每收一块就把该文件已收的所有块重扫一遍，
+    /// 于是单块成本随已传块数线性增长，整个文件是 O(n²)。6GB / 8MB = 768 块时，
+    /// 最后一块要扫 768 行才能算出一个本可以直接加出来的数。
+    ///
+    /// 改成增量累加（uploaded_bytes = uploaded_bytes + 本块大小）之后，
+    /// 单块成本与已传块数无关，且并发上传多块时也是正确的——
+    /// 增量在数据库里做，不存在应用层「读-改-写」的丢更新问题。
+    /// </summary>
+    private async Task RecordReceivedChunkAsync(
+        Guid sessionId, Guid fileId, int chunkIndex, long offset, int chunkBytes,
+        string expectedHash, string serverHash, CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+        var received = EnumMapping.ToSnakeCase(UploadChunkStatus.Received);
+        var fileUploading = EnumMapping.ToSnakeCase(UploadFileStatus.Uploading);
+        var sessionUploading = EnumMapping.ToSnakeCase(UploadStatus.Uploading);
+
+        // 两处细节决定这条语句在并发下对不对，都不是随手能省的：
+        //
+        // 一、`xmax = 0` 是 PostgreSQL 判定「这一行是刚插入的还是被冲突更新的」的标准写法：
+        //     新插入的行 xmax 为 0，被 DO UPDATE 命中的行 xmax 是当前事务号。
+        //     用它把重传识别出来——同一块传两次，字节数只能计一次，
+        //     否则进度会超过 100%、ETA 变成负数，而进度是判断「还要多久」的唯一依据。
+        //
+        // 二、会话那条 UPDATE 的增量取自 `f` 的 RETURNING，而不是另起一个 delta 子查询。
+        //     这不是写法偏好：PostgreSQL 文档写明数据修改型 CTE 之间的执行顺序是**未定义**的，
+        //     两条互不依赖的 UPDATE 谁先谁后不作保证。而客户端现在会并行传同一个文件的多块，
+        //     多个后端会同时更新同一行 upload_files 和同一行 upload_sessions——
+        //     一旦两个后端的加锁顺序相反就是死锁。让会话的更新在数据上依赖文件的更新，
+        //     执行顺序被钉死为 upload_chunks → upload_files → upload_sessions，
+        //     所有后端顺序一致，死锁在结构上不可能发生。
+        //
+        //     COALESCE 兜住 `f` 一行都没更新的情况（文件 id 不存在）：
+        //     少了它 `uploaded_bytes + NULL` 会把整列写成 NULL，
+        //     而这一列是进度和续传判定的依据。
+        await _db.Database.ExecuteSqlInterpolatedAsync($"""
+            WITH ins AS (
+                INSERT INTO upload_chunks (
+                    id, upload_file_id, chunk_index, offset_bytes,
+                    size_bytes, expected_hash, server_hash, status, received_at)
+                VALUES (
+                    gen_random_uuid(), {fileId}, {chunkIndex}, {offset},
+                    {chunkBytes}, {expectedHash}, {serverHash}, {received}, {now})
+                ON CONFLICT (upload_file_id, chunk_index) DO UPDATE SET
+                    offset_bytes  = EXCLUDED.offset_bytes,
+                    size_bytes    = EXCLUDED.size_bytes,
+                    expected_hash = EXCLUDED.expected_hash,
+                    server_hash   = EXCLUDED.server_hash,
+                    status        = EXCLUDED.status,
+                    received_at   = EXCLUDED.received_at
+                RETURNING (xmax = 0) AS is_new, size_bytes
+            ),
+            f AS (
+                UPDATE upload_files SET
+                    uploaded_chunks = uploaded_chunks
+                        + (SELECT CASE WHEN is_new THEN 1 ELSE 0 END FROM ins),
+                    uploaded_bytes  = uploaded_bytes
+                        + (SELECT CASE WHEN is_new THEN size_bytes ELSE 0 END FROM ins),
+                    status          = {fileUploading}
+                WHERE id = {fileId}
+                RETURNING (SELECT CASE WHEN is_new THEN size_bytes ELSE 0 END FROM ins) AS bytes
+            )
+            UPDATE upload_sessions SET
+                uploaded_bytes   = uploaded_bytes + COALESCE((SELECT bytes FROM f), 0),
+                status           = {sessionUploading},
+                last_activity_at = {now},
+                updated_at       = {now}
+            WHERE id = {sessionId}
+            """, ct);
     }
 
     public async Task<CompleteUploadFileResponse> CompleteFileAsync(Guid clientId, Guid sessionId, Guid fileId, CompleteUploadFileRequest request, CancellationToken ct = default)
@@ -448,7 +538,7 @@ public class UploadSessionService : IUploadSessionService
             TotalFiles = session.TotalFiles,
             ErrorCode = session.ErrorCode,
             ErrorMessage = session.ErrorMessage,
-            Resumable = WritableStatuses.Contains(session.Status) || session.Status == UploadStatus.Verifying
+            Resumable = ActiveStatuses.Contains(session.Status) || session.Status == UploadStatus.Verifying
         };
 
         // 审计 H-18：整个会话的已收分块一次查回来按文件分组，不再每个文件查一次。
@@ -509,6 +599,31 @@ public class UploadSessionService : IUploadSessionService
         await _audit.RecordAsync("upload.session.cancel", AuditResult.Success, "upload_session", session.Id, ct: ct);
     }
 
+    public async Task InterruptSessionAsync(
+        Guid clientId, Guid sessionId, InterruptUploadSessionRequest request, CancellationToken ct = default)
+    {
+        var session = await LoadOwnedSessionAsync(clientId, sessionId, ct);
+
+        // 已经终结的会话不回头：入库完了、被人取消了、被管理端暂停了，都不该由 Agent 改写
+        if (session.Status is UploadStatus.Committed or UploadStatus.Cancelled
+            or UploadStatus.Expired or UploadStatus.Paused)
+            return;
+
+        session.Status = UploadStatus.RetryWait;
+        session.ErrorCode = Truncate(request.ErrorCode, 64);
+        session.ErrorMessage = Truncate(request.ErrorMessage, 2000);
+        session.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync(ct);
+
+        await _audit.RecordAsync("upload.session.interrupt", AuditResult.Success, "upload_session", session.Id, ct: ct);
+
+        _logger.LogWarning("上传会话 {SessionId} 中断，暂存与已传分块保留以便续传：{Code} {Message}",
+            session.Id, request.ErrorCode, request.ErrorMessage);
+    }
+
+    private static string? Truncate(string? value, int maxLength) =>
+        string.IsNullOrWhiteSpace(value) ? null : (value.Length <= maxLength ? value : value[..maxLength]);
+
     private async Task<UploadSession> LoadOwnedSessionAsync(Guid clientId, Guid sessionId, CancellationToken ct)
     {
         var session = await _db.UploadSessions.FirstOrDefaultAsync(s => s.Id == sessionId, ct)
@@ -526,11 +641,15 @@ public class UploadSessionService : IUploadSessionService
         return file;
     }
 
-    private async Task MarkFileFailedAsync(UploadFileEntity file, string errorCode, CancellationToken ct)
+    /// <summary>
+    /// 把文件标记为失败。按 id 直接更新而不是先加载实体：调用点（分块校验失败）
+    /// 已经不再持有跟踪实体，而这里也没必要为了改两个字段把整行读回来。
+    /// </summary>
+    private async Task MarkFileFailedAsync(Guid fileId, string errorCode, CancellationToken ct)
     {
-        file.Status = UploadFileStatus.Failed;
-        file.ErrorCode = errorCode;
-        await _db.SaveChangesAsync(ct);
+        var failed = EnumMapping.ToSnakeCase(UploadFileStatus.Failed);
+        await _db.Database.ExecuteSqlInterpolatedAsync(
+            $"UPDATE upload_files SET status = {failed}, error_code = {errorCode} WHERE id = {fileId}", ct);
     }
 
     private static List<ChunkRangeDto> ToRanges(List<int> sorted)

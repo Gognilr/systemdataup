@@ -7,7 +7,7 @@ export async function vUpgrades() {
   $('#app').innerHTML = shell('upgrades', 'Agent 升级下发', loading());
   try {
     $('#view').innerHTML = `<div class="card" style="max-width:860px">
-      <p class="text-muted">经指令通道向选定客户端下发 upgrade_agent 指令，Agent 自行下载并安装升级包。</p>
+      <p class="text-muted">给选中的客户端下发升级通知，它们会自己下载并安装新版本。</p>
       <div class="frow"><label>选择客户端</label>${searchPickerHtml('ug-clients', { multi: true, placeholder: '输入主机名或显示名搜索，可多选' })}
         <div class="hint">搜索后点选，已选的机器会显示在输入框下方</div></div>
       <div class="form-grid"><div class="frow"><label>目标版本 *</label><input id="ug_ver" placeholder="如 1.2.0"></div><div class="frow"><label>升级包 SHA-256 *</label><input id="ug_sha" class="mono" required></div></div>

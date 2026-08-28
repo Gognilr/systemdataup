@@ -56,7 +56,7 @@ LOADERS.alerts = async function () {
       { l: '等级', render: r => status('alert_level', r.level) },
       { l: '状态', render: r => `${status('alert_status', r.status)}${r.isSilenced ? ' <span class="status status--mut pill">静默中</span>' : ''}` },
       { l: '标题', render: r => `<b>${esc(r.title)}</b><span class="sub">${esc((r.message || '').slice(0, 80))}</span>` },
-      { l: '类别', k: 'category' },
+      { l: '类别', render: r => esc(L.alert_category[r.category] || r.category || '—') },
       { l: '客户端 / 任务', render: r => `${esc(r.clientHostname || '—')}<span class="sub">${esc(r.taskName || '')}</span>` },
       { l: '指派给', render: r => esc(r.assignedToName || '—') },
       { l: '次数', num: true, k: 'occurrenceCount' },
@@ -98,8 +98,7 @@ export async function openAlertDrawer(id, viaNav = false) {
     <div class="kv">
       <div class="row"><div class="k">标题</div><div class="v"><b>${esc(d.title)}</b></div></div>
       <div class="row"><div class="k">等级 / 状态</div><div class="v">${status('alert_level', d.level)} ${status('alert_status', d.status)}</div></div>
-      <div class="row"><div class="k">类别</div><div class="v">${esc(d.category || '—')}</div></div>
-      <div class="row"><div class="k">告警键</div><div class="v mono">${esc(d.alertKey)}</div></div>
+      <div class="row"><div class="k">类别</div><div class="v">${esc(L.alert_category[d.category] || d.category || '—')}</div></div>
       <div class="row"><div class="k">客户端 / 任务</div><div class="v">${esc(d.clientHostname || '—')} / ${esc(d.taskName || '—')}</div></div>
       <div class="row"><div class="k">首次 / 最近发生</div><div class="v">${fmtDT(d.firstOccurredAt)} / ${fmtDT(d.lastOccurredAt)}</div></div>
       <div class="row"><div class="k">发生次数</div><div class="v">${esc(d.occurrenceCount)}</div></div>
@@ -114,7 +113,11 @@ export async function openAlertDrawer(id, viaNav = false) {
       <div class="row"><div class="k">处理备注</div><div class="v">${esc(d.handlingNote || '—')}</div></div>
     </div>
     <h3>告警消息</h3><pre class="json">${esc(d.message || '—')}</pre>
-    ${d.metadata ? `<h3>元数据</h3><pre class="json">${esc(prettyJson(d.metadata))}</pre>` : ''}`
+    ${d.metadata ? `<h3>附加信息</h3><pre class="json">${esc(prettyJson(d.metadata))}</pre>` : ''}
+    <details class="fadv"><summary>内部标识（排查用）</summary><div class="kv">
+      <div class="row"><div class="k">去重键</div><div class="v mono">${esc(d.alertKey)}</div></div>
+      <div class="row"><div class="k">类别标识</div><div class="v mono">${esc(d.category || '—')}</div></div>
+    </div></details>`
     });
     if (!viaNav) history.replaceState(null, '', '#/alerts/' + id);
   } catch (e) { errToast(e); }

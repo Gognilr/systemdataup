@@ -18,13 +18,24 @@ export const L = {
   channel: { email: '邮件', wecom: '企业微信', dingtalk: '钉钉' },
   result: { success: '成功', failure: '失败' },
   batch_status: { pending: '等待', running: '执行中', completed: '已完成', partial: '部分完成', failed: '失败', cancelled: '已取消' },
+  command_status: { pending: '等待客户端领取', claimed: '客户端已领取', running: '执行中', succeeded: '成功', failed: '失败', cancelled: '已取消', expired: '已过期', rejected: '被拒绝' },
   recognizer: { latest_single_file: '最新单文件', latest_directory: '最新目录', multi_file_set: '多文件集', subdirectory_units: '子目录单元' },
   service_expected: { running: '运行中', stopped: '已停止' },
   service_actual: { running: '运行中', stopped: '已停止', paused: '已暂停', not_found: '服务不存在', unknown: '未知' },
   service_start_type: { boot: '引导启动', system: '系统启动', auto: '自动', manual: '手动', disabled: '已禁用' },
   client_runtime: { idle: '空闲', uploading: '上传中', working: '执行中' },
   upload_status: { created: '已创建', waiting_permission: '等待放行', uploading: '传输中', paused: '已暂停', retry_wait: '等待重试', received: '已接收', verifying: '校验中', verified: '已校验', committed: '已入库', failed: '失败', cancelled: '已取消', expired: '已过期' },
-  precheck: { not_scanned: '未扫描', passed: '通过', still_changing: '仍在变化', no_new_backup: '没有新备份', required_file_missing: '缺少必需文件', size_abnormal: '大小异常', path_not_found: '路径不存在', access_denied: '拒绝访问', failed: '失败' }
+  precheck: { not_scanned: '未检查', passed: '通过', still_changing: '文件还在写入', no_new_backup: '没有新备份', required_file_missing: '缺少必需文件', size_abnormal: '大小不对', path_not_found: '路径不存在', access_denied: '没有读取权限', failed: '失败' },
+  // 告警类别此前在列表和详情里都是原样输出的英文标识（precheck_failed、upload_commit_failed…）。
+  // 收到告警的人要据此决定做什么，这一列却是最需要翻译的一列。
+  alert_category: {
+    precheck_failed: '备份检查未通过', upload_failed: '备份上传失败', upload_commit_failed: '存入备份库失败',
+    size_abnormal: '备份大小不对', backup_missed: '到点没有备份', verification_failed: '备份复查未通过',
+    restore_verify_failed: '恢复前复查未通过', client_offline: '客户端离线', client_resource: '客户端资源吃紧',
+    client_enrollment: '客户端登记', certificate_expiry: '证书即将到期', service_state: '被监控的服务状态异常',
+    server_storage_low: '服务端磁盘不足', storage: '备份库异常',
+    retention_delete_failed: '过期备份删除失败', retention_breaker_tripped: '保留清理已自动停手'
+  }
 };
 
 /* ── §6.1 状态标记：形状+文字+颜色三重编码。
@@ -44,6 +55,8 @@ const STATUS_MAP = {
   open: ['wait'], acknowledged: ['busy'], in_progress: ['busy'],
   recovered: ['ok'], closed: ['off'], ignored: ['off'],
   pending: ['wait'], sent: ['ok'],
+  // 指令状态：没有映射的值会退成灰点，「成功」显示成灰的就失去了一眼可读的意义
+  claimed: ['wait'], succeeded: ['ok'], rejected: ['err', 'pill'],
   created: ['wait'], waiting_permission: ['wait'], retry_wait: ['wait'],
   received: ['busy'], verified: ['ok'], committed: ['ok'],
   automatic: ['ok'], approval_required: ['busy'], manual: ['mut'], monitor_only: ['mut'], paused: ['wait'],
@@ -280,7 +293,7 @@ export function errToast(e) { toast(e && e.message ? e.message : String(e), 'err
 
 const CRON_DOW = [['1', '周一'], ['2', '周二'], ['3', '周三'], ['4', '周四'], ['5', '周五'], ['6', '周六'], ['0', '周日']];
 const CRON_FREQ = [
-  ['', '不自动扫描（只手动预检）'],
+  ['', '不自动扫描（只在需要时手动点「立即备份」）'],
   ['hourly', '每小时'],
   ['daily', '每天'],
   ['weekly', '每周'],
@@ -331,7 +344,7 @@ function cronCompose(s) {
 }
 
 function cronEcho(s, expr) {
-  if (!expr) return '不自动扫描。任务仍然可以在列表里手动点「预检」';
+  if (!expr) return '不自动扫描。任务仍然可以在列表里手动点「立即备份」';
   const tz = '（按客户端所在时区）';
   const dowText = (CRON_DOW.find(d => d[0] === String(s.dow)) || ['', ''])[1];
   let text;

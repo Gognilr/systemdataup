@@ -15,8 +15,6 @@ public class UploadBatch
     /// <summary>批次内最大并发客户端数</summary>
     public int MaxConcurrentClients { get; set; } = 2;
 
-    /// <summary>单客户端最大并发上传数</summary>
-    public int MaxConcurrentPerClient { get; set; } = 1;
 
     /// <summary>批次带宽限速（KB/s）</summary>
     public int? BandwidthLimitKbps { get; set; }

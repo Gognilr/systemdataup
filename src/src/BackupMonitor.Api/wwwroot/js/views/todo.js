@@ -52,7 +52,7 @@ LOADERS.todo = async function () {
         parts.push(todoItem('○', 'info', `最近自动登记：${esc(client.hostname)}`, `${esc(client.displayName || '')} · 登记：${relTime(client.createdAt)} · 最近心跳：${relTime(client.lastHeartbeatAt)}`, '查看', { kind: 'navigate', hash: `#/clients/${client.id}` }));
   }
   for (const task of problematicTasks) {
-        const reason = task.lastPrecheckStatus ? `最近预检：${esc(L.precheck[task.lastPrecheckStatus] || task.lastPrecheckStatus)}` : `最近成功：${relTime(task.lastSuccessAt)}`;
+        const reason = task.lastPrecheckStatus ? `上次检查：${esc(L.precheck[task.lastPrecheckStatus] || task.lastPrecheckStatus)}` : `最近成功：${relTime(task.lastSuccessAt)}`;
         parts.push(todoItem('▲', 'danger', `任务「${esc(task.name)}」需要检查`, `${esc(task.clientHostname || '')} · ${reason}`, '查看', { kind: 'navigate', hash: `#/tasks/${task.id}` }));
   }
   if (count(summary.problematicTasks) > problematicTasks.length) {

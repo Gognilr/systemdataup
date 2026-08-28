@@ -45,6 +45,37 @@ public class AdminBackupController : ApiBaseController
         return OkData(result);
     }
 
+    /// <summary>
+    /// 删除备份集（待办方案 D）：移入回收站而不是直接物理删，误删还能捞回来。
+    /// 已锁定 / 有活动保留锁 / 正在被恢复下载的备份集会被拒绝（409），
+    /// 判据与保留清理完全一致。
+    /// </summary>
+    [HttpPost("{backupSetId:guid}/recycle")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]
+    public async Task<ActionResult<ApiResponse>> Recycle(Guid backupSetId, CancellationToken ct)
+    {
+        await _backupService.RecycleAsync(backupSetId, ct);
+        return OkMessage("已移入回收站，到期前都可以还原");
+    }
+
+    /// <summary>从回收站还原</summary>
+    [HttpPost("{backupSetId:guid}/restore-from-recycle-bin")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]
+    public async Task<ActionResult<ApiResponse>> RestoreFromRecycleBin(Guid backupSetId, CancellationToken ct)
+    {
+        await _backupService.RestoreFromRecycleBinAsync(backupSetId, ct);
+        return OkMessage("已从回收站还原");
+    }
+
+    /// <summary>立即彻底删除（只对回收站里的备份集开放，物理删除仓库目录，不可撤销）</summary>
+    [HttpPost("{backupSetId:guid}/purge")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]
+    public async Task<ActionResult<ApiResponse>> Purge(Guid backupSetId, CancellationToken ct)
+    {
+        await _backupService.PurgeAsync(backupSetId, ct);
+        return OkMessage("备份集已彻底删除");
+    }
+
     /// <summary>锁定备份（18.4，禁止保留清理）</summary>
     [HttpPost("{backupSetId:guid}/lock")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]

@@ -100,6 +100,17 @@ public class CompleteUploadFileResponse
     public string? ServerSha256 { get; set; }
 }
 
+/// <summary>
+/// 中断会话请求（待办方案 E）：这次传失败了，但会话与暂存要留着，下次接着传。
+/// 与 cancel 的区别就在这里——cancel 是「这次不传了」，interrupt 是「等下再来」。
+/// </summary>
+public class InterruptUploadSessionRequest
+{
+    public string? ErrorCode { get; set; }
+
+    public string? ErrorMessage { get; set; }
+}
+
 /// <summary>完成会话请求（设计书 14.5）</summary>
 public class CompleteUploadSessionRequest
 {

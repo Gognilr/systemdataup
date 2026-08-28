@@ -63,6 +63,7 @@ public static class DependencyInjection
         // 按请求新建的话每次都是第一次，永远比不出增量。
         services.AddSingleton<UploadRateSampler>();
         services.AddScoped<IUploadProgressService, UploadProgressService>();
+        services.AddScoped<IUploadSessionControlService, UploadSessionControlService>();
         services.AddScoped<IUploadSessionService, UploadSessionService>();
         services.AddScoped<IStorageSettingsService, StorageSettingsService>();
 
@@ -72,6 +73,8 @@ public static class DependencyInjection
         services.AddScoped<IBackupTaskService, BackupTaskService>();
         services.AddScoped<IRecognizerWizardService, RecognizerWizardService>();
         services.AddScoped<IBatchOperationService, BatchOperationService>();
+        services.AddScoped<IExecutionQueueService, ExecutionQueueService>();
+        services.AddScoped<IBackupPlanService, BackupPlanService>();
         services.AddScoped<IBackupSetService, BackupSetService>();
         services.AddScoped<IAlertService, AlertService>();
         services.AddScoped<IAuditQueryService, AuditQueryService>();
@@ -102,6 +105,7 @@ public static class DependencyInjection
         services.AddHostedService<MissedBackupWorker>();
         services.AddHostedService<LifecycleExpiryWorker>();
         services.AddHostedService<RepositoryReconcileWorker>();
+        services.AddHostedService<SequentialExecutionWorker>();
 
         return services;
     }

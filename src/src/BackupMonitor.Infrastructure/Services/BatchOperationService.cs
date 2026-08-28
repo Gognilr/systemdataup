@@ -22,6 +22,12 @@ public interface IBatchOperationService
 /// <summary>批量操作实现（批量预检 / 批量上传幂等创建 / 批次查询）</summary>
 public class BatchOperationService : IBatchOperationService
 {
+    /// <summary>
+    /// 批量上传单项的超时（分钟）。取值比计划的 4 小时默认值宽：批量上传是人在界面上
+    /// 挑好候选点下去的，动辄是几十 GB 的历史备份集，不该按夜间计划的节奏判超时。
+    /// </summary>
+    private const int BatchItemTimeoutMinutes = 720;
+
     private static readonly UploadStatus[] ActiveUploadStatuses =
     [
         UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading,
@@ -200,7 +206,6 @@ public class BatchOperationService : IBatchOperationService
                 : request.Name.Trim(),
             CreatedBy = _context.UserId,
             MaxConcurrentClients = Math.Clamp(request.MaxConcurrentClients, 1, 50),
-            MaxConcurrentPerClient = Math.Clamp(request.MaxConcurrentPerClient, 1, 10),
             BandwidthLimitKbps = request.TemporaryBandwidthLimitKbps,
             Status = BatchStatus.Pending,
             TotalItems = accepted.Count,
@@ -212,26 +217,42 @@ public class BatchOperationService : IBatchOperationService
         _db.UploadBatches.Add(batch);
         await _db.SaveChangesAsync(ct);
 
-        // 逐候选下发上传指令（幂等键绑定批次，重复创建不会二次下发）
-        foreach (var candidate in accepted)
+        // V028：不再一次性把所有上传指令全下发出去，而是投进顺序执行队列。
+        // MaxConcurrentClients 由此成为队列的并发度——这个字段此前只是存下来给历史页
+        // 显示成「2 客户端 × 1」，没有任何调度逻辑读它，多台客户端完全没有闸门。
+        // 真正的放行由 SequentialExecutionWorker 做：前一项终结才放下一项。
+        var run = new Core.Entities.Execution.ExecutionRun
         {
-            await _commands.CreateCommandAsync(
-                candidate.ClientId, CommandType.UploadCandidate,
-                taskId: candidate.TaskId,
-                candidateBackupSetId: candidate.Id,
-                payload: new
-                {
-                    candidateBackupSetId = candidate.Id,
-                    batchId = batch.Id,
-                    bandwidthLimitKbps = batch.BandwidthLimitKbps ?? candidate.Task.BandwidthLimitKbps,
-                    chunkSizeBytes = candidate.Task.ChunkSizeBytes,
-                    maxConcurrentPerClient = batch.MaxConcurrentPerClient
-                },
-                priority: candidate.Task.Priority,
-                idempotencyKey: $"batch-upload:{batch.Id}:{candidate.Id}",
-                createdBy: _context.UserId,
-                ct: ct);
+            Id = Guid.NewGuid(),
+            Kind = ExecutionRunKind.UploadBatch,
+            UploadBatchId = batch.Id,
+            Name = batch.Name,
+            Status = BatchStatus.Pending,
+            MaxConcurrent = batch.MaxConcurrentClients,
+            ItemTimeoutMinutes = BatchItemTimeoutMinutes,
+            TriggerSource = "manual",
+            TriggeredBy = _context.UserId,
+            TotalItems = accepted.Count,
+            CreatedAt = now
+        };
+
+        var sort = 0;
+        foreach (var candidate in accepted.OrderBy(c => c.Task.Priority))
+        {
+            run.Items.Add(new Core.Entities.Execution.ExecutionRunItem
+            {
+                Id = Guid.NewGuid(),
+                SortOrder = sort++,
+                ClientId = candidate.ClientId,
+                TaskId = candidate.TaskId,
+                CandidateBackupSetId = candidate.Id,
+                CommandType = CommandType.UploadCandidate,
+                Status = ExecutionItemStatus.Pending
+            });
         }
+
+        _db.ExecutionRuns.Add(run);
+        await _db.SaveChangesAsync(ct);
 
         await _audit.RecordAsync("operations.upload_batch", AuditResult.Success, "upload_batch", batch.Id,
             afterData: JsonSerializer.Serialize(new
@@ -286,49 +307,53 @@ public class BatchOperationService : IBatchOperationService
             .Where(s => s.UploadBatchId == batchId)
             .ToListAsync(ct);
 
-        // 批次下发但客户端尚未创建会话的候选：从指令反查
-        var candidateIdsInSessions = sessions.Select(s => s.CandidateBackupSetId).ToHashSet();
-        var pendingCommands = await _db.Commands.AsNoTracking()
-            .Include(c => c.Client)
-            .Include(c => c.CandidateBackupSet)
-            .Where(c => c.IdempotencyKey != null && c.IdempotencyKey.StartsWith($"batch-upload:{batchId}:"))
+        // V028 起批次的清单以队列为准：还在排队、已经放行、跑完了各是什么状态，队列里都记着。
+        // 此前只能从「已有会话」和「已下发指令」反推，而排队中的项还没有指令，
+        // 在界面上根本不存在——现在它们必须存在，否则并发闸的效果无从观察。
+        var queueItems = await _db.ExecutionRunItems.AsNoTracking()
+            .Include(i => i.Task).ThenInclude(t => t.Client)
+            .Where(i => i.Run.UploadBatchId == batchId)
+            .OrderBy(i => i.SortOrder)
             .ToListAsync(ct);
 
-        var commandByCandidate = pendingCommands
-            .Where(c => c.CandidateBackupSetId is not null)
-            .GroupBy(c => c.CandidateBackupSetId!.Value)
-            .ToDictionary(g => g.Key, g => g.OrderByDescending(c => c.CreatedAt).First());
+        var sessionByCandidate = sessions
+            .GroupBy(s => s.CandidateBackupSetId)
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(s => s.CreatedAt).First());
+
+        var queueCandidateIds = queueItems
+            .Where(i => i.CandidateBackupSetId is not null)
+            .Select(i => i.CandidateBackupSetId!.Value)
+            .ToList();
+        var candidateKeys = await _db.CandidateBackupSets.AsNoTracking()
+            .Where(c => queueCandidateIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, c => c.CandidateKey, ct);
+
+        var commandIds = queueItems.Where(i => i.CommandId != null).Select(i => i.CommandId!.Value).ToList();
+        var commandStatuses = await _db.Commands.AsNoTracking()
+            .Where(c => commandIds.Contains(c.Id))
+            .ToDictionaryAsync(c => c.Id, c => c.Status, ct);
 
         var items = new List<UploadBatchItemDto>();
-
-        foreach (var session in sessions)
+        foreach (var item in queueItems)
         {
-            commandByCandidate.TryGetValue(session.CandidateBackupSetId, out var command);
+            var candidateId = item.CandidateBackupSetId ?? Guid.Empty;
+            sessionByCandidate.TryGetValue(candidateId, out var session);
+
             items.Add(new UploadBatchItemDto
             {
-                CandidateBackupSetId = session.CandidateBackupSetId,
-                CandidateKey = session.CandidateBackupSet.CandidateKey,
-                ClientId = session.ClientId,
-                ClientHostname = session.Client.Hostname,
-                CommandId = command?.Id,
-                CommandStatus = command is not null ? EnumMapping.ToSnakeCase(command.Status) : null,
-                UploadSessionId = session.Id,
-                UploadSessionStatus = EnumMapping.ToSnakeCase(session.Status)
-            });
-        }
-
-        foreach (var command in pendingCommands.Where(c =>
-                     c.CandidateBackupSetId is not null
-                     && !candidateIdsInSessions.Contains(c.CandidateBackupSetId.Value)))
-        {
-            items.Add(new UploadBatchItemDto
-            {
-                CandidateBackupSetId = command.CandidateBackupSetId!.Value,
-                CandidateKey = command.CandidateBackupSet?.CandidateKey ?? string.Empty,
-                ClientId = command.ClientId,
-                ClientHostname = command.Client.Hostname,
-                CommandId = command.Id,
-                CommandStatus = EnumMapping.ToSnakeCase(command.Status)
+                CandidateBackupSetId = candidateId,
+                CandidateKey = candidateKeys.GetValueOrDefault(candidateId, string.Empty),
+                ClientId = item.ClientId,
+                ClientHostname = item.Task.Client.Hostname,
+                CommandId = item.CommandId,
+                CommandStatus = item.CommandId is not null
+                    && commandStatuses.TryGetValue(item.CommandId.Value, out var commandStatus)
+                    ? EnumMapping.ToSnakeCase(commandStatus)
+                    : null,
+                UploadSessionId = item.UploadSessionId ?? session?.Id,
+                UploadSessionStatus = session is not null ? EnumMapping.ToSnakeCase(session.Status) : null,
+                QueueStatus = EnumMapping.ToSnakeCase(item.Status),
+                Message = item.Message
             });
         }
 
@@ -340,7 +365,6 @@ public class BatchOperationService : IBatchOperationService
             CreatedByName = batch.CreatedByUser?.DisplayName,
             Status = EnumMapping.ToSnakeCase(batch.Status),
             MaxConcurrentClients = batch.MaxConcurrentClients,
-            MaxConcurrentPerClient = batch.MaxConcurrentPerClient,
             BandwidthLimitKbps = batch.BandwidthLimitKbps,
             TotalItems = batch.TotalItems,
             SucceededItems = batch.SucceededItems,

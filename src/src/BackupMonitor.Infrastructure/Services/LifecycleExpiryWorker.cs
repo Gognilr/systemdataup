@@ -31,6 +31,13 @@ public class LifecycleExpiryWorker : BackgroundService
     /// <summary>上传会话超时（秒）system_settings 键（V001 已种子，此前赋值后零引用）</summary>
     public const string SessionTimeoutKey = "upload_session_timeout_seconds";
 
+    /// <summary>
+    /// 会话超时的兜底默认值（秒）。6 小时，与 V029 种进 system_settings 的值一致。
+    /// 它不是「一次上传最多能传多久」，而是「多久没有任何动静才认定它废了」——
+    /// 原来的 1 小时对 6GB 级别的备份集太窄，慢链路或白天限速就会在还能续传的时候先判死。
+    /// </summary>
+    public const int DefaultSessionTimeoutSeconds = 21600;
+
     /// <summary>指令领取后未上报开始的退回阈值（秒）system_settings 键（V022 新增，默认 900）</summary>
     public const string ClaimTimeoutKey = "command_claim_timeout_seconds";
 
@@ -43,7 +50,12 @@ public class LifecycleExpiryWorker : BackgroundService
     /// <summary>单轮暂存清理条数上限，避免一轮删太多把巡检卡在锁 TTL 之外</summary>
     private const int CleanupBatchSize = 200;
 
-    /// <summary>会话「还能继续写」的四个状态，与 UploadSessionService.WritableStatuses 一致</summary>
+    /// <summary>
+    /// 还没终结、因而要参与超时判定的四个状态，与 UploadSessionService.ActiveStatuses 一致。
+    ///
+    /// paused 刻意留在里面：它不再是可写状态（待办方案 E 把它从写入白名单里拿掉了），
+    /// 但它仍然占着暂存空间和并发额度。有人点了暂停之后忘掉，超时线就是唯一的兜底。
+    /// </summary>
     private static readonly UploadStatus[] WritableStatuses =
         [UploadStatus.Created, UploadStatus.Uploading, UploadStatus.Paused, UploadStatus.RetryWait];
 
@@ -135,7 +147,7 @@ public class LifecycleExpiryWorker : BackgroundService
         var settings = scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>();
 
         // 下限 60 秒：配得太小会把正在正常传输、只是块间隔略长的会话误杀。
-        var timeoutSeconds = Math.Max(60, await settings.GetIntAsync(SessionTimeoutKey, 3600, ct));
+        var timeoutSeconds = Math.Max(60, await settings.GetIntAsync(SessionTimeoutKey, DefaultSessionTimeoutSeconds, ct));
         var now = DateTime.UtcNow;
         var deadline = now.AddSeconds(-timeoutSeconds);
 

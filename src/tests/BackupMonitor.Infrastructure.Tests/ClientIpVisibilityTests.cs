@@ -1,6 +1,7 @@
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
+using BackupMonitor.Infrastructure.Security;
 using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Models.Agent;
@@ -34,13 +35,22 @@ public class ClientIpVisibilityTests : IAsyncLifetime
         var sc = new ServiceCollection();
         sc.AddLogging();
         sc.AddDbContext<AppDbContext>(o => o.UseNpgsql(_fixture.ConnectionString));
-        sc.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        // AgentConfigService 依赖 CommandSigner（下发配置要签名），而 CommandSigner
+        // 构造时就要一把真实的 RSA 私钥——空配置会让整条心跳链路在 DI 解析阶段就失败。
+        sc.AddSingleton(SigningConfiguration());
+        sc.AddSingleton<CommandSigner>();
+        // ClientAdminService 还要 CertificateAuthority（客户端详情带证书状态）。
+        // 它只依赖 IConfiguration 和日志，两者上面都有了。
+        sc.AddSingleton<CertificateAuthority>();
         sc.AddSingleton<ICurrentContext, NullCurrentContext>();
         sc.AddScoped<IAuditRecorder, DbAuditRecorder>();
         sc.AddScoped<IAgentNotificationService, AgentNotificationService>();
         sc.AddScoped<IAlertingService, AlertingService>();
         sc.AddScoped<IAgentConfigService, AgentConfigService>();
         sc.AddScoped<IAgentHeartbeatService, AgentHeartbeatService>();
+        // ClientAdminService 还要 ICommandDispatcher（详情/操作里会下发指令）；
+        // CommandService 的依赖（库、CommandSigner、告警、日志）上面都齐了。
+        sc.AddScoped<ICommandDispatcher, CommandService>();
         sc.AddScoped<IClientAdminService, ClientAdminService>();
         sc.AddSingleton(sp => new SystemSettingsProvider(
             sp.GetRequiredService<IServiceScopeFactory>(),
@@ -115,8 +125,13 @@ public class ClientIpVisibilityTests : IAsyncLifetime
         await using (var scope = _services.CreateAsyncScope())
         {
             var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-            await db.Database.ExecuteSqlRawAsync(
-                "UPDATE clients SET ip_addresses = '{\"unexpected\": true}'::jsonb WHERE id = {0}", clientId);
+            // 脏数据本身带花括号，而 ExecuteSqlRaw 会对 SQL 文本做复合格式化——
+            // {"unexpected" 被当成占位符去解析，直接抛 FormatException，
+            // 于是这条用例从来没跑到它真正要验的那一步。
+            // 改成把 JSON 当参数传，格式化就无从插手。
+            const string dirtyJson = "{\"unexpected\": true}";
+            await db.Database.ExecuteSqlInterpolatedAsync(
+                $"UPDATE clients SET ip_addresses = CAST({dirtyJson} AS jsonb) WHERE id = {clientId}");
         }
 
         Assert.Empty((await DetailAsync(clientId)).IpAddresses);
@@ -165,6 +180,18 @@ public class ClientIpVisibilityTests : IAsyncLifetime
         await using var scope = _services.CreateAsyncScope();
         var svc = scope.ServiceProvider.GetRequiredService<IClientAdminService>();
         return await svc.GetDetailAsync(clientId);
+    }
+
+    /// <summary>CommandSigner 需要一把真实的 RSA 私钥才能构造；测试里现造一把即可。</summary>
+    private static IConfiguration SigningConfiguration()
+    {
+        using var rsa = System.Security.Cryptography.RSA.Create(2048);
+        return new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Security:CommandSigningPrivateKey"] = Convert.ToBase64String(rsa.ExportPkcs8PrivateKey())
+            })
+            .Build();
     }
 
     private async Task<Guid> SeedClientAsync()

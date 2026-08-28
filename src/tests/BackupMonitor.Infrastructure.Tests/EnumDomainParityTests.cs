@@ -35,7 +35,11 @@ public class EnumDomainParityTests
         { "importance_level", Values<ImportanceLevel>() },
         { "audit_result", Values<AuditResult>() },
         // 审计 G-12 新增 cancelled，把这个域一并纳入守护范围
-        { "notification_status", Values<NotificationStatus>() }
+        { "notification_status", Values<NotificationStatus>() },
+        // V028 备份计划与顺序执行队列的三个新域
+        { "plan_schedule_kind", Values<PlanScheduleKind>() },
+        { "execution_run_kind", Values<ExecutionRunKind>() },
+        { "execution_item_status", Values<ExecutionItemStatus>() }
     };
 
     private static string[] Values<TEnum>() where TEnum : struct, Enum =>

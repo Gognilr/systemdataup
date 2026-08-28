@@ -19,11 +19,11 @@ public class RetentionPolicy
     /// <summary>保留年度版本数</summary>
     public int? KeepYearlyCount { get; set; }
 
-    /// <summary>最短保留天数</summary>
-    public int MinimumRetentionDays { get; set; } = 30;
+    /// <summary>最短保留天数。默认 0：份数/周期规则说了算，不再压过「只留最近 N 份」（V027）</summary>
+    public int MinimumRetentionDays { get; set; }
 
-    /// <summary>回收区保留天数</summary>
-    public int RecycleBinDays { get; set; } = 30;
+    /// <summary>回收区保留天数。默认 7：删掉的先放回收站一周，还能捞回来（V027）</summary>
+    public int RecycleBinDays { get; set; } = 7;
 
     /// <summary>扩展配置（jsonb）</summary>
     public string? Config { get; set; }

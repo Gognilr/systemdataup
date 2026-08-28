@@ -2,10 +2,10 @@
    备份工具最基本的一块表盘：一份几十 GB 的备份传了两小时，
    人要能看出来它还在动、大概什么时候完、还是已经卡死了。 */
 import { api } from '../api.js';
-import { App, LOADERS } from '../state.js';
+import { App, ACTIONS, LOADERS } from '../state.js';
 import {
   $, esc, status, fmtBytes, fmtRate, fmtDuration, relTime,
-  tableHtml, emptyState, xferBar
+  tableHtml, emptyState, xferBar, toast, errToast, confirmModal
 } from '../ui.js';
 import { shell, loading } from '../app.js';
 
@@ -16,7 +16,7 @@ const POLL_IDLE_MS = 15000;
 
 export async function vTransfers() {
   $('#app').innerHTML = shell('transfers', '传输中',
-    `<div class="toolbar"><span class="tip">只显示正在进行的上传会话；传完入库后请到「备份集」查看。</span></div><div id="vwrap">${loading()}</div>`);
+    `<div class="toolbar"><span class="tip">只显示正在传的备份；传完存好之后到「备份集」页面看。</span></div><div id="vwrap">${loading()}</div>`);
   await LOADERS.transfers();
 }
 
@@ -92,5 +92,45 @@ const COLUMNS = [
       : esc(fmtDuration(r.idleSeconds)))
   },
   { l: '状态', render: r => status('upload_status', r.status) },
-  { l: '开始于', render: r => relTime(r.startedAt) }
+  { l: '开始于', render: r => relTime(r.startedAt) },
+  {
+    // 这张表此前是纯只读的：白天发现某台机器正在把带宽占满时，唯一能做的是等它传完。
+    // 暂停会真的停住写入（服务端不再接受分块），暂存与已传的块都留着，恢复时从断点继续。
+    l: '操作',
+    render: r => {
+      const b = [];
+      if (r.status === 'paused')
+        b.push(`<button class="small primary" data-ui-action="act" data-view="transfers" data-action="resume" data-id="${esc(r.sessionId)}">恢复</button>`);
+      else
+        b.push(`<button class="small" data-ui-action="act" data-view="transfers" data-action="pause" data-id="${esc(r.sessionId)}">暂停</button>`);
+      b.push(`<button class="small danger" data-ui-action="act" data-view="transfers" data-action="cancel" data-id="${esc(r.sessionId)}">取消</button>`);
+      return b.join(' ');
+    }
+  }
 ];
+
+ACTIONS['transfers:pause'] = async id => {
+  try {
+    await api(`/api/v1/admin/upload-sessions/${id}/pause`, { method: 'POST' });
+    toast('已暂停，恢复时从断点继续', 'ok');
+    LOADERS.transfers();
+  } catch (e) { errToast(e); }
+};
+
+ACTIONS['transfers:resume'] = async id => {
+  try {
+    await api(`/api/v1/admin/upload-sessions/${id}/resume`, { method: 'POST' });
+    toast('已恢复，客户端会接着传', 'ok');
+    LOADERS.transfers();
+  } catch (e) { errToast(e); }
+};
+
+ACTIONS['transfers:cancel'] = async id => {
+  // 取消之后这次传输就作废了，已传的部分不会被用上——问一句再动手
+  if (!await confirmModal('取消这次传输？已经传上来的部分会作废，下次要重新传。')) return;
+  try {
+    await api(`/api/v1/admin/upload-sessions/${id}/cancel`, { method: 'POST' });
+    toast('这次传输已取消', 'ok');
+    LOADERS.transfers();
+  } catch (e) { errToast(e); }
+};

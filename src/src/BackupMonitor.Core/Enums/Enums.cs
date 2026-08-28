@@ -277,3 +277,36 @@ public enum ImportanceLevel
     High,
     Critical
 }
+
+/// <summary>备份计划的调度方式（V028）</summary>
+public enum PlanScheduleKind
+{
+    /// <summary>每天在 RunAt 时刻执行</summary>
+    Daily,
+
+    /// <summary>每周指定的几天在 RunAt 时刻执行</summary>
+    Weekly
+}
+
+/// <summary>一次顺序执行的来源（V028）：备份计划到点，或一次批量上传</summary>
+public enum ExecutionRunKind
+{
+    BackupPlan,
+    UploadBatch
+}
+
+/// <summary>
+/// 顺序执行队列里单项的状态（V028）。
+/// timeout 与 failed 分开：前者是「等不到它了」（客户端关机/一直没回音），
+/// 后者是「它明确失败了」——排障时要看的地方完全不同。
+/// </summary>
+public enum ExecutionItemStatus
+{
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Timeout,
+    Skipped,
+    Cancelled
+}

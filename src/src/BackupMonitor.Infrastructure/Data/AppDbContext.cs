@@ -60,6 +60,10 @@ public class AppDbContext : DbContext
     public DbSet<Command> Commands => Set<Command>();
     public DbSet<BackupSet> BackupSets => Set<BackupSet>();
     public DbSet<BackupFile> BackupFiles => Set<BackupFile>();
+    public DbSet<BackupPlan> BackupPlans => Set<BackupPlan>();
+    public DbSet<BackupPlanItem> BackupPlanItems => Set<BackupPlanItem>();
+    public DbSet<Core.Entities.Execution.ExecutionRun> ExecutionRuns => Set<Core.Entities.Execution.ExecutionRun>();
+    public DbSet<Core.Entities.Execution.ExecutionRunItem> ExecutionRunItems => Set<Core.Entities.Execution.ExecutionRunItem>();
 
     #endregion
 

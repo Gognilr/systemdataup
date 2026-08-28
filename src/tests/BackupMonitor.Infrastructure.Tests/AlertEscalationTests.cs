@@ -239,7 +239,13 @@ public class AlertEscalationTests : IAsyncLifetime
             RecognizerType = RecognizerType.MultiFileSet,
             TaskMode = TaskMode.Automatic,
             Enabled = enabled,
-            ScanSchedule = "0 2 * * *",
+            // 计划时刻取「4 小时前的那一分钟」并显式钉在 UTC：写死 "0 2 * * *" 时，
+            // 实体默认时区 Asia/Shanghai 会让上一次计划落在中国时间当天 02:00，
+            // 于是每天 02:00~04:00 这两小时里它仍在宽限期内 → 判不出漏备份，
+            // 「真的漏了备份的任务告警仍然保持活动」在这个时段必然失败。
+            // 相对当前时刻取值，任何时候跑都稳定越过宽限期，相邻两次计划仍相隔 24 小时。
+            ScanSchedule = $"{now.AddHours(-4).Minute} {now.AddHours(-4).Hour} * * *",
+            ScheduleTimezone = "UTC",
             CreatedAt = createdAt ?? now.AddDays(-30),
             UpdatedAt = now
         };

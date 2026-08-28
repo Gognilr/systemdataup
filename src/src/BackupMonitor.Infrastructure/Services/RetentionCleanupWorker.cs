@@ -306,7 +306,7 @@ public class RetentionCleanupWorker : BackgroundService
                     $"backup_set:{set.Id}:retention_delete_failed",
                     AlertLevel.Warning,
                     "retention_delete_failed",
-                    $"备份集物理删除失败（{set.BackupSetCode}）",
+                    $"备份文件删不掉（{set.BackupSetCode}）",
                     ex.Message,
                     backupSetId: set.Id,
                     ct: ct);
@@ -384,22 +384,41 @@ public class RetentionCleanupWorker : BackgroundService
             // 熔断判定：本轮回收比例达到阈值即整体暂停该任务，不做部分回收——
             // 部分回收同样会删掉数据，且会让下一轮继续蚕食。
             var percent = candidates.Count * 100 / sets.Count;
+
             if (percent >= breakerPercent)
             {
-                _logger.LogError(
-                    "保留清理熔断：任务 {Task} 本轮拟回收 {N}/{Total}（{Percent}%），达到阈值 {Threshold}%，已暂停该任务回收",
-                    task.Name, candidates.Count, sets.Count, percent, breakerPercent);
+                // 首次清理一次性豁免：熔断挡的是「配错策略」，而「第一次给一个已经攒了几十份的
+                // 任务配上保留策略」必然是一次大比例回收——恰好是最常见的场景，却被这道保险
+                // 整个挡住，于是「配了策略仍然一份不删」。判据是这个任务此前从没被清理过
+                // （没有任何备份集处于 recycle_bin / deleted）。豁免只发生一次：本轮回收之后
+                // 就有 recycle_bin 记录了，下一轮再出现大比例回收就是真的异常。
+                var everCleaned = await db.BackupSets.AnyAsync(
+                    s => s.TaskId == task.Id
+                        && (s.Status == BackupSetStatus.RecycleBin || s.Status == BackupSetStatus.Deleted),
+                    ct);
 
-                await alerting.RaiseAsync(
-                    $"task:{task.Id}:retention_breaker",
-                    AlertLevel.Critical,
-                    "retention_breaker_tripped",
-                    $"保留清理熔断（任务 {task.Name}）",
-                    $"策略 {policy.Name} 本轮拟将 {candidates.Count}/{sets.Count} 个备份集（{percent}%）移入回收站，" +
-                    $"达到熔断阈值 {breakerPercent}%。已暂停该任务的本轮回收，请核对保留规则是否配置正确。",
-                    taskId: task.Id,
-                    ct: ct);
-                continue;
+                if (everCleaned)
+                {
+                    _logger.LogError(
+                        "保留清理熔断：任务 {Task} 本轮拟回收 {N}/{Total}（{Percent}%），达到阈值 {Threshold}%，已暂停该任务回收",
+                        task.Name, candidates.Count, sets.Count, percent, breakerPercent);
+
+                    await alerting.RaiseAsync(
+                        $"task:{task.Id}:retention_breaker",
+                        AlertLevel.Critical,
+                        "retention_breaker_tripped",
+                        $"这一轮要删的备份太多，已自动停手（任务 {task.Name}）",
+                        $"保留策略「{policy.Name}」本轮打算把 {candidates.Count}/{sets.Count} 份备份（{percent}%）移进回收站，" +
+                        $"超过了 {breakerPercent}% 这条保险线。这一轮已经停手，一份都没删——请先核对保留规则是不是配错了。",
+                        taskId: task.Id,
+                        ct: ct);
+                    continue;
+                }
+
+                _logger.LogWarning(
+                    "任务 {Task} 首次执行保留清理，本轮拟回收 {N}/{Total}（{Percent}%）超过阈值 {Threshold}%，" +
+                    "按首次豁免继续执行；回收先进回收站，{Days} 天内可撤销",
+                    task.Name, candidates.Count, sets.Count, percent, breakerPercent, policy.RecycleBinDays);
             }
 
             await alerting.RecoverAsync($"task:{task.Id}:retention_breaker", ct);
@@ -482,7 +501,7 @@ public class RetentionCleanupWorker : BackgroundService
     private static bool IsLocked(BackupSet set, DateTime now) =>
         set.Locked || set.RetentionLocks.Any(l => l.Active && (l.ExpiresAt == null || l.ExpiresAt > now));
 
-    /// <summary>物理删除仓库目录（带路径安全守卫）</summary>
+    /// <summary>物理删除仓库目录（守卫见 RepositoryDirectory，与管理端「立即彻底删除」共用同一份）</summary>
     private void DeleteRepositoryDirectory(BackupSet set, string repositoryRoot)
     {
         if (string.IsNullOrWhiteSpace(set.RepositoryPath))
@@ -491,33 +510,7 @@ public class RetentionCleanupWorker : BackgroundService
             return;
         }
 
-        var full = Path.GetFullPath(set.RepositoryPath);
-
-        // 守卫：必须是绝对路径、不能是盘符根、至少两级目录
-        if (!Path.IsPathRooted(full))
-            throw new InvalidOperationException($"仓库路径不是绝对路径：{full}");
-
-        var root = Path.GetPathRoot(full);
-        var relative = Path.GetRelativePath(root ?? full, full);
-        var segments = relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
-        if (segments.Length < 2)
-            throw new InvalidOperationException($"仓库路径层级过浅，拒绝删除：{full}");
-
-        // 围栏（最关键的一道）：待删目录必须落在当前仓库根之内。
-        // backup_sets.repository_path 是数据库列，迁移出错、手工改库、仓库路径重配或上游拼接
-        // bug 都可能让它指向任意目录，而这里执行的是递归删除——上面的"至少两级"守卫拦不住
-        // C:\Program Files\PostgreSQL 这类路径。入库侧（UploadCommitWorker）本来就用
-        // PathSafety.ResolveUnderBase 做了基目录约束，销毁侧必须对称。
-        //
-        // 仓库根被改过之后，历史备份集会落在围栏之外并因此无法物理删除：这是刻意选择的
-        // 失败方向——拒绝并告警，交由人工确认，绝不猜测性地删除。
-        if (!PathSafety.IsUnderBase(repositoryRoot, full))
-            throw new InvalidOperationException(
-                $"仓库目录不在当前仓库根 {Path.GetFullPath(repositoryRoot)} 之内，拒绝删除：{full}");
-
-        if (Directory.Exists(full))
-            Directory.Delete(full, recursive: true);
-        else
-            _logger.LogWarning("备份集 {Code} 仓库目录不存在，跳过物理删除：{Path}", set.BackupSetCode, full);
+        if (!RepositoryDirectory.DeleteUnderRoot(set.RepositoryPath, repositoryRoot))
+            _logger.LogWarning("备份集 {Code} 仓库目录不存在，跳过物理删除：{Path}", set.BackupSetCode, set.RepositoryPath);
     }
 }

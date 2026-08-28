@@ -116,6 +116,68 @@ public class UploadSessionResumeTests : IDisposable
     }
 
     [Fact]
+    public async Task 重传同一块不会把已传字节算两遍()
+    {
+        await using var sp = BuildServices();
+        await using var scope = sp.CreateAsyncScope();
+        var (svc, db, clientId, candidateId) = await NewSessionContextAsync(scope);
+        var created = await svc.CreateSessionAsync(clientId, CreateRequest(candidateId));
+        var sessionId = created.UploadSessionId;
+        var fileId = created.Files[0].UploadFileId;
+
+        await UploadChunkAsync(svc, clientId, sessionId, fileId, 0);
+        await UploadChunkAsync(svc, clientId, sessionId, fileId, 0);
+        await UploadChunkAsync(svc, clientId, sessionId, fileId, 0);
+
+        // 计数从「每块重新 SUM 一遍」改成了数据库侧增量累加，
+        //「这一块是新收的还是重传的」由 upsert 的 xmax 判定。判错的表现是
+        // 进度超过 100%、剩余时间变成负数——重试在弱网下是常态，必须钉住。
+        var file = await db.UploadFiles.AsNoTracking().SingleAsync(f => f.Id == fileId);
+        var session = await db.UploadSessions.AsNoTracking().SingleAsync(s => s.Id == sessionId);
+        Assert.Equal(1, file.UploadedChunks);
+        Assert.Equal(ChunkSize, file.UploadedBytes);
+        Assert.Equal(ChunkSize, session.UploadedBytes);
+    }
+
+    [Fact]
+    public async Task 并发上传多块时计数不丢且整文件哈希仍然正确()
+    {
+        await using var sp = BuildServices();
+        await using var setup = sp.CreateAsyncScope();
+        var (svc, _, clientId, candidateId) = await NewSessionContextAsync(setup);
+        var created = await svc.CreateSessionAsync(clientId, CreateRequest(candidateId));
+        var sessionId = created.UploadSessionId;
+        var fileId = created.Files[0].UploadFileId;
+
+        // 全部分块同时上传。每路各用一个 scope：AppDbContext 不是线程安全的，
+        // 而真实场景里这几个请求本来就落在各自独立的请求作用域上。
+        // 客户端现在默认并行 4 路发送，这条用例复现的就是那个形状。
+        await Task.WhenAll(Enumerable.Range(0, ChunkCount).Select(async index =>
+        {
+            await using var parallelScope = sp.CreateAsyncScope();
+            var parallelSvc = parallelScope.ServiceProvider.GetRequiredService<IUploadSessionService>();
+            await UploadChunkAsync(parallelSvc, clientId, sessionId, fileId, index);
+        }));
+
+        // 增量累加发生在数据库里（uploaded_bytes = uploaded_bytes + n），
+        // 不存在应用层「读-改-写」的丢更新。这条断言钉住的就是这一点。
+        await using var verifyScope = sp.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var file = await verifyDb.UploadFiles.AsNoTracking().SingleAsync(f => f.Id == fileId);
+        var session = await verifyDb.UploadSessions.AsNoTracking().SingleAsync(s => s.Id == sessionId);
+        Assert.Equal(ChunkCount, file.UploadedChunks);
+        Assert.Equal(Payload.Length, file.UploadedBytes);
+        Assert.Equal(Payload.Length, session.UploadedBytes);
+
+        // 几块并发写进同一个暂存文件，整文件哈希必须仍然对得上——
+        // 各块写入区间由 offset 严格划分、互不重叠，这是允许并发写的前提。
+        var complete = await svc.CompleteFileAsync(clientId, sessionId, fileId,
+            new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = FullHash() });
+        Assert.Equal("verified", complete.Status);
+        Assert.Equal(FullHash(), complete.ServerSha256);
+    }
+
+    [Fact]
     public async Task 块哈希不匹配拒收()
     {
         await using var sp = BuildServices();
@@ -221,6 +283,79 @@ public class UploadSessionResumeTests : IDisposable
         // 补传缺失块后完成
         await UploadChunkAsync(svc2, clientId, sessionId, fileId, 2);
         var complete = await svc2.CompleteFileAsync(clientId, sessionId, fileId,
+            new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = FullHash() });
+        Assert.Equal("verified", complete.Status);
+    }
+
+    /// <summary>
+    /// 待办方案 E：暂停必须真的停住写入。
+    /// paused 此前被列在可写状态里，于是这个状态只是个标签——
+    /// 界面上点了暂停，客户端照传不误。
+    /// </summary>
+    [Fact]
+    public async Task 暂停中的会话拒绝写入()
+    {
+        await using var sp = BuildServices();
+        await using var scope = sp.CreateAsyncScope();
+        var (svc, db, clientId, candidateId) = await NewSessionContextAsync(scope);
+
+        var created = await svc.CreateSessionAsync(clientId, CreateRequest(candidateId));
+        var sessionId = created.UploadSessionId;
+        var fileId = created.Files[0].UploadFileId;
+
+        await UploadChunkAsync(svc, clientId, sessionId, fileId, 0);
+
+        await db.UploadSessions.Where(s => s.Id == sessionId)
+            .ExecuteUpdateAsync(s => s.SetProperty(x => x.Status, UploadStatus.Paused));
+
+        var ex = await Assert.ThrowsAsync<BusinessException>(
+            () => UploadChunkAsync(svc, clientId, sessionId, fileId, 1));
+        Assert.Equal(409, ex.StatusCode);
+
+        // 已经传上来的块一块都不能少：暂停不是取消
+        var missing = await svc.GetMissingChunksAsync(clientId, sessionId, fileId);
+        Assert.Equal(new List<int> { 0 }, missing.Received);
+    }
+
+    /// <summary>
+    /// 待办方案 E 的另一半：出错也要能续传。
+    /// Agent 原先遇到异常一律调 cancel，会话作废、幂等键释放，下一次从 0 开始——
+    /// 「断网能续传，出错不能续传」。中断则把会话停在可续传的状态。
+    /// </summary>
+    [Fact]
+    public async Task 出错中断后接着传而不是从头传()
+    {
+        var idempotencyKey = $"it3-interrupt-{Guid.NewGuid():N}";
+
+        await using var sp = BuildServices();
+        await using var scope = sp.CreateAsyncScope();
+        var (svc, db, clientId, candidateId) = await NewSessionContextAsync(scope);
+
+        var created = await svc.CreateSessionAsync(clientId, CreateRequest(candidateId, idempotencyKey));
+        var sessionId = created.UploadSessionId;
+        var fileId = created.Files[0].UploadFileId;
+
+        await UploadChunkAsync(svc, clientId, sessionId, fileId, 0);
+        await UploadChunkAsync(svc, clientId, sessionId, fileId, 1);
+
+        // 传到一半出错
+        await svc.InterruptSessionAsync(clientId, sessionId,
+            new InterruptUploadSessionRequest { ErrorCode = "UPLOAD_ERROR", ErrorMessage = "连接被重置" });
+
+        var session = await db.UploadSessions.AsNoTracking().SingleAsync(s => s.Id == sessionId);
+        Assert.Equal(UploadStatus.RetryWait, session.Status);
+        Assert.Equal("UPLOAD_ERROR", session.ErrorCode);
+
+        // 下一条上传指令凭幂等键拿回同一个会话，只补缺的那一块
+        var resumed = await svc.CreateSessionAsync(clientId, CreateRequest(candidateId, idempotencyKey));
+        Assert.Equal("resumed", resumed.Status);
+        Assert.Equal(sessionId, resumed.UploadSessionId);
+
+        var missing = await svc.GetMissingChunksAsync(clientId, sessionId, fileId);
+        Assert.Equal(new List<int> { 2 }, missing.Missing);
+
+        await UploadChunkAsync(svc, clientId, sessionId, fileId, 2);
+        var complete = await svc.CompleteFileAsync(clientId, sessionId, fileId,
             new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = FullHash() });
         Assert.Equal("verified", complete.Status);
     }

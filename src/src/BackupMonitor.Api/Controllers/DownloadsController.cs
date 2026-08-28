@@ -67,6 +67,10 @@ public class DownloadsController : ApiBaseController
             Response.StatusCode = StatusCodes.Status200OK;
             Response.ContentType = "application/zip";
             Response.Headers.ContentDisposition = BuildContentDisposition($"{context.BackupSetCode}.zip");
+            // 明说不支持续传：ZIP 是边打包边写出的，没有 Content-Length，也无法从中间某个字节接着给。
+            // 不写这个头的话，下载工具会自己发 Range 请求、被当成普通请求全量重发，
+            // 表现成「续传了但进度回到 0」——比直接说不支持更难排查。
+            Response.Headers.AcceptRanges = "none";
 
             using (var zip = new ZipArchive(counting, ZipArchiveMode.Create, leaveOpen: true))
             {
@@ -158,6 +162,9 @@ public class DownloadsController : ApiBaseController
         Response.ContentType = "application/octet-stream";
         Response.Headers.ContentDisposition = BuildContentDisposition(file.FileName);
         Response.ContentLength = length;
+        // 断点续传的能力一直都在，但没有这个头，浏览器与下载工具无从知道：
+        // 它们据此判断「这个地址能不能续」，看不到就一律从头下。
+        Response.Headers.AcceptRanges = "bytes";
         if (isRangeRequest)
             Response.Headers.ContentRange = $"bytes {start}-{end}/{fileLength}";
 

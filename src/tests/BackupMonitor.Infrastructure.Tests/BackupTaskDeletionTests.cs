@@ -202,6 +202,7 @@ internal sealed class UnusedCommandDispatcher : ICommandDispatcher
         TimeSpan? ttl = null,
         string? idempotencyKey = null,
         Guid? createdBy = null,
+        bool restartIfNotActive = false,
         CancellationToken ct = default) =>
         throw new NotSupportedException("删除备份任务不应下发指令");
 }

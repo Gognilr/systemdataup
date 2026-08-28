@@ -17,6 +17,11 @@ public interface ICommandDispatcher
     /// <summary>
     /// 创建一条待认领指令。提供 idempotencyKey 时重复下发返回原指令（设计书 8.5）。
     /// </summary>
+    /// <param name="restartIfNotActive">
+    /// 幂等键命中一条「已经不可能再被执行」的指令时（已成功完结，或还挂着 pending 但已过期），
+    /// 把它复位成新的一条重新下发，而不是把旧结果原样返回。
+    /// 给识别测试这类「同一个任务只该有一条在跑，但每次点都要真的重跑一遍」的动作用。
+    /// </param>
     Task<Command> CreateCommandAsync(
         Guid clientId,
         CommandType commandType,
@@ -27,6 +32,7 @@ public interface ICommandDispatcher
         TimeSpan? ttl = null,
         string? idempotencyKey = null,
         Guid? createdBy = null,
+        bool restartIfNotActive = false,
         CancellationToken ct = default);
 }
 
@@ -90,6 +96,7 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
         TimeSpan? ttl = null,
         string? idempotencyKey = null,
         Guid? createdBy = null,
+        bool restartIfNotActive = false,
         CancellationToken ct = default)
     {
         if (!string.IsNullOrWhiteSpace(idempotencyKey))
@@ -105,8 +112,16 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
                         s.CandidateBackupSetId == existing.CandidateBackupSetId
                         && s.Status == UploadStatus.Failed, ct);
 
+                // 幂等键命中一条不可能再被执行的指令：已经成功完结（结果是上一次的），
+                // 或还挂着 pending 但 expires_at 已过（认领查询会跳过它，等于永远不会跑）。
+                // 调用方声明了 restartIfNotActive 就复位重下，否则维持原样返回旧指令。
+                var notActiveForRestart = restartIfNotActive
+                    && (existing.Status == CommandStatus.Succeeded
+                        || (existing.Status == CommandStatus.Pending && existing.ExpiresAt <= DateTime.UtcNow));
+
                 if (existing.Status is CommandStatus.Failed or CommandStatus.Cancelled or CommandStatus.Expired or CommandStatus.Rejected
-                    || uploadAcceptedButCommitFailed)
+                    || uploadAcceptedButCommitFailed
+                    || notActiveForRestart)
                 {
                     existing.Status = CommandStatus.Pending;
                     existing.ClaimedAt = null;
@@ -360,7 +375,7 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
                 $"command:{command.Id}:failed",
                 AlertLevel.Warning,
                 category,
-                $"{EnumMapping.ToSnakeCase(command.CommandType)} 指令执行失败",
+                $"{PlainText.Of(command.CommandType)}失败",
                 command.ResultMessage ?? command.ResultCode,
                 clientId: command.ClientId,
                 taskId: command.TaskId,

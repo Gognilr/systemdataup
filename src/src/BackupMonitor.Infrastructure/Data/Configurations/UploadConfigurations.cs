@@ -16,7 +16,6 @@ public class UploadBatchConfiguration : IEntityTypeConfiguration<UploadBatch>
         builder.Property(e => e.Name).HasColumnName("name").HasMaxLength(255);
         builder.Property(e => e.CreatedBy).HasColumnName("created_by");
         builder.Property(e => e.MaxConcurrentClients).HasColumnName("max_concurrent_clients").HasDefaultValue(2);
-        builder.Property(e => e.MaxConcurrentPerClient).HasColumnName("max_concurrent_per_client").HasDefaultValue(1);
         builder.Property(e => e.BandwidthLimitKbps).HasColumnName("bandwidth_limit_kbps");
         builder.Property(e => e.Status).HasColumnName("status");
         builder.Property(e => e.TotalItems).HasColumnName("total_items").HasDefaultValue(0);
@@ -126,10 +125,11 @@ public class UploadFileConfiguration : IEntityTypeConfiguration<UploadFileEntity
             .HasForeignKey(e => e.UploadSessionId)
             .OnDelete(DeleteBehavior.Cascade);
 
+        // SetNull 而不是 Restrict：见 UploadFileEntity.CandidateFileId 的注释。
         builder.HasOne(e => e.CandidateFile)
             .WithMany()
             .HasForeignKey(e => e.CandidateFileId)
-            .OnDelete(DeleteBehavior.Restrict);
+            .OnDelete(DeleteBehavior.SetNull);
     }
 }
 

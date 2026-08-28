@@ -28,6 +28,9 @@ public interface IBackupTaskService
     Task<DispatchCommandResponse> DispatchUploadAsync(Guid taskId, DispatchUploadRequest request, CancellationToken ct = default);
     Task<TestRecognitionResponse> TestRecognitionAsync(Guid taskId, CancellationToken ct = default);
     Task<CommandResultDto> GetCommandResultAsync(Guid commandId, CancellationToken ct = default);
+
+    /// <summary>该任务最近一次识别测试的指令（含结果）；从未测过返回 null。</summary>
+    Task<CommandResultDto?> GetLatestRecognitionTestAsync(Guid taskId, CancellationToken ct = default);
 }
 
 /// <summary>备份任务服务实现（CRUD 乐观锁 + 暂停/恢复 + 指令下发 + 识别测试）</summary>
@@ -73,6 +76,7 @@ public class BackupTaskService : IBackupTaskService
     private readonly ICommandDispatcher _commands;
     private readonly ICurrentContext _context;
     private readonly IAuditRecorder _audit;
+    private readonly SystemSettingsProvider _settings;
     private readonly ILogger<BackupTaskService> _logger;
 
     public BackupTaskService(
@@ -80,12 +84,14 @@ public class BackupTaskService : IBackupTaskService
         ICommandDispatcher commands,
         ICurrentContext context,
         IAuditRecorder audit,
+        SystemSettingsProvider settings,
         ILogger<BackupTaskService> logger)
     {
         _db = db;
         _commands = commands;
         _context = context;
         _audit = audit;
+        _settings = settings;
         _logger = logger;
     }
 
@@ -104,6 +110,23 @@ public class BackupTaskService : IBackupTaskService
         if (duplicate)
             throw new BusinessException("DUPLICATE_TASK_NAME", $"该客户端已存在同名任务：{request.Name}", 409);
 
+        // V027：没选保留策略就绑默认策略。「不绑定」在清理器里的含义是「这个任务的备份永远不清理」——
+        // 而它此前是新建任务的默认值，结果就是仓库无限增长。想要永不清理仍然可以在建完之后显式解绑。
+        var retentionPolicyId = request.RetentionPolicyId;
+        if (retentionPolicyId is null)
+        {
+            retentionPolicyId = await RetentionPolicyService.GetDefaultPolicyIdAsync(_settings, ct);
+
+            // 默认策略被删掉或配错了不该让「建任务」整个失败——退回不绑定，并留下痕迹。
+            // 显式指定的策略不走这里：那种情况该报 404（见 ApplyEditableFields）。
+            if (retentionPolicyId is not null
+                && !await _db.RetentionPolicies.AnyAsync(p => p.Id == retentionPolicyId.Value, ct))
+            {
+                _logger.LogWarning("默认保留策略 {PolicyId} 不存在，新任务将不绑定保留策略", retentionPolicyId);
+                retentionPolicyId = null;
+            }
+        }
+
         var task = new BackupTask { Id = Guid.NewGuid(), ClientId = request.ClientId };
         ApplyEditableFields(task, request.Name, request.ApplicationName, request.SourcePath,
             request.RecognizerType, request.TaskMode, request.Enabled, request.Priority,
@@ -111,7 +134,7 @@ public class BackupTaskService : IBackupTaskService
             request.ScheduleTimezone, request.RandomDelayMinutes, request.StabilityIntervalSeconds,
             request.MaxStabilityWaitSeconds, request.MinTotalBytes, request.MaxTotalBytes,
             request.MinFileCount, request.BandwidthLimitKbps, request.ChunkSizeBytes,
-            request.RetryCount, request.RetryIntervalSeconds, request.RetentionPolicyId,
+            request.RetryCount, request.RetryIntervalSeconds, retentionPolicyId,
             request.RecognizerConfig, request.AlertConfig);
 
         task.ConfigVersion = 1;
@@ -184,20 +207,22 @@ public class BackupTaskService : IBackupTaskService
             .FirstOrDefaultAsync(c => c.Id == commandId, ct)
             ?? throw new NotFoundException("指令", commandId);
 
-        return new CommandResultDto
-        {
-            CommandId = command.Id,
-            CommandType = EnumMapping.ToSnakeCase(command.CommandType),
-            Status = EnumMapping.ToSnakeCase(command.Status),
-            TaskId = command.TaskId,
-            CreatedAt = command.CreatedAt,
-            StartedAt = command.StartedAt,
-            CompletedAt = command.CompletedAt,
-            ResultCode = command.ResultCode,
-            ResultMessage = command.ResultMessage,
-            ResultPayload = command.ResultPayload
-        };
+        return ToCommandResultDto(command);
     }
+
+    private static CommandResultDto ToCommandResultDto(Core.Entities.Backup.Command command) => new()
+    {
+        CommandId = command.Id,
+        CommandType = EnumMapping.ToSnakeCase(command.CommandType),
+        Status = EnumMapping.ToSnakeCase(command.Status),
+        TaskId = command.TaskId,
+        CreatedAt = command.CreatedAt,
+        StartedAt = command.StartedAt,
+        CompletedAt = command.CompletedAt,
+        ResultCode = command.ResultCode,
+        ResultMessage = command.ResultMessage,
+        ResultPayload = command.ResultPayload
+    };
 
     public async Task DeleteAsync(Guid taskId, CancellationToken ct = default)
     {
@@ -399,6 +424,11 @@ public class BackupTaskService : IBackupTaskService
         var activeAlertCount = await _db.Alerts.CountAsync(a =>
             a.TaskId == taskId && ActiveAlertStatuses.Contains(a.Status), ct);
 
+        // 属于某个备份计划时，扫描计划不再由客户端触发（AgentConfigService 会把它置空）
+        var planMembership = await _db.BackupPlanItems.AsNoTracking()
+            .Include(i => i.Plan)
+            .FirstOrDefaultAsync(i => i.TaskId == taskId, ct);
+
         return new BackupTaskDetailDto
         {
             Id = task.Id,
@@ -439,6 +469,8 @@ public class BackupTaskService : IBackupTaskService
             RetryIntervalSeconds = task.RetryIntervalSeconds,
             RetentionPolicyId = task.RetentionPolicyId,
             RetentionPolicyName = task.RetentionPolicy?.Name,
+            PlanId = planMembership?.PlanId,
+            PlanName = planMembership?.Plan.Name,
             RecognizerConfig = task.RecognizerConfig,
             AlertConfig = task.AlertConfig,
             CreatedAt = task.CreatedAt,
@@ -570,7 +602,15 @@ public class BackupTaskService : IBackupTaskService
         return new DispatchCommandResponse { CommandId = command.Id };
     }
 
-    /// <summary>识别测试（设计书 16.8，异步：下发带 testOnly 标记的预检指令，结果经指令回报）</summary>
+    /// <summary>
+    /// 识别测试（设计书 16.8，异步：下发带 testOnly 标记的预检指令，结果经指令回报）。
+    ///
+    /// 幂等键固定成 test-recognition:{taskId}，一个任务永远只有一条识别测试指令：
+    /// - 上一条还在排队/执行中：直接把它还回去，而不是再堆一条排在它后面
+    ///   （原先每点一次「重新测试」就多一条，全都排在那条没跑完的后面，越点越慢）；
+    /// - 上一条已经跑完：复位重下，同时这一行就是「最近一次识别测试」的落点，
+    ///   界面关掉对话框之后照样查得到（GetLatestRecognitionTestAsync）。
+    /// </summary>
     public async Task<TestRecognitionResponse> TestRecognitionAsync(Guid taskId, CancellationToken ct = default)
     {
         var task = await _db.BackupTasks.AsNoTracking()
@@ -579,20 +619,48 @@ public class BackupTaskService : IBackupTaskService
             ?? throw new NotFoundException("备份任务", taskId);
 
         EnsureClientDispatchable(task.Client);
+        await EnsureClientAliveAsync(task.Client, ct);
 
         var command = await _commands.CreateCommandAsync(
             task.ClientId, CommandType.PrecheckTask,
             taskId: task.Id,
             payload: new { testOnly = true },
-            priority: task.Priority,
+            // 优先级压过常规指令（越小越优先）：Agent 的指令是串行执行的，
+            // 识别测试排在一条上传后面就是几分钟起步，而人正对着对话框等。
+            // 插队的代价很小——试扫不算哈希、不写任何东西，通常一秒内就跑完；
+            // 注意它只能插到「还没被领走」的指令前面，正在跑的那条仍然要等它跑完。
+            priority: 10,
+            idempotencyKey: RecognitionTestKey(task.Id),
             createdBy: _context.UserId,
+            restartIfNotActive: true,
             ct: ct);
 
         await _audit.RecordAsync("task.test_recognition", AuditResult.Success, "backup_task", task.Id,
             afterData: JsonSerializer.Serialize(new { command.Id }), ct: ct);
 
-        return new TestRecognitionResponse { OperationId = command.Id };
+        return new TestRecognitionResponse
+        {
+            OperationId = command.Id,
+            Status = command.Status is CommandStatus.Claimed or CommandStatus.Running
+                ? "already_running"
+                : "accepted"
+        };
     }
+
+    /// <summary>
+    /// 最近一次识别测试的指令（含结果）。识别测试的等待窗口只有一分钟，
+    /// 而人关掉对话框之后 Agent 照样会把它跑完——没有这个查询，那次结果就等于白跑了。
+    /// </summary>
+    public async Task<CommandResultDto?> GetLatestRecognitionTestAsync(Guid taskId, CancellationToken ct = default)
+    {
+        var key = RecognitionTestKey(taskId);
+        var command = await _db.Commands.AsNoTracking()
+            .FirstOrDefaultAsync(c => c.IdempotencyKey == key, ct);
+
+        return command is null ? null : ToCommandResultDto(command);
+    }
+
+    private static string RecognitionTestKey(Guid taskId) => $"test-recognition:{taskId:N}";
 
     // ---------- 私有辅助 ----------
 
@@ -602,6 +670,33 @@ public class BackupTaskService : IBackupTaskService
             throw new BusinessException("CONFLICT", "客户端尚未审批通过，不能下发指令", 409);
         if (client.Status is ClientStatus.Disabled or ClientStatus.Revoked)
             throw new BusinessException("CONFLICT", "客户端已禁用或已注销，不能下发指令", 409);
+    }
+
+    /// <summary>
+    /// 只给「人在界面前等结果」的动作用（识别测试）：客户端已经不发心跳了就当场说清楚，
+    /// 而不是把指令挂进队列、让人对着进度条等满一分钟再去猜是不是离线。
+    ///
+    /// 阈值取系统设置里的 client_offline_threshold_seconds，与存活巡检同一个值——
+    /// 各写各的判定，迟早会出现「客户端列表显示在线、这里说它离线」。
+    /// 状态本身也要看：巡检可能还没跑到，也可能刚跑完，两个信号哪个先到都算数。
+    /// 计划扫描、立即备份这类不需要即时反馈的照旧不拦——指令有 24 小时 TTL，
+    /// 客户端回来以后接着执行才是对的。
+    /// </summary>
+    private async Task EnsureClientAliveAsync(Core.Entities.Client.Client client, CancellationToken ct)
+    {
+        var offlineAfter = Math.Max(1, await _settings.GetIntAsync(
+            SystemWatchdogWorker.OfflineThresholdKey, 300, ct));
+        var lastSeen = client.LastHeartbeatAt ?? client.ApprovedAt ?? client.CreatedAt;
+        var silence = (DateTime.UtcNow - lastSeen).TotalSeconds;
+
+        if (client.Status != ClientStatus.Offline && silence < offlineAfter)
+            return;
+
+        var detail = client.LastHeartbeatAt is null
+            ? "它从未上报过心跳"
+            : $"最近一次心跳是 {client.LastHeartbeatAt:yyyy-MM-dd HH:mm:ss} UTC";
+        throw new BusinessException("CLIENT_OFFLINE",
+            $"客户端「{client.DisplayName}」当前离线，{detail}。等它恢复连接后再测试。", 409);
     }
 
     /// <summary>判断当前是否处于任务上传窗口（按任务时区换算）</summary>

@@ -2,7 +2,7 @@
 import { api } from '../api.js';
 import { App, ACTIONS, LOADERS } from '../state.js';
 import {
-  $, esc, L, optsOf, status, fmtBytes, fmtDT, relTime, shortId, prettyJson,
+  $, esc, L, optsOf, status, fmtBytes, fmtDT, relTime, prettyJson,
   tableHtml, pagerHtml, skeleton, emptyState, hasFilter, batchBarHtml,
   toast, errToast, confirmModal, formModal, openDrawer, openModal, closeModal, clientLabel, clientName,
   describeCron, searchPickerHtml, initSearchPicker
@@ -46,7 +46,7 @@ LOADERS.tasks = async function () {
       { l: '模式', k: 'taskMode', sort: true, render: r => status('task_mode', r.taskMode) },
       { l: '启用', k: 'enabled', sort: true, render: r => r.enabled ? '是' : '否' },
       { l: '重要级', render: r => esc(L.importance[r.importanceLevel] || r.importanceLevel) },
-      { l: '最近预检', render: r => r.lastPrecheckStatus ? status('precheck', r.lastPrecheckStatus) : '—' },
+      { l: '上次检查结果', render: r => r.lastPrecheckStatus ? status('precheck', r.lastPrecheckStatus) : '—' },
       { l: '最近成功', k: 'lastSuccessAt', sort: true, render: r => relTime(r.lastSuccessAt) },
       { l: '操作', render: r => {
         const b = [`<button class="small" data-ui-action="act" data-view="tasks" data-action="detail" data-id="${esc(r.id)}">详情</button>`,
@@ -54,8 +54,8 @@ LOADERS.tasks = async function () {
         b.push(r.taskMode === 'paused'
           ? `<button class="small primary" data-ui-action="act" data-view="tasks" data-action="resume" data-id="${esc(r.id)}">恢复</button>`
           : `<button class="small" data-ui-action="act" data-view="tasks" data-action="pause" data-id="${esc(r.id)}">暂停</button>`);
-        b.push(`<button class="small" data-ui-action="act" data-view="tasks" data-action="test-recognition" data-id="${esc(r.id)}">试识别</button>`);
-        b.push(`<button class="small" data-ui-action="act" data-view="tasks" data-action="precheck" data-id="${esc(r.id)}">预检</button>`);
+        b.push(`<button class="small" data-ui-action="act" data-view="tasks" data-action="test-recognition" data-id="${esc(r.id)}">看看备份什么</button>`);
+        b.push(`<button class="small primary" data-ui-action="act" data-view="tasks" data-action="backup-now" data-id="${esc(r.id)}">立即备份</button>`);
         b.push(`<button class="small danger" data-ui-action="act" data-view="tasks" data-action="del" data-id="${esc(r.id)}">删除</button>`);
         return b.join(' ');
       } }
@@ -67,7 +67,7 @@ LOADERS.tasks = async function () {
 
 App.batchActs = App.batchActs || {};
 App.batchActs.tasks = [
-  { t: '批量预检', fn: id => api(`/api/v1/admin/backup-tasks/${id}/precheck`, { method: 'POST' }) },
+  { t: '立即备份', fn: id => api(`/api/v1/admin/backup-tasks/${id}/precheck`, { method: 'POST' }) },
   { t: '暂停', fn: id => api(`/api/v1/admin/backup-tasks/${id}/pause`, { method: 'POST' }) },
   { t: '恢复', fn: id => api(`/api/v1/admin/backup-tasks/${id}/resume`, { method: 'POST' }) }
 ];
@@ -97,6 +97,13 @@ const TASK_TEMPLATES = [
     detail: '例：每天往同一个目录里丢一个 .bak，文件名带日期',
     recognizerType: 'latest_single_file',
     recognizerConfig: {}
+  },
+  {
+    id: 'grouped_latest_set',
+    title: '目录里堆着历次备份，每次备份是一组同名文件',
+    detail: '例：致远 OA 的 2026-08-27@02_00.zip 加同名 .properties；只取日期最新的那一组',
+    recognizerType: 'multi_file_set',
+    recognizerConfig: { requiredFiles: ['*.zip', '*.properties'], groupBy: 'basename', recursive: false }
   },
   {
     id: 'subdirectory_units',
@@ -167,6 +174,8 @@ function describeRecognizerConfig(json) {
   if (cfg.depth > 1) rows.push(['业务单元层级', `第 ${cfg.depth} 层`]);
   if (!cfg.recursive) rows.push(['子目录', '不深入子目录']);
   if (cfg.batchRegex) rows.push(['目录名筛选', cfg.batchRegex]);
+  if (cfg.groupBy === 'basename') rows.push(['目录里的历次备份', '每次备份是一组同名文件，只取最新的那一组']);
+  else if (cfg.groupBy) rows.push(['分组键（正则）', cfg.groupBy]);
 
   return `<div class="kv">${rows.map(([k, v]) =>
     `<div class="row"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join('')}</div>`;
@@ -196,7 +205,8 @@ function parseRecognizerConfig(json) {
     recursive: cfg.recursive !== false,
     depth: Number.isInteger(cfg.businessUnitDepth) && cfg.businessUnitDepth > 0 ? cfg.businessUnitDepth : 1,
     unitDaily: String(cfg.unitLayout || '').toLowerCase() === 'latest_directory',
-    batchRegex: typeof cfg.batchRegex === 'string' ? cfg.batchRegex : ''
+    batchRegex: typeof cfg.batchRegex === 'string' ? cfg.batchRegex : '',
+    groupBy: typeof cfg.groupBy === 'string' ? cfg.groupBy.trim() : ''
   };
 }
 
@@ -219,12 +229,19 @@ function composeRecognizerConfig(vals) {
   if (excludeDirs.length) cfg.excludeDirectories = excludeDirs;
   if (vals.cfgRecursive === false) cfg.recursive = false;
   if (vals.cfgBatchRegex) cfg.batchRegex = vals.cfgBatchRegex;
+  // groupBy 必须在这里写回。表单是「从零拼一份 JSON」而不是「改一份 JSON」，
+  // 漏掉一个键 = 保存一次就把它悄悄删掉——手写进去的配置活不过下一次编辑。
+  if (vals.cfgGroupBy) cfg.groupBy = vals.cfgGroupBy;
   return JSON.stringify(cfg, null, 2);
 }
 
 async function taskFormFields(initial, template, prefill, client) {
   const policies = await api('/api/v1/admin/retention-policies');
-  const policyOpts = [{ v: '', t: '（不绑定）' }].concat((policies || []).map(p => ({ v: p.id, t: p.name })));
+  // 「不绑定」在服务端清理器里的含义就是「这个任务的备份永远不清理」——写清楚，
+  // 别让人以为它是「用系统默认」。新建任务默认选中标了默认的那份策略。
+  const policyOpts = [{ v: '', t: '（不绑定 —— 永不清理，仓库会一直涨）' }]
+    .concat((policies || []).map(p => ({ v: p.id, t: p.isDefault ? `${p.name}（默认）` : p.name })));
+  const defaultPolicyId = (policies || []).find(p => p.isDefault)?.id || '';
 
   // 取值优先级：编辑已有任务 → 库里的值；新建 → 向导推断结果 → 模板默认值。
   const v = initial || prefill || (template
@@ -241,6 +258,14 @@ async function taskFormFields(initial, template, prefill, client) {
   const pausedHint = isPaused
     ? '任务当前处于暂停状态。保存表单会按这里选中的模式让它恢复运行；想继续暂停就直接关掉表单。'
     : '';
+
+  // 保留手写进 JSON 的自定义正则：下拉里没有它的话，一次保存就把它抹掉了。
+  const groupByOpts = [
+    { v: '', t: '不分组（这个目录里就是一份备份）' },
+    { v: 'basename', t: '只取最新的一组（同名文件算一组）' }
+  ];
+  if (cfg.groupBy && cfg.groupBy !== 'basename')
+    groupByOpts.push({ v: cfg.groupBy, t: `自定义正则：${cfg.groupBy}` });
 
   const fields = [];
   // 建任务只有四件事必须由人决定：哪台机器、叫什么、备份的是什么应用、备份文件落在哪个目录。
@@ -264,22 +289,37 @@ async function taskFormFields(initial, template, prefill, client) {
     { name: 'cfgRequired', label: '必需文件', type: 'textarea', rows: 3, value: cfg.required.join('\n'),
       placeholder: 'UFDATA.BAK\nUfErpAct.Lst',
       hint: '一行一个。每次备份必须包含这些文件，缺任何一个就判为不完整。留空表示不检查。支持 * 通配，大小写不敏感' },
+    // 分组不进高级选项，理由和必需文件一样：一个目录里堆着一个月的备份时，
+    // 配不配它决定的是「每天传最新的 6 GB」还是「每天把 64 GB 全量重传一遍」，
+    // 而且不配的那一份候选压根不代表某一天的备份。这个问题使用者自己答得上来。
+    { name: 'cfgGroupBy', label: '目录里的历次备份', type: 'select', value: cfg.groupBy, options: groupByOpts,
+      hint: '同一个目录里堆着多次备份时用。「只取最新的一组」按去掉扩展名的文件名归组（NAME.zip 与 NAME.properties 算同一组），取时间最新的那一组' },
     // 任务模式收进高级选项：默认「自动」已经是绝大多数人要的行为——扫到就传，不需要人管。
     // 它此前摆在基本项里，默认值又是「需审批」，等于每建一个任务都要求使用者先理解一套
     // 他多半不需要的审批流程；而审批本身在管理端没有入口，选错了任务就静默不上传。
     { name: 'taskMode', label: '任务模式', type: 'select', value: taskModeValue,
       options: optsOf(L.task_mode).filter(o => o.v !== 'paused'), advanced: true,
-      hint: pausedHint || '自动：扫到即上传入库（默认，不需要人工干预）；仅监控：只扫描告警、不上传；需审批/手动：要人在管理端逐份下发上传' },
+      hint: pausedHint || '自动：扫到就传走存好（默认，不需要人管）；仅监控：只检查、发现问题告警，但不上传；需审批 / 手动：每一份都要人在这里点一次「立即备份」才会传' },
     { name: 'importanceLevel', label: '重要级', type: 'select', value: v.importanceLevel || 'normal', options: optsOf(L.importance), advanced: true },
     { name: 'enabled', label: '状态', labelText: '启用该任务', type: 'checkbox', value: v.enabled !== false, advanced: true },
     { name: 'priority', label: '优先级', type: 'number', value: v.priority ?? 100, hint: '数值小的优先', advanced: true },
-    { name: 'scanSchedule', label: '扫描计划', type: 'cron', value: v.scanSchedule || '', advanced: true },
+    // 任务进了备份计划之后，它自己的扫描计划就不再下发给客户端（服务端会把它置空下发）。
+    // 两者都留着的话，同一个任务一天会跑两次：一次 Agent 按 cron 触发，一次计划驱动。
+    // 因此这里不再给一个可以填、填了却不生效的输入框，而是直说由谁驱动。
+    v.planName
+      ? { name: 'scanSchedule', type: 'static', label: '扫描计划',
+          html: `<div class="dirpath">由备份计划「${esc(v.planName)}」驱动</div>`,
+          hint: '要改执行时间，去「备份计划」页改那个计划；把任务移出计划后，这里的扫描计划会重新生效' }
+      : { name: 'scanSchedule', label: '扫描计划', type: 'cron', value: v.scanSchedule || '', advanced: true },
     // 时刻用选择器而不是让人敲 HH:mm：敲错的代价是保存被拒（还算好的），
     // 或者敲成一个合法但不是他要的时刻（22:0 到底是 22:00 还是 22:10）。
     { name: 'uploadWindowStart', label: '上传窗口开始', type: 'time', value: v.uploadWindowStart || '', advanced: true,
       hint: '留空表示不限制上传时段。跨天窗口（如 22:00 到次日 06:00）直接这么填就行' },
     { name: 'uploadWindowEnd', label: '上传窗口结束', type: 'time', value: v.uploadWindowEnd || '', advanced: true },
-    { name: 'retentionPolicyId', label: '保留策略', type: 'select', value: v.retentionPolicyId || '', options: policyOpts, advanced: true },
+    { name: 'retentionPolicyId', label: '保留策略', type: 'select',
+      value: initial ? (v.retentionPolicyId || '') : (v.retentionPolicyId || defaultPolicyId),
+      options: policyOpts, advanced: true,
+      hint: '决定这个任务的旧备份什么时候被清掉。不选就按默认策略走；选「不绑定」则永不清理' },
     // A3：大小异常判定的三个阈值，此前只在详情页展示、表单里从没有过输入项——
     // 界面上写着「大小限制 1 GB ~ 50 GB」，但没有任何地方能把它填进去。
     { name: 'minTotalBytes', label: '总大小下限', type: 'number', value: v.minTotalBytes ?? '', advanced: true,
@@ -358,7 +398,10 @@ function taskFormValues(vals, base) {
     name: vals.name, applicationName: vals.applicationName, sourcePath: vals.sourcePath,
     recognizerType: vals.recognizerType, taskMode: vals.taskMode, enabled: vals.enabled,
     priority: Number(vals.priority) || 100, importanceLevel: vals.importanceLevel,
-    scanSchedule: vals.scanSchedule || null,
+    // 任务在备份计划里时，表单上没有扫描计划这个输入框（由计划驱动）。
+    // 这里必须回填原值：读不到就当成 null 的话，一次保存就把它存的 cron 抹掉了，
+    // 而人把任务移出计划之后正指望它回来。
+    scanSchedule: (vals.scanSchedule ?? base?.scanSchedule) || null,
     uploadWindowStart: vals.uploadWindowStart || null, uploadWindowEnd: vals.uploadWindowEnd || null,
     retentionPolicyId: vals.retentionPolicyId || null,
     minTotalBytes: numOrNull(vals.minTotalBytes), maxTotalBytes: numOrNull(vals.maxTotalBytes),
@@ -383,8 +426,9 @@ export async function openTaskDrawer(id, viaNav = false) {
       onClose: () => { if (location.hash === '#/tasks/' + id) history.replaceState(null, '', '#/tasks'); },
       bodyHtml: `
     <div style="margin-bottom:var(--s-3)">
-      <button class="small" data-ui-action="act" data-view="tasks" data-action="test-recognition" data-id="${esc(id)}">试一下识别</button>
-      <button class="small" data-ui-action="act" data-view="tasks" data-action="precheck" data-id="${esc(id)}">下发预检</button>
+      <button class="small primary" data-ui-action="act" data-view="tasks" data-action="backup-now" data-id="${esc(id)}">立即备份</button>
+      <button class="small" data-ui-action="act" data-view="tasks" data-action="test-recognition" data-id="${esc(id)}">看看会备份哪些文件</button>
+      <button class="small" data-ui-action="act" data-view="tasks" data-action="last-recognition" data-id="${esc(id)}">上次识别测试</button>
     </div>
     <div class="kv">
       <div class="row"><div class="k">客户端</div><div class="v">${esc(clientName({ displayName: d.clientDisplayName, hostname: d.clientHostname }))}<span class="sub mono">${esc(d.clientHostname)}</span></div></div>
@@ -394,15 +438,17 @@ export async function openTaskDrawer(id, viaNav = false) {
       <div class="row"><div class="k">模式</div><div class="v">${status('task_mode', d.taskMode)}</div></div>
       <div class="row"><div class="k">启用</div><div class="v">${d.enabled ? '是' : '否'}</div></div>
       <div class="row"><div class="k">重要级 / 优先级</div><div class="v">${esc(L.importance[d.importanceLevel] || d.importanceLevel)} / ${esc(d.priority)}</div></div>
-      <div class="row"><div class="k">扫描计划</div><div class="v">${esc(describeCron(d.scanSchedule))}</div></div>
+      <div class="row"><div class="k">扫描计划</div><div class="v">${d.planName
+        ? `由备份计划「${esc(d.planName)}」驱动`
+        : esc(describeCron(d.scanSchedule))}</div></div>
       <div class="row"><div class="k">上传窗口</div><div class="v">${esc(d.uploadWindowStart || '—')} ~ ${esc(d.uploadWindowEnd || '—')}（${esc(d.scheduleTimezone)}）</div></div>
       <div class="row"><div class="k">稳定判定</div><div class="v">${esc(d.stabilityIntervalSeconds)}s / 最长 ${esc(d.maxStabilityWaitSeconds)}s</div></div>
       <div class="row"><div class="k">大小限制</div><div class="v">${fmtBytes(d.minTotalBytes)} ~ ${fmtBytes(d.maxTotalBytes)}，文件数 ≥ ${esc(d.minFileCount ?? '—')}</div></div>
       <div class="row"><div class="k">限速 / 分块</div><div class="v">${d.bandwidthLimitKbps ? esc(d.bandwidthLimitKbps) + ' KB/s' : '不限'} / ${fmtBytes(d.chunkSizeBytes)}</div></div>
       <div class="row"><div class="k">重试</div><div class="v">${esc(d.retryCount)} 次，间隔 ${esc(d.retryIntervalSeconds)}s</div></div>
-      <div class="row"><div class="k">保留策略</div><div class="v">${esc(d.retentionPolicyName || '未绑定')}</div></div>
+      <div class="row"><div class="k">保留策略</div><div class="v">${d.retentionPolicyName ? esc(d.retentionPolicyName) : '未绑定（这个任务的备份永不清理）'}</div></div>
       <div class="row"><div class="k">最近扫描 / 成功</div><div class="v">${fmtDT(d.lastScanAt)} / ${fmtDT(d.lastSuccessAt)}</div></div>
-      <div class="row"><div class="k">配置版本 / rowVersion</div><div class="v">${esc(d.configVersion)} / ${esc(d.rowVersion)}</div></div>
+      <div class="row"><div class="k">配置版本</div><div class="v">${esc(d.configVersion)}<span class="sub">每改一次任务配置加一，客户端据此判断要不要重新拉取</span></div></div>
     </div>
     <h3>识别规则</h3>${describeRecognizerConfig(d.recognizerConfig)}
     <details class="fadv"><summary>原始配置（JSON）</summary><pre class="json">${esc(prettyJson(d.recognizerConfig))}</pre></details>
@@ -410,6 +456,135 @@ export async function openTaskDrawer(id, viaNav = false) {
     });
     if (!viaNav) history.replaceState(null, '', '#/tasks/' + id);
   } catch (e) { errToast(e); }
+}
+
+/* ── 立即备份 ──
+   一个按钮，一件事：现在就把这个任务备份一次。
+
+   它原先叫「下发预检」——那说的是系统内部的第一步（让客户端扫一遍看有没有新备份），
+   而不是使用者要的结果。更糟的是这个名字在不同任务模式下含义还不一样：自动模式下
+   预检通过服务端会自己接着下发上传，所以「下发预检」实际等于完整备份；
+   手动/需审批模式下它只产生一个候选，而下发上传在界面上根本没有入口——
+   人点完按钮、看到「已下发」的提示，然后什么都没发生。
+
+   这里把两步合成一步：扫描 → （非自动模式再补一刀）下发上传，全程把进度显示出来。
+   使用者不需要知道「预检」「候选备份集」这些词。 */
+async function runBackupNow(taskId) {
+  let detail;
+  try {
+    detail = await api(`/api/v1/admin/backup-tasks/${taskId}`);
+  } catch (e) { errToast(e); return; }
+
+  let dispatched;
+  try {
+    dispatched = await api(`/api/v1/admin/backup-tasks/${taskId}/precheck`, { method: 'POST' });
+  } catch (e) { errToast(e); return; }
+
+  openModal(`立即备份：${detail.name}`, '<div class="hint">已通知客户端，等待它开始扫描…</div>');
+  const body = () => document.querySelector('#overlay .mbody');
+  const say = html => { if (body()) body().innerHTML = html; };
+
+  // 备份文件动辄几 GB，扫描要把它们读一遍算 SHA-256，比识别测试慢得多，
+  // 因此等待窗口给到 5 分钟；超时也不算失败，任务照常在后台走完。
+  const cmd = await pollCommand(dispatched.commandId, 300000, body, st =>
+    say(`<div class="hint">客户端正在扫描备份文件…（当前状态：${esc(st)}）</div>`));
+  if (cmd === null) return;                       // 用户关掉了对话框
+  if (cmd === 'timeout') {
+    say('<div class="hint">扫描仍在进行。大备份读一遍要花些时间，可以关掉这里，稍后在「传输中」页面看进度。</div>');
+    return;
+  }
+  if (cmd.status !== 'succeeded') {
+    say(`<div class="hint">${esc(describeBackupOutcome(cmd))}</div>`);
+    LOADERS.tasks();
+    return;
+  }
+
+  // 自动模式：服务端在收到预检结果时已经把上传指令发出去了，这里不要重复发。
+  if (detail.taskMode === 'automatic') {
+    say('<div class="hint">扫描通过，已开始上传。进度在「传输中」页面。</div>');
+    toast('已开始备份', 'ok');
+    LOADERS.tasks();
+    return;
+  }
+
+  const candidateId = candidateIdOf(cmd.resultPayload);
+  if (!candidateId) {
+    say('<div class="hint">扫描完成，但这次没有发现需要备份的新文件。</div>');
+    LOADERS.tasks();
+    return;
+  }
+
+  try {
+    await dispatchUpload(taskId, candidateId, false);
+    say('<div class="hint">已开始上传。进度在「传输中」页面。</div>');
+    toast('已开始备份', 'ok');
+  } catch (e) {
+    // 上传窗口和「客户端正忙」是配置意图，不是故障：问一句再强制，而不是默默绕过，
+    // 也不是甩一句错误码让人自己去猜该怎么办。
+    const askable = e.code === 'OUT_OF_UPLOAD_WINDOW' || e.code === 'CLIENT_BUSY';
+    if (!askable) { say(`<div class="hint">扫描通过，但下发上传失败：${esc(e.message)}</div>`); return; }
+
+    const question = e.code === 'CLIENT_BUSY'
+      ? '这台客户端还有别的上传在进行。仍然现在就传吗？'
+      : '当前不在这个任务配置的上传窗口内。仍然现在就传吗？';
+    if (!await confirmModal(question)) { say('<div class="hint">已取消，扫描结果保留着，之后可以再传。</div>'); return; }
+    try {
+      await dispatchUpload(taskId, candidateId, true);
+      say('<div class="hint">已开始上传。进度在「传输中」页面。</div>');
+      toast('已开始备份', 'ok');
+    } catch (e2) { say(`<div class="hint">下发上传失败：${esc(e2.message)}</div>`); }
+  }
+  LOADERS.tasks();
+}
+
+/* 把预检失败码说成人话。
+   「no_new_backup」并不是失败——它是最常见的正常结果（今天还没产生新备份），
+   照着 result_code 原样甩出来只会让人以为出了故障。 */
+function describeBackupOutcome(cmd) {
+  const known = {
+    no_new_backup: '没有发现新的备份文件——源目录里的还是上一次那一份。',
+    still_changing: '备份文件还在写入中，这次先跳过；等它稳定下来会自动再试一次。',
+    required_file_missing: '扫到的文件不完整，缺少「必需文件」里点名的文件。',
+    size_abnormal: '备份大小超出了任务设定的上下限，判为异常，没有上传。',
+    path_not_found: '客户端上找不到这个源路径。',
+    access_denied: '客户端没有权限读取这个源路径。'
+  };
+  return known[cmd.resultCode]
+    || `这次备份没有成功：${cmd.resultMessage || cmd.resultCode || cmd.status}`;
+}
+
+const dispatchUpload = (taskId, candidateBackupSetId, force) =>
+  api(`/api/v1/admin/backup-tasks/${taskId}/upload`, { method: 'POST', body: { candidateBackupSetId, force } });
+
+/* 预检指令的结构化结果里带着这次扫出来的候选备份集 ID。 */
+function candidateIdOf(resultPayload) {
+  if (!resultPayload) return null;
+  try {
+    const parsed = JSON.parse(resultPayload);
+    return typeof parsed.candidateBackupSetId === 'string' ? parsed.candidateBackupSetId : null;
+  } catch (e) { return null; }
+}
+
+/* 轮询一条指令直到有结论。
+   返回指令对象 / 'timeout' / null（对话框已被关掉，调用方应当直接返回）。
+   识别测试与立即备份共用：两者等的是同一件事——Agent 什么时候把这条指令跑完。 */
+async function pollCommand(commandId, timeoutMs, body, onProgress) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!body()) return null;
+    await new Promise(r => setTimeout(r, 2000));
+    if (!body()) return null;
+
+    let cmd;
+    try {
+      cmd = await api(`/api/v1/admin/backup-tasks/commands/${commandId}`);
+    } catch (e) { errToast(e); return null; }
+
+    if (cmd.status === 'succeeded' || cmd.status === 'failed') return cmd;
+    if (cmd.status === 'cancelled' || cmd.status === 'expired') return cmd;
+    onProgress(cmd.status);
+  }
+  return 'timeout';
 }
 
 /* ── 识别测试 ──
@@ -424,14 +599,53 @@ async function runRecognitionTest(taskId) {
     dispatched = await api(`/api/v1/admin/backup-tasks/${taskId}/test-recognition`, { method: 'POST' });
   } catch (e) { errToast(e); return; }
 
-  const commandId = dispatched.operationId;
-  const ov = openModal('识别测试', '<div class="hint">已下发指令，等待客户端执行…</div>');
+  // 服务端不会为同一个任务堆第二条测试指令：上一条还在跑就把它还回来，这里如实说明，
+  // 否则人会以为自己刚点的那一次没生效。
+  const queued = dispatched.status === 'already_running';
+  const waiting = queued
+    ? '这个任务已经有一次识别测试在执行，正在等它的结果…'
+    : '已下发指令，等待客户端执行…';
+  openRecognitionModal(taskId, `<div class="hint">${waiting}</div>`);
   const body = () => document.querySelector('#overlay .mbody');
+
+  const cmd = await pollCommand(dispatched.operationId, 60000, body, st => {
+    if (body()) body().innerHTML = `<div class="hint">${waiting}（当前状态：${esc(st)}）</div>`;
+  });
+  if (cmd === null) return;                    // 用户关掉了对话框
+  if (!body()) return;
+
+  if (cmd === 'timeout')
+    body().innerHTML = pendingResultHtml('客户端还没把结果报回来。');
+  else if (cmd.status === 'cancelled' || cmd.status === 'expired')
+    body().innerHTML = `<div class="hint">指令已${cmd.status === 'expired' ? '过期' : '取消'}，客户端可能不在线。</div>`;
+  else
+    body().innerHTML = renderRecognitionResult(cmd);
+}
+
+/* 等不到结果时说的话。
+   要点是「这次测试没有作废」：指令有 24 小时有效期，客户端忙完手上的活照样会把它跑完，
+   结果落在指令行上。原先这里写的是"稍后可以重新测试"——那等于让人把刚才那次白等的
+   十几秒再等一遍，而上一次的结果其实一直在服务端躺着。 */
+function pendingResultHtml(lead) {
+  return `<div class="hint">${esc(lead)}测试没有取消——客户端可能正忙着传别的备份，或者这次扫描的目录比较大。
+    它跑完之后，这里和任务详情里的「上次识别测试」都能看到结果。</div>
+    <div style="margin-top:12px"><button class="primary" data-act="refresh-last">刷新看看</button></div>`;
+}
+
+/* 识别测试对话框的壳子：下发新测试与回看上次结果共用。
+   两处都要能勾必需文件、都要能刷新，处理器写一份。 */
+function openRecognitionModal(taskId, bodyHtml) {
+  const ov = openModal('识别测试', bodyHtml);
 
   // 试扫结果里是客户端上真实存在的文件名。让人对着它们打勾，比让他回忆
   // 「那个文件到底叫 UfErpAct.Lst 还是 UFERPACT.LST」可靠得多——
   // 大小写、扩展名、要不要带路径，这些他都不需要再想。
   ov.addEventListener('click', async ev => {
+    if (ev.target.closest('[data-act="refresh-last"]')) {
+      await showLastRecognitionTest(taskId);
+      return;
+    }
+
     const btn = ev.target.closest('[data-act="apply-required"]');
     if (!btn) return;
     const picked = [...ov.querySelectorAll('[data-required]:checked')].map(x => x.dataset.required);
@@ -444,33 +658,46 @@ async function runRecognitionTest(taskId) {
       LOADERS.tasks();
     } catch (e) { errToast(e); btn.disabled = false; }
   });
+  return ov;
+}
 
-  // Agent 每 10 秒轮询一次指令，加上扫描本身的耗时，60 秒足够覆盖正常情况。
-  const deadline = Date.now() + 60000;
-  while (Date.now() < deadline) {
-    if (!body()) return;                       // 用户关掉了对话框
-    await new Promise(r => setTimeout(r, 2000));
-    if (!body()) return;
+/* 回看最近一次识别测试的结果。
+   等待窗口只有一分钟，而扫描慢、客户端在忙、人自己把窗口关了都很常见——
+   没有这个入口，那次已经跑完并躺在服务端的结果就只能靠再测一遍才能看到。 */
+async function showLastRecognitionTest(taskId) {
+  let cmd;
+  try {
+    cmd = await api(`/api/v1/admin/backup-tasks/${taskId}/test-recognition/latest`);
+  } catch (e) { errToast(e); return; }
 
-    let cmd;
-    try {
-      cmd = await api(`/api/v1/admin/backup-tasks/commands/${commandId}`);
-    } catch (e) { errToast(e); return; }
-
-    if (cmd.status === 'succeeded' || cmd.status === 'failed') {
-      if (body()) body().innerHTML = renderRecognitionResult(cmd);
-      return;
-    }
-    if (cmd.status === 'cancelled' || cmd.status === 'expired') {
-      if (body()) body().innerHTML = `<div class="hint">指令已${cmd.status === 'expired' ? '过期' : '取消'}，客户端可能不在线。</div>`;
-      return;
-    }
-    if (body())
-      body().innerHTML = `<div class="hint">已下发指令，等待客户端执行…（当前状态：${esc(cmd.status)}）</div>`;
+  if (!cmd) {
+    openRecognitionModal(taskId, '<div class="hint">这个任务还没有做过识别测试。点「看看会备份哪些文件」测一次。</div>');
+    return;
   }
 
-  if (body())
-    body().innerHTML = '<div class="hint">等待超时。客户端可能离线，或扫描耗时较长——稍后可在任务详情里重新测试。</div>';
+  if (cmd.status === 'succeeded' || cmd.status === 'failed') {
+    const when = fmtDT(cmd.completedAt || cmd.createdAt);
+    openRecognitionModal(taskId,
+      `<p class="hint">这是 ${esc(when)} 那次测试的结果。</p>${renderRecognitionResult(cmd)}`);
+    return;
+  }
+
+  if (cmd.status === 'cancelled' || cmd.status === 'expired') {
+    openRecognitionModal(taskId,
+      `<div class="hint">上一次测试已${cmd.status === 'expired' ? '过期' : '取消'}，客户端始终没有领走它。确认客户端在线后再测一次。</div>`);
+    return;
+  }
+
+  // pending / claimed / running：还在跑，把它当成一次新的等待接着等下去。
+  openRecognitionModal(taskId, `<div class="hint">上一次测试还在执行（当前状态：${esc(cmd.status)}），继续等它的结果…</div>`);
+  const body = () => document.querySelector('#overlay .mbody');
+  const done = await pollCommand(cmd.commandId, 60000, body, st => {
+    if (body()) body().innerHTML = `<div class="hint">上一次测试还在执行（当前状态：${esc(st)}），继续等它的结果…</div>`;
+  });
+  if (done === null || !body()) return;
+  body().innerHTML = done === 'timeout'
+    ? pendingResultHtml('还是没等到结果。')
+    : renderRecognitionResult(done);
 }
 
 function renderRecognitionResult(cmd) {
@@ -714,10 +941,8 @@ ACTIONS['tasks:detail'] = async id => openTaskDrawer(id);
 ACTIONS['tasks:pause'] = async id => { await api(`/api/v1/admin/backup-tasks/${id}/pause`, { method: 'POST' }); toast('任务已暂停', 'ok'); LOADERS.tasks(); };
 ACTIONS['tasks:resume'] = async id => { await api(`/api/v1/admin/backup-tasks/${id}/resume`, { method: 'POST' }); toast('任务已恢复', 'ok'); LOADERS.tasks(); };
 ACTIONS['tasks:test-recognition'] = async id => { await runRecognitionTest(id); };
-ACTIONS['tasks:precheck'] = async id => {
-  const d = await api(`/api/v1/admin/backup-tasks/${id}/precheck`, { method: 'POST' });
-  toast(`预检指令已下发（指令 ${shortId(d.commandId)}，${d.status}）`, 'ok');
-};
+ACTIONS['tasks:last-recognition'] = async id => { await showLastRecognitionTest(id); };
+ACTIONS['tasks:backup-now'] = async id => { await runBackupNow(id); };
 ACTIONS['tasks:del'] = async id => {
   if (!await confirmModal('删除该备份任务？此操作不可恢复。')) return;
   await api(`/api/v1/admin/backup-tasks/${id}`, { method: 'DELETE' });

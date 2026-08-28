@@ -18,6 +18,12 @@ public sealed class BackupScanResult
     public string? FailureCode { get; init; }
     public string? FailureMessage { get; init; }
     public List<PrecheckFileDto> Files { get; init; } = [];
+
+    /// <summary>
+    /// 试扫（识别测试）产物：没算 SHA-256，因此 ManifestHash / QuickFingerprint / CandidateKey 都是空的。
+    /// 这种结果只能拿去给人看，绝不能当预检结果上报——SubmitOneScanAsync 会挡住它。
+    /// </summary>
+    public bool IsTestScan { get; init; }
 }
 
 /// <summary>
@@ -36,7 +42,22 @@ public sealed class BackupScanner
         _logger = logger;
     }
 
-    public async Task<List<BackupScanResult>> ScanAsync(AgentTaskConfigDto task, CancellationToken ct)
+    /// <summary>正式扫描：算全量 SHA-256，结果可以上报为预检结果。</summary>
+    public Task<List<BackupScanResult>> ScanAsync(AgentTaskConfigDto task, CancellationToken ct)
+        => ScanCoreAsync(task, testOnly: false, ct);
+
+    /// <summary>
+    /// 试扫（识别测试）：只回答"会挑中哪些文件、判定通不通过"，不算 SHA-256。
+    ///
+    /// 这是识别测试从"几十秒"回到"秒级"的关键。它和正式扫描共用同一套遍历与识别逻辑
+    /// （否则试扫说的和实际扫的会分叉），区别只在于跳过全量哈希：
+    /// 界面用到的只有 relativePath / sizeBytes / lastModifiedAt / isRequired，
+    /// 而人在对话框前面等着——为了几个不看的哈希值把 2GB 的 zip 整读一遍不值得。
+    /// </summary>
+    public Task<List<BackupScanResult>> ScanForTestAsync(AgentTaskConfigDto task, CancellationToken ct)
+        => ScanCoreAsync(task, testOnly: true, ct);
+
+    private async Task<List<BackupScanResult>> ScanCoreAsync(AgentTaskConfigDto task, bool testOnly, CancellationToken ct)
     {
         var source = Environment.ExpandEnvironmentVariables(task.SourcePath);
         var rules = RecognizerRules.Parse(task.RecognizerConfig);
@@ -52,14 +73,14 @@ public sealed class BackupScanner
                 directory => directory.FullName,
                 directory => NewestAllowedFileTime(directory.FullName, rules));
             if (!expansion.Success)
-                return [Failure(task, source, "path_not_found", expansion.FailureMessage!)];
+                return [Failure(task, source, "path_not_found", expansion.FailureMessage!, testOnly)];
 
             source = expansion.Path!;
         }
 
         if (!Directory.Exists(source))
         {
-            return [Failure(task, source, "path_not_found", $"源目录不存在：{source}")];
+            return [Failure(task, source, "path_not_found", $"源目录不存在：{source}", testOnly)];
         }
 
         var roots = SelectRoots(source, task.RecognizerType, rules);
@@ -86,7 +107,7 @@ public sealed class BackupScanner
             var businessUnit = selected.BusinessUnit;
             if (files.Count == 0)
             {
-                results.Add(Failure(task, selected.Root, "no_new_backup", "未发现符合识别规则的备份文件", businessUnit));
+                results.Add(Failure(task, selected.Root, "no_new_backup", "未发现符合识别规则的备份文件", testOnly, businessUnit));
                 continue;
             }
 
@@ -94,7 +115,7 @@ public sealed class BackupScanner
             var stabilitySeconds = Math.Max(0, task.StabilityIntervalSeconds);
             if (stabilitySeconds > 0 && DateTime.UtcNow - newest < TimeSpan.FromSeconds(stabilitySeconds))
             {
-                results.Add(Failure(task, selected.Root, "still_changing", "最新文件仍处于稳定观察窗口", businessUnit));
+                results.Add(Failure(task, selected.Root, "still_changing", "最新文件仍处于稳定观察窗口", testOnly, businessUnit));
                 continue;
             }
 
@@ -108,8 +129,9 @@ public sealed class BackupScanner
                     RelativePath = relative,
                     SizeBytes = file.Length,
                     LastModifiedAt = file.LastWriteTimeUtc,
-                    Sha256 = await ComputeSha256Async(file.FullName, ct),
-                    QuickHash = await ComputeQuickHashAsync(file.FullName, ct),
+                    // 试扫不算哈希：这两个值界面一个都不看，而全量 SHA-256 要把文件整读一遍。
+                    Sha256 = testOnly ? null : await ComputeSha256Async(file.FullName, ct),
+                    QuickHash = testOnly ? null : await ComputeQuickHashAsync(file.FullName, ct),
                     // 这里曾经只用 GlobMatch(relative, pattern)，而缺失判定用的是 MatchesPath。
                     // 于是 requiredFiles 写 UFDATA.BAK、文件在子目录里时，判定算它到场、
                     // 界面却不给它标 [必需]——同一个事实在两处显示不一致。
@@ -117,15 +139,26 @@ public sealed class BackupScanner
                 });
             }
 
-            var manifest = string.Join('\n', fileDtos
-                .OrderBy(f => f.RelativePath, StringComparer.OrdinalIgnoreCase)
-                .Select(f => $"{f.RelativePath}|{f.SizeBytes}|{f.LastModifiedAt.Ticks}|{f.Sha256}"));
-            var manifestHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(manifest))).ToLowerInvariant();
-            var quickFingerprint = string.Join('\n', fileDtos
-                .OrderBy(f => f.RelativePath, StringComparer.OrdinalIgnoreCase)
-                .Select(f => $"{f.RelativePath}|{f.SizeBytes}|{f.LastModifiedAt.Ticks}|{f.QuickHash}"));
-            var candidateKey = $"{task.TaskId:N}:{businessUnit?.ExternalKey ?? "root"}:{manifestHash}";
             var missingRequired = rules.HasMissingRequired(fileDtos.Select(f => f.RelativePath));
+
+            // 试扫没有哈希，manifestHash / candidateKey 也就无从谈起。
+            // 这里刻意留空而不是拿空哈希凑一个出来——凑出来的 key 看着像真的，
+            // 一旦哪天被误当作候选去重的依据，就是两份不同的备份撞成同一个候选。
+            string? manifestHash = null;
+            string? quickFingerprintHash = null;
+            var candidateKey = string.Empty;
+            if (!testOnly)
+            {
+                var manifest = string.Join('\n', fileDtos
+                    .OrderBy(f => f.RelativePath, StringComparer.OrdinalIgnoreCase)
+                    .Select(f => $"{f.RelativePath}|{f.SizeBytes}|{f.LastModifiedAt.Ticks}|{f.Sha256}"));
+                manifestHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(manifest))).ToLowerInvariant();
+                var quickFingerprint = string.Join('\n', fileDtos
+                    .OrderBy(f => f.RelativePath, StringComparer.OrdinalIgnoreCase)
+                    .Select(f => $"{f.RelativePath}|{f.SizeBytes}|{f.LastModifiedAt.Ticks}|{f.QuickHash}"));
+                quickFingerprintHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(quickFingerprint))).ToLowerInvariant();
+                candidateKey = $"{task.TaskId:N}:{businessUnit?.ExternalKey ?? "root"}:{manifestHash}";
+            }
 
             results.Add(new BackupScanResult
             {
@@ -135,8 +168,9 @@ public sealed class BackupScanner
                 BusinessUnit = businessUnit,
                 Status = missingRequired ? "required_file_missing" : "passed",
                 BackupBusinessTime = newest,
-                QuickFingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(quickFingerprint))).ToLowerInvariant(),
+                QuickFingerprint = quickFingerprintHash,
                 ManifestHash = manifestHash,
+                IsTestScan = testOnly,
                 FailureCode = missingRequired ? "REQUIRED_FILE_MISSING" : null,
                 FailureMessage = missingRequired ? "识别规则要求的文件未全部出现" : null,
                 Files = fileDtos
@@ -147,7 +181,7 @@ public sealed class BackupScanner
     }
 
     private static BackupScanResult Failure(
-        AgentTaskConfigDto task, string sourceRoot, string status, string message, PrecheckBusinessUnitDto? unit = null) =>
+        AgentTaskConfigDto task, string sourceRoot, string status, string message, bool testOnly, PrecheckBusinessUnitDto? unit = null) =>
         new()
         {
             TaskId = task.TaskId,
@@ -156,7 +190,8 @@ public sealed class BackupScanner
             BusinessUnit = unit,
             Status = status,
             FailureCode = status.ToUpperInvariant(),
-            FailureMessage = message
+            FailureMessage = message,
+            IsTestScan = testOnly
         };
 
     private List<(string Root, PrecheckBusinessUnitDto? BusinessUnit)> SelectRoots(string source, string recognizerType, RecognizerRules rules)

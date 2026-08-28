@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using BackupMonitor.Core.Enums;
+using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Models.Admin;
 using MailKit.Net.Smtp;
@@ -241,7 +242,8 @@ public class NotificationDispatchWorker : BackgroundService
             .AppendLine()
             .AppendLine(delivery.Alert?.Message)
             .AppendLine()
-            .AppendLine($"告警等级: {delivery.Alert?.Level}")
+            // 枚举原样拼进去写出来是 Warning——这封邮件是给人读的，不是给日志读的
+            .AppendLine($"告警等级: {(delivery.Alert is null ? "—" : PlainText.Of(delivery.Alert.Level))}")
             // C2 第4点：时间改按系统配置的报表时区渲染，并标注时区名（不再写死 UTC）
             .AppendLine($"发生时间: {occurredLocal:yyyy-MM-dd HH:mm:ss} ({reportTimezone.Id})")
             .ToString();

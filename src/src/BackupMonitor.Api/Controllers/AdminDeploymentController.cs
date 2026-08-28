@@ -46,10 +46,14 @@ public sealed class AdminDeploymentController : ApiBaseController
             out var parsedUntil)
             ? parsedUntil
             : (DateTime?)null;
-        var openUntil = await _enrollment.GetOpenUntilAsync(configuredUntil, ct);
+        var window = await _enrollment.GetWindowAsync(configuredUntil, ct);
+        var openUntil = window.OpenUntilUtc;
 
         return OkData(new DeploymentStatusDto
         {
+            EnrollmentWindowOpen = openUntil is not null && openUntil > DateTime.UtcNow,
+            EnrollmentExtendMinutes = (int)LanEnrollmentService.ExtendDuration.TotalMinutes,
+            EnrollmentWindowIsInstallDefault = !window.ManuallyOpened,
             ServerAddress = serverAddress,
             ServerStatus = "running",
             DatabaseStatus = health.Status.ToString().ToLowerInvariant(),
@@ -65,8 +69,11 @@ public sealed class AdminDeploymentController : ApiBaseController
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.manage")]
     public async Task<ActionResult<ApiResponse<object>>> OpenEnrollmentWindow(CancellationToken ct)
     {
-        var until = await _enrollment.OpenForAsync(UserId, TimeSpan.FromMinutes(30), ct);
-        return OkData<object>(new { enrollmentOpenUntilUtc = until }, "LAN 自动登记已开放 30 分钟");
+        var minutes = (int)LanEnrollmentService.ExtendDuration.TotalMinutes;
+        var until = await _enrollment.OpenForAsync(UserId, LanEnrollmentService.ExtendDuration, ct);
+        return OkData<object>(
+            new { enrollmentOpenUntilUtc = until, extendMinutes = minutes },
+            $"免令牌登记窗口已重新开放 {minutes} 分钟；只影响新机器，已注册客户端不受影响");
     }
 
     private string GetClientInstallerVersion()

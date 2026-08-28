@@ -9,7 +9,15 @@ namespace BackupMonitor.Infrastructure.Tests;
 /// 这两条都是纯本地行为，不需要数据库：
 /// 一、同一台机器连续两次采样，磁盘/服务/会话三块没变就不该重复上报；
 /// 二、第一次心跳必须带全量快照——服务端此时对这台机器一无所知。
+///
+/// 归进 postgres 集合不是因为要用数据库，而是要**避开并行**：
+/// 快照摘要把磁盘可用空间按 64MB 分桶，而库测试会起本地 PostgreSQL 实例、
+/// 写暂存文件，同一块盘上轻易就跨掉一个桶——于是「两次采样之间机器没有变化」
+/// 这个前提在并行跑全量时不成立，本类会随机变红。
+/// xUnit 同一集合内的测试类串行执行，把它放进来即可让前提重新成立。
+/// 不在构造函数里接夹具：本类确实一行数据库都不碰。
 /// </summary>
+[Collection("postgres")]
 public sealed class AgentHeartbeatCadenceTests
 {
     [Fact]

@@ -16,10 +16,12 @@ namespace BackupMonitor.Api.Controllers;
 public class AdminUploadProgressController : ApiBaseController
 {
     private readonly IUploadProgressService _progress;
+    private readonly IUploadSessionControlService _control;
 
-    public AdminUploadProgressController(IUploadProgressService progress)
+    public AdminUploadProgressController(IUploadProgressService progress, IUploadSessionControlService control)
     {
         _progress = progress;
+        _control = control;
     }
 
     /// <summary>当前在传的会话及其进度、速度、预计剩余时间</summary>
@@ -29,5 +31,35 @@ public class AdminUploadProgressController : ApiBaseController
     {
         var result = await _progress.GetActiveAsync(ct);
         return OkData(result);
+    }
+
+    /// <summary>
+    /// 暂停这次传输（待办方案 E）。会话置 paused 之后不再接受分块写入，
+    /// 暂存与已传的块都留着，恢复时从断点继续。
+    /// </summary>
+    [HttpPost("{sessionId:guid}/pause")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.upload")]
+    public async Task<ActionResult<ApiResponse>> Pause(Guid sessionId, CancellationToken ct)
+    {
+        await _control.PauseAsync(sessionId, ct);
+        return OkMessage("已暂停，恢复时会从断点继续");
+    }
+
+    /// <summary>恢复：放回可写状态并重新下发上传指令</summary>
+    [HttpPost("{sessionId:guid}/resume")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.upload")]
+    public async Task<ActionResult<ApiResponse>> Resume(Guid sessionId, CancellationToken ct)
+    {
+        await _control.ResumeAsync(sessionId, ct);
+        return OkMessage("已恢复，客户端会从断点继续传");
+    }
+
+    /// <summary>取消这次传输（已入库的不能取消）</summary>
+    [HttpPost("{sessionId:guid}/cancel")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.upload")]
+    public async Task<ActionResult<ApiResponse>> Cancel(Guid sessionId, CancellationToken ct)
+    {
+        await _control.CancelAsync(sessionId, ct);
+        return OkMessage("这次传输已取消");
     }
 }

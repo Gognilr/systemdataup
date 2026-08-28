@@ -1,6 +1,7 @@
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
+using BackupMonitor.Infrastructure.Security;
 using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Models.Agent;
 using Microsoft.EntityFrameworkCore;
@@ -31,7 +32,10 @@ public class HeartbeatSnapshotUnchangedTests : IAsyncLifetime
         var sc = new ServiceCollection();
         sc.AddLogging();
         sc.AddDbContext<AppDbContext>(o => o.UseNpgsql(_fixture.ConnectionString));
-        sc.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        // AgentConfigService 依赖 CommandSigner（下发配置要签名），而 CommandSigner
+        // 构造时就要一把真实的 RSA 私钥——空配置会让整条心跳链路在 DI 解析阶段就失败。
+        sc.AddSingleton(SigningConfiguration());
+        sc.AddSingleton<CommandSigner>();
         sc.AddSingleton<ICurrentContext, NullCurrentContext>();
         sc.AddScoped<IAuditRecorder, DbAuditRecorder>();
         sc.AddScoped<IAgentNotificationService, AgentNotificationService>();
@@ -46,6 +50,18 @@ public class HeartbeatSnapshotUnchangedTests : IAsyncLifetime
     }
 
     public async Task DisposeAsync() => await _services.DisposeAsync();
+
+    /// <summary>CommandSigner 需要一把真实的 RSA 私钥才能构造；测试里现造一把即可。</summary>
+    private static IConfiguration SigningConfiguration()
+    {
+        using var rsa = System.Security.Cryptography.RSA.Create(2048);
+        return new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Security:CommandSigningPrivateKey"] = Convert.ToBase64String(rsa.ExportPkcs8PrivateKey())
+            })
+            .Build();
+    }
 
     [Fact]
     public async Task 快照未变时磁盘告警仍然按库里的记录评估()
