@@ -79,6 +79,8 @@ public class AgentConfigService : IAgentConfigService
         // 会永远低于心跳要求的版本，于是每一次心跳都触发一次全量配置拉取。
         var version = await ComputeVersionAsync(clientId, ct);
 
+        var fingerprints = await LoadQuickFingerprintsAsync(tasks.Select(t => t.Id).ToList(), ct);
+
         var response = new AgentConfigResponse
         {
             Version = version,
@@ -100,7 +102,8 @@ public class AgentConfigService : IAgentConfigService
                 ChunkSizeBytes = t.ChunkSizeBytes,
                 RandomDelayMinutes = t.RandomDelayMinutes,
                 RecognizerConfig = t.RecognizerConfig,
-                ConfigVersion = t.ConfigVersion
+                ConfigVersion = t.ConfigVersion,
+                LastQuickFingerprints = fingerprints.TryGetValue(t.Id, out var f) ? f : []
             }).ToList(),
             MonitoredServices = services.Select(d => new AgentMonitoredServiceDto
             {
@@ -120,5 +123,51 @@ public class AgentConfigService : IAgentConfigService
         response.Signature = _signer.SignConfig(response, clientId);
 
         return response;
+    }
+
+    /// <summary>
+    /// 每个任务 / 业务单元最近一次候选备份集的 QuickFingerprint，供 Agent 的两段式扫描当基线。
+    ///
+    /// 取「最近一次预检」的那一条而不是「最近一次入库」的：基线要回答的是
+    /// 「磁盘上这份和 Agent 上次看到的那份是不是同一个」，与它有没有传上来无关。
+    ///
+    /// 没有业务单元的候选归到 root，与 BackupScanner 拼 candidateKey 时的
+    /// `businessUnit?.ExternalKey ?? "root"` 是同一个口径——两边对不上的话，
+    /// 基线永远命中不了，两段式退化成每次都算全量哈希（慢，但不会答错）。
+    /// </summary>
+    private async Task<Dictionary<Guid, List<AgentUnitFingerprintDto>>> LoadQuickFingerprintsAsync(
+        List<Guid> taskIds, CancellationToken ct)
+    {
+        if (taskIds.Count == 0)
+            return [];
+
+        var rows = await _db.CandidateBackupSets.AsNoTracking()
+            .Where(c => taskIds.Contains(c.TaskId) && c.QuickFingerprint != null)
+            .Select(c => new
+            {
+                c.TaskId,
+                ExternalKey = c.BusinessUnit == null ? null : c.BusinessUnit.ExternalKey,
+                c.QuickFingerprint,
+                c.PrecheckedAt,
+                c.UpdatedAt
+            })
+            .ToListAsync(ct);
+
+        return rows
+            .GroupBy(r => r.TaskId)
+            .ToDictionary(
+                g => g.Key,
+                g => g
+                    .GroupBy(r => string.IsNullOrWhiteSpace(r.ExternalKey) ? "root" : r.ExternalKey!)
+                    .Select(unit => new AgentUnitFingerprintDto
+                    {
+                        ExternalKey = unit.Key,
+                        QuickFingerprint = unit
+                            .OrderByDescending(r => r.PrecheckedAt ?? r.UpdatedAt)
+                            .ThenByDescending(r => r.UpdatedAt)
+                            .First().QuickFingerprint!
+                    })
+                    .OrderBy(f => f.ExternalKey, StringComparer.Ordinal)
+                    .ToList());
     }
 }

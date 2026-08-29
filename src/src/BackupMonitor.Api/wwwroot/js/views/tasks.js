@@ -7,22 +7,28 @@ import {
   toast, errToast, confirmModal, formModal, openDrawer, openModal, closeModal, clientLabel, clientName,
   describeCron, searchPickerHtml, initSearchPicker
 } from '../ui.js';
-import { shell, loading } from '../app.js';
+import { shell, loading, syncInFlightButtons } from '../app.js';
 import { runDirectoryWizard } from './recognizer-wizard.js';
 
 export async function vTasks() {
-  App.state.tasks = App.state.tasks || { page: 1, pageSize: 20, mode: '', totalCount: 0, selected: [] , sortKey: 'createdAt', sortDesc: true};
+  App.state.tasks = App.state.tasks || { page: 1, pageSize: 20, mode: '', totalCount: 0, selected: [] , sortKey: 'createdAt', sortDesc: true, forceFullHash: false };
   const st = App.state.tasks;
   $('#app').innerHTML = shell('tasks', '备份任务', `
     <div class="toolbar">
       <select id="f_mode"><option value="">全部模式</option>${optsOf(L.task_mode).map(o => `<option value="${o.v}" ${st.mode === o.v ? 'selected' : ''}>${o.t}</option>`).join('')}</select>
       <button class="primary" data-ui-action="loader" data-loader="tasks">查询</button>
+      <label class="sub" style="display:inline-flex;align-items:center;gap:4px" title="不比对快速指纹，把每个文件整读一遍重算 SHA-256。备份没变化时会慢很多，平时不需要勾。">
+        <input type="checkbox" id="f_force_full_hash" ${st.forceFullHash ? 'checked' : ''}>强制完整校验
+      </label>
       <div class="spacer"></div>
       <button class="primary" data-ui-action="act" data-view="tasks" data-action="create">＋ 新建任务</button>
     </div>
     <div id="bb-tasks">${batchBarHtml('tasks')}</div>
     <div id="vwrap">${loading()}</div>`);
   $('#f_mode').onchange = () => { st.mode = $('#f_mode').value; st.page = 1; LOADERS.tasks(); };
+  // 「强制完整校验」是这一页的一个开关，不是每行一个勾选框——它极少被用到，
+  // 给每个任务都摆一个只会把操作列挤满。勾上之后这一页的「立即备份」都走完整校验。
+  $('#f_force_full_hash').onchange = e => { st.forceFullHash = e.target.checked; };
   await LOADERS.tasks();
 }
 
@@ -62,12 +68,26 @@ LOADERS.tasks = async function () {
     ], data.items, { empty, stateKey: 'tasks' }) + pagerHtml('tasks', st);
     const bb = $('#bb-tasks');
     if (bb) bb.outerHTML = `<div id="bb-tasks">${batchBarHtml('tasks')}</div>`;
+    // 表格是刚重画出来的，正在跑的「立即备份」得重新锁上（见 syncInFlightButtons）。
+    syncInFlightButtons(wrap);
   } catch (e) { wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 };
 
 App.batchActs = App.batchActs || {};
 App.batchActs.tasks = [
-  { t: '立即备份', fn: id => api(`/api/v1/admin/backup-tasks/${id}/precheck`, { method: 'POST' }) },
+  // bulk：一次请求带上所有选中的任务，服务端建一次执行按并发度放行。
+  // 逐个下发的老写法等于十个任务同时开传，服务端暂存盘扛不住——那正是这一条要消灭的行为。
+  { t: '立即备份', bulk: true, fn: async ids => {
+    const r = await api('/api/v1/admin/backup-tasks/batch-precheck', {
+      method: 'POST',
+      // 不带 forceFullHash：批量走执行队列，队列项上没地方存指令参数。
+      // 「强制完整校验」是单个任务的逃生门，要用就一个一个点。
+      body: { taskIds: ids }
+    });
+    const skipped = r.skippedTasks ? `，${r.skippedTasks} 个跳过（停用/暂停/客户端不可用）` : '';
+    toast(`已排队 ${r.queuedTasks} 个任务，同时最多跑 ${r.maxConcurrent} 个${skipped}。进度在「传输中」页面。`, 'ok');
+    return true;
+  } },
   { t: '暂停', fn: id => api(`/api/v1/admin/backup-tasks/${id}/pause`, { method: 'POST' }) },
   { t: '恢复', fn: id => api(`/api/v1/admin/backup-tasks/${id}/resume`, { method: 'POST' }) }
 ];
@@ -327,10 +347,10 @@ async function taskFormFields(initial, template, prefill, client) {
         + (defaultPolicy ? '' : '。当前系统还没有默认策略，此时「跟随默认」等于不清理，请先去保留策略页设一份') },
     // A3：大小异常判定的三个阈值，此前只在详情页展示、表单里从没有过输入项——
     // 界面上写着「大小限制 1 GB ~ 50 GB」，但没有任何地方能把它填进去。
-    { name: 'minTotalBytes', label: '总大小下限', type: 'number', value: v.minTotalBytes ?? '', advanced: true,
-      hint: '单位：字节（1 GB = 1073741824）。低于此值判为大小异常，留空表示不检查' },
-    { name: 'maxTotalBytes', label: '总大小上限', type: 'number', value: v.maxTotalBytes ?? '', advanced: true,
-      hint: '单位：字节。高于此值判为大小异常，留空表示不检查' },
+    { name: 'minTotalBytes', label: '总大小下限', type: 'bytes', value: v.minTotalBytes ?? '', advanced: true,
+      hint: '低于此值判为大小异常，留空表示不检查' },
+    { name: 'maxTotalBytes', label: '总大小上限', type: 'bytes', value: v.maxTotalBytes ?? '', advanced: true,
+      hint: '高于此值判为大小异常。备份通常会随业务增长，填得太紧会周期性误报' },
     { name: 'minFileCount', label: '文件数下限', type: 'number', value: v.minFileCount ?? '', advanced: true,
       hint: '备份文件数少于此值判为大小异常，留空表示不检查' },
     // B3：随机延迟此前是个死字段——实体有、表单没有输入项——用来错开多台机器同一时刻扫描/上传。
@@ -465,6 +485,11 @@ export async function openTaskDrawer(id, viaNav = false) {
   } catch (e) { errToast(e); }
 }
 
+/* 「强制完整校验」勾选：跳过 Agent 的快速指纹基线，把每个文件整读一遍重算 SHA-256。
+   平时不勾——快速指纹只采样头尾各 64KB，认不出「中段被改而 size 与 mtime 都没变」的文件，
+   这个勾选就是那条已知边界的逃生门，而不是默认每次都付的代价。 */
+const forceFullHashQuery = () => (App.state.tasks && App.state.tasks.forceFullHash) ? '?forceFullHash=true' : '';
+
 /* ── 立即备份 ──
    一个按钮，一件事：现在就把这个任务备份一次。
 
@@ -484,24 +509,45 @@ async function runBackupNow(taskId) {
 
   let dispatched;
   try {
-    dispatched = await api(`/api/v1/admin/backup-tasks/${taskId}/precheck`, { method: 'POST' });
+    dispatched = await api(`/api/v1/admin/backup-tasks/${taskId}/precheck${forceFullHashQuery()}`, { method: 'POST' });
   } catch (e) { errToast(e); return; }
 
-  openModal(`立即备份：${detail.name}`, '<div class="hint">已通知客户端，等待它开始扫描…</div>');
-  const body = () => document.querySelector('#overlay .mbody');
-  const say = html => { if (body()) body().innerHTML = html; };
+  // already_running：服务端幂等键命中了一条还在跑的预检，返回的是那一条而不是新的。
+  // 这里必须如实说，否则人会以为自己刚点的没生效，转头去点第三次。
+  // 开场就说清「扫描阶段传输中是空的」。不说的话，人扫到一半去那一页看不到东西，
+  // 只能得出「没发起成功」这一个结论——而实际上客户端正在读几十 GB。
+  const opening = dispatched.status === 'already_running'
+    ? '<div class="hint">这个任务已经有一次备份在进行，正在等它的结果…</div>'
+    : '<div class="hint">已通知客户端，等待它开始扫描…</div>'
+      + '<div class="hint">扫描要把备份文件整读一遍算校验和，大备份会花不少时间；'
+      + '这个阶段「传输中」页面还是空的，等扫完才会出现上传。</div>';
+  // persistent：扫描要跑几分钟，点空白处误关一次的代价是「以为没发起，再点一次」。
+  // 关闭仍有「关闭」按钮与 Esc 两条明路。
+  const ov = openModal(`立即备份：${detail.name}`, opening, { persistent: true });
+  // 认准**这一个**遮罩，而不是 '#overlay'：这次等待会一直跑到备份有结论为止，
+  // 中途人完全可能打开别的弹窗——按 id 取的话，这里的进度会写进人家的窗口里去。
+  const body = () => (ov.isConnected ? ov.querySelector('.mbody') : null);
+  const say = html => { const el = body(); if (el) el.innerHTML = html; };
 
-  // 备份文件动辄几 GB，扫描要把它们读一遍算 SHA-256，比识别测试慢得多，
-  // 因此等待窗口给到 5 分钟；超时也不算失败，任务照常在后台走完。
-  const cmd = await pollCommand(dispatched.commandId, 300000, body, st =>
-    say(`<div class="hint">客户端正在扫描备份文件…（当前状态：${esc(st)}）</div>`));
-  if (cmd === null) return;                       // 用户关掉了对话框
+  // 等待窗口 2 小时，而不是原先的 5 分钟：18 个账套的 U8 备份盘一轮要把几十 GB
+  // 读一遍算 SHA-256，5 分钟到点解锁之后按钮重新可点，而那时扫描才刚开头——
+  // 再点一次就是整份重扫。超时仍然不算失败，任务照常在后台走完。
+  // background：窗口关掉也接着等，按钮跟着一直锁到这次备份真的有结论为止。
+  const already = dispatched.status === 'already_running' ? '（这一次是先前那条备份）' : '';
+  const cmd = await pollCommand(dispatched.commandId, 7200000, body,
+    c => say(`<div class="hint">${backupProgressText(c, already)}</div>`),
+    { background: true });
+  if (cmd === null) return;                       // 连续取不到指令状态，放弃等待
   if (cmd === 'timeout') {
-    say('<div class="hint">扫描仍在进行。大备份读一遍要花些时间，可以关掉这里，稍后在「传输中」页面看进度。</div>');
+    say('<div class="hint">扫描仍在进行。大备份读一遍要花些时间，可以关掉这里，稍后回来看这个任务的「上次检查结果」。</div>');
     return;
   }
   if (cmd.status !== 'succeeded') {
-    say(`<div class="hint">${esc(describeBackupOutcome(cmd))}</div>`);
+    const outcome = describeBackupOutcome(cmd);
+    say(`<div class="hint">${esc(outcome)}</div>`);
+    // 窗口早就被关掉时，这句话没有任何地方可以显示——补一条 toast，
+    // 否则人只知道按钮解锁了，不知道这次备份到底成没成。
+    if (!body()) toast(`${detail.name}：${outcome}`, 'err');
     LOADERS.tasks();
     return;
   }
@@ -517,6 +563,7 @@ async function runBackupNow(taskId) {
   const candidateId = candidateIdOf(cmd.resultPayload);
   if (!candidateId) {
     say('<div class="hint">扫描完成，但这次没有发现需要备份的新文件。</div>');
+    if (!body()) toast(`${detail.name}：没有发现需要备份的新文件`, 'ok');
     LOADERS.tasks();
     return;
   }
@@ -529,7 +576,19 @@ async function runBackupNow(taskId) {
     // 上传窗口和「客户端正忙」是配置意图，不是故障：问一句再强制，而不是默默绕过，
     // 也不是甩一句错误码让人自己去猜该怎么办。
     const askable = e.code === 'OUT_OF_UPLOAD_WINDOW' || e.code === 'CLIENT_BUSY';
-    if (!askable) { say(`<div class="hint">扫描通过，但下发上传失败：${esc(e.message)}</div>`); return; }
+    if (!askable) {
+      say(`<div class="hint">扫描通过，但下发上传失败：${esc(e.message)}</div>`);
+      if (!body()) toast(`${detail.name}：扫描通过，但下发上传失败——${e.message}`, 'err');
+      return;
+    }
+
+    // 窗口早被关掉了：这时候突然弹一个确认框，对使用者是凭空冒出来的东西——
+    // 他多半已经在看别的页面，也想不起来这是哪个任务的哪一步。改成如实报一句，
+    // 扫描结果留着，他回到这个任务再点一次就能接着传。
+    if (!body()) {
+      toast(`${detail.name}：${e.code === 'CLIENT_BUSY' ? '客户端还有别的上传在进行' : '当前不在上传窗口内'}，这次没有传；扫描结果留着，需要的话再点一次「立即备份」`, 'err');
+      return;
+    }
 
     const question = e.code === 'CLIENT_BUSY'
       ? '这台客户端还有别的上传在进行。仍然现在就传吗？'
@@ -539,7 +598,10 @@ async function runBackupNow(taskId) {
       await dispatchUpload(taskId, candidateId, true);
       say('<div class="hint">已开始上传。进度在「传输中」页面。</div>');
       toast('已开始备份', 'ok');
-    } catch (e2) { say(`<div class="hint">下发上传失败：${esc(e2.message)}</div>`); }
+    } catch (e2) {
+      say(`<div class="hint">下发上传失败：${esc(e2.message)}</div>`);
+      if (!body()) toast(`${detail.name}：下发上传失败——${e2.message}`, 'err');
+    }
   }
   LOADERS.tasks();
 }
@@ -573,25 +635,60 @@ function candidateIdOf(resultPayload) {
 }
 
 /* 轮询一条指令直到有结论。
-   返回指令对象 / 'timeout' / null（对话框已被关掉，调用方应当直接返回）。
-   识别测试与立即备份共用：两者等的是同一件事——Agent 什么时候把这条指令跑完。 */
-async function pollCommand(commandId, timeoutMs, body, onProgress) {
+   返回指令对象 / 'timeout' / null（放弃等待）。
+   识别测试与立即备份共用：两者等的是同一件事——Agent 什么时候把这条指令跑完。
+
+   opts.background：对话框被关掉之后**继续等**，只是把节奏放慢。
+   立即备份要的就是这个——「关掉窗口」表达的是「我不想盯着看」，不是「这次备份不算数」。
+   而调用方仍然被 act 分发层的在途集合锁着，指令没终结之前按钮不会重新变成可点，
+   这正是原先「关掉两秒按钮就亮了、再点一次触发整份重扫」的成因。
+   识别测试不传这个开关：那条路径关掉窗口就是不要结果了，等下去没有意义。
+
+   一次接口失败不再直接放弃：慢扫描要等几十分钟，中间一个网络抖动就把等待丢掉的话，
+   按钮会提前解锁，等于这条锁形同虚设。连续失败到第 3 次才认输。 */
+async function pollCommand(commandId, timeoutMs, body, onProgress, opts = {}) {
   const deadline = Date.now() + timeoutMs;
+  let failures = 0;
   while (Date.now() < deadline) {
-    if (!body()) return null;
-    await new Promise(r => setTimeout(r, 2000));
-    if (!body()) return null;
+    const visible = !!body();
+    if (!visible && !opts.background) return null;
+    await new Promise(r => setTimeout(r, visible ? 2000 : 10000));
+    if (!body() && !opts.background) return null;
 
     let cmd;
     try {
       cmd = await api(`/api/v1/admin/backup-tasks/commands/${commandId}`);
-    } catch (e) { errToast(e); return null; }
+      failures = 0;
+    } catch (e) {
+      if (++failures >= 3) { errToast(e); return null; }
+      continue;
+    }
 
     if (cmd.status === 'succeeded' || cmd.status === 'failed') return cmd;
     if (cmd.status === 'cancelled' || cmd.status === 'expired') return cmd;
-    onProgress(cmd.status);
+    onProgress(cmd);
   }
   return 'timeout';
+}
+
+/* Agent 在扫描途中报上来的进度，服务端原样放在 resultPayload 里。
+   没有进度（老版本 Agent、或指令还没被领走）时返回 null，调用方退回到只报状态。 */
+function progressOf(cmd) {
+  if (!cmd || !cmd.resultPayload) return null;
+  try {
+    const p = JSON.parse(cmd.resultPayload).progress;
+    return p && p.message ? p : null;
+  } catch (e) { return null; }
+}
+
+/* 一句话说清「现在在干什么」。
+   状态词（running）对使用者没有信息量——他要判断的是「这东西还在动吗、还要多久」，
+   而这个判断只有进度里的「第几个账套 · 正在读哪个文件」回答得了。 */
+function backupProgressText(cmd, already) {
+  const p = progressOf(cmd);
+  if (!p) return `客户端正在扫描备份文件…${already}（当前状态：${esc(cmd.status)}）`;
+  const percent = typeof p.percent === 'number' ? `${Math.round(p.percent)}% · ` : '';
+  return `${percent}${esc(p.message)}${already}`;
 }
 
 /* ── 识别测试 ──
@@ -615,8 +712,8 @@ async function runRecognitionTest(taskId) {
   openRecognitionModal(taskId, `<div class="hint">${waiting}</div>`);
   const body = () => document.querySelector('#overlay .mbody');
 
-  const cmd = await pollCommand(dispatched.operationId, 60000, body, st => {
-    if (body()) body().innerHTML = `<div class="hint">${waiting}（当前状态：${esc(st)}）</div>`;
+  const cmd = await pollCommand(dispatched.operationId, 60000, body, c => {
+    if (body()) body().innerHTML = `<div class="hint">${waiting}（当前状态：${esc(c.status)}）</div>`;
   });
   if (cmd === null) return;                    // 用户关掉了对话框
   if (!body()) return;
@@ -698,8 +795,8 @@ async function showLastRecognitionTest(taskId) {
   // pending / claimed / running：还在跑，把它当成一次新的等待接着等下去。
   openRecognitionModal(taskId, `<div class="hint">上一次测试还在执行（当前状态：${esc(cmd.status)}），继续等它的结果…</div>`);
   const body = () => document.querySelector('#overlay .mbody');
-  const done = await pollCommand(cmd.commandId, 60000, body, st => {
-    if (body()) body().innerHTML = `<div class="hint">上一次测试还在执行（当前状态：${esc(st)}），继续等它的结果…</div>`;
+  const done = await pollCommand(cmd.commandId, 60000, body, c => {
+    if (body()) body().innerHTML = `<div class="hint">上一次测试还在执行（当前状态：${esc(c.status)}），继续等它的结果…</div>`;
   });
   if (done === null || !body()) return;
   body().innerHTML = done === 'timeout'

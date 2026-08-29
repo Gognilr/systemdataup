@@ -182,6 +182,197 @@ public sealed class AgentRegistrationTurnkeyTests
         }
     }
 
+    // ---------- A1：重注册的身份连续性 ----------
+
+    /// <summary>
+    /// 带正确签名重注册（自愈路径：ClearIdentity 保留了私钥）→ 行为与改动前完全一致：
+    /// 直接 Online、签发证书、继承管理员设过的名字与分组。
+    /// </summary>
+    [Fact]
+    public async Task 带连续性证明的重注册静默继承旧身份()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (configuration, _) = CreateLanConfiguration(root);
+            await using var db = CreateDbContext();
+            var service = CreateService(db, configuration, new TestCurrentContext("192.168.20.15"));
+
+            using var key = RSA.Create(2048);
+            var publicKey = Convert.ToBase64String(key.ExportSubjectPublicKeyInfo());
+            var machineId = $"continuity-ok-{Guid.NewGuid():N}";
+
+            await SeedOfflineClientAsync(db, service, machineId, publicKey, "财务服务器");
+
+            var response = await service.SubmitAsync(new SubmitRegistrationRequest
+            {
+                MachineId = machineId,
+                Hostname = "reinstalled-host",
+                PublicKey = publicKey,
+                ContinuityProof = SignMachineId(key, machineId),
+                PreviousPublicKey = publicKey
+            });
+
+            Assert.Equal("approved", response.Status);
+
+            var client = await db.Clients.Include(c => c.Certificates)
+                .SingleAsync(c => c.Id == response.RegistrationId);
+            Assert.Equal(ClientStatus.Online, client.Status);
+            Assert.Equal("财务服务器", client.DisplayName);
+            Assert.Single(client.Certificates);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    /// <summary>
+    /// 不带签名（卸载重装，state.json 连同私钥一起没了）→ PendingApproval、**不签发证书**，
+    /// 但名字与分组仍然继承——第三态是「交给人确认」，不是拒绝。
+    ///
+    /// 拒绝会把「重装后永远 409」的死锁装回来，那比冒名顶替更常见也更难查。
+    /// </summary>
+    [Fact]
+    public async Task 无连续性证明的重注册落待审批且不签发证书()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (configuration, _) = CreateLanConfiguration(root);
+            await using var db = CreateDbContext();
+            var service = CreateService(db, configuration, new TestCurrentContext("192.168.20.15"));
+
+            var machineId = $"continuity-none-{Guid.NewGuid():N}";
+            await SeedOfflineClientAsync(db, service, machineId, CreatePublicKey(), "财务服务器");
+
+            var response = await service.SubmitAsync(new SubmitRegistrationRequest
+            {
+                MachineId = machineId,
+                Hostname = "impostor-host",
+                PublicKey = CreatePublicKey()
+            });
+
+            Assert.Equal("pending_approval", response.Status);
+
+            var client = await db.Clients.Include(c => c.Certificates)
+                .SingleAsync(c => c.Id == response.RegistrationId);
+            Assert.Equal(ClientStatus.PendingApproval, client.Status);
+            Assert.Empty(client.Certificates);
+            Assert.Null(client.CertificateThumbprint);
+            Assert.Equal("财务服务器", client.DisplayName);
+            Assert.Contains("无法证明是同一台机器", client.Notes ?? "", StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    /// <summary>用另一把密钥签的证明与不带签名同等处理，且必须留下独立的审计记录。</summary>
+    [Fact]
+    public async Task 错误签名与无签名同等处理并写出审计()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (configuration, _) = CreateLanConfiguration(root);
+            await using var db = CreateDbContext();
+            var service = CreateService(db, configuration, new TestCurrentContext("192.168.20.15"));
+
+            var machineId = $"continuity-bad-{Guid.NewGuid():N}";
+            await SeedOfflineClientAsync(db, service, machineId, CreatePublicKey(), "财务服务器");
+
+            using var attacker = RSA.Create(2048);
+            var attackerPublicKey = Convert.ToBase64String(attacker.ExportSubjectPublicKeyInfo());
+
+            var response = await service.SubmitAsync(new SubmitRegistrationRequest
+            {
+                MachineId = machineId,
+                Hostname = "impostor-host",
+                PublicKey = attackerPublicKey,
+                ContinuityProof = SignMachineId(attacker, machineId),
+                PreviousPublicKey = attackerPublicKey
+            });
+
+            var client = await db.Clients.SingleAsync(c => c.Id == response.RegistrationId);
+            Assert.Equal(ClientStatus.PendingApproval, client.Status);
+
+            Assert.True(
+                await db.AuditLogs.AnyAsync(a => a.Action == "agent.registration.identity_unproven"),
+                "第三态必须留一条独立的审计记录——那是事后唯一能回答「那台机器什么时候被换掉」的地方");
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    /// <summary>回归：活跃/疑似离线的旧身份仍然一律 409，原有的死锁修复不得被这条改动带偏。</summary>
+    [Fact]
+    public async Task 旧身份仍在线时依旧拒绝重注册()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (configuration, _) = CreateLanConfiguration(root);
+            await using var db = CreateDbContext();
+            var service = CreateService(db, configuration, new TestCurrentContext("192.168.20.15"));
+
+            using var key = RSA.Create(2048);
+            var publicKey = Convert.ToBase64String(key.ExportSubjectPublicKeyInfo());
+            var machineId = $"continuity-online-{Guid.NewGuid():N}";
+
+            await service.SubmitAsync(new SubmitRegistrationRequest
+            {
+                MachineId = machineId,
+                Hostname = "original-host",
+                PublicKey = publicKey
+            });
+
+            // 旧身份保持 Online：连正确的连续性证明也不能顶掉它。
+            var exception = await Assert.ThrowsAsync<BusinessException>(() => service.SubmitAsync(
+                new SubmitRegistrationRequest
+                {
+                    MachineId = machineId,
+                    Hostname = "second-host",
+                    PublicKey = publicKey,
+                    ContinuityProof = SignMachineId(key, machineId),
+                    PreviousPublicKey = publicKey
+                }));
+
+            Assert.Equal("CONFLICT", exception.ErrorCode);
+            Assert.Equal(409, exception.StatusCode);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    /// <summary>先正常注册一台，再把它压成 Offline，模拟「服务端已确认掉线」。</summary>
+    private static async Task SeedOfflineClientAsync(
+        AppDbContext db, AgentRegistrationService service, string machineId, string publicKey, string displayName)
+    {
+        var first = await service.SubmitAsync(new SubmitRegistrationRequest
+        {
+            MachineId = machineId,
+            Hostname = "original-host",
+            DisplayName = displayName,
+            PublicKey = publicKey
+        });
+
+        await db.Clients.Where(c => c.Id == first.RegistrationId)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.Status, ClientStatus.Offline));
+        db.ChangeTracker.Clear();
+    }
+
+    private static string SignMachineId(RSA key, string machineId) =>
+        Convert.ToBase64String(key.SignData(
+            System.Text.Encoding.UTF8.GetBytes(machineId),
+            HashAlgorithmName.SHA256,
+            RSASignaturePadding.Pkcs1));
+
     private AppDbContext CreateDbContext() => new(
         new DbContextOptionsBuilder<AppDbContext>()
             .UseNpgsql(_fixture.ConnectionString)

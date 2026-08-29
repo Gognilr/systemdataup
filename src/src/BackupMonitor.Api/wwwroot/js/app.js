@@ -209,6 +209,48 @@ document.addEventListener('change', e => {
     if (LOADERS[t.dataset.selall]) LOADERS[t.dataset.selall]();
   }
 });
+/* ── act 分发的在途去重 ──
+   「立即备份」这类动作要跑几分钟，期间按钮仍然可用：点空白处把等待窗口误关掉，
+   列表里的按钮立刻又能点，同一个任务就被下发了两条、三条指令。
+   这里按 view+action+id 记一个在途集合，在途期间的点击直接丢弃，
+   并把按钮置成 disabled/aria-busy——修的是分发层，所有走 act 的按钮一起受益。
+
+   复位放在 finally 里：失败也要解锁，否则一次网络错误就把按钮永久卡死。 */
+const IN_FLIGHT_ACTS = new Set();
+
+function runActOnce(el) {
+  const key = `${el.dataset.view}:${el.dataset.action}:${el.dataset.id || ''}`;
+  if (IN_FLIGHT_ACTS.has(key)) return;
+  IN_FLIGHT_ACTS.add(key);
+  el.disabled = true;
+  el.setAttribute('aria-busy', 'true');
+  const afterLoader = el.dataset.afterLoader;
+  Promise.resolve(App.act(el.dataset.view, el.dataset.action, el.dataset.id))
+    .catch(errToast)
+    .finally(() => {
+      IN_FLIGHT_ACTS.delete(key);
+      // 动作跑完时列表往往已经重渲染过，原来那个 DOM 节点不在文档里了——
+      // 对已经脱离文档的节点解锁是无害的空操作，新渲染出来的按钮本来就是可用的。
+      el.disabled = false;
+      el.removeAttribute('aria-busy');
+      if (afterLoader) LOADERS[afterLoader]?.();
+    });
+}
+
+/* 列表重渲染之后，把还在跑的那些动作重新按回 disabled。
+   在途集合本身仍然挡得住重复分发（runActOnce 先查它），但按钮看着是可点的——
+   人点下去没有任何反应，只会以为界面卡了然后接着点。列表刷新在「立即备份」
+   这条路径上是必然发生的（动作跑完会调 LOADERS.tasks），所以这一步不是锦上添花。 */
+export function syncInFlightButtons(root = document) {
+  if (!IN_FLIGHT_ACTS.size) return;
+  root.querySelectorAll('[data-ui-action="act"]').forEach(el => {
+    const key = `${el.dataset.view}:${el.dataset.action}:${el.dataset.id || ''}`;
+    if (!IN_FLIGHT_ACTS.has(key)) return;
+    el.disabled = true;
+    el.setAttribute('aria-busy', 'true');
+  });
+}
+
 document.addEventListener('click', e => {
   const action = e.target.closest ? e.target.closest('[data-ui-action]') : null;
   if (action) {
@@ -218,8 +260,7 @@ document.addEventListener('click', e => {
           if (typeof App[action.dataset.method] === 'function') App[action.dataset.method]();
           break;
         case 'act':
-          Promise.resolve(App.act(action.dataset.view, action.dataset.action, action.dataset.id))
-            .then(() => action.dataset.afterLoader && LOADERS[action.dataset.afterLoader]?.());
+          runActOnce(action);
           break;
         case 'loader':
           LOADERS[action.dataset.loader]?.();

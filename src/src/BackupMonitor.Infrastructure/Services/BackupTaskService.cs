@@ -24,7 +24,14 @@ public interface IBackupTaskService
     Task<BackupTaskDetailDto> GetDetailAsync(Guid taskId, CancellationToken ct = default);
     Task<BackupTaskDetailDto> PauseAsync(Guid taskId, CancellationToken ct = default);
     Task<BackupTaskDetailDto> ResumeAsync(Guid taskId, CancellationToken ct = default);
-    Task<DispatchCommandResponse> DispatchPrecheckAsync(Guid taskId, CancellationToken ct = default);
+    Task<DispatchCommandResponse> DispatchPrecheckAsync(Guid taskId, bool forceFullHash = false, CancellationToken ct = default);
+
+    /// <summary>
+    /// 一批任务的「立即备份」（D3）。建一次 Manual 执行交给顺序执行器按并发度放行，
+    /// 而不是给每个任务各发一条独立指令——那样十个任务就是十个同时开传。
+    /// </summary>
+    Task<BatchBackupNowResponse> DispatchPrecheckBatchAsync(
+        BatchBackupNowRequest request, CancellationToken ct = default);
     Task<DispatchCommandResponse> DispatchUploadAsync(Guid taskId, DispatchUploadRequest request, CancellationToken ct = default);
     Task<TestRecognitionResponse> TestRecognitionAsync(Guid taskId, CancellationToken ct = default);
     Task<CommandResultDto> GetCommandResultAsync(Guid commandId, CancellationToken ct = default);
@@ -73,6 +80,7 @@ public class BackupTaskService : IBackupTaskService
     private readonly ICurrentContext _context;
     private readonly IAuditRecorder _audit;
     private readonly SystemSettingsProvider _settings;
+    private readonly IExecutionQueueService _queue;
     private readonly ILogger<BackupTaskService> _logger;
 
     public BackupTaskService(
@@ -81,6 +89,7 @@ public class BackupTaskService : IBackupTaskService
         ICurrentContext context,
         IAuditRecorder audit,
         SystemSettingsProvider settings,
+        IExecutionQueueService queue,
         ILogger<BackupTaskService> logger)
     {
         _db = db;
@@ -88,6 +97,7 @@ public class BackupTaskService : IBackupTaskService
         _context = context;
         _audit = audit;
         _settings = settings;
+        _queue = queue;
         _logger = logger;
     }
 
@@ -500,8 +510,21 @@ public class BackupTaskService : IBackupTaskService
         return await GetDetailAsync(task.Id, ct);
     }
 
-    /// <summary>手动下发预检（设计书 16.6）</summary>
-    public async Task<DispatchCommandResponse> DispatchPrecheckAsync(Guid taskId, CancellationToken ct = default)
+    /// <summary>
+    /// 手动下发预检（设计书 16.6，「立即备份」按钮走的就是这条）。
+    ///
+    /// 幂等键固定成 manual-precheck:{taskId}，语义与识别测试（TestRecognitionAsync）对齐：
+    /// 一个任务同一时刻只该有一条手动预检指令。
+    /// - 上一条还在 pending/claimed/running：原样还回去，响应带 already_running，
+    ///   界面接着轮询那一条，而不是装作新发起了一次；
+    /// - 上一条已经终结（成功/失败/取消/过期）：复位重下（restartIfNotActive）。
+    ///
+    /// 原先键里拼了当前秒，只挡得住同一秒内的重复提交——扫描要跑几分钟，
+    /// 误关等待窗口后再点一次就是一条全新指令，点几次就并发几条。
+    /// 反过来，只认「键存在就拒绝」也不行：那会让任务在第一次备份之后永远点不动，
+    /// 所以终结态必须允许重下。
+    /// </summary>
+    public async Task<DispatchCommandResponse> DispatchPrecheckAsync(Guid taskId, bool forceFullHash = false, CancellationToken ct = default)
     {
         var task = await _db.BackupTasks.AsNoTracking()
             .Include(t => t.Client)
@@ -513,12 +536,61 @@ public class BackupTaskService : IBackupTaskService
         var command = await _commands.CreateCommandAsync(
             task.ClientId, CommandType.PrecheckTask,
             taskId: task.Id,
+            // forceFullHash：跳过 Agent 的快速指纹基线，无条件重算全量 SHA-256。
+            // 定期做一次完整校验是有意义的，但它应该是人明确要求的动作，不是默认每次都做。
+            payload: forceFullHash ? new { forceFullHash = true } : null,
             priority: task.Priority,
             createdBy: _context.UserId,
-            idempotencyKey: $"manual-precheck:{task.Id}:{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}",
+            idempotencyKey: ManualPrecheckKey(task.Id),
+            restartIfNotActive: true,
             ct: ct);
 
-        return new DispatchCommandResponse { CommandId = command.Id };
+        return new DispatchCommandResponse
+        {
+            CommandId = command.Id,
+            Status = command.Status is CommandStatus.Claimed or CommandStatus.Running
+                ? "already_running"
+                : "accepted"
+        };
+    }
+
+    private static string ManualPrecheckKey(Guid taskId) => $"manual-precheck:{taskId:N}";
+
+    /// <summary>
+    /// 批量「立即备份」（D3）。单个任务点一次仍然走 DispatchPrecheckAsync 保持即时反馈
+    /// （重复点击由 D1 的在途去重与稳定幂等键挡住）；多选才建执行，
+    /// 因为「十个任务同时开传」正是要消灭的那个行为。
+    ///
+    /// 一个任务都建不起来（全都停用/暂停/客户端不可用）时退回逐个下发，
+    /// 让每个任务各自的失败原因照常回到调用方，而不是笼统一句「没建成」。
+    /// </summary>
+    public async Task<BatchBackupNowResponse> DispatchPrecheckBatchAsync(
+        BatchBackupNowRequest request, CancellationToken ct = default)
+    {
+        var taskIds = (request.TaskIds ?? []).Distinct().ToList();
+        if (taskIds.Count == 0)
+            throw new BusinessException("INVALID_REQUEST", "没有选中任何任务", 400);
+
+        var run = await _queue.CreateManualRunAsync(taskIds, _context.UserId, ct);
+        if (run is not null)
+        {
+            return new BatchBackupNowResponse
+            {
+                ExecutionRunId = run.Id,
+                QueuedTasks = run.Items.Count(i => i.Status == ExecutionItemStatus.Pending),
+                SkippedTasks = run.Items.Count(i => i.Status == ExecutionItemStatus.Skipped),
+                MaxConcurrent = run.MaxConcurrent
+            };
+        }
+
+        var dispatched = 0;
+        foreach (var taskId in taskIds)
+        {
+            await DispatchPrecheckAsync(taskId, forceFullHash: false, ct);
+            dispatched++;
+        }
+
+        return new BatchBackupNowResponse { QueuedTasks = dispatched, MaxConcurrent = dispatched };
     }
 
     /// <summary>审批/手动下发上传（设计书 16.7）</summary>

@@ -55,6 +55,17 @@ public class BrowseSnapshotDto
     /// 「这里看起来是空的」和「这里我看不见」对使用者是完全不同的两件事。
     /// </summary>
     public List<string> DeniedPaths { get; set; } = [];
+
+    /// <summary>
+    /// 根目录本身的文件统计。子目录的同名字段挂在各自的 BrowseEntryDto 上，
+    /// 根目录没有对应的条目，只能放在这里——否则「源目录下直接堆着文件」这种最简单的结构
+    /// 反而拿不到准确的文件总数与总字节。
+    /// </summary>
+    public int? RootFileCount { get; set; }
+
+    public long? RootTotalFileBytes { get; set; }
+
+    public bool RootSampled { get; set; }
 }
 
 /// <summary>目录树中的一个节点（文件或目录），只有元数据。</summary>
@@ -74,6 +85,32 @@ public class BrowseEntryDto
 
     /// <summary>目录的直接子项数（含未返回的部分）；文件为 null。</summary>
     public int? ChildCount { get; set; }
+
+    /// <summary>
+    /// 该目录下的文件总数（含抽样未返回的部分）；文件节点为 null。
+    ///
+    /// 推断端需要的是「每个叶子有几个文件、名字是什么模式」，不是每个文件的名字。
+    /// 有了这个数，抽样之后 InferRequiredFiles 的「各单元里的个数是否一致」那一档
+    /// 才仍然判得准——只数抓回来的那几个会把一致的判成不一致。
+    /// </summary>
+    public int? FileCount { get; set; }
+
+    /// <summary>该目录下文件的总字节数（含抽样未返回的部分）；文件节点为 null。</summary>
+    public long? TotalFileBytes { get; set; }
+
+    /// <summary>
+    /// 该目录的文件做过抽样（只返回了最新的一批）。
+    ///
+    /// 与 Truncated 分开：Truncated 是「有整块结构没看见」，Sampled 是
+    /// 「看见了全貌的代表性样本，明细没全带回来」。前者要扣置信度，后者不该扣。
+    /// </summary>
+    public bool Sampled { get; set; }
+
+    /// <summary>
+    /// 该条目是 junction / 符号链接。枚举时**不下探**，但照常列出并标记——
+    /// 静默跳过会让「这里有东西」表现成「这里是空的」。
+    /// </summary>
+    public bool IsReparsePoint { get; set; }
 
     /// <summary>该目录的子项因限额未能全部返回。</summary>
     public bool Truncated { get; set; }

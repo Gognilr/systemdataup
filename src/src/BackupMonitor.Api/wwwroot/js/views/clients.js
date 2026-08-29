@@ -167,6 +167,9 @@ LOADERS.clients = async function () {
         const more = actMenu([
           // 改名和改分组不看状态：它们只动服务端自己的记录，离线甚至已注销的机器也该能整理。
           actBtn({ label: '重命名 / 改分组', view: 'clients', action: 'edit', id: r.id, small: false }),
+          // 「这台机器上还有没有别的备份没被监控起来」——这个问题此前无法回答。
+          actBtn({ label: '探测备份目录', view: 'clients', action: 'probe', id: r.id,
+            allowed: caps.canDispatch, why: caps.whyDispatch, small: false }),
           caps.canEnable
             ? actBtn({ label: '启用', view: 'clients', action: 'enable', id: r.id, cls: 'primary', small: false })
             : actBtn({ label: '禁用', view: 'clients', action: 'disable', id: r.id, allowed: caps.canDisable, why: caps.whyDisable, small: false }),
@@ -242,6 +245,14 @@ ACTIONS['clients:approve'] = async id => {
   toast(`已审批，证书指纹 ${d.certificateThumbprint}，有效期至 ${fmtDT(d.certificateExpiresAt)}`, 'ok');
   LOADERS.clients();
 };
+/* 「我看过了，这台机器是预期内的」。只把条目从待办队列摘掉——客户端本来就在正常工作，
+   状态、证书一概不动，所以不弹确认框：这个动作没有需要人再想一遍的后果，
+   而误点的代价只是少看一眼，条目还能在客户端列表里找回来。 */
+ACTIONS['clients:confirm-enrollment'] = async id => {
+  await api(`/api/v1/admin/clients/${id}/confirm-enrollment`, { method: 'POST' });
+  toast('已确认，这台机器不再出现在待办里', 'ok');
+  LOADERS.clients();
+};
 ACTIONS['clients:reject'] = async id => {
   formModal('拒绝注册', [{ name: 'reason', label: '拒绝原因', type: 'text', placeholder: '可选' }], async v => {
     await api(`/api/v1/admin/clients/${id}/reject`, { method: 'POST', body: { reason: v.reason || null } });
@@ -291,6 +302,71 @@ ACTIONS['clients:revoke'] = async id => {
     toast('客户端已注销', 'ok'); LOADERS.clients();
   }, '注销');
 };
+/* 主动探测这台机器上像备份目录的地方（B7）。
+   结果里真正有价值的是**未监控的那几行**——已经被任务盯着的那些只是让人确认没漏。 */
+ACTIONS['clients:probe'] = async id => {
+  const dispatched = await api(`/api/v1/admin/clients/${id}/probe-backup-dirs`, {
+    method: 'POST', body: { maxDepth: 4, maxCandidates: 20 }
+  });
+  const ov = openModal('探测备份目录', '<div class="hint">正在让客户端扫描各个磁盘…（最多半分钟）</div>', { persistent: true });
+  const body = html => { if (document.body.contains(ov)) ov.querySelector('.mbody').innerHTML = html; };
+
+  const deadline = Date.now() + 90000;
+  while (Date.now() < deadline) {
+    if (!document.body.contains(ov)) return;
+    await new Promise(r => setTimeout(r, 1500));
+    if (!document.body.contains(ov)) return;
+
+    let r;
+    try { r = await api(`/api/v1/admin/clients/probe-backup-dirs/${dispatched.commandId}`); }
+    catch (e) { body(`<div class="empty">${esc(e.message)}</div>`); return; }
+
+    if (r.status === 'succeeded') { body(probeResultHtml(r)); return; }
+    if (r.status === 'failed' || r.status === 'expired' || r.status === 'cancelled') {
+      body(`<div class="empty">${esc(r.resultMessage || '探测失败：' + r.status)}</div>`);
+      return;
+    }
+    body(`<div class="hint">客户端正在扫描…（当前状态：${esc(r.status)}）</div>`);
+  }
+  body('<div class="hint">客户端一直没有回应。它可能离线了，稍后再试。</div>');
+};
+
+function probeResultHtml(response) {
+  const found = (response.result && response.result.candidates) || [];
+  const coverage = new Map((response.coverage || []).map(c => [c.path, c]));
+  const notes = [];
+  if (response.result && response.result.truncated)
+    notes.push('磁盘太大，没有扫完（有时间上限）。下面是已经找到的那些。');
+  const denied = (response.result && response.result.deniedPaths) || [];
+  if (denied.length)
+    notes.push(`有 ${denied.length} 个目录没有读取权限，没能看进去——那里也可能有备份。`);
+
+  if (!found.length) {
+    return `<div class="hint">没有找到像备份目录的地方。这不代表这台机器上没有备份，
+      只代表自动判断没认出来——到「备份任务 → 新建」里自己指一个目录更可靠。</div>
+      ${notes.map(n => `<div class="hint">${esc(n)}</div>`).join('')}`;
+  }
+
+  const unmonitored = found.filter(c => !(coverage.get(c.path) || {}).monitored).length;
+  return `<p><strong>找到 ${found.length} 个像备份目录的地方，其中 ${unmonitored} 个还没被监控。</strong></p>
+    ${notes.map(n => `<div class="hint">${esc(n)}</div>`).join('')}
+    ${found.map(c => {
+      const cov = coverage.get(c.path);
+      const monitored = cov && cov.monitored;
+      return `<div class="probe-row${monitored ? ' is-monitored' : ''}">
+        <div class="probe-main">
+          <div class="probe-path">${esc(c.path)}</div>
+          <ul class="probe-signals">${(c.signals || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul>
+          <div class="sub">${esc(c.fileCount)} 个文件 · ${fmtBytes(c.totalBytes)}${
+            c.newestFileAt ? ' · 最新 ' + esc(fmtDT(c.newestFileAt)) : ''}</div>
+        </div>
+        <span class="sub">${monitored ? '已被任务「' + esc(cov.taskName || '') + '」监控' : '未监控'}</span>
+      </div>`;
+    }).join('')}
+    <div class="hint">要把未监控的目录接进来，到「备份任务 → 新建任务」，向导第一屏也有同一个探测入口，
+      在那里可以直接点「用这个目录建任务」。</div>`;
+}
+
 ACTIONS['clients:metrics'] = async id => {
   const d = await api(`/api/v1/admin/clients/${id}/refresh-metrics`, { method: 'POST' });
   toast(`刷新指标指令已下发（指令 ${shortId(d.commandId)}）`, 'ok');

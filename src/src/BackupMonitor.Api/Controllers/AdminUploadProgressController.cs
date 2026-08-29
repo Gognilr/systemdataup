@@ -33,6 +33,15 @@ public class AdminUploadProgressController : ApiBaseController
         return OkData(result);
     }
 
+    /// <summary>全局上传闸的状态：几个在传、几个在排队、上限是多少</summary>
+    [HttpGet("queue-status")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.read")]
+    public async Task<ActionResult<ApiResponse<UploadQueueStatusDto>>> QueueStatus(CancellationToken ct)
+    {
+        var result = await _progress.GetQueueStatusAsync(ct);
+        return OkData(result);
+    }
+
     /// <summary>
     /// 暂停这次传输（待办方案 E）。会话置 paused 之后不再接受分块写入，
     /// 暂存与已传的块都留着，恢复时从断点继续。

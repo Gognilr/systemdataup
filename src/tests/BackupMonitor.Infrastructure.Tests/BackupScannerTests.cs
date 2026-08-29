@@ -45,9 +45,13 @@ public sealed class BackupScannerTests : IDisposable
     {
         var scanner = new BackupScanner(NullLogger<BackupScanner>.Instance);
         var task = TaskConfig(recognizerType, recognizerConfig);
-        return testOnly
-            ? await scanner.ScanForTestAsync(task, CancellationToken.None)
-            : await scanner.ScanAsync(task, CancellationToken.None);
+        if (testOnly)
+            return await scanner.ScanForTestAsync(task, CancellationToken.None);
+
+        var results = new List<BackupScanResult>();
+        await foreach (var scan in scanner.ScanAsync(task, CancellationToken.None))
+            results.Add(scan);
+        return results;
     }
 
     private AgentTaskConfigDto TaskConfig(string recognizerType, string recognizerConfig) => new()
@@ -63,6 +67,108 @@ public sealed class BackupScannerTests : IDisposable
         // 稳定观察窗口设为 0：测试刚写完文件，否则一律返回 still_changing。
         StabilityIntervalSeconds = 0
     };
+
+    // ---------- D2：两段式扫描 ----------
+
+    /// <summary>
+    /// 快速指纹与服务端下发的基线一致 → 直接 no_new_backup，一个字节的全量哈希都不算。
+    /// 这就是「今天已经备过了，人只是想确认一下」那条最常见路径省下的那次整份重读。
+    /// </summary>
+    [Fact]
+    public async Task 快速指纹与上次一致时跳过全量哈希()
+    {
+        WriteFile("full.bak");
+
+        var baseline = Assert.Single(await ScanAllAsync("multi_file_set", "{}"));
+        Assert.Equal("passed", baseline.Status);
+        Assert.NotNull(baseline.QuickFingerprint);
+
+        var second = Assert.Single(await ScanWithBaselineAsync(baseline.QuickFingerprint!));
+
+        Assert.Equal("no_new_backup", second.Status);
+        // 没算全量哈希，也就不该有 manifest 与候选键——凑一个出来才是真正危险的做法。
+        Assert.Null(second.ManifestHash);
+        Assert.Contains("no_new_backup", second.CandidateKey);
+    }
+
+    /// <summary>源目录里出现新内容 → 走完整路径，行为与改动前一致。</summary>
+    [Fact]
+    public async Task 有新备份时仍然走完整哈希()
+    {
+        WriteFile("full.bak");
+        var baseline = Assert.Single(await ScanAllAsync("multi_file_set", "{}"));
+
+        WriteFile("full.bak", "backup-payload-changed");
+        var second = Assert.Single(await ScanWithBaselineAsync(baseline.QuickFingerprint!));
+
+        Assert.Equal("passed", second.Status);
+        Assert.NotNull(second.ManifestHash);
+        Assert.NotEqual(baseline.CandidateKey, second.CandidateKey);
+    }
+
+    /// <summary>
+    /// 已知且刻意接受的边界：QuickHash 只采样头尾各 64KB，文件中段被改而 size 与 mtime
+    /// 都没变时它认不出来，这里会判 no_new_backup。写成一条用例是为了表明这是选择，不是疏漏；
+    /// 逃生门是 forceFullHash（界面上的「强制完整校验」），下一条用例验证它确实能认出来。
+    /// </summary>
+    [Fact]
+    public async Task 中段被改而大小与时间不变时判为没有新备份()
+    {
+        var path = MutateMiddleSetup();
+        var baseline = Assert.Single(await ScanAllAsync("multi_file_set", "{}"));
+
+        MutateMiddleKeepingSizeAndTime(path);
+
+        var second = Assert.Single(await ScanWithBaselineAsync(baseline.QuickFingerprint!));
+        Assert.Equal("no_new_backup", second.Status);
+    }
+
+    [Fact]
+    public async Task 强制完整校验能认出中段的改动()
+    {
+        var path = MutateMiddleSetup();
+        var baseline = Assert.Single(await ScanAllAsync("multi_file_set", "{}"));
+
+        MutateMiddleKeepingSizeAndTime(path);
+
+        var second = Assert.Single(await ScanWithBaselineAsync(baseline.QuickFingerprint!, forceFullHash: true));
+        Assert.Equal("passed", second.Status);
+        Assert.NotEqual(baseline.ManifestHash, second.ManifestHash);
+    }
+
+    /// <summary>头尾各 64KB 之外要有中段可改，因此文件必须明显大于 128KB。</summary>
+    private string MutateMiddleSetup()
+    {
+        var path = Path.Combine(_root, "big.bak");
+        var bytes = new byte[512 * 1024];
+        for (var i = 0; i < bytes.Length; i++)
+            bytes[i] = (byte)(i % 251);
+        File.WriteAllBytes(path, bytes);
+        return path;
+    }
+
+    private static void MutateMiddleKeepingSizeAndTime(string path)
+    {
+        var written = File.GetLastWriteTimeUtc(path);
+        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Write))
+        {
+            stream.Seek(256 * 1024, SeekOrigin.Begin);
+            stream.Write([0xEE, 0xEE, 0xEE, 0xEE]);
+        }
+        File.SetLastWriteTimeUtc(path, written);
+    }
+
+    private async Task<List<BackupScanResult>> ScanWithBaselineAsync(string quickFingerprint, bool forceFullHash = false)
+    {
+        var scanner = new BackupScanner(NullLogger<BackupScanner>.Instance);
+        var task = TaskConfig("multi_file_set", "{}");
+        task.LastQuickFingerprints =
+            [new AgentUnitFingerprintDto { ExternalKey = "root", QuickFingerprint = quickFingerprint }];
+        var results = new List<BackupScanResult>();
+        await foreach (var scan in scanner.ScanAsync(task, forceFullHash, progress: null, CancellationToken.None))
+            results.Add(scan);
+        return results;
+    }
 
     /// <summary>
     /// 识别测试（试扫）不算 SHA-256。
@@ -232,7 +338,7 @@ public sealed class BackupScannerTests : IDisposable
             TaskMode = "automatic",
             Enabled = true,
             RecognizerConfig = "{}"
-        }, CancellationToken.None);
+        }, CancellationToken.None).ToListAsync();
 
         Assert.Equal("path_not_found", Assert.Single(results).Status);
     }
@@ -310,7 +416,7 @@ public sealed class BackupScannerTests : IDisposable
             Enabled = true,
             RecognizerConfig = recognizerConfig,
             StabilityIntervalSeconds = 0
-        }, CancellationToken.None);
+        }, CancellationToken.None).ToListAsync();
     }
 
     /// <summary>root\2025\12、root\2026\07（空）、root\2026\08（有文件），root\*\* 应当扫到 2026\08。</summary>

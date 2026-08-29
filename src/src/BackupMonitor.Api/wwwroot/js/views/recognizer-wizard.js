@@ -16,7 +16,8 @@
       于是「改一个勾选 → 立刻看到判定变化」成立，配置从「填完再说」变成「看着调」。 */
 
 import { api } from '../api.js';
-import { esc, fmtBytes, fmtDT, status, openModal, closeModal, errToast, skeleton } from '../ui.js';
+import { esc, fmtBytes, fmtDT, status, openModal, closeModal, errToast, skeleton,
+  bytesFieldHtml, initBytesFields } from '../ui.js';
 
 const MAX_WAIT_MS = 90000;
 const POLL_INTERVAL_MS = 1500;
@@ -48,6 +49,8 @@ export function runDirectoryWizard(clientId) {
       expanded: new Set(),
       proposal: null,
       required: new Set(),
+      // 尺寸基线的当前取值（可能被人改过）。null = 不检查。
+      baseline: { minTotalBytes: null, minFileCount: null },
       history: []
     };
 
@@ -96,10 +99,32 @@ export function runDirectoryWizard(clientId) {
         closeModal();
       } else if (act === 'retry') {
         await load(st.snapshot ? st.snapshot.root : null);
+      } else if (act === 'probe') {
+        await probe();
+      } else if (act === 'use-probed') {
+        st.selected = path;
+        await load(path, true);
       }
     });
 
+    // 尺寸基线是个会产生告警的阈值，人必须看得见并能改。改完不需要重新预演——
+    // 预演跑的是识别规则，而它是任务字段，两者不在一条链路上。
+    // 监听 input 而不只是 change：总大小走的是「数值 + 单位」组合控件，
+    // 只改数值不失焦就直接点「建任务」时，change 还没发生，填的数会丢。
+    const readBaseline = target => {
+      const wrap = target.closest('[data-baseline]');
+      if (!wrap) return false;
+      // 组合控件把换算好的字节数放在内部的隐藏 input 里；文件数下限就是这个元素本身。
+      const input = wrap.matches('input') ? wrap : wrap.querySelector('input[type="hidden"]');
+      const value = String(input ? input.value : '').trim();
+      st.baseline[wrap.dataset.baseline] = value === '' ? null : Number(value);
+      return true;
+    };
+    ov.addEventListener('input', ev => { readBaseline(ev.target); });
+
     ov.addEventListener('change', ev => {
+      if (readBaseline(ev.target)) return;
+
       const box = ev.target.closest('[data-required]');
       if (!box) return;
       const pattern = box.dataset.required;
@@ -151,7 +176,8 @@ export function runDirectoryWizard(clientId) {
       if (snap.isDriveList) {
         body(`<p class="hint" style="margin-top:0">备份文件在哪个盘上？</p>
           <div class="dirtree">${snap.entries.map(driveRow).join('') || '<div class="empty">没有可浏览的磁盘</div>'}</div>`);
-        footer('<button data-act="manual">改为自己描述结构</button>');
+        // 不知道备份在哪时，「一层层点开找」是这一屏唯一的出路——探测就是给这种情况的。
+        footer('<button data-act="probe">帮我找找备份目录</button><button data-act="manual">改为自己描述结构</button>');
         return;
       }
 
@@ -193,6 +219,57 @@ export function runDirectoryWizard(clientId) {
       return st.selected !== normPath(st.snapshot.root) || (st.snapshot.maxDepth || 0) < INFER_DEPTH;
     }
 
+    /* ── 主动探测：「这台机器上还有没有别的备份没被监控起来」 ──
+
+       浏览回答不了这个问题——它是定向的，得先知道路径。探测是发现式的：
+       给一台机器，返回像备份目录的地方，并标出哪些已经被现有任务盯着。
+       真正的产出是**未监控的那几行**。 */
+    async function probe() {
+      body(`<div class="hint">正在让客户端扫描各个磁盘，找像备份目录的地方…（最多半分钟）</div>${skeleton(4)}`);
+      footer('');
+      try {
+        const dispatched = await api(`/api/v1/admin/clients/${clientId}/probe-backup-dirs`, {
+          method: 'POST',
+          body: { maxDepth: 4, maxCandidates: 20 }
+        });
+        const result = await waitForProbe(dispatched.commandId, alive, stage => {
+          body(`<div class="hint">已下发探测指令，等待客户端执行…（${esc(stage)}）</div>${skeleton(4)}`);
+        });
+        if (!alive()) return;
+        renderProbe(result);
+      } catch (e) {
+        if (!alive()) return;
+        body(`<div class="empty">${esc(e.message)}</div>`);
+        footer('<button data-act="drives">返回磁盘列表</button><button data-act="manual">改为自己描述结构</button>');
+      }
+    }
+
+    function renderProbe(response) {
+      const found = (response.result && response.result.candidates) || [];
+      const coverage = new Map((response.coverage || []).map(c => [c.path, c]));
+      const notes = [];
+      if (response.result && response.result.truncated)
+        notes.push('磁盘太大，没有扫完（有时间上限）。下面是已经找到的那些。');
+      const denied = (response.result && response.result.deniedPaths) || [];
+      if (denied.length)
+        notes.push(`有 ${denied.length} 个目录没有读取权限，没能看进去——那里也可能有备份。`);
+
+      if (!found.length) {
+        body(`<h3 style="margin-top:0">没有找到像备份目录的地方</h3>
+          ${notes.map(n => `<div class="hint">${esc(n)}</div>`).join('')}
+          <p class="hint">这不代表这台机器上没有备份，只代表自动判断没认出来。直接从磁盘列表点进去找更可靠。</p>`);
+        footer('<button data-act="drives">自己找</button><button data-act="manual">改为自己描述结构</button>');
+        return;
+      }
+
+      const unmonitored = found.filter(c => !(coverage.get(c.path) || {}).monitored).length;
+      body(`
+        <h3 style="margin-top:0">找到 ${found.length} 个像备份目录的地方，其中 ${unmonitored} 个还没被监控</h3>
+        ${notes.map(n => `<div class="hint">${esc(n)}</div>`).join('')}
+        ${found.map(c => probeRow(c, coverage.get(c.path))).join('')}`);
+      footer('<button data-act="drives">自己找</button><button data-act="manual">改为自己描述结构</button>');
+    }
+
     /* ── 第二步：推断 + 预演 ── */
 
     async function infer(deepened = false) {
@@ -221,6 +298,10 @@ export function runDirectoryWizard(clientId) {
 
         st.required = new Set(
           (st.proposal.requiredFileCandidates || []).filter(c => c.recommended).map(c => c.pattern));
+        st.baseline = {
+          minTotalBytes: st.proposal.suggestedMinTotalBytes ?? null,
+          minFileCount: st.proposal.suggestedMinFileCount ?? null
+        };
         renderProposal();
       } catch (e) {
         if (!alive()) return;
@@ -251,9 +332,12 @@ export function runDirectoryWizard(clientId) {
           <p class="wiz-summary">${esc(p.summary)}</p>
           <ul class="evidence">${(p.evidence || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul>
         </div>
+        ${periodHtml(p)}
+        ${sizeBaselineHtml(p, st)}
         ${requiredPickerHtml(p)}
         <h3>按这条规则，现在扫一遍的结果会是</h3>
         <div data-preview>${previewHtml(p.preview)}</div>`);
+      initBytesFields(ov);
 
       footer(`<button data-act="back-browse">换个目录</button>
         <button data-act="manual">不太对，我自己调</button>
@@ -330,9 +414,14 @@ function nodeHtml(entry, level, st) {
   const hasChildren = (entry.children || []).length > 0;
   const picked = st.selected === path;
 
+  // 链接目录（junction / 符号链接）不下探，但要照常列出并说明——
+  // 静默跳过会让「这里有东西」表现成「这里是空的」。
   const meta = entry.accessDenied
     ? '<span class="dwarn">无访问权限</span>'
-    : `${entry.childCount != null ? entry.childCount + ' 项' : ''}${entry.truncated ? ' · 未列全' : ''}`;
+    : entry.isReparsePoint
+      ? '<span class="dwarn">链接目录（未展开）</span>'
+      : `${entry.childCount != null ? entry.childCount + ' 项' : ''}${entry.truncated ? ' · 未列全' : ''}${
+          entry.sampled ? ` · 只列了最新的 ${(entry.children || []).filter(c => !c.isDirectory).length} 个文件（共 ${entry.fileCount}）` : ''}`;
 
   let html = `<div class="dnode${picked ? ' is-picked' : ''}" style="--lvl:${level}">
     ${hasChildren
@@ -340,7 +429,7 @@ function nodeHtml(entry, level, st) {
       : '<span class="dtoggle"></span>'}
     <button class="dname" data-act="select" data-path="${esc(path)}">📁 ${esc(entry.name)}</button>
     <span class="dmeta">${meta}</span>
-    ${entry.depthLimited && !entry.accessDenied
+    ${entry.depthLimited && !entry.accessDenied && !entry.isReparsePoint
       ? `<button class="small" data-act="open" data-path="${esc(path)}">打开</button>` : ''}
   </div>`;
 
@@ -355,7 +444,15 @@ function nodeHtml(entry, level, st) {
    分成"默认勾上"和"不作判据"两块，而不是一个平铺列表 —— 后者会让人以为
    没勾的那些是被漏掉了。真正要传达的是：它们照常备份，只是不参与完整性判定，
    而且要说清楚为什么（"各账套启用年度不同，附件库个数本来就不一样"）。
-   只把勾去掉不给理由，人只会觉得系统看漏了，然后手动勾上，制造一堆假警报。 */
+   只把勾去掉不给理由，人只会觉得系统看漏了，然后手动勾上，制造一堆假警报。
+
+   "有候选但一条都不推荐"是真实形态，必须单独排一版：用友 U8 常常只扫出
+   UFFile_*.dat 这类模式候选，而 StructureInference.InferRequiredFiles 的模式档
+   要 present && stable 才给 Recommended，各账套启用年度不同、个数本来就不一样，
+   于是 picked 为空、extras 非空。这时若照常渲染推荐区，人看到的是一个空的
+   .filepick 框，配一句"勾上的文件如果缺了…"——一条都没勾，这句话是错的。
+   所以空推荐时不渲染那个空框，改用"暂不检查"的说法，下面照常列出 extras
+   （勾选框保持未勾），让人自己决定要不要拿其中某条当判据。 */
 function requiredPickerHtml(proposal) {
   const candidates = proposal.requiredFileCandidates || [];
   if (!candidates.length) {
@@ -366,8 +463,14 @@ function requiredPickerHtml(proposal) {
   const picked = candidates.filter(c => c.recommended);
   const extras = candidates.filter(c => !c.recommended);
 
+  if (!picked.length) {
+    return `<h3>每次备份必须有哪些文件</h3>
+      <p class="hint">这次没有看出每次都固定出现的文件，暂不检查。下面这些照常备份上传，只是不作为完整性判据；建任务后也可以在任务详情里补上。</p>
+      <div class="filepick">${extras.map(candidateHtml).join('')}</div>`;
+  }
+
   return `<h3>每次备份必须有哪些文件</h3>
-    <p class="hint">勾上的文件如果缺了，这次备份就判为不完整，不会入库。</p>
+    <p class="hint">勾上的文件如果缺了，这次备份就判为不完整，不会入库。按模式认的那几条，判据是「至少有一个」。</p>
     <div class="filepick">
       ${picked.map(candidateHtml).join('')}
     </div>
@@ -377,7 +480,10 @@ function requiredPickerHtml(proposal) {
 }
 
 function candidateHtml(c) {
-  // 每个单元里个数不固定时，把区间显示出来——那正是它不能当判据的理由本身。
+  // 个数不固定的模式（U8 按年度分的附件库）现在也是判据了，只是判的是「至少有一个」。
+  // 区间照常显示，但必须跟一句判据说明——只给一个「2–5 个」，人会以为要求每次都有 5 个，
+  // 然后把这条唯一能发现「附件库整批丢失」的检查自己取消掉。
+  const varyingCount = c.recommended && c.kind === 'pattern' && c.countPerUnitMin !== c.countPerUnitMax;
   const count = c.countPerUnitMax > 1 || c.countPerUnitMin !== c.countPerUnitMax
     ? `每个 ${c.countPerUnitMin === c.countPerUnitMax
         ? c.countPerUnitMin
@@ -393,6 +499,7 @@ function candidateHtml(c) {
       c.kind === 'pattern' ? '<span class="tagkind" title="文件名每次不同，按模式认">按模式</span>' : ''}</span>
     <span class="filepick__meta">${scope} · ${count}约 ${fmtBytes(c.typicalSizeBytes)}</span>
     ${c.notRecommendedReason ? `<span class="filepick__why">${esc(c.notRecommendedReason)}</span>` : ''}
+    ${varyingCount ? `<span class="filepick__why">个数每个单元不一样，这是正常的——判据是「至少有一个」，不是个数：整批丢失才判为不完整</span>` : ''}
   </label>`;
 }
 
@@ -444,6 +551,37 @@ function unitHtml(unit) {
 
 /* ── 工具 ── */
 
+/* 一行候选。信号必须显示出来——人要看得懂它为什么被列出来，
+   否则这张表就是一串没有依据的路径，跟随便猜没有区别。 */
+function probeRow(candidate, coverage) {
+  const monitored = coverage && coverage.monitored;
+  return `<div class="probe-row${monitored ? ' is-monitored' : ''}">
+    <div class="probe-main">
+      <div class="probe-path">${esc(displayPath(candidate.path))}</div>
+      <ul class="probe-signals">${(candidate.signals || []).map(x => `<li>${esc(x)}</li>`).join('')}</ul>
+      <div class="sub">${esc(candidate.fileCount)} 个文件 · ${fmtBytes(candidate.totalBytes)}${
+        candidate.newestFileAt ? ' · 最新 ' + esc(fmtDT(candidate.newestFileAt)) : ''}</div>
+    </div>
+    ${monitored
+      ? `<span class="sub">已被任务「${esc(coverage.taskName || '')}」监控</span>`
+      : `<button class="small primary" data-act="use-probed" data-path="${esc(candidate.path)}">用这个目录建任务</button>`}
+  </div>`;
+}
+
+async function waitForProbe(commandId, alive, onStage) {
+  const deadline = Date.now() + MAX_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (!alive()) throw new Error('已取消');
+    const r = await api(`/api/v1/admin/clients/probe-backup-dirs/${commandId}`);
+    if (r.status === 'succeeded') return r;
+    if (r.status === 'failed' || r.status === 'expired' || r.status === 'cancelled')
+      throw new Error(r.resultMessage || `探测失败（${r.status}）`);
+    onStage(r.status);
+    await sleep(POLL_INTERVAL_MS);
+  }
+  throw new Error('客户端一直没有回应。它可能离线了，稍后再试。');
+}
+
 async function waitForSnapshot(commandId, alive, onStage) {
   const deadline = Date.now() + MAX_WAIT_MS;
   while (Date.now() < deadline) {
@@ -487,8 +625,53 @@ function buildResult(st) {
     sourcePath: proposedSourcePath(st),
     recognizerType: st.proposal.recognizerType,
     recognizerConfig: buildConfig(st),
-    applicationName: st.proposal.suggestedApplicationName || ''
+    applicationName: st.proposal.suggestedApplicationName || '',
+    // 带进建任务表单的高级项。空值等于「不检查」——与表单里留空的含义一致，
+    // 不需要在这里再翻译一次。
+    minTotalBytes: st.baseline.minTotalBytes,
+    minFileCount: st.baseline.minFileCount
   };
+}
+
+/* 备份周期与历史缺口。
+
+   这里只**陈述事实**：不因为有缺口就降低置信度（缺口是被识别对象的性质，
+   不是识别质量的问题），也不在这一步发告警（那归 MissedBackupWorker）。
+   把两者混在一起，会让「这个目录有历史缺备」表现成「向导看不懂这个目录」。 */
+function periodHtml(p) {
+  if (!p.detectedPeriod) return '';
+  const missing = p.missingBackupDates || [];
+  return `<div class="wiz-note">
+    <div><strong>备份周期</strong>：${esc(p.detectedPeriod)}一备</div>
+    ${missing.length
+      ? `<div class="hint">按这个周期推算，这 ${missing.length} 天没有对应的备份：${missing.slice(0, 10).map(esc).join('、')}${missing.length > 10 ? ' …' : ''}。<br>这是这个目录本身的情况，不影响上面的识别结论——列出来只是让你知道。</div>`
+      : '<div class="hint">历史记录连续，没有发现缺口。</div>'}
+  </div>`;
+}
+
+/* 尺寸基线。
+
+   判据（备份大小低于下限就判「大小异常」并告警）本来就存在且链路完整，缺的只有建议值——
+   要人凭空想一个字节数填进去，于是现场基本不会生效，而「备份文件突然变成 0 字节」
+   是备份故障里最经典的一种。
+
+   只给下限，不给上限：备份变大通常是业务正常增长，给上限会制造周期性假警报。 */
+function sizeBaselineHtml(p, st) {
+  const note = p.sizeBaselineNote;
+  if (!note && p.suggestedMinTotalBytes == null && p.suggestedMinFileCount == null) return '';
+  return `<div class="wiz-note">
+    <div><strong>备份大小下限</strong></div>
+    ${note ? `<div class="hint">${esc(note)}</div>` : ''}
+    <div class="wiz-baseline">
+      <label>总大小下限
+        <div data-baseline="minTotalBytes">${bytesFieldHtml('baselineMinTotalBytes', st.baseline.minTotalBytes ?? '')}</div>
+      </label>
+      <label>文件数下限
+        <input type="number" min="0" data-baseline="minFileCount"
+               value="${st.baseline.minFileCount ?? ''}" placeholder="留空表示不检查">
+      </label>
+    </div>
+  </div>`;
 }
 
 /* 一次抓几层。

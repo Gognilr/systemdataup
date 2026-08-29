@@ -52,6 +52,27 @@ public class AgentTaskConfigDto
     public string RecognizerConfig { get; set; } = "{}";
 
     public long ConfigVersion { get; set; }
+
+    /// <summary>
+    /// 上一次候选备份集的 QuickFingerprint，按业务单元 externalKey 索引（无业务单元时为 root）。
+    ///
+    /// 给 Agent 的两段式扫描当基线用：先只算头尾采样的 QuickHash 拼出指纹，
+    /// 与这里的值一致就直接回报 no_new_backup，不再把整份备份读一遍算 SHA-256。
+    ///
+    /// 由服务端下发而不是 Agent 自存：两处状态迟早漂移，而漂移的表现是
+    /// 「明明有新备份却说没有」——那是这个系统最不能出的错。
+    /// 因此它也必须进配置签名，能改写响应体的人不能借它让备份静默停摆。
+    /// </summary>
+    public List<AgentUnitFingerprintDto> LastQuickFingerprints { get; set; } = [];
+}
+
+/// <summary>某个业务单元上一次候选备份集的快速指纹</summary>
+public class AgentUnitFingerprintDto
+{
+    /// <summary>业务单元 external_key；任务没有业务单元时固定为 root，与 BackupScanner 的 candidateKey 口径一致。</summary>
+    public string ExternalKey { get; set; } = "root";
+
+    public string QuickFingerprint { get; set; } = string.Empty;
 }
 
 /// <summary>下发给 Agent 的关键服务监控定义</summary>

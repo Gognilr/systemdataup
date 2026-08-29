@@ -107,6 +107,18 @@ public class AdminClientController : ApiBaseController
         return OkData(result, "客户端已审批通过并签发证书");
     }
 
+    /// <summary>
+    /// 确认一次自动登记：把它从待办的「最近自动登记」里摘掉。
+    /// 不改客户端状态，因此要的是 manage 权限而不是审批那一套流程。
+    /// </summary>
+    [HttpPost("{clientId:guid}/confirm-enrollment")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.manage")]
+    public async Task<ActionResult<ApiResponse>> ConfirmEnrollment(Guid clientId, CancellationToken ct)
+    {
+        await _clientService.ConfirmEnrollmentAsync(clientId, ct);
+        return OkMessage("已确认这台机器的自动登记");
+    }
+
     /// <summary>拒绝注册（15.3）</summary>
     [HttpPost("{clientId:guid}/reject")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.manage")]

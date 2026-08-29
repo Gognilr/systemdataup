@@ -31,7 +31,13 @@ namespace BackupMonitor.Shared.Recognition;
 /// </summary>
 public static class BusinessUnitResolver
 {
-    /// <summary>date_leaf 模式下探的层数上限。够深到能容纳「分组目录 → 账套 → 日期」再多一层。</summary>
+    /// <summary>
+    /// date_leaf 模式下探的层数上限的**兜底值**。够深到能容纳「分组目录 → 账套 → 日期」再多一层。
+    ///
+    /// 只在规则里没写 unitMaxDepth 时才用得上（存量任务、手写配置）。向导推断出来的配置
+    /// 一律带着 unitMaxDepth，理由见 <see cref="RecognizerRules.UnitMaxDepth"/>：
+    /// 三个调用点各自取默认值，正是「向导说 18 个、Agent 扫出另一批」那类静默分叉的来源。
+    /// </summary>
     public const int DefaultMaxDepth = 6;
 
     /// <summary>一个业务单元：目录本身、它相对源目录的路径（就是 external_key）、以及它在第几层。</summary>
@@ -48,16 +54,28 @@ public static class BusinessUnitResolver
         public required Func<TDir, string> RelativePath { get; init; }
     }
 
+    /// <summary>
+    /// 解出源目录下的业务单元。
+    ///
+    /// <paramref name="maxDepth"/> 的取值顺序是「显式传入 → 规则里的 unitMaxDepth → DefaultMaxDepth」。
+    /// 显式传入只留给推断本身（它受快照抓取深度约束，见 StructureInference.SnapshotUnitMaxDepth）；
+    /// 预演和真扫都不传，于是两边拿到的是**推断当时用过的那个数**而不是各自的默认值——
+    /// 这正是「向导说会识别出 18 个账套、Agent 实际扫出另一批」不可能发生的保证。
+    /// </summary>
+    /// <param name="maxDepth">0 表示不指定，交给规则或兜底值决定。</param>
     public static List<Unit<TDir>> Resolve<TDir>(
         TDir source,
         RecognizerRules rules,
         Navigator<TDir> navigator,
-        int maxDepth = DefaultMaxDepth)
+        int maxDepth = 0)
     {
+        var effectiveMaxDepth = maxDepth > 0 ? maxDepth : (rules.UnitMaxDepth ?? DefaultMaxDepth);
+
         var units = rules switch
         {
-            { BusinessUnitPaths.Count: > 0 } => ByPaths(source, rules, navigator, maxDepth),
-            { UnitLayout: "date_leaf" } => ByDateLeaf(source, rules, navigator, maxDepth),
+            { BusinessUnitPaths.Count: > 0 } => ByPaths(source, rules, navigator, effectiveMaxDepth),
+            { UnitLayout: "date_leaf" } => ByDateLeaf(source, rules, navigator, effectiveMaxDepth),
+            // ByDepth 不用这个上限：它按 businessUnitDepth 走固定深度，深度本身就是那条规则。
             _ => ByDepth(source, rules, navigator)
         };
 
@@ -129,8 +147,11 @@ public static class BusinessUnitResolver
             if (DateName.IsDateLayer(names))
                 return self;
 
-            var nested = children.SelectMany(c => Descend(c, depth + 1)).ToList();
-            return nested.Count > 0 ? nested : self;
+            // 递归下去必然有结果：Descend 每次至少返回目录自身，而 children 到这里非空。
+            // 两种「停下来」的情况（子目录为空、下一层是日期层）都已在上面直接返回 self，
+            // 所以这里不需要再拿 self 兜底——写成 `nested.Count > 0 ? nested : self` 的话，
+            // else 分支永远不可达，只会让人误以为存在「下探后一个单元都没有」的情形。
+            return children.SelectMany(c => Descend(c, depth + 1)).ToList();
         }
     }
 

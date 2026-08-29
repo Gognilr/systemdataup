@@ -75,6 +75,9 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
     /// </summary>
     private const int MaxResultPayloadBytes = 2 * 1024 * 1024;
 
+    private static readonly JsonSerializerOptions ProgressJson =
+        new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+
     private readonly AppDbContext _db;
     private readonly CommandSigner _signer;
     private readonly IAlertingService _alerting;
@@ -136,6 +139,11 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
                     existing.ResultCode = null;
                     existing.ResultMessage = null;
                     existing.ResultPayload = null;
+                    // 复位重下要连 payload 一起换成这一次的参数。
+                    // 不换的话，同一个幂等键上「勾了强制完整校验」的这次点击会拿着
+                    // 上一次的 payload 去跑——人明确要求的动作被静默忽略。
+                    // 指令签名 v2 覆盖 payload，重签在下一行，两者不能拆开。
+                    existing.Payload = payload is null ? null : JsonSerializer.Serialize(payload);
                     existing.ExpiresAt = DateTime.UtcNow.Add(ttl ?? DefaultTtl);
                     existing.Nonce = TokenHasher.GenerateToken(16);
                     existing.Signature = _signer.SignCommand(existing);
@@ -262,6 +270,9 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
         // 审计 D-06：进度上报同样要收口。Message 来自客户端，长度不受任何约束，
         // 而 result_payload 是 jsonb——这里虽然是服务端自己序列化的，
         // 但内容仍是客户端给的，超大 Message 一样能把这张表撑坏。
+        // 键名走 camelCase：result_payload 里其余内容（candidateBackupSetId 等）都是
+        // Agent 自己按 camelCase 写的，浏览器端按同一套读。默认的 PascalCase 会让
+        // 同一个字段在同一列里有两种拼法，界面读进度时必然踩空。
         command.ResultPayload = NormalizeResultPayload(JsonSerializer.Serialize(new
         {
             progress = new
@@ -271,7 +282,7 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
                 Message = Truncate(request.Message, MaxResultMessageLength),
                 updatedAt = DateTime.UtcNow
             }
-        }), commandId);
+        }, ProgressJson), commandId);
         await _db.SaveChangesAsync(ct);
     }
 

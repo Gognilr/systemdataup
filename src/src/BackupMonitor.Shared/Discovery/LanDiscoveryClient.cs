@@ -44,54 +44,125 @@ public sealed class LanDiscoveryClient
         {
             EnableBroadcast = true
         };
+
+        DisableUdpConnReset(socket);
+
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(timeout);
 
         var probe = SendProbesAsync(socket, bytes, ResolveBroadcastTargets(), timeoutCts.Token);
 
-        while (!timeoutCts.IsCancellationRequested)
+        try
         {
-            UdpReceiveResult received;
-            try
+            while (!timeoutCts.IsCancellationRequested)
             {
-                received = await socket.ReceiveAsync(timeoutCts.Token);
-            }
-            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
-            {
-                break;
-            }
+                // 外层 ct 在两次接收之间被取消时也必须停下来并抛出：停机信号不能被
+                // 当成「探测窗口到了」而返回一份半截结果，理由同下面的 catch 过滤器。
+                ct.ThrowIfCancellationRequested();
 
-            LanDiscoveryResponse? response;
-            try
-            {
-                response = JsonSerializer.Deserialize<LanDiscoveryResponse>(received.Buffer, JsonOptions);
-            }
-            catch (JsonException)
-            {
-                continue;
-            }
+                UdpReceiveResult received;
+                try
+                {
+                    received = await socket.ReceiveAsync(timeoutCts.Token);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    // 只有「超时窗口到了」才算正常收尾。timeoutCts 是 ct 的链接源，
+                    // 外层 ct 取消时它同样会 IsCancellationRequested——如果不区分这两者，
+                    // 停机信号会被当成探测结束，方法返回部分结果，调用方
+                    // （AgentWorker.TryRediscoverServerAddressAsync）接着拿一个已取消的
+                    // ct 去 probe 候选地址。外层取消必须让异常传播出去。
+                    break;
+                }
+                catch (SocketException ex)
+                {
+                    // Windows 上 UDP 套接字收到 ICMP 端口不可达，会以 WSAECONNRESET 的形式
+                    // 从后续的 receive 抛出。它只说明「刚才发给某个地址的包被拒了」，
+                    // 与还在路上的其他应答无关，丢掉这一次继续收。
+                    // 其他 SocketError 说明套接字本身已经坏了，此时不能无条件 continue，
+                    // 否则会在这里空转到超时为止。
+                    if (ex.SocketErrorCode == SocketError.ConnectionReset)
+                        continue;
 
-            if (response is null
-                || response.Protocol != LanDiscoveryProtocol.Name
-                || response.ProtocolVersion != LanDiscoveryProtocol.Version
-                || !CryptographicOperations.FixedTimeEquals(
-                    System.Text.Encoding.UTF8.GetBytes(response.Nonce),
-                    System.Text.Encoding.UTF8.GetBytes(nonce))
-                || !Uri.TryCreate(response.ApiAddress, UriKind.Absolute, out var api)
-                || api.Scheme != Uri.UriSchemeHttp && api.Scheme != Uri.UriSchemeHttps
-                || string.IsNullOrWhiteSpace(response.ServerInstanceId))
-                continue;
+                    break;
+                }
 
-            // 同一台服务端会因为多轮探测和多个广播目标重复应答，按实例 ID 覆盖即可。
-            results[response.ServerInstanceId] = new DiscoveredServer(
-                response.ServerInstanceId,
-                string.IsNullOrWhiteSpace(response.DisplayName) ? "BackupMonitor Server" : response.DisplayName,
-                response.ApiAddress.TrimEnd('/'),
-                response.ProtocolVersion);
+                LanDiscoveryResponse? response;
+                try
+                {
+                    response = JsonSerializer.Deserialize<LanDiscoveryResponse>(received.Buffer, JsonOptions);
+                }
+                catch (JsonException)
+                {
+                    continue;
+                }
+
+                // Nonce 单独判空：属性虽然有 = string.Empty 初始化，但 System.Text.Json
+                // 遇到 "nonce": null 照样会把 null 写进 setter，Encoding.GetBytes(null)
+                // 抛的是 ArgumentNullException，接收循环只 catch 了 JsonException，
+                // 于是一个字段填对 protocol/version 的畸形包就能打断整轮发现——
+                // 安装向导和运行期重发现都会被一句「发现失败」终止。
+                if (response is null
+                    || response.Protocol != LanDiscoveryProtocol.Name
+                    || response.ProtocolVersion != LanDiscoveryProtocol.Version
+                    || string.IsNullOrEmpty(response.Nonce)
+                    || !CryptographicOperations.FixedTimeEquals(
+                        System.Text.Encoding.UTF8.GetBytes(response.Nonce),
+                        System.Text.Encoding.UTF8.GetBytes(nonce))
+                    || !Uri.TryCreate(response.ApiAddress, UriKind.Absolute, out var api)
+                    || api.Scheme != Uri.UriSchemeHttp && api.Scheme != Uri.UriSchemeHttps
+                    || string.IsNullOrWhiteSpace(response.ServerInstanceId))
+                    continue;
+
+                // 同一台服务端会因为多轮探测和多个广播目标重复应答，按实例 ID 覆盖即可。
+                results[response.ServerInstanceId] = new DiscoveredServer(
+                    response.ServerInstanceId,
+                    string.IsNullOrWhiteSpace(response.DisplayName) ? "BackupMonitor Server" : response.DisplayName,
+                    response.ApiAddress.TrimEnd('/'),
+                    response.ProtocolVersion);
+            }
+        }
+        finally
+        {
+            // 任何退出路径（正常收尾、外层取消抛出、套接字失效）都要把探测任务收干净：
+            // socket 马上就要随 using 释放，留一个还在往上面发包的游离任务只会在别处
+            // 冒出 ObjectDisposedException。SendProbesAsync 内部吞掉了所有异常，
+            // 这里的 await 不会盖掉正在传播的原始异常。
+            await probe;
         }
 
-        await probe;
         return results.Values.OrderBy(item => item.DisplayName, StringComparer.CurrentCultureIgnoreCase).ToArray();
+    }
+
+    /// <summary>SIO_UDP_CONNRESET 的控制码；Windows 专有，其他平台上不存在这个 ioctl。</summary>
+    private const int SioUdpConnReset = unchecked((int)0x9800000C);
+
+    /// <summary>
+    /// 关掉 Windows 上「UDP 收到 ICMP 端口不可达就让后续 receive 抛 WSAECONNRESET」的行为。
+    ///
+    /// 广播探测天然会打到一堆没有监听这个端口的主机上，对方回 ICMP 端口不可达是正常现象。
+    /// 不关掉的话，一台无关主机的拒绝就足以让整轮发现在接收阶段异常中断——
+    /// 明明有服务端在应答，界面上却是「没找到服务端」。
+    /// 接收循环里另有一层 ConnectionReset 兜底，是因为这个 ioctl 本身可能失败（受限套接字、
+    /// 被网络过滤驱动拦截），两道都留着才不至于回到老样子。
+    /// </summary>
+    private static void DisableUdpConnReset(UdpClient socket)
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        try
+        {
+            socket.Client.IOControl(SioUdpConnReset, new byte[] { 0, 0, 0, 0 }, null);
+        }
+        catch (SocketException)
+        {
+            // 设不上就退回到接收循环里的兜底，不影响发现本身。
+        }
+        catch (PlatformNotSupportedException)
+        {
+            // 同上：这个 ioctl 在非 Windows 运行时上不存在。
+        }
     }
 
     /// <summary>

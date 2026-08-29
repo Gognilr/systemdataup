@@ -19,6 +19,7 @@ builder.Services.AddSingleton<BackupMonitor.Agent.AgentSignatureVerifier>();
 builder.Services.AddSingleton<BackupMonitor.Agent.SystemProbe>();
 builder.Services.AddSingleton<BackupMonitor.Agent.BackupScanner>();
 builder.Services.AddSingleton<BackupMonitor.Agent.DirectoryBrowser>();
+builder.Services.AddSingleton<BackupMonitor.Agent.BackupDirectoryProber>();
 builder.Services.AddSingleton<BackupMonitor.Agent.InstalledServiceProbe>();
 builder.Services.AddHostedService<BackupMonitor.Agent.AgentWorker>();
 

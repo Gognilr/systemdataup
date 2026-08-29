@@ -147,14 +147,37 @@ public sealed class AgentApiClient : IDisposable
         if (string.IsNullOrWhiteSpace(_options.ServerCertificateFingerprint))
             return false;
 
+        // 候选地址必须是 https，否则整条 TLS 链路根本不存在，下面挂的指纹回调
+        // 一次都不会被调用，这个方法就退化成「对面能不能返回 200」——
+        // 而发现应答里的 apiAddress 是网络上任何一台机器都能抢答的字段
+        // （实例 ID 也是明文广播、可抄的），只剩指纹这一道锚点。
+        // 放一个 http:// 候选进来，等于把「换服务端地址」这件事交给了先抢答的人，
+        // 而且结果会写进 state.json，重启后依然生效。
+        if (!Uri.TryCreate(serverUrl, UriKind.Absolute, out var candidateUri)
+            || !string.Equals(candidateUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            return false;
+
         var expectedFingerprint = NormalizeFingerprint(_options.ServerCertificateFingerprint);
+
+        // 纵深防御：只记录「回调确实跑过并且匹配成功」，不满足于「回调已经挂上」。
+        // 这个缺陷本身的形状就是「挂了回调但没跑」，所以返回值不能再依赖同一个假设。
+        // 回调可能在其他线程上被调用，但这里是单次请求：GetAsync 返回时握手早已完成，
+        // 读这个局部变量之前存在明确的先行发生关系，不需要额外的同步原语。
+        var fingerprintVerified = false;
+
         using var handler = new SocketsHttpHandler
         {
             ConnectCallback = ConnectPreferIPv4Async,
             SslOptions =
             {
                 RemoteCertificateValidationCallback = (_, serverCertificate, _, _) =>
-                    MatchesFingerprint(serverCertificate, expectedFingerprint)
+                {
+                    if (!MatchesFingerprint(serverCertificate, expectedFingerprint))
+                        return false;
+
+                    fingerprintVerified = true;
+                    return true;
+                }
             }
         };
         using var probe = new HttpClient(handler, disposeHandler: false)
@@ -166,7 +189,7 @@ public sealed class AgentApiClient : IDisposable
         try
         {
             using var response = await probe.GetAsync("api/v1/agent/bootstrap", HttpCompletionOption.ResponseHeadersRead, ct);
-            return response.IsSuccessStatusCode;
+            return response.IsSuccessStatusCode && fingerprintVerified;
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
         {

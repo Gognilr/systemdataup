@@ -178,6 +178,7 @@ public class PrecheckAfterUploadTests : IDisposable
         sc.AddScoped<IUploadSessionService, UploadSessionService>();
         sc.AddScoped<IAlertingService, NoopAlertingService>();
         sc.AddScoped<ICommandDispatcher, RecordingCommandDispatcher>();
+        sc.AddScoped<IExecutionQueueService, ExecutionQueueService>();
         sc.AddScoped<IAgentPrecheckService, AgentPrecheckService>();
         return sc.BuildServiceProvider();
     }

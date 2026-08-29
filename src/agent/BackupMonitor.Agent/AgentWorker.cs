@@ -22,6 +22,7 @@ public sealed class AgentWorker : BackgroundService
     [
         "precheck_task", "precheck_all", "upload_candidate", "upload_latest",
         "rescan", "rehash", "sync_config", "refresh_metrics", "upgrade_agent",
+        "probe_backup_dirs",
         "browse_path", "list_services"
     ];
 
@@ -35,6 +36,7 @@ public sealed class AgentWorker : BackgroundService
     private readonly SystemProbe _probe;
     private readonly BackupScanner _scanner;
     private readonly DirectoryBrowser _browser;
+    private readonly BackupDirectoryProber _prober;
     private readonly InstalledServiceProbe _serviceProbe;
     private readonly ILogger<AgentWorker> _logger;
 
@@ -131,6 +133,7 @@ public sealed class AgentWorker : BackgroundService
         SystemProbe probe,
         BackupScanner scanner,
         DirectoryBrowser browser,
+        BackupDirectoryProber prober,
         InstalledServiceProbe serviceProbe,
         ILogger<AgentWorker> logger)
     {
@@ -144,6 +147,7 @@ public sealed class AgentWorker : BackgroundService
         _probe = probe;
         _scanner = scanner;
         _browser = browser;
+        _prober = prober;
         _serviceProbe = serviceProbe;
         _logger = logger;
     }
@@ -556,6 +560,22 @@ public sealed class AgentWorker : BackgroundService
             if (string.Equals(address, currentUrl, StringComparison.OrdinalIgnoreCase))
                 continue;   // 就是当前这个地址，换过去也还是连不上
 
+            // 非 HTTPS 候选在这里就拦掉，而不是让它落到 probe 里被一并当成「连不上」：
+            // probe 失败那条日志写的是「指纹校验未通过（或该地址连不上）」，对 http 候选
+            // 完全是误导——它根本没有 TLS 可校验，而这恰恰是伪造应答最省事的一种形状，
+            // 是最需要在日志里一眼看清的一条。
+            // 注意闸门只加在运行期这条路上：LanDiscoveryClient 仍接受 http，
+            // 非 LanSimple 部署的服务端播的就是 http://，安装向导要靠它发现服务端，
+            // 而安装阶段有人工带外核对指纹，运行期自动切换没有。
+            if (!Uri.TryCreate(address, UriKind.Absolute, out var candidateUri)
+                || !string.Equals(candidateUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "拒绝候选服务端 {Address}：发现应答给出的是非 HTTPS 地址，无法校验证书指纹。",
+                    address);
+                continue;
+            }
+
             if (!await _api.ProbeServerAddressAsync(address, ct))
             {
                 // 实例 ID 对得上但证书指纹对不上，正是伪造应答该有的样子——必须留痕。
@@ -626,6 +646,11 @@ public sealed class AgentWorker : BackgroundService
     ///
     /// 指令之间仍然串行（MaxItems 不变）。拆的是「心跳 vs 指令」，不是「指令之间」——
     /// 并发跑多个上传会把源盘 IO 打满，那是另一个问题。
+    ///
+    /// 刚跑完一条指令就立刻再拉一次待办队列（D2）：一次「立即备份」是
+    /// 预检指令 → 回报结果 → 服务端发上传指令 两跳，两跳之间各等满一个轮询周期
+    /// 就是白等的 10 秒。空闲时的频率一点没动——不增加常态负载，
+    /// 也不是靠把 CommandPollIntervalSeconds 调小来换观感。
     /// </summary>
     private async Task RunCommandLoopAsync(CancellationToken ct)
     {
@@ -634,7 +659,8 @@ public sealed class AgentWorker : BackgroundService
             var delaySeconds = Math.Clamp(_options.CommandPollIntervalSeconds, 2, 60);
             try
             {
-                await ClaimAndExecuteCommandsAsync(ct);
+                if (await ClaimAndExecuteCommandsAsync(ct))
+                    continue;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -805,10 +831,24 @@ public sealed class AgentWorker : BackgroundService
                 return false;
             }
 
+            var machineId = _stateStore.GetOrCreateMachineId();
+
+            // 身份连续性证明（A1）：用手上这把私钥对 machineId 签一次。
+            //
+            // 无条件签，不需要判断「本地有没有旧身份」——判断的活儿在服务端：
+            //   · 服务端没有同 machineId 的旧记录 → 这两个字段根本不会被看；
+            //   · 有旧记录且它存的公钥就是这一把 → 证明成立，静默继承名字与分组（自愈重注册走的正是这条）；
+            //   · 有旧记录但公钥对不上（卸载重装后密钥是新生成的）→ 证明不成立，落 PendingApproval。
+            // 这个分界正好合理：ClearIdentity 的自愈路径**保留私钥**，卸载默认删掉整个 state.json。
+            var continuityProof = Convert.ToBase64String(key.SignData(
+                System.Text.Encoding.UTF8.GetBytes(machineId),
+                HashAlgorithmName.SHA256,
+                RSASignaturePadding.Pkcs1));
+
             var request = new SubmitRegistrationRequest
             {
                 RegistrationToken = registrationToken,
-                MachineId = _stateStore.GetOrCreateMachineId(),
+                MachineId = machineId,
                 Hostname = Environment.MachineName,
                 DisplayName = string.IsNullOrWhiteSpace(_options.DisplayName) ? Environment.MachineName : _options.DisplayName,
                 OsName = "Windows",
@@ -816,7 +856,9 @@ public sealed class AgentWorker : BackgroundService
                 Architecture = RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant(),
                 AgentVersion = _options.AgentVersion,
                 IpAddresses = _probe.GetIpAddresses(),
-                PublicKey = publicKey
+                PublicKey = publicKey,
+                ContinuityProof = continuityProof,
+                PreviousPublicKey = publicKey
             };
             var submitted = await _api.SubmitRegistrationAsync(request, ct);
             if (!string.IsNullOrWhiteSpace(registrationToken))
@@ -900,7 +942,8 @@ public sealed class AgentWorker : BackgroundService
         }
     }
 
-    private async Task ClaimAndExecuteCommandsAsync(CancellationToken ct)
+    /// <summary>认领并执行待办指令。返回 true 表示这一轮确实跑了指令，调用方应当立刻再拉一次。</summary>
+    private async Task<bool> ClaimAndExecuteCommandsAsync(CancellationToken ct)
     {
         var response = await _api.ClaimCommandsAsync(new ClaimCommandsRequest
         {
@@ -920,6 +963,8 @@ public sealed class AgentWorker : BackgroundService
                 _activeCommands.TryRemove(command.Id, out _);
             }
         }
+
+        return response.Commands.Count > 0;
     }
 
     private async Task ExecuteCommandAsync(CommandDto command, CancellationToken ct)
@@ -962,16 +1007,20 @@ public sealed class AgentWorker : BackgroundService
             {
                 "precheck_task" => IsTestOnly(command)
                     ? await ExecuteRecognitionTestAsync(command.TaskId, ct)
-                    : await ExecutePrecheckAsync(command.TaskId, command.Id, ct),
+                    : await ExecutePrecheckAsync(command.TaskId, command.Id, WantsFullHash(command), ct),
                 "precheck_all" => await ExecutePrecheckAllAsync(command.Id, ct),
                 "upload_candidate" or "upload_latest" => await ExecuteUploadAsync(command, ct),
-                "rescan" or "rehash" => await ExecutePrecheckAsync(command.TaskId, command.Id, ct),
+                // rehash 顾名思义就是「重算哈希」：它必须绕开快速指纹这道门槛，
+                // 否则这条指令在备份没变化时什么都不做，而它存在的意义正是重新算一遍。
+                "rescan" => await ExecutePrecheckAsync(command.TaskId, command.Id, WantsFullHash(command), ct),
+                "rehash" => await ExecutePrecheckAsync(command.TaskId, command.Id, forceFullHash: true, ct),
                 "sync_config" => await SyncConfigAsync(ct) is not null
                     ? CommandResult.FromSuccess("CONFIG_SYNCED", "配置已同步")
                     : CommandResult.FromFailure("CONFIG_NOT_CHANGED", "配置未变化"),
                 "refresh_metrics" => CommandResult.FromSuccess("OK", "指标将在下一次心跳上报"),
                 "upgrade_agent" => await StageUpgradeAsync(command, ct),
                 "browse_path" => ExecuteBrowse(command, ct),
+                "probe_backup_dirs" => ExecuteProbe(command, ct),
                 "list_services" => ExecuteListServices(command, ct),
                 _ => CommandResult.FromFailure("COMMAND_UNSUPPORTED", $"不支持的指令类型：{command.Type}")
             };
@@ -1007,7 +1056,7 @@ public sealed class AgentWorker : BackgroundService
         var executed = 0;
         foreach (var task in config.Tasks.Where(t => t.Enabled))
         {
-            var result = await SubmitScanResultsAsync(task, commandId, ct);
+            var result = await SubmitScanResultsAsync(task, commandId, forceFullHash: false, ct);
             if (result > 0)
                 executed += result;
         }
@@ -1019,7 +1068,16 @@ public sealed class AgentWorker : BackgroundService
     /// 指令参数里是否带 testOnly。识别测试走的是同一种指令，
     /// 区别在于只看不写——绝不能让"试一下"产生候选备份集。
     /// </summary>
-    private static bool IsTestOnly(CommandDto command)
+    private static bool IsTestOnly(CommandDto command) => HasTrueFlag(command, "testOnly");
+
+    /// <summary>
+    /// 指令参数里是否带 forceFullHash（界面上的「强制完整校验」）。
+    /// 带了就跳过快速指纹基线，无条件算全量 SHA-256——它是两段式扫描那条
+    /// 「文件中段被改而 size 与 mtime 都没变」边界的逃生门。
+    /// </summary>
+    private static bool WantsFullHash(CommandDto command) => HasTrueFlag(command, "forceFullHash");
+
+    private static bool HasTrueFlag(CommandDto command, string name)
     {
         if (string.IsNullOrWhiteSpace(command.Payload))
             return false;
@@ -1027,7 +1085,7 @@ public sealed class AgentWorker : BackgroundService
         try
         {
             using var document = JsonDocument.Parse(command.Payload);
-            return document.RootElement.TryGetProperty("testOnly", out var value)
+            return document.RootElement.TryGetProperty(name, out var value)
                    && value.ValueKind == JsonValueKind.True;
         }
         catch (JsonException)
@@ -1179,6 +1237,44 @@ public sealed class AgentWorker : BackgroundService
     }
 
     /// <summary>
+    /// 主动探测本机上「像备份目录」的地方（B7）。
+    ///
+    /// 与 browse_path 同样同步执行、同样只回元数据，但更严：
+    /// **一个文件名都不返回**，只有候选目录本身的统计特征。
+    /// 触顶（条目 / 时间闸）时把已经算出来的候选原样返回并标 Truncated，
+    /// 而不是整个失败——半份结果远好过一句「超时了」。
+    /// </summary>
+    private CommandResult ExecuteProbe(CommandDto command, CancellationToken ct)
+    {
+        ProbeBackupDirsCommandPayload payload;
+        try
+        {
+            payload = string.IsNullOrWhiteSpace(command.Payload)
+                ? new ProbeBackupDirsCommandPayload()
+                : JsonSerializer.Deserialize<ProbeBackupDirsCommandPayload>(command.Payload, BrowseJsonOptions)
+                  ?? new ProbeBackupDirsCommandPayload();
+        }
+        catch (JsonException ex)
+        {
+            return CommandResult.FromFailure("PROBE_PAYLOAD_INVALID", $"探测指令参数无法解析：{ex.Message}");
+        }
+
+        try
+        {
+            var result = _prober.Probe(payload, ct);
+            var json = JsonSerializer.Serialize(result, BrowseJsonOptions);
+            var message = $"扫了 {result.ScannedDirectories} 个目录，找到 {result.Candidates.Count} 个候选"
+                          + (result.Truncated ? "（未扫完）" : "");
+            return new CommandResult(true, "PROBE_OK", message, json);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "备份目录探测失败");
+            return CommandResult.FromFailure("PROBE_FAILED", $"备份目录探测失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// 列出本机安装的 Windows 服务，供服务端配置关键服务监控时挑选。
     /// 只读，不对任何服务做启停。
     /// </summary>
@@ -1224,7 +1320,7 @@ public sealed class AgentWorker : BackgroundService
         PropertyNameCaseInsensitive = true
     };
 
-    private async Task<CommandResult> ExecutePrecheckAsync(Guid? taskId, Guid commandId, CancellationToken ct)
+    private async Task<CommandResult> ExecutePrecheckAsync(Guid? taskId, Guid commandId, bool forceFullHash, CancellationToken ct)
     {
         if (taskId is null)
             return CommandResult.FromFailure("TASK_ID_REQUIRED", "预检指令缺少 taskId");
@@ -1233,7 +1329,7 @@ public sealed class AgentWorker : BackgroundService
         if (task is null)
             return CommandResult.FromFailure("TASK_NOT_FOUND", $"本地配置不存在任务：{taskId}");
 
-        var count = await SubmitScanResultsAsync(task, commandId, ct);
+        var count = await SubmitScanResultsAsync(task, commandId, forceFullHash, ct);
         return CommandResult.FromSuccess("PRECHECK_SUBMITTED", $"已提交 {count} 个预检结果");
     }
 
@@ -1241,9 +1337,17 @@ public sealed class AgentWorker : BackgroundService
     /// 扫描并上报预检结果。commandId 为 null 表示这次扫描不是由服务端指令触发的
     /// （本地扫描计划自行触发），服务端据此跳过指令幂等与结果回填。
     /// </summary>
-    private async Task<int> SubmitScanResultsAsync(AgentTaskConfigDto task, Guid? commandId, CancellationToken ct)
+    private async Task<int> SubmitScanResultsAsync(
+        AgentTaskConfigDto task, Guid? commandId, bool forceFullHash, CancellationToken ct)
     {
-        var scans = await _scanner.ScanAsync(task, ct);
+        // 指令触发的扫描才报进度：计划扫描没有对应的指令，也没有人在界面上等着看。
+        ScanProgressCallback? progress = commandId is null
+            ? null
+            : new ScanProgressReporter(
+                (payload, token) => _api.ReportProgressAsync(commandId.Value, payload, token),
+                task.Name).Report;
+
+        var scans = _scanner.ScanAsync(task, forceFullHash, progress, ct);
         return await SubmitScansWithRestabilizeAsync(task, scans, commandId, ct);
     }
 
@@ -1253,7 +1357,8 @@ public sealed class AgentWorker : BackgroundService
     /// 阻塞会让心跳停摆。用于计划扫描与指令预检两条路径；识别测试走的是
     /// ScanWithSyncRestabilizeAsync 的同步等待，不经过这里。
     /// </summary>
-    private async Task<int> SubmitScansWithRestabilizeAsync(AgentTaskConfigDto task, List<BackupScanResult> scans, Guid? commandId, CancellationToken ct)
+    private async Task<int> SubmitScansWithRestabilizeAsync(
+        AgentTaskConfigDto task, IAsyncEnumerable<BackupScanResult> scans, Guid? commandId, CancellationToken ct)
     {
         var now = DateTime.UtcNow;
         var maxWaitSeconds = task.MaxStabilityWaitSeconds;
@@ -1266,7 +1371,10 @@ public sealed class AgentWorker : BackgroundService
         // 这份快照只用来读「之前有没有重试记录」，写仍然走 Update，不存在读到脏值的问题。
         var pending = _stateStore.Snapshot().PendingRestabilizeScans;
 
-        foreach (var scan in scans)
+        // await foreach：扫描器逐个业务单元产出结果，这里也就逐个提交。
+        // 全部扫完再提交的话，一个 18 账套的备份盘要等几十 GB 全读完才发出第一条上传指令，
+        // 而在那之前管理端的「传输中」是空的——看起来跟没发起过一模一样。
+        await foreach (var scan in scans.WithCancellation(ct))
         {
             if (scan.Status != "still_changing")
             {
@@ -1384,8 +1492,8 @@ public sealed class AgentWorker : BackgroundService
 
             try
             {
-                var scans = await _scanner.ScanAsync(task, ct);
-                var submitted = await SubmitScansWithRestabilizeAsync(task, scans, commandId, ct);
+                var submitted = await SubmitScansWithRestabilizeAsync(
+                    task, _scanner.ScanAsync(task, ct), commandId, ct);
                 if (submitted > 0)
                     _logger.LogInformation("等待稳定后重新扫描完成 task={Task} 已提交 {Count} 个预检结果", task.Name, submitted);
             }
@@ -1654,6 +1762,64 @@ public sealed class AgentWorker : BackgroundService
     ///
     /// 上报失败只记 LogDebug 吞掉：它是装饰，让它把一次正在进行的上传搞失败是本末倒置。
     /// </summary>
+    /// <summary>
+    /// 扫描进度的节流上报。
+    ///
+    /// 和上传那个 ProgressReporter 分开写，因为两者的「值得上报」判据完全不同：
+    /// 上传按已发字节数的百分比走，扫描的百分比在一个 5 分钟的哈希里根本不动，
+    /// 真正有信息量的是「换到第几个账套了、正在读哪个文件」——所以这里按**事件**报，
+    /// 只用一个时间下限防止小单元多的任务把接口刷爆。
+    ///
+    /// 单元切换一律放行：那是人最想看到的一跳，压掉它节流就把唯一有用的信号也压没了。
+    /// </summary>
+    internal sealed class ScanProgressReporter
+    {
+        private static readonly TimeSpan MinInterval = TimeSpan.FromSeconds(5);
+
+        private readonly Func<CommandProgressRequest, CancellationToken, Task> _send;
+        private readonly string _taskName;
+        private readonly Stopwatch _clock = Stopwatch.StartNew();
+        private TimeSpan _lastReportedAt = -MinInterval;
+        private int _lastUnitIndex = -1;
+
+        public ScanProgressReporter(Func<CommandProgressRequest, CancellationToken, Task> send, string taskName)
+        {
+            _send = send;
+            _taskName = taskName;
+        }
+
+        public async Task Report(ScanProgress p, CancellationToken ct)
+        {
+            var unitChanged = p.UnitIndex != _lastUnitIndex;
+            if (!unitChanged && _clock.Elapsed - _lastReportedAt < MinInterval)
+                return;
+            _lastUnitIndex = p.UnitIndex;
+            _lastReportedAt = _clock.Elapsed;
+
+            // 百分比按「已完成的单元 + 当前单元内的文件进度」算。这个数只用来画进度条，
+            // 文件大小差异会让它走得不匀——所以下面那句话才是主角，百分比是配角。
+            var unitFraction = p.FileCount > 0 ? (decimal)p.FileIndex / p.FileCount : 0m;
+            var percent = p.UnitCount > 0
+                ? Math.Clamp(Math.Round((p.UnitIndex + unitFraction) * 100 / p.UnitCount, 1), 0, 99)
+                : 0m;
+
+            var where = p.UnitCount > 1
+                ? $"第 {p.UnitIndex + 1}/{p.UnitCount} 个"
+                  + (string.IsNullOrWhiteSpace(p.Unit) ? "" : $"：{p.Unit}")
+                : _taskName;
+            var what = p.Stage == "hashing"
+                ? $"正在校验 {p.File}" + (p.FileCount > 1 ? $"（{p.FileIndex + 1}/{p.FileCount} 个文件）" : "")
+                : "正在查找备份文件";
+
+            await _send(new CommandProgressRequest
+            {
+                Percent = percent,
+                Stage = p.Stage == "hashing" ? "hashing" : "scanning",
+                Message = $"{where} · {what}"
+            }, ct);
+        }
+    }
+
     internal sealed class ProgressReporter
     {
         private static readonly TimeSpan MinInterval = TimeSpan.FromSeconds(30);
@@ -2114,7 +2280,7 @@ public sealed class AgentWorker : BackgroundService
                 "按扫描计划触发预检 task={Task} cron={Cron} next={Next:O}", task.Name, task.ScanSchedule, followingDue);
             try
             {
-                var submitted = await SubmitScanResultsAsync(task, commandId: null, ct);
+                var submitted = await SubmitScanResultsAsync(task, commandId: null, forceFullHash: false, ct);
                 _logger.LogInformation("计划扫描完成 task={Task} 已提交 {Count} 个预检结果", task.Name, submitted);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)

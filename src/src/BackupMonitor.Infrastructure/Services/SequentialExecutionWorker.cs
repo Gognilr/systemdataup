@@ -35,6 +35,17 @@ public class SequentialExecutionWorker : BackgroundService
     /// <summary>补跑上限（小时）：服务端停机超过这个时长，过期的那次计划不再补跑</summary>
     public const string CatchupKey = "execution_queue_catchup_hours";
 
+    /// <summary>
+    /// 全局活动上传会话上限（D3）。它覆盖所有来源——计划执行、批量操作、手动立即备份、
+    /// 自动模式下预检通过后的自动上传——而不只是手动点击那一条路。
+    ///
+    /// 闸放在下发侧（这里决定什么时候把指令发出去），不放在 UploadSessionService 的
+    /// 建会话侧：Agent 对 UPLOAD_SESSION_CONFLICT 没有退避重试，在那一步 409
+    /// 等于把限流变成备份失败。这不是优化建议，是必须遵守的约束。
+    /// UploadSessionService 里那条按客户端的检查是兜底、不是队列，保持不动。
+    /// </summary>
+    public const string GlobalUploadLimitKey = "max_concurrent_uploads_total";
+
     /// <summary>单实例锁键（设计书 §25，scheduled_locks.lock_key）</summary>
     public const string LockKey = "worker:execution_queue";
 
@@ -178,6 +189,7 @@ public class SequentialExecutionWorker : BackgroundService
     {
         var graceMinutes = Math.Clamp(await settings.GetIntAsync(NoUploadGraceKey, 10, ct), 1, 1440);
         var grace = TimeSpan.FromMinutes(graceMinutes);
+        var globalUploadLimit = Math.Clamp(await settings.GetIntAsync(GlobalUploadLimitKey, 4, ct), 1, 64);
 
         var runs = await db.ExecutionRuns
             .Include(r => r.Items)
@@ -195,7 +207,7 @@ public class SequentialExecutionWorker : BackgroundService
 
             // 取消掉的执行不再放行新项，只等在跑的那几项跑完
             if (run.Status != BatchStatus.Cancelled)
-                await StartPendingItemsAsync(db, commands, run, now, ct);
+                await StartPendingItemsAsync(db, commands, run, globalUploadLimit, now, ct);
 
             await FinalizeRunAsync(db, run, now, ct);
         }
@@ -308,11 +320,20 @@ public class SequentialExecutionWorker : BackgroundService
     }
 
     /// <summary>
-    /// 并发闸：running 少于 max_concurrent 时按 sort_order 放行下一项。
-    /// 这就是 upload_batches.max_concurrent_clients 一直缺的那段调度逻辑。
+    /// 两道并发闸：
+    ///   一、这次执行自己的 max_concurrent（running 少于它才按 sort_order 放行下一项）——
+    ///       这就是 upload_batches.max_concurrent_clients 一直缺的那段调度逻辑；
+    ///   二、全局活动上传会话数（max_concurrent_uploads_total），跨执行、跨来源统一算。
+    ///
+    /// 第二道每放行一项就重查一次，而不是在循环外算一次：这一轮里刚放行的项马上就会建会话，
+    /// 拿循环开始时的计数往下放，一轮就能超发好几个。查一次是一条 COUNT，
+    /// 相比一次上传的代价可以忽略。
+    ///
+    /// 达到上限就 break 而不是判失败——排队是这一条的全部意义。名额由会话终结释放
+    /// （committed / failed / cancelled / expired，僵尸会话由 LifecycleExpiryWorker 回收）。
     /// </summary>
     private async Task StartPendingItemsAsync(
-        AppDbContext db, ICommandDispatcher commands, ExecutionRun run, DateTime now, CancellationToken ct)
+        AppDbContext db, ICommandDispatcher commands, ExecutionRun run, int globalUploadLimit, DateTime now, CancellationToken ct)
     {
         var running = run.Items.Count(i => i.Status == ExecutionItemStatus.Running);
         var pending = run.Items
@@ -334,6 +355,15 @@ public class SequentialExecutionWorker : BackgroundService
                 break;
 
             ct.ThrowIfCancellationRequested();
+
+            var activeUploads = await CountActiveUploadsAsync(db, ct);
+            if (activeUploads >= globalUploadLimit)
+            {
+                _logger.LogInformation(
+                    "全局上传并发已达上限（{Active}/{Limit}），执行 {RunId} 的剩余项继续排队",
+                    activeUploads, globalUploadLimit, run.Id);
+                break;
+            }
 
             try
             {
@@ -384,6 +414,14 @@ public class SequentialExecutionWorker : BackgroundService
             }
         }
     }
+
+    /// <summary>
+    /// 全服务端当前活动的上传会话数。刻意不按客户端分组——「一台客户端最多同时传几个」
+    /// 由 UploadSessionService 管，这里管的是「服务端暂存盘同时被几路读写」，
+    /// 十个任务在十台不同客户端上时前者一次都不会触发。
+    /// </summary>
+    private static Task<int> CountActiveUploadsAsync(AppDbContext db, CancellationToken ct) =>
+        db.UploadSessions.CountAsync(s => UploadSessionStatuses.Active.Contains(s.Status), ct);
 
     /// <summary>全部项终结时收尾：completed / partial / failed，并回写计数</summary>
     private async Task FinalizeRunAsync(AppDbContext db, ExecutionRun run, DateTime now, CancellationToken ct)

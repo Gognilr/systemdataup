@@ -96,11 +96,22 @@ public static class SnapshotRecognizer
             var missing = rules.Required
                 .Where(pattern => !files.Any(f => RecognizerRules.MatchesPath(f.Relative, pattern)))
                 .ToList();
+
+            // 分卷连续性与「必需文件在不在」是两个问题：缺第 2 卷时第 1、3、4 卷都在场，
+            // requiredFiles 那条判据会说「齐了」，而整份归档解不开。
+            // 判定实现共用 RecognizerRules.FindVolumeGap，与 Agent 真扫是同一段代码。
+            var volumeGap = rules.FindVolumeGap(files.Select(f => f.Relative));
+
             if (missing.Count > 0)
             {
                 unit.Status = "required_file_missing";
                 unit.FailureMessage = "识别规则要求的文件未全部出现";
                 unit.MissingRequired = missing;
+            }
+            else if (volumeGap is not null)
+            {
+                unit.Status = "required_file_missing";
+                unit.FailureMessage = volumeGap;
             }
             else
             {
@@ -166,6 +177,9 @@ public static class SnapshotRecognizer
         {
             // 与 BackupScanner 共用 BusinessUnitResolver：单元怎么找只能有一份定义，
             // 否则向导预演出 18 个账套、真扫出 3 个，而这种分叉没有任何人会发现。
+            //
+            // 刻意不传 maxDepth：下探层数要从 rules.UnitMaxDepth 拿（推断写进配置的那个数），
+            // 这里显式传一个，就又变回「预演与真扫各持一个深度」的老毛病。
             var units = BusinessUnitResolver.Resolve(source, rules, SnapshotNavigator(source));
             var pickLatestChild = rules.UnitLayout is "latest_directory" or "date_leaf";
 

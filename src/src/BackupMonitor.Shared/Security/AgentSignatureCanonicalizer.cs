@@ -128,6 +128,17 @@ public static class AgentSignatureCanonicalizer
                 task.RecognizerConfig,
                 task.ConfigVersion.ToString(CultureInfo.InvariantCulture)
             ]);
+
+            // 快速指纹基线：字段追加在任务块末尾，前面的顺序一个都不动。
+            // 它决定 Agent 会不会跳过全量哈希，不签名就等于把「让备份静默停摆」
+            // 这个开关暴露给任何能改写响应体的人。
+            var fingerprints = task.LastQuickFingerprints ?? [];
+            fields.Add(fingerprints.Count.ToString(CultureInfo.InvariantCulture));
+            foreach (var fingerprint in fingerprints.OrderBy(f => f.ExternalKey, StringComparer.Ordinal))
+            {
+                fields.Add(fingerprint.ExternalKey);
+                fields.Add(fingerprint.QuickFingerprint);
+            }
         }
 
         fields.Add(services.Count.ToString(CultureInfo.InvariantCulture));

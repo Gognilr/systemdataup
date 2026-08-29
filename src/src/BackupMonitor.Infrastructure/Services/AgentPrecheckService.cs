@@ -27,17 +27,20 @@ public class AgentPrecheckService : IAgentPrecheckService
     private readonly AppDbContext _db;
     private readonly ICommandDispatcher _dispatcher;
     private readonly IAlertingService _alerting;
+    private readonly IExecutionQueueService _queue;
     private readonly ILogger<AgentPrecheckService> _logger;
 
     public AgentPrecheckService(
         AppDbContext db,
         ICommandDispatcher dispatcher,
         IAlertingService alerting,
+        IExecutionQueueService queue,
         ILogger<AgentPrecheckService> logger)
     {
         _db = db;
         _dispatcher = dispatcher;
         _alerting = alerting;
+        _queue = queue;
         _logger = logger;
     }
 
@@ -182,6 +185,12 @@ public class AgentPrecheckService : IAgentPrecheckService
         candidate.TotalFiles = request.TotalFiles;
         candidate.TotalBytes = request.TotalBytes;
         candidate.ManifestHash = request.ManifestHash;
+
+        // 快速指纹变了就推一次配置版本：Agent 的两段式扫描拿它当基线，
+        // 而 Agent 只在配置版本变高时才重新拉配置。不推的话它会一直握着上上次的值，
+        // 下一次「立即备份」必然对不上、退回整份重读——D2 想省掉的正是这一次读盘。
+        var fingerprintChanged = !string.Equals(
+            candidate.QuickFingerprint, request.QuickFingerprint, StringComparison.OrdinalIgnoreCase);
         candidate.QuickFingerprint = request.QuickFingerprint;
         candidate.FailureCode = failureCode;
         candidate.FailureMessage = failureMessage;
@@ -223,6 +232,9 @@ public class AgentPrecheckService : IAgentPrecheckService
         // 任务最近预检状态
         task.LastPrecheckStatus = status;
         task.LastScanAt = now;
+
+        if (fingerprintChanged && !string.IsNullOrWhiteSpace(request.QuickFingerprint))
+            await BumpConfigRevisionAsync(clientId, ct);
 
         await _db.SaveChangesAsync(ct);
 
@@ -294,8 +306,11 @@ public class AgentPrecheckService : IAgentPrecheckService
             _ => "rejected"
         };
 
-        // 自动模式：预检通过立即下发上传指令
-        if (accepted && task.TaskMode == TaskMode.Automatic)
+        // 自动模式：预检通过立即下发上传指令。
+        // 全局上传名额满了就改为排队（D3）——只堵手动点击那一条路的话，
+        // 自动模式照样能把服务端暂存盘打满。名额腾出来时由 SequentialExecutionWorker 放行。
+        if (accepted && task.TaskMode == TaskMode.Automatic
+            && !await _queue.TryDeferUploadAsync(clientId, task.Id, candidate.Id, ct))
         {
             await _dispatcher.CreateCommandAsync(
                 clientId,
@@ -396,4 +411,22 @@ public class AgentPrecheckService : IAgentPrecheckService
         !string.IsNullOrWhiteSpace(value)
         && Regex.IsMatch(value, "^[0-9a-fA-F]{64}$", RegexOptions.CultureInvariant);
 
+    /// <summary>
+    /// 推高客户端配置修订号，让下一次心跳把配置重新拉一遍。
+    /// 口径与 MonitoredServiceAdminService 一致：取「任务版本最大值与当前修订号的较大者」再加一，
+    /// 保证 ComputeVersionAsync 的 max(任务版本, 修订号) 确实变大。
+    /// </summary>
+    private async Task BumpConfigRevisionAsync(Guid clientId, CancellationToken ct)
+    {
+        var client = await _db.Clients.FirstOrDefaultAsync(c => c.Id == clientId, ct);
+        if (client is null)
+            return;
+
+        var taskVersion = await _db.BackupTasks
+            .Where(t => t.ClientId == clientId)
+            .Select(t => (long?)t.ConfigVersion)
+            .MaxAsync(ct) ?? 0;
+
+        client.ConfigRevision = Math.Max(client.ConfigRevision, taskVersion) + 1;
+    }
 }

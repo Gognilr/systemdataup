@@ -84,7 +84,7 @@ public sealed class RecognizerWizardTests : IDisposable
             Enabled = true,
             RecognizerConfig = proposal.RecognizerConfig,
             StabilityIntervalSeconds = 0
-        }, CancellationToken.None).GetAwaiter().GetResult();
+        }, CancellationToken.None).ToListAsync().GetAwaiter().GetResult();
     }
 
     // ---------- 目录快照 ----------
@@ -378,12 +378,114 @@ public sealed class RecognizerWizardTests : IDisposable
     [InlineData("账套001", false, false)]
     // 8 位数字既不是年也不是月——它归 LooksLikeDate 管，两条判定不能互相抢。
     [InlineData("20260817", false, false)]
-    [InlineData("2026年", false, false)]
-    [InlineData("08月", false, false)]
+    // B5：中文量词形态靠「年」「月」这两个字自证，不需要放宽数字位数下限——
+    // 上面 ZT001、账套001 这些反例照旧不成立。
+    [InlineData("2026年", true, false)]
+    [InlineData("08月", false, true)]
+    [InlineData("25日", false, true)]
+    [InlineData("第01车间", false, false)]
+    [InlineData("2026年13月", false, false)]
     public void 年月目录识别(string name, bool isYear, bool isMonthOrDay)
     {
         Assert.Equal(isYear, StructureInference.LooksLikeYear(name));
         Assert.Equal(isMonthOrDay, StructureInference.LooksLikeMonthOrDay(name));
+    }
+
+    // ---------- B5：中文年月分层 ----------
+
+    /// <summary>
+    /// `备份\2026年\08月\*.bak` 此前落到「没能看懂」（置信度 25），因为 LooksLikeYear
+    /// 要求整名全是 ASCII 数字。中文年月在国产 ERP 和手写批处理里很常见。
+    /// </summary>
+    [Fact]
+    public void 中文年月分层能走情形零()
+    {
+        for (var day = 1; day <= 5; day++)
+            Write($@"2026年\08月\db_2026-08-{day:00}.bak", new string('x', 4096));
+
+        var proposal = StructureInference.Infer(Snapshot(maxDepth: 4), DateTime.UtcNow, 4);
+
+        Assert.True(proposal.Confidence >= 50, $"置信度过低：{proposal.Confidence}");
+        // 源路径必须带通配，否则到了 9 月任务就失效，且失效的表现是 path_not_found。
+        Assert.EndsWith("/*/*", proposal.SourcePath, StringComparison.Ordinal);
+    }
+
+    // ---------- B3：尺寸基线建议 ----------
+
+    /// <summary>
+    /// 判据（备份大小低于下限判 size_abnormal）本来就存在且告警链路完整，
+    /// 缺的只有建议值——要人凭空想一个字节数填进去，于是现场基本不会生效。
+    /// </summary>
+    [Fact]
+    public void 单元够多且大小接近时给出下限建议()
+    {
+        // 6 个单元，每份 4 MB 上下（差异控制在离散度闸门以内）
+        for (var unit = 1; unit <= 6; unit++)
+            Write($@"ZT{unit:000}\db.bak", new string('x', 4 * 1024 * 1024 + unit * 1024));
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        Assert.NotNull(proposal.SuggestedMinTotalBytes);
+        // 取最小一份的一半、向下取整到 MB。
+        Assert.Equal(2L * 1024 * 1024, proposal.SuggestedMinTotalBytes);
+        Assert.NotNull(proposal.SizeBaselineNote);
+        Assert.Contains("建议下限", proposal.SizeBaselineNote!, StringComparison.Ordinal);
+    }
+
+    /// <summary>样本太少不给建议值——给了就是瞎猜，而这个数会产生告警。</summary>
+    [Fact]
+    public void 单元太少时不给建议值并说明原因()
+    {
+        for (var unit = 1; unit <= 2; unit++)
+            Write($@"ZT{unit:000}\db.bak", new string('x', 4 * 1024 * 1024));
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        Assert.Null(proposal.SuggestedMinTotalBytes);
+        Assert.NotNull(proposal.SizeBaselineNote);
+        Assert.Contains("样本太少", proposal.SizeBaselineNote!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 离散度闸门：MinTotalBytes 是**任务级**的单一阈值，而判定是按每个业务单元做的。
+    /// 大小相差百倍时任何统一下限都必然在一头出错——宁可不给，也不要给一个假装有用的数。
+    /// </summary>
+    [Fact]
+    public void 各单元大小相差过大时不给建议值()
+    {
+        Write(@"ZT001\db.bak", new string('x', 64 * 1024));
+        Write(@"ZT002\db.bak", new string('x', 4 * 1024 * 1024));
+        Write(@"ZT003\db.bak", new string('x', 8 * 1024 * 1024));
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        Assert.Null(proposal.SuggestedMinTotalBytes);
+        Assert.Contains("没有意义", proposal.SizeBaselineNote ?? "", StringComparison.Ordinal);
+    }
+
+    // ---------- B4：周期与缺口不影响置信度 ----------
+
+    /// <summary>
+    /// 有缺口与没缺口的置信度必须**完全相同**。缺口是被识别对象的性质，
+    /// 不是识别质量的问题——混在一起会让「这个目录有历史缺备」表现成「向导看不懂它」。
+    /// </summary>
+    [Fact]
+    public void 历史缺口不影响置信度()
+    {
+        for (var day = 1; day <= 20; day++)
+            Write($@"2026080{day:00}\db.bak".Replace("2026080", "202608"), new string('x', 4096));
+
+        var full = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+        Assert.Equal("每天", full.DetectedPeriod);
+        Assert.Empty(full.MissingBackupDates);
+
+        Directory.Delete(Path.Combine(_root, "20260805"), recursive: true);
+        Directory.Delete(Path.Combine(_root, "20260812"), recursive: true);
+
+        var gapped = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        Assert.Equal(full.Confidence, gapped.Confidence);
+        Assert.Equal(["2026-08-05", "2026-08-12"], gapped.MissingBackupDates);
     }
 
     /// <summary>致远 OA：Backup\2025\12、Backup\2026\07（空）、Backup\2026\08（30 组）。</summary>
@@ -637,7 +739,8 @@ public sealed class RecognizerWizardTests : IDisposable
         var sourcePath = sourcePattern is null ? _root : Path.Combine(_root, sourcePattern);
 
         var scanner = new BackupScanner(NullLogger<BackupScanner>.Instance);
-        var scanned = await scanner.ScanAsync(new AgentTaskConfigDto
+        var scanned = new List<BackupScanResult>();
+        await foreach (var one in scanner.ScanAsync(new AgentTaskConfigDto
         {
             TaskId = Guid.NewGuid(),
             Name = "一致性测试",
@@ -648,7 +751,10 @@ public sealed class RecognizerWizardTests : IDisposable
             Enabled = true,
             RecognizerConfig = recognizerConfig,
             StabilityIntervalSeconds = 0
-        }, CancellationToken.None);
+        }, CancellationToken.None))
+        {
+            scanned.Add(one);
+        }
 
         var snapshot = Browse(maxDepth: 6, maxEntries: 20000);
         var rules = RecognizerRules.Parse(recognizerConfig);
@@ -917,17 +1023,73 @@ public sealed class RecognizerWizardTests : IDisposable
             scans.Select(s => s.BusinessUnit?.ExternalKey).OrderBy(x => x, StringComparer.Ordinal));
     }
 
+    /// <summary>
+    /// 推断用的下探层数必须随配置一起交出去。
+    ///
+    /// 这个数原本只活在推断代码里：推断显式用 4，向导预演和 Agent 真扫都取
+    /// BusinessUnitResolver.DefaultMaxDepth（6）。快照只有 4 层时预演无处可去、碰巧一致；
+    /// Agent 面对的是真实文件系统，date_leaf 会一路下探到第 6 层——于是向导展示的单元
+    /// 与实际扫描出的单元静默地不是同一批，external_key（取的就是相对路径）也跟着变。
+    /// 所以这里盯住两件事：配置里带着 unitMaxDepth，且据它算出来的单元三方完全一致。
+    /// </summary>
+    [Fact]
+    public void 单元下探层数写进配置让预演与真扫认同一批单元()
+    {
+        // 单元在第 2 层（分组容器下面），另加一个第 1 层的单元凑出「层级不齐」以走上 date_leaf；
+        // 再挂一条比推断能看的还深的支路——正是它会让真扫比向导多下探一层。
+        foreach (var day in new[] { "20260827", "20260828" })
+            Write($@"ZT001\{day}\UFDATA.BAK", new string('x', 2048));
+
+        foreach (var unit in new[] { "ZT101", "ZT102" })
+        foreach (var day in new[] { "20260827", "20260828" })
+            Write($@"group\{unit}\{day}\UFDATA.BAK", new string('x', 2048));
+
+        Write(@"group\ZT103\sub1\sub2\leaf\UFDATA.BAK", new string('x', 2048));
+
+        var snapshot = Browse(maxDepth: 6);
+        var source = SnapshotNode.FromSnapshot(snapshot);
+        var proposal = StructureInference.Infer(source, snapshot.CapturedAt);
+        var rules = RecognizerRules.Parse(proposal.RecognizerConfig);
+
+        Assert.Equal("subdirectory_units", proposal.RecognizerType);
+        Assert.Equal("date_leaf", rules.UnitLayout);
+
+        // 推断把自己用过的层数落进了配置，而且这个键是被承认的键名——
+        // 不进 KnownKeys 的话，校验端会把它报成拼错的键。
+        Assert.Contains("unitMaxDepth", proposal.RecognizerConfig, StringComparison.Ordinal);
+        Assert.NotNull(rules.UnitMaxDepth);
+        Assert.Empty(RecognizerRules.FindUnknownKeys(proposal.RecognizerConfig));
+
+        // 拿这份配置重新解一遍单元：不传 maxDepth，走的正是预演与 Agent 那条
+        // 「从规则里取层数」的路径，结果必须与推断报告的那批一模一样。
+        var resolved = BusinessUnitResolver.Resolve(source, rules, SnapshotRecognizer.SnapshotNavigator(source));
+
+        Assert.Equal(4, resolved.Count);
+        Assert.Contains("4 个业务单元", proposal.Summary, StringComparison.Ordinal);
+
+        // 深支路停在第 4 层。少了 unitMaxDepth 它会变成 group/ZT103/sub1/sub2/leaf——
+        // 单元个数没变，键却换了一个，这正是那种谁都不会察觉的分叉。
+        Assert.Contains(resolved, u => u.RelativePath == "group/ZT103/sub1/sub2");
+
+        var scans = Scan(proposal);
+        Assert.Equal(
+            resolved.Select(u => (string?)u.RelativePath).OrderBy(x => x, StringComparer.Ordinal),
+            scans.Select(s => s.BusinessUnit?.ExternalKey).OrderBy(x => x, StringComparer.Ordinal));
+    }
+
     // ---------- 名字带年份的附件库 ----------
 
     /// <summary>
     /// U8 的 UFFile_{账套}_{年度}.dat 是按年度分的附件库，各账套的**启用年度不同**——
     /// 2022 年起用的有 5 个，2024 年起用的只有 3 个，两者都是完整备份。
     ///
-    /// 所以这个模式必须「被看见但不被勾选」：看不见（现状）等于向导对这几个文件失语；
-    /// 勾上则会在每一个启用年度较晚的账套上制造假警报。
+    /// 这条模式一度「被看见但不被勾选」，理由是个数会浮动、不能当判据。前半句对，
+    /// 后半句下过了头：requiredFiles 判的从来不是个数，是「至少匹配到一个」。
+    /// 于是「附件库一个都不剩」没有任何一道检查拦得住——主库还在、文件数还够、
+    /// 总大小还超（附件库比主库小得多）。所以现在它是判据，判的是整批丢失。
     /// </summary>
     [Fact]
-    public void 个数随账套变化的附件库列出来但不当判据()
+    public void 个数随账套变化的附件库按至少有一个当判据()
     {
         var startYears = new[] { 2022, 2023, 2024 };
         for (var i = 0; i < startYears.Length; i++)
@@ -944,18 +1106,29 @@ public sealed class RecognizerWizardTests : IDisposable
             proposal.RequiredFileCandidates.Where(c => c.Pattern.StartsWith("UFFile", StringComparison.Ordinal)));
 
         Assert.Equal("pattern", candidate.Kind);
-        Assert.False(candidate.Recommended);
+        Assert.True(candidate.Recommended);
+        Assert.Null(candidate.NotRecommendedReason);
+        // 个数区间照常给出来：它是「判据不是个数」这句话的依据，人要看得见。
         Assert.Equal(3, candidate.CountPerUnitMin);
         Assert.Equal(5, candidate.CountPerUnitMax);
-        Assert.Contains("个数不一样", candidate.NotRecommendedReason!);
+        Assert.Contains(proposal.Evidence, e => e.Contains("至少有一个", StringComparison.Ordinal));
 
-        // 不当判据 ≠ 不备份：它不进 requiredFiles，但照常被采集。
         var rules = RecognizerRules.Parse(proposal.RecognizerConfig);
-        Assert.DoesNotContain(rules.Required, p => p.StartsWith("UFFile", StringComparison.Ordinal));
+        Assert.Contains(rules.Required, p => p.StartsWith("UFFile", StringComparison.Ordinal));
         Assert.Contains("UFDATA.BAK", rules.Required);
 
-        var files = Scan(proposal).Single(s => s.BusinessUnit?.ExternalKey == "ZT001").Files;
+        // 个数不同的账套都算完整：启用年度早的 5 个、晚的 3 个，一个都不该报警。
+        var scans = Scan(proposal);
+        Assert.All(scans, s => Assert.Equal("passed", s.Status));
+        var files = scans.Single(s => s.BusinessUnit?.ExternalKey == "ZT001").Files;
         Assert.Equal(5, files.Count(f => f.RelativePath.StartsWith("UFFile", StringComparison.Ordinal)));
+
+        // 而附件库整批丢了，就是不完整——这正是原先漏掉的那种故障。
+        foreach (var dat in Directory.GetFiles(Path.Combine(_root, "ZT001", "20260828"), "UFFile_*.dat"))
+            File.Delete(dat);
+
+        var afterLoss = Scan(proposal).Single(s => s.BusinessUnit?.ExternalKey == "ZT001");
+        Assert.Equal("required_file_missing", afterLoss.Status);
     }
 
     // ---------- 平铺目录里每天一组多个库 ----------

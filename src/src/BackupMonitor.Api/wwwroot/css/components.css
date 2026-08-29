@@ -121,6 +121,13 @@ pre.json{background:var(--surface-sunk);border:1px solid var(--border);border-ra
 .cronrow>[data-cron-raw]{flex:1 1 200px;min-width:160px}
 .cronrow>[hidden]{display:none}
 
+/* 字节量组合控件：数值 + 单位。数值框留得下 11 位（TB 级也很少超过这个），
+   单位框固定宽度，两者并排不换行——换行会让人以为是两个独立的字段。 */
+.bytesfield{display:block}
+.bytesrow{display:flex;gap:var(--s-2);align-items:center}
+.bytesrow>[data-bytes-num]{flex:1 1 140px;min-width:100px}
+.bytesrow>[data-bytes-unit]{width:auto;min-width:72px;flex:0 0 auto}
+
 /* ── P3 信息架构：通知双 Tab / 待办队列 / 轻量提示 ── */
 .text-muted,.tip{color:var(--text-muted);font:var(--t-sm)}
 .text-error{color:var(--err-fg)}
@@ -146,6 +153,9 @@ pre.json{background:var(--surface-sunk);border:1px solid var(--border);border-ra
 .todo-main{min-width:0;flex:1}
 .todo-title{font:500 var(--t-body);color:var(--text)}
 .todo-detail{margin-top:2px;color:var(--text-muted);font:var(--t-sm);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 一条待办可能有两个按钮（比如「查看」+「确认」）：按钮组不参与压缩，
+   要被挤掉的是上面那行说明文字，不是人要点的东西。 */
+.todo-actions{display:flex;gap:var(--s-2);flex-shrink:0;margin-left:auto}
 .result-block{margin-top:var(--s-4)}
 
 /* ── P3 命令面板 ── */
@@ -239,7 +249,7 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
   .dashboard-columns{grid-template-columns:1fr}
   .dashboard-statusbar{align-items:flex-start;flex-direction:column;gap:var(--s-1);padding:var(--s-2) var(--s-3)}
   .todo-item{align-items:flex-start}
-  .todo-item button{margin-left:auto;flex-shrink:0}
+  .todo-item .todo-actions{margin-left:auto;flex-shrink:0}
   .command-panel{margin-top:6vh}
 }
 
@@ -377,6 +387,25 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 .wiz-title{font:600 var(--t-sm);color:var(--text-muted);margin-bottom:var(--s-1)}
 .wiz-summary{font:600 var(--t-lg);line-height:1.6;margin:0 0 var(--s-2)}
 .evidence{margin:0;padding-left:18px;color:var(--text-muted);font:var(--t-sm);line-height:1.8}
+
+/* 结论之外的附加事实（备份周期、历史缺口、尺寸基线）：视觉上要比结论块弱一档，
+   但不能弱到像脚注——尺寸基线是个会产生告警的阈值，人必须看见并能改。 */
+.wiz-note{border:1px solid var(--border);border-radius:var(--r-md);
+  padding:var(--s-3) var(--s-4);margin-bottom:var(--s-4)}
+.wiz-note .hint{margin-top:var(--s-1)}
+.wiz-baseline{display:flex;gap:var(--s-4);flex-wrap:wrap;margin-top:var(--s-2)}
+.wiz-baseline label{display:flex;flex-direction:column;gap:4px;font:var(--t-sm);color:var(--text-muted)}
+.wiz-baseline input{width:200px}
+.wiz-baseline .bytesfield{width:200px}
+.wiz-baseline .bytesrow>[data-bytes-num]{width:auto}
+
+/* 探测结果表：未监控的那几行才是这个功能的产出，必须一眼看得出来。 */
+.probe-row{display:flex;align-items:flex-start;gap:var(--s-2);padding:var(--s-2) var(--s-3);
+  border:1px solid var(--border);border-radius:var(--r-md);margin-bottom:var(--s-2)}
+.probe-row.is-monitored{opacity:.6}
+.probe-main{flex:1;min-width:0}
+.probe-path{font-family:var(--font-mono);font-size:12px;word-break:break-all}
+.probe-signals{margin:4px 0 0;padding-left:18px;color:var(--text-muted);font:var(--t-sm);line-height:1.7}
 
 .filepick{display:flex;flex-direction:column;gap:var(--s-1)}
 .filepick__item{display:flex;align-items:center;gap:var(--s-2);padding:var(--s-1) var(--s-2);

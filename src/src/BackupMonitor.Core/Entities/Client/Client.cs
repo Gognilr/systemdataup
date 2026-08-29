@@ -52,6 +52,15 @@ public class Client : IHasRowVersion
     /// <summary>登记方式：lan_simple / secure。</summary>
     public string EnrollmentMode { get; set; } = "secure";
 
+    /// <summary>
+    /// 这次自动登记已被人工确认的时间。只作用于待办队列：非空表示「我看过了，这台机器是预期内的」，
+    /// 该客户端不再出现在待办的「最近自动登记」里。不参与任何备份/证书链路。
+    /// </summary>
+    public DateTime? EnrollmentReviewedAt { get; set; }
+
+    /// <summary>确认这次自动登记的操作人</summary>
+    public Guid? EnrollmentReviewedBy { get; set; }
+
     public DateTime? ApprovedAt { get; set; }
 
     /// <summary>审批人</summary>

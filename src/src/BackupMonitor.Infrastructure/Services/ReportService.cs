@@ -397,7 +397,10 @@ public class ReportService : IReportService
 
         var recentEnrollFrom = now.AddDays(-7);
         var recentEnrollments = _db.Clients.AsNoTracking()
-            .Where(c => c.EnrollmentMode == "lan_simple" && c.CreatedAt >= recentEnrollFrom);
+            // 与 ClientAdminService.GetRecentAutomaticEnrollmentsAsync 同一份口径：
+            // 确认过的不再算待办，否则「处理后会从队列移除」在这一类事项上就是句空话。
+            .Where(c => c.EnrollmentMode == "lan_simple" && c.CreatedAt >= recentEnrollFrom
+                && c.EnrollmentReviewedAt == null);
         var recentEnrollmentsCount = await recentEnrollments.CountAsync(ct);
         var recentEnrollmentsItems = await recentEnrollments
             .OrderByDescending(c => c.CreatedAt)

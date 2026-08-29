@@ -11,6 +11,12 @@ public interface IUploadProgressService
 {
     /// <summary>当前在传的会话，按剩余量从大到小排——最该盯着的那条排在最上面。</summary>
     Task<IReadOnlyList<UploadProgressDto>> GetActiveAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// 全局上传闸的当前状态（D3）：几个在传、几个在排队、上限是多少。
+    /// 不显示的话，限流的表现就是「点了没反应」——那比不限流更糟。
+    /// </summary>
+    Task<UploadQueueStatusDto> GetQueueStatusAsync(CancellationToken ct = default);
 }
 
 /// <summary>
@@ -35,11 +41,34 @@ public class UploadProgressService : IUploadProgressService
 
     private readonly AppDbContext _db;
     private readonly UploadRateSampler _sampler;
+    private readonly SystemSettingsProvider _settings;
 
-    public UploadProgressService(AppDbContext db, UploadRateSampler sampler)
+    public UploadProgressService(AppDbContext db, UploadRateSampler sampler, SystemSettingsProvider settings)
     {
         _db = db;
         _sampler = sampler;
+        _settings = settings;
+    }
+
+    public async Task<UploadQueueStatusDto> GetQueueStatusAsync(CancellationToken ct = default)
+    {
+        // 「在传」用 Active 而不是 InFlight：占着全局名额的口径必须与
+        // SequentialExecutionWorker 放行时数的那一个完全一致，否则界面上显示
+        // 「3 个在传，上限 4」而队列却不放行，人无从判断系统是不是卡住了。
+        var active = await _db.UploadSessions
+            .CountAsync(s => UploadSessionStatuses.Active.Contains(s.Status), ct);
+
+        var queued = await _db.Set<Core.Entities.Execution.ExecutionRunItem>()
+            .CountAsync(i => i.Status == ExecutionItemStatus.Pending
+                && (i.Run.Status == BatchStatus.Pending || i.Run.Status == BatchStatus.Running), ct);
+
+        return new UploadQueueStatusDto
+        {
+            ActiveUploads = active,
+            QueuedItems = queued,
+            GlobalLimit = Math.Clamp(
+                await _settings.GetIntAsync(SequentialExecutionWorker.GlobalUploadLimitKey, 4, ct), 1, 64)
+        };
     }
 
     public async Task<IReadOnlyList<UploadProgressDto>> GetActiveAsync(CancellationToken ct = default)

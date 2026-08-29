@@ -14,6 +14,19 @@ namespace BackupMonitor.Shared.Recognition;
 /// 因此规则语义只在这里实现一次：Agent 扫真实文件系统，服务端扫快照，
 /// 两者共用同一套 Parse / GlobMatch / IsAllowedFile。
 /// </summary>
+/// <param name="UnitMaxDepth">
+/// 业务单元下探的层数上限，**由向导推断时把它实际用过的那个数写进配置**。
+///
+/// 存在的理由：这个数原本没有落盘，于是三个调用点各取各的——向导推断显式传 4、
+/// 向导预演和 Agent 真扫都取 BusinessUnitResolver.DefaultMaxDepth（6）。
+/// 快照只有 4 层时预演无处可去，碰巧与推断一致；Agent 面对的却是真实文件系统，
+/// date_leaf 会一路下探到第 6 层。目录比快照深、且置信度 ≥ 70（NeedsDeeperScan 为 false，
+/// 向导不会再抓更深的快照）时，向导展示的单元集合与 Agent 扫出来的不是同一批，
+/// external_key 取的是相对路径，也跟着变——而这种分叉没有任何提示。
+///
+/// 所以「用了几层」必须和规则一起存下来：三方读同一个数，而不是各自取默认值。
+/// 为 null 表示配置里没写（存量任务、手写配置），此时才回落到 DefaultMaxDepth。
+/// </param>
 public sealed record RecognizerRules(
     List<string> Includes,
     List<string> Excludes,
@@ -24,7 +37,9 @@ public sealed record RecognizerRules(
     int BusinessUnitDepth = 1,
     string? UnitLayout = null,
     string? GroupBy = null,
-    List<string>? BusinessUnitPathPatterns = null)
+    List<string>? BusinessUnitPathPatterns = null,
+    int? UnitMaxDepth = null,
+    bool VolumeContinuity = false)
 {
     /// <summary>
     /// 人自己指定的业务单元位置（相对源目录的通配，如 `ZT0*`、`ZT201-ZT216/*`）。
@@ -32,7 +47,7 @@ public sealed record RecognizerRules(
     /// </summary>
     public List<string> BusinessUnitPaths { get; } = BusinessUnitPathPatterns ?? [];
 
-    public static RecognizerRules Empty() => new([], [], [], [], true, null, 1, null, null, []);
+    public static RecognizerRules Empty() => new([], [], [], [], true, null, 1, null, null, [], null);
 
     /// <summary>
     /// 识别规则里所有被承认的键名。
@@ -48,7 +63,7 @@ public sealed record RecognizerRules(
         "excludeDirectories", "excludeDirs",
         "requiredFiles", "requiredPatterns", "required",
         "recursive", "businessUnitDepth", "unitLayout", "batchRegex", "groupBy",
-        "businessUnitPaths"
+        "businessUnitPaths", "unitMaxDepth", "volumeContinuity"
     ];
 
     /// <summary>
@@ -155,11 +170,26 @@ public sealed record RecognizerRules(
                 result = result with { Recursive = recursive.GetBoolean() };
             }
 
+            if (root.TryGetProperty("volumeContinuity", out var volumeContinuity)
+                && (volumeContinuity.ValueKind == JsonValueKind.True || volumeContinuity.ValueKind == JsonValueKind.False))
+            {
+                result = result with { VolumeContinuity = volumeContinuity.GetBoolean() };
+            }
+
             if (root.TryGetProperty("businessUnitDepth", out var depth)
                 && depth.TryGetInt32(out var parsedDepth)
                 && parsedDepth > 0)
             {
                 result = result with { BusinessUnitDepth = Math.Min(parsedDepth, 32) };
+            }
+
+            // 上限同样收到 32：这个值最终变成 date_leaf 的递归深度，
+            // 一条手写成 unitMaxDepth: 1000000 的配置不该把 Agent 拖进一次深不见底的遍历。
+            if (root.TryGetProperty("unitMaxDepth", out var unitMaxDepth)
+                && unitMaxDepth.TryGetInt32(out var parsedUnitMaxDepth)
+                && parsedUnitMaxDepth > 0)
+            {
+                result = result with { UnitMaxDepth = Math.Min(parsedUnitMaxDepth, 32) };
             }
 
             if (root.TryGetProperty("unitLayout", out var unitLayout)
@@ -387,6 +417,65 @@ public sealed record RecognizerRules(
             return false;
         var paths = relativePaths.ToList();
         return Required.Any(pattern => !paths.Any(path => MatchesPath(path, pattern)));
+    }
+
+    /// <summary>
+    /// 分卷连续性检查：每一组分卷的卷号必须从 1 连续到最大值，中间不缺号。
+    /// 缺号返回一句人话（点名缺第几卷），完整返回 null。
+    ///
+    /// volumeContinuity 为 false 时永远返回 null——这是一条**选择开启**的判据，
+    /// 不是对所有任务的普遍要求：多数备份根本不是分卷形态。
+    ///
+    /// 与 HasMissingRequired 分开而不是塞进去：那一条问的是「该有的文件在不在」，
+    /// 这一条问的是「在的这些文件构不构成一份完整归档」。
+    /// 缺一卷时整份归档无法解压，但每一卷本身都在场——两条判据回答的不是同一个问题。
+    /// </summary>
+    public string? FindVolumeGap(IEnumerable<string> relativePaths)
+    {
+        if (!VolumeContinuity)
+            return null;
+
+        var groups = new Dictionary<string, SortedSet<int>>(StringComparer.OrdinalIgnoreCase);
+        var tails = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var path in relativePaths)
+        {
+            var name = FileNameOf(path);
+            var volume = FileNamePattern.ParseVolume(name);
+            if (volume is not null)
+            {
+                if (!groups.TryGetValue(volume.Value.Stem, out var set))
+                    groups[volume.Value.Stem] = set = [];
+                set.Add(volume.Value.Index);
+                continue;
+            }
+
+            var tail = FileNamePattern.VolumeTailStem(name);
+            if (tail is not null)
+                tails.Add(tail);
+        }
+
+        foreach (var (stem, indices) in groups)
+        {
+            // .z01/.z02 这种形态的末卷是 .zip 本身，它没有卷号。末卷不在场时整份同样解不开，
+            // 所以它缺席要单独说——而不是把它算成「卷号不连续」，那会指错方向。
+            if (stem.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)
+                || stem.EndsWith(".rar", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!tails.Contains(stem))
+                    return $"分卷归档 {stem} 缺末卷 {stem}（只有 {string.Join("、", indices)} 号分卷）";
+            }
+
+            var expected = 1;
+            foreach (var index in indices)
+            {
+                if (index != expected)
+                    return $"分卷归档 {stem} 缺第 {expected} 卷（现有 {string.Join("、", indices)}）";
+                expected++;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>路径的任一段命中 excludeDirectories 即为被排除目录。</summary>

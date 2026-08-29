@@ -26,22 +26,48 @@ LOADERS.transfers = async function () {
   if (!wrap) return;
   try {
     // api() 在少数分支会返回 null，兜一层空数组，免得整页栽在 rows.length 上。
-    const rows = (await api('/api/v1/admin/upload-sessions/active')) || [];
-    wrap.innerHTML = summaryHtml(rows) + tableHtml(COLUMNS, rows, {
+    const [rows, queue] = await Promise.all([
+      api('/api/v1/admin/upload-sessions/active').then(r => r || []),
+      // 排队状态取不到不该让整页失败：它是补充信息，正在传的那几条才是主角。
+      api('/api/v1/admin/upload-sessions/queue-status').catch(() => null)
+    ]);
+    wrap.innerHTML = queueHtml(queue) + summaryHtml(rows) + tableHtml(COLUMNS, rows, {
       empty: emptyState('ok', {
         glyph: '⇅', title: '当前没有正在传输的备份',
-        sub: '客户端开始上传后，这里会自动出现并每 5 秒刷新一次'
+        // 刚点过「立即备份」的人多半是被那句「进度在传输中页面」指过来的，
+        // 而扫描阶段这里本来就是空的——不说清楚，空页面唯一能得出的结论是「没发起成功」。
+        sub: '客户端开始上传后，这里会自动出现并每 5 秒刷新一次。'
+          + '刚点过「立即备份」的话，客户端要先把备份文件整读一遍算校验和，'
+          + '几十 GB 会花上一段时间，这个阶段这里还是空的'
       })
     });
+    // 有东西排队时也按快节奏刷：人盯着的正是「什么时候轮到我」。
+    const busy = rows.length || (queue && queue.queuedItems);
     App.timer = setTimeout(() => {
       if (location.hash === '#/transfers') LOADERS.transfers();
-    }, rows.length ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+    }, busy ? POLL_ACTIVE_MS : POLL_IDLE_MS);
   } catch (e) {
     // 刷新失败不清空已有内容也不再排下一次：一直重试会把错误刷成滚动条，
     // 而上一次的数字仍然比空白有用。
     wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
   }
 };
+
+/* 全局上传闸的状态。限流如果看不见，它的表现就是「点了备份没反应」——
+   人会以为系统坏了，然后去点更多次。排队数为 0 且没到上限时不显示，
+   常态下这一行不该占地方。 */
+function queueHtml(q) {
+  if (!q || (!q.queuedItems && q.activeUploads < q.globalLimit)) return '';
+  const full = q.activeUploads >= q.globalLimit;
+  return `<div class="dashboard-statusbar${full ? ' has-work' : ''}" role="status">
+    <span class="status-mark" aria-hidden="true">⧖</span>
+    <strong class="status-title">${esc(q.activeUploads)} 个正在传 / ${esc(q.queuedItems)} 个排队中</strong>
+    <span class="status-meta">
+      <span>全局上限 ${esc(q.globalLimit)}</span>
+      <span>${full ? '已达上限，排队的会在有名额时自动开始' : '有空余名额'}</span>
+    </span>
+  </div>`;
+}
 
 function summaryHtml(rows) {
   if (!rows.length) return '';

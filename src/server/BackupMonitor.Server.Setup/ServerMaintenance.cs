@@ -1060,7 +1060,12 @@ internal sealed class ServerMaintenance
         await using var connection = new NpgsqlConnection(BuildConnectionString(endpoint));
         await connection.OpenAsync(ct);
 
-        await using (var exists = new NpgsqlCommand("SELECT to_regclass('public.schema_migrations')", connection))
+        // ::text 不能省。to_regclass 返回的是 regclass，而 ExecuteScalar 按 System.Object 读，
+        // Npgsql 8 对这种没有默认 CLR 映射的类型是直接抛错的：
+        // "Reading as 'System.Object' is not supported for fields having DataTypeName 'regclass'"。
+        // 转成 text 之后，表不存在仍然是 NULL，判空逻辑不变。
+        await using (var exists = new NpgsqlCommand(
+            "SELECT to_regclass('public.schema_migrations')::text", connection))
         {
             var table = await exists.ExecuteScalarAsync(ct);
             if (table is null or DBNull)

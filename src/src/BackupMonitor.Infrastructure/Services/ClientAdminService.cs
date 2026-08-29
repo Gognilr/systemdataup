@@ -22,6 +22,7 @@ public interface IClientAdminService
     Task<ClientDetailDto> UpdateAsync(Guid clientId, UpdateClientRequest request, CancellationToken ct = default);
     Task<IReadOnlyList<RecentAutoEnrollmentDto>> GetRecentAutomaticEnrollmentsAsync(
         int days = 7, int limit = 20, CancellationToken ct = default);
+    Task ConfirmEnrollmentAsync(Guid clientId, CancellationToken ct = default);
     Task<CertificateRenewalResponse> RenewCertificateAsync(Guid clientId, CancellationToken ct = default);
     Task<ClientMetricsHistoryDto> GetMetricsHistoryAsync(Guid clientId, int hours = 24, int limit = 1440, CancellationToken ct = default);
     Task<IReadOnlyList<ClientResourceRowDto>> GetResourceOverviewAsync(int limit = 50, CancellationToken ct = default);
@@ -519,7 +520,10 @@ public class ClientAdminService : IClientAdminService
         limit = Math.Clamp(limit, 1, 50);
         var from = DateTime.UtcNow.AddDays(-days);
         return await _db.Clients.AsNoTracking()
-            .Where(c => c.EnrollmentMode == "lan_simple" && c.CreatedAt >= from)
+            // 已确认过的不再列出：这一类事项本来只有「时间到了自己消失」一条出路，
+            // 于是队列里长期挂着清不掉的条目，人很快就不看待办页了。
+            .Where(c => c.EnrollmentMode == "lan_simple" && c.CreatedAt >= from
+                && c.EnrollmentReviewedAt == null)
             .OrderByDescending(c => c.CreatedAt)
             .Take(limit)
             .Select(c => new RecentAutoEnrollmentDto
@@ -733,6 +737,30 @@ public class ClientAdminService : IClientAdminService
             CertificateIssuedAt = issued.IssuedAt,
             CertificateExpiresAt = issued.ExpiresAt
         };
+    }
+
+    /// <summary>
+    /// 确认一次自动登记：「我看过了，这台机器是预期内的」。
+    ///
+    /// 只把它从待办队列里摘掉，不改客户端状态、不动证书——它本来就已经在正常工作了。
+    /// 重复确认是幂等的：批量点击、两个人同时处理都不该报错。
+    /// </summary>
+    public async Task ConfirmEnrollmentAsync(Guid clientId, CancellationToken ct = default)
+    {
+        var client = await _db.Clients.FirstOrDefaultAsync(c => c.Id == clientId, ct)
+            ?? throw new NotFoundException("客户端", clientId);
+
+        if (client.EnrollmentReviewedAt is not null)
+            return;
+
+        client.EnrollmentReviewedAt = DateTime.UtcNow;
+        client.EnrollmentReviewedBy = _context.UserId;
+        await _db.SaveChangesAsync(ct);
+
+        await _audit.RecordAsync("client.confirm_enrollment", AuditResult.Success, "client", client.Id,
+            afterData: $"{{\"enrollmentReviewedAt\":\"{client.EnrollmentReviewedAt:O}\"}}", ct: ct);
+
+        _logger.LogInformation("客户端 {ClientId}({Hostname}) 的自动登记已确认", client.Id, client.Hostname);
     }
 
     public async Task<CertificateRenewalResponse> RenewCertificateAsync(

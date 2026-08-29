@@ -35,6 +35,53 @@ public class BrowseClientPathResultDto
     public BrowseSnapshotDto? Snapshot { get; set; }
 }
 
+/// <summary>探测客户端上的备份目录（管理端 → 服务端）。</summary>
+public class ProbeBackupDirsRequest
+{
+    /// <summary>限定只扫这几个盘。留空 = 全部固定磁盘。</summary>
+    public List<string>? Roots { get; set; }
+
+    [Range(1, 6)]
+    public int MaxDepth { get; set; } = 4;
+
+    [Range(1, 100)]
+    public int MaxCandidates { get; set; } = 20;
+}
+
+/// <summary>探测结果轮询响应。与浏览一样是异步的：指令下发之后界面轮询。</summary>
+public class ProbeBackupDirsResultResponse
+{
+    public Guid CommandId { get; set; }
+    public string Status { get; set; } = null!;
+    public DateTime CreatedAt { get; set; }
+    public DateTime? CompletedAt { get; set; }
+    public string? ResultCode { get; set; }
+    public string? ResultMessage { get; set; }
+
+    /// <summary>指令成功时的候选清单；未完成或失败时为 null。</summary>
+    public ProbeBackupDirsResultDto? Result { get; set; }
+
+    /// <summary>
+    /// 每个候选是否已经被这台客户端的某个任务覆盖。**这才是这个功能真正的产出**——
+    /// 未监控的那几行。在服务端算，因为只有服务端知道有哪些任务。
+    /// </summary>
+    public List<ProbeCandidateCoverageDto> Coverage { get; set; } = [];
+}
+
+/// <summary>候选目录与现有任务的对照。</summary>
+public class ProbeCandidateCoverageDto
+{
+    public string Path { get; set; } = string.Empty;
+
+    /// <summary>已经被某个任务监控。</summary>
+    public bool Monitored { get; set; }
+
+    /// <summary>覆盖它的任务名（未监控时为 null）。</summary>
+    public string? TaskName { get; set; }
+
+    public Guid? TaskId { get; set; }
+}
+
 /// <summary>基于某次快照做结构推断 / 规则预演的共同入参。</summary>
 public class SnapshotScopedRequest
 {
@@ -112,6 +159,37 @@ public class RecognizerProposalDto
     /// 而人在资源管理器里明明看得见东西。
     /// </summary>
     public bool NeedsDeeperScan { get; set; }
+
+    /// <summary>
+    /// 建议的备份总大小下限（字节）。取观察到的最小一份的一半，向下取整到 MB。
+    ///
+    /// 只给下限，不给上限：备份变大通常是业务正常增长，给上限会制造周期性假警报；
+    /// 备份变小才是故障信号（0 字节、压缩中断、磁盘满只写了元数据）。
+    /// 这与「不对文件个数变化做自动判定」是同一条取舍原则。
+    ///
+    /// 样本不足或各单元大小离散度过大时为 null——见 SizeBaselineNote。
+    /// </summary>
+    public long? SuggestedMinTotalBytes { get; set; }
+
+    /// <summary>建议的文件数下限：推荐必需文件的条数。</summary>
+    public int? SuggestedMinFileCount { get; set; }
+
+    /// <summary>
+    /// 上面两个数是怎么来的，一句人话。界面必须显示出来——
+    /// 这是个会产生告警的阈值，人必须看见并能改。
+    /// </summary>
+    public string? SizeBaselineNote { get; set; }
+
+    /// <summary>推断出的备份周期：「每天」/「每周」/「每月」/「不规律」；推不出为 null。</summary>
+    public string? DetectedPeriod { get; set; }
+
+    /// <summary>
+    /// 按推断出的周期推算，历史上缺了哪几次（yyyy-MM-dd）。
+    ///
+    /// 这里只陈述事实给人看：**不因为有缺口就降低置信度**（缺口是被识别对象的性质，
+    /// 不是识别质量的问题），也**不在配置阶段发告警**（那归 MissedBackupWorker）。
+    /// </summary>
+    public List<string> MissingBackupDates { get; set; } = [];
 
     /// <summary>按这条规则在快照上跑出来的结果。</summary>
     public RecognizerPreviewDto? Preview { get; set; }

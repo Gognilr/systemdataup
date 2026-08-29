@@ -226,11 +226,7 @@ internal sealed class PostgreSqlManager
             $"ALTER ROLE postgres WITH PASSWORD {superuserLiteral}", root))
             await superuser.ExecuteNonQueryAsync(ct);
 
-        var applicationLiteral = await QuoteLiteralAsync(root, newApplicationPassword, ct);
-        await using var application = new NpgsqlCommand(
-            $"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'backup_monitor_app') THEN CREATE ROLE backup_monitor_app LOGIN PASSWORD {applicationLiteral}; ELSE ALTER ROLE backup_monitor_app WITH LOGIN PASSWORD {applicationLiteral}; END IF; END $$;",
-            root);
-        await application.ExecuteNonQueryAsync(ct);
+        await EnsureApplicationRoleAsync(root, newApplicationPassword, ct);
     }
 
     private static IReadOnlyDictionary<string, string?> BuildPasswordEnvironment(PostgresEndpoint endpoint) =>
@@ -393,11 +389,7 @@ internal sealed class PostgreSqlManager
         await using (var extension = new NpgsqlCommand("CREATE EXTENSION IF NOT EXISTS pgcrypto", root))
             await extension.ExecuteNonQueryAsync(ct);
 
-        var rolePassword = await QuoteLiteralAsync(root, applicationPassword, ct);
-        await using (var role = new NpgsqlCommand(
-            $"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'backup_monitor_app') THEN CREATE ROLE backup_monitor_app LOGIN PASSWORD {rolePassword}; ELSE ALTER ROLE backup_monitor_app WITH LOGIN PASSWORD {rolePassword}; END IF; END $$;",
-            root))
-            await role.ExecuteNonQueryAsync(ct);
+        await EnsureApplicationRoleAsync(root, applicationPassword, ct);
 
         await using (var databaseExists = new NpgsqlCommand(
             "SELECT 1 FROM pg_database WHERE datname = 'backup_monitor'", root))
@@ -419,6 +411,48 @@ internal sealed class PostgreSqlManager
             "REVOKE ALL ON DATABASE backup_monitor FROM PUBLIC; GRANT CONNECT ON DATABASE backup_monitor TO backup_monitor_app",
             root);
         await revoke.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// 保证 backup_monitor_app 角色存在，并把它的口令设成给定的一套。
+    ///
+    /// 这段逻辑首装（EnsureDatabaseAndRoleAsync）和导入配置备份包对齐口令（SetRolePasswordsAsync）
+    /// 都要跑，只能有一份：两处各写一遍，漏改其中一处的后果不是编译错误而是**静默的口令不一致**——
+    /// 集群里的角色口令和 server-secrets.json 对不上，要等服务端下次启动连库才暴露。
+    ///
+    /// 为什么不用 <c>DO $$ … $$</c> 包一个 IF NOT EXISTS：PostgreSQL 没有 CREATE ROLE IF NOT EXISTS，
+    /// DO 块原本就是为补这个缺口而写的，但它和口令字面量是致命组合。quote_literal() 只负责转义单引号，
+    /// 返回的是 <c>'ab$$cd'</c> 这样的普通字面量；把它塞进美元引用块里，口令中只要含 <c>$$</c>
+    /// 就会**提前闭合美元引用块**，轻则语法错误，重则从块外注入 SQL——而这条命令是以 postgres
+    /// 超级用户身份执行的。自动生成的口令是 Base64（字母表里没有 <c>$</c>）所以正常路径安全，
+    /// 但这里的入参也可能来自管理员导入的 .bmbp 备份包 secrets，或 BACKUPMONITOR_POSTGRES_PASSWORD
+    /// 环境变量，内容完全不受控。改成「先查存在、再发一条 CREATE 或 ALTER」，全程不出现美元引用。
+    ///
+    /// 存在性判断走查询参数而不是拼字符串：角色名眼下是常量，但留一个「这里可以拼」的样板，
+    /// 下一个人就会照着把变量拼进去。
+    ///
+    /// 口令这一处只能用 quote_literal()：CREATE/ALTER ROLE 的 PASSWORD 子句是工具命令语法，
+    /// 不接受参数占位符（@p / $1），传参数会直接报语法错误——不是没想到参数化，是用不了。
+    /// </summary>
+    private static async Task EnsureApplicationRoleAsync(
+        NpgsqlConnection root,
+        string applicationPassword,
+        CancellationToken ct)
+    {
+        bool exists;
+        await using (var probe = new NpgsqlCommand("SELECT 1 FROM pg_roles WHERE rolname = @name", root))
+        {
+            probe.Parameters.AddWithValue("name", "backup_monitor_app");
+            exists = await probe.ExecuteScalarAsync(ct) is not null;
+        }
+
+        var passwordLiteral = await QuoteLiteralAsync(root, applicationPassword, ct);
+        var sql = exists
+            ? $"ALTER ROLE backup_monitor_app WITH LOGIN PASSWORD {passwordLiteral}"
+            : $"CREATE ROLE backup_monitor_app LOGIN PASSWORD {passwordLiteral}";
+
+        await using var command = new NpgsqlCommand(sql, root);
+        await command.ExecuteNonQueryAsync(ct);
     }
 
     private static async Task<string> QuoteLiteralAsync(NpgsqlConnection connection, string value, CancellationToken ct)

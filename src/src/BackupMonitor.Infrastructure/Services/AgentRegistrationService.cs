@@ -126,6 +126,9 @@ public class AgentRegistrationService : IAgentRegistrationService
             // 继承到新行上——重装一台机器不该让「财务服务器」变回 WIN-8KJ2P3。
             Client? superseded = null;
 
+            // 没有旧身份时这一项无意义（谈不上「连续」）；有旧身份时它决定第二态还是第三态。
+            var identityProven = true;
+
             // 活跃/待审批实例不能被静默覆盖；旧的 revoked/disabled 身份可重新登记。
             var existing = await _db.Clients
                 .Where(c => c.MachineId == request.MachineId)
@@ -153,15 +156,34 @@ public class AgentRegistrationService : IAgentRegistrationService
                     throw new BusinessException("CONFLICT", "该机器已注册，请勿重复提交", 409);
                 }
 
+                // 三态判定（A1）。核心是「能证明连续性就静默继承，不能证明就交给人确认」，
+                // 而不是「不能证明就拒绝」——后者会把重装后永远 409 的死锁装回来。
+                identityProven = VerifyContinuity(existing, request);
+
                 await SupersedeOfflineClientAsync(existing, now, ct);
                 superseded = existing;
+
+                if (!identityProven)
+                {
+                    // 独立的审计动作，不复用注册成功那一条：这是事后唯一能回答
+                    // 「那台机器是什么时候被换掉的」的地方。
+                    await _audit.RecordAsync("agent.registration.identity_unproven", AuditResult.Failure,
+                        "client", existing.Id,
+                        afterData: JsonSerializer.Serialize(new
+                        {
+                            existing.MachineId,
+                            previousHostname = existing.Hostname,
+                            newHostname = request.Hostname,
+                            hadProof = !string.IsNullOrWhiteSpace(request.ContinuityProof)
+                        }), ct: ct);
+                }
             }
 
             if (string.IsNullOrWhiteSpace(request.PublicKey) || !_certificateAuthority.CanParsePublicKey(request.PublicKey))
                 throw new BusinessException("INVALID_REQUEST", "publicKey 缺失或不是合法的 Base64 SPKI 公钥", 400);
 
             var clientId = Guid.NewGuid();
-            var issued = lanEnrollment
+            var issued = lanEnrollment && identityProven
                 ? await _certificateAuthority.IssueClientCertificateAsync(clientId, request.Hostname, request.PublicKey)
                 : null;
 
@@ -180,9 +202,11 @@ public class AgentRegistrationService : IAgentRegistrationService
                 IpAddresses = request.IpAddresses is { Count: > 0 }
                     ? JsonSerializer.Serialize(request.IpAddresses)
                     : null,
-                Status = lanEnrollment ? ClientStatus.Online : ClientStatus.PendingApproval,
+                Status = lanEnrollment && identityProven ? ClientStatus.Online : ClientStatus.PendingApproval,
                 EnrollmentMode = lanEnrollment ? "lan_simple" : "secure",
-                ApprovedAt = lanEnrollment ? now : null,
+                ApprovedAt = lanEnrollment && identityProven ? now : null,
+                // 第三态不签发证书：拿不到证书就上不了 mTLS，即使这一行被自动建出来，
+                // 它在管理员点头之前也做不了任何事。
                 CertificateThumbprint = issued?.Thumbprint,
                 CertificateExpiresAt = issued?.ExpiresAt,
                 PublicKey = request.PublicKey
@@ -212,6 +236,16 @@ public class AgentRegistrationService : IAgentRegistrationService
                     registrationToken.Status = RegistrationTokenStatus.Expired;
             }
 
+            if (superseded is not null && !identityProven)
+            {
+                // 审批界面上要看得见「为什么这一台要人点头」。不说清楚，审批就退化成盲点头
+                // ——与 StructureInference 头部那条 Evidence 原则同源。
+                client.Notes =
+                    $"这台机器（{request.MachineId}）此前以另一把密钥注册过（旧身份 {superseded.Hostname}，"
+                    + $"于 {now:yyyy-MM-dd HH:mm:ss} UTC 被本次注册取代），"
+                    + "本次注册无法证明是同一台机器。确认是本机重装后再批准。";
+            }
+
             await _db.SaveChangesAsync(ct);
             await _audit.RecordAsync("agent.registration", AuditResult.Success, "client", client.Id,
                 afterData: JsonSerializer.Serialize(new
@@ -219,10 +253,11 @@ public class AgentRegistrationService : IAgentRegistrationService
                     client.MachineId,
                     client.Hostname,
                     mode = lanEnrollment ? "lan_simple" : "secure",
-                    status = client.Status.ToString()
+                    status = client.Status.ToString(),
+                    identityProven
                 }), ct: ct);
 
-            if (lanEnrollment && _alerting is not null)
+            if (lanEnrollment && identityProven && _alerting is not null)
             {
                 await _alerting.RaiseAsync(
                     $"client:{client.Id}:automatic-enrollment",
@@ -248,8 +283,8 @@ public class AgentRegistrationService : IAgentRegistrationService
             return new SubmitRegistrationResponse
             {
                 RegistrationId = client.Id,
-                Status = lanEnrollment ? "approved" : "pending_approval",
-                PollAfterSeconds = lanEnrollment ? 0 : 30
+                Status = lanEnrollment && identityProven ? "approved" : "pending_approval",
+                PollAfterSeconds = lanEnrollment && identityProven ? 0 : 30
             };
         }
         catch (DbUpdateException ex) when (IsMachineIdConflict(ex))
@@ -302,7 +337,68 @@ public class AgentRegistrationService : IAgentRegistrationService
     /// uq_clients_machine_id_active 是 <c>WHERE status NOT IN ('revoked','disabled')</c>
     /// 的部分唯一索引，即时校验，而 EF 不保证 UPDATE 一定排在 INSERT 前面。
     /// 调用方已经开了事务，这次中间提交仍然是原子的。
+    ///
+    /// 这里有一条必须写在纸面上的前提：<b>machine_id 是客户端自报的</b>，服务端无法验证它。
+    /// 所以「让位」能力的信任来源在两种部署形态下完全不同，不要默认它一律受令牌保护：
+    ///
+    /// <list type="bullet">
+    /// <item>Secure 模式：重新注册要出示一次性注册令牌，顶替能力随之受令牌管控。</item>
+    /// <item>LanSimple + <c>LanMode:AutomaticEnrollment=true</c> 的免令牌形态：没有令牌这一关，
+    /// 同网段任何人只要自报一台已被判定为 Offline 的机器的 machine_id，就能顶掉那条身份，
+    /// 并继承它的显示名称与分组。这个形态的信任模型本来就是「信任这个网段」
+    /// （另有 LanMode:PrivateNetworkOnly 和免令牌登记窗口两道闸），让位能力就落在这条信任线之内。</item>
+    /// </list>
+    ///
+    /// 影响面到此为止：新身份拿的是<b>新的 clientId</b>，绑在旧 clientId 上的备份任务、历史备份、
+    /// 证书一律不继承，被顶掉的旧身份是 Revoked 且证书已吊销；能跨过去的只有显示名称和分组
+    /// 这两项纯展示属性。也就是说最坏情况是「网段内有人制造出一台名字眼熟的新客户端」，
+    /// 不是「接管了旧客户端的数据」。
     /// </remarks>
+    /// <summary>
+    /// 这次注册能不能证明「我就是上一次那台机器」。
+    ///
+    /// 三条都满足才算证明成立：带了签名、带了旧公钥、旧公钥与库里存的那把逐字相同，
+    /// 且签名用它验得过（签的内容是 machineId 本身）。
+    ///
+    /// 为什么要比对 PreviousPublicKey 而不是只用库里那把去验签：两者本该相同，
+    /// 不同就说明请求方拿的是**另一把**旧密钥——那正是要识别的情况，
+    /// 而只用库里那把去验会把它表现成「签名错误」，丢掉了「他手里有另一把钥匙」这条信息。
+    ///
+    /// 旧身份没存公钥（更早版本注册的）时无法验证，按「不能证明」处理走人工确认——
+    /// 那正是这一条要的保守方向。
+    /// </summary>
+    private bool VerifyContinuity(Client existing, SubmitRegistrationRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.ContinuityProof)
+            || string.IsNullOrWhiteSpace(request.PreviousPublicKey)
+            || string.IsNullOrWhiteSpace(existing.PublicKey))
+        {
+            return false;
+        }
+
+        if (!string.Equals(existing.PublicKey.Trim(), request.PreviousPublicKey.Trim(), StringComparison.Ordinal))
+            return false;
+
+        try
+        {
+            var publicKey = Convert.FromBase64String(request.PreviousPublicKey.Trim());
+            var signature = Convert.FromBase64String(request.ContinuityProof.Trim());
+            using var rsa = System.Security.Cryptography.RSA.Create();
+            rsa.ImportSubjectPublicKeyInfo(publicKey, out _);
+            return rsa.VerifyData(
+                System.Text.Encoding.UTF8.GetBytes(request.MachineId),
+                signature,
+                System.Security.Cryptography.HashAlgorithmName.SHA256,
+                System.Security.Cryptography.RSASignaturePadding.Pkcs1);
+        }
+        catch (Exception ex) when (ex is FormatException or System.Security.Cryptography.CryptographicException)
+        {
+            // 签名或公钥格式不对：与验不过同等处理，交给人确认。
+            _logger.LogWarning(ex, "身份连续性证明无法校验 machineId={MachineId}", request.MachineId);
+            return false;
+        }
+    }
+
     private async Task SupersedeOfflineClientAsync(Client existing, DateTime now, CancellationToken ct)
     {
         existing.Status = ClientStatus.Revoked;

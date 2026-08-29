@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization.Metadata;
 using BackupMonitor.Shared.Models.Admin;
@@ -25,6 +25,21 @@ public static class StructureInference
     private const double DateLayerThreshold = 0.6;
 
     /// <summary>
+    /// 在快照上找业务单元时下探的层数上限：源目录 → 分组容器 → 单元 → 日期目录。
+    ///
+    /// 取 4 而不是 BusinessUnitResolver.DefaultMaxDepth（6），是因为向导默认只抓 4 层，
+    /// 再深的结构快照里本来就不存在，继续下探只会在 DepthLimited 的空目录上打转；
+    /// 而抓取深度也不能随手调大——层数一深条目数是乘出来的，很容易顶到 3000 条上限，
+    /// 反而让本来看得懂的结构被标成"没抓全"。
+    ///
+    /// 这个 4 只是**调用方没说抓了几层时**的兜底。向导在只差一层就能看懂时会用 6 重抓一次
+    /// （见 recognizer-wizard.js 的 DEEP_SCAN_DEPTH），那一次的快照真有 6 层，
+    /// 此时仍按 4 找单元，等于白重抓——深处的单元照样看不见。所以 Infer 接收
+    /// snapshotMaxDepth，有值就用它。
+    /// </summary>
+    private const int SnapshotUnitMaxDepth = 4;
+
+    /// <summary>
     /// 一个目录要被判定为"一份备份由多个同名文件构成"，需要这个比例的 basename
     /// 拥有 ≥2 个不同扩展名。
     /// </summary>
@@ -41,8 +56,19 @@ public static class StructureInference
         TypeInfoResolver = new DefaultJsonTypeInfoResolver()
     };
 
-    public static RecognizerProposalDto Infer(SnapshotNode source, DateTime capturedAt)
+    /// <param name="snapshotMaxDepth">
+    /// 本次快照实际抓取的层数（BrowseSnapshotDto.MaxDepth）。0 表示调用方不知道，
+    /// 此时按 <see cref="SnapshotUnitMaxDepth"/> 兜底。它决定在快照上找业务单元时下探多深，
+    /// 并会原样写进配置的 unitMaxDepth 交给预演和真扫——三方共用一个数，才谈得上一致。
+    /// </param>
+    public static RecognizerProposalDto Infer(SnapshotNode source, DateTime capturedAt, int snapshotMaxDepth = 0)
     {
+        // 上限仍夹在 DefaultMaxDepth 以内：抓取深度是客户端传上来的，不该由它决定
+        // 服务端递归多深。
+        var unitMaxDepth = snapshotMaxDepth > 0
+            ? Math.Min(snapshotMaxDepth, BusinessUnitResolver.DefaultMaxDepth)
+            : SnapshotUnitMaxDepth;
+
         var directories = VisibleDirectories(source).ToList();
         var files = VisibleFiles(source).ToList();
         var evidence = new List<string>();
@@ -85,7 +111,8 @@ public static class StructureInference
                 confidence: dateRatio >= 0.9 ? 90 : 72,
                 summary: $"{source.Name} 下按日期建目录（共 {directories.Count} 个），最新的是 {latest.Name}"
                          + DescribeRequired(required),
-                evidence, required, dateDirectories);
+                evidence, required, dateDirectories,
+                dateNames: dateDirectories.Select(d => d.Name).ToList());
         }
 
         // 情形二：下面是业务单元，单元里按日期建目录 —— 账套001\20260825\…
@@ -105,7 +132,7 @@ public static class StructureInference
         //
         // 所以单元集合是这一分支唯一的事实来源：摘要说几个、必需文件考察几个、
         // 预演跑几个，全部由它派生，结构上不可能再对不上。
-        var units = ResolveUnits(source);
+        var units = ResolveUnits(source, unitMaxDepth);
         var unitsWithDates = units.Where(u => u.HasDateChildren).ToList();
         var unitDateRatio = units.Count == 0 ? 0 : (double)unitsWithDates.Count / units.Count;
 
@@ -145,6 +172,15 @@ public static class StructureInference
             else
             {
                 config["unitLayout"] = "date_leaf";
+
+                // 把推断实际用过的下探层数一并写进配置。
+                //
+                // 不写的话，预演和 Agent 真扫都会各自取 BusinessUnitResolver.DefaultMaxDepth（6），
+                // 而推断用的是 4。快照只有 4 层时预演无处可去、碰巧一致；Agent 面对的是真实
+                // 文件系统，date_leaf 会一路下探到第 6 层，于是「向导说有这些账套」和
+                // 「实际扫出这些账套」静默地不是同一批，external_key（相对路径）也跟着变。
+                // depths.Count == 1 那条分支不需要它：那里写死了 businessUnitDepth，走的是固定深度。
+                config["unitMaxDepth"] = unitMaxDepth;
             }
 
             AddRequired(config, required);
@@ -160,8 +196,23 @@ public static class StructureInference
                          + $"每个单元按日期建目录"
                          + (newestLeaf is not null ? $"，最新的是 {newestLeaf.Name}" : "")
                          + DescribeRequired(required),
-                evidence, required, leaves);
+                evidence, required, leaves,
+                // 周期要从**一个**单元的日期目录序列上算：把所有单元的日期目录混在一起，
+                // 18 个账套同一天各有一个目录，去重之后间隔没变、但「样本」凭空多了 18 倍，
+                // 缺口判定会被同一天的重复项掩盖。取日期目录最多的那个单元最有代表性。
+                dateNames: unitsWithDates
+                    .Select(u => VisibleDirectories(u.Node).Where(c => LooksLikeDate(c.Name)).Select(c => c.Name).ToList())
+                    .OrderByDescending(list => list.Count)
+                    .FirstOrDefault() ?? []);
         }
+
+        // 情形二点五：固定槽位轮转覆盖 —— 周一\ 周二\ … 周日\、Day1\…Day7\
+        //
+        // 排在情形三之前是因为它更具体（情形三只要求「多数子目录里直接有文件」，
+        // 轮转结构必然满足），先判不会抢走原有分支；不成立返回 null 原样落回。
+        var rotating = DetectRotatingSlots(source, directories);
+        if (rotating is not null)
+            return rotating;
 
         // 情形三：这一层是业务单元层，单元里直接放备份文件 —— 账套001\*.bak
         var unitsWithFiles = directories.Where(d => VisibleFiles(d).Any()).ToList();
@@ -194,6 +245,176 @@ public static class StructureInference
             summary: $"没能看懂 {source.Name} 的结构",
             evidence, [], []);
     }
+
+    // ---------- B1：轮转式备份目录 ----------
+
+    /// <summary>
+    /// 轮转槽位词表。**就这四类，不要再扩。**
+    ///
+    /// 前三类词表封闭、语义唯一，名字本身就能自证；纯序号那一类靠「个数 ≥ 3、最大值 ≤ 31」
+    /// 两个额外约束收窄，否则 1…18 这种账套编号会撞进来。
+    ///
+    /// 明确不收 `A B C`、`奇/偶`、`一 二 三`：它们与真实业务分组（车间 A/B/C、区域 A/B）
+    /// 无法区分，误判代价高于收益。真遇到了走逃生门——人手动选 latest_directory 模板，
+    /// 一次配置的事。
+    /// </summary>
+    private static readonly (string Label, string[] Words)[] RotationVocabularies =
+    [
+        ("星期（中文）", ["周一", "周二", "周三", "周四", "周五", "周六", "周日", "周天",
+                        "星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日", "星期天"]),
+        ("星期（英文）", ["mon", "tue", "wed", "thu", "fri", "sat", "sun",
+                        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]),
+        ("DayN", ["day1", "day2", "day3", "day4", "day5", "day6", "day7",
+                  "day01", "day02", "day03", "day04", "day05", "day06", "day07",
+                  "d1", "d2", "d3", "d4", "d5", "d6", "d7"])
+    ];
+
+    /// <summary>轮转槽位至少要有这么多个——两个目录说明不了任何轮转规律。</summary>
+    private const int MinRotationSlots = 3;
+
+    /// <summary>
+    /// 相邻槽位之间最小的时间间隔（天）。取 4 小时：比它更密的「均匀分布」
+    /// 是同一批任务依次跑完的痕迹，不是轮转覆盖。
+    /// </summary>
+    private const double MinRotationIntervalDays = 4.0 / 24;
+
+    /// <summary>
+    /// 固定槽位轮转覆盖：`周一…周日`、`Day1…Day7`、`Mon…Sun`、`01…07`。
+    ///
+    /// 轮转的语义是**覆盖**：N 个槽位是同一份备份的 N 个历史副本，任一时刻只有一个是
+    /// 「当前的那份备份」。判成 N 个业务单元的后果有三个，最要命的是第三个：
+    ///   1. 单元数与 external_key 全错（周一…周日 成了业务单元名）；
+    ///   2. 存储与带宽 ×N（N 个副本各自成为独立候选并各自上传）；
+    ///   3. **周期性偏科失败完全看不见**——MissedBackupWorker 是按任务判的，
+    ///      只要 N 个槽位里有任何一个是新的就不告警；而「周三」这个假单元自己的预检
+    ///      永远 passed（文件在、必需文件齐、早过稳定窗口）。于是「每周三的备份一直没成功」
+    ///      这件事，系统里没有任何一处会说出来。
+    ///
+    /// **不新增识别器类型**：轮转的结构语义与现有 latest_directory 完全一致，
+    /// 而 Agent 侧的 latest_directory 是按「目录内最新文件的 mtime」选目录、不是按名字排序，
+    /// 对 周一…周日 这种名字无序的槽位天然正确。所以这是一条纯推断端的改动。
+    ///
+    /// 两道判据必须**同时**成立，只用名字是不够的：一个恰好按星期分的**业务**目录
+    /// 会被错认。宁可认不出来交给人选。
+    /// </summary>
+    private static RecognizerProposalDto? DetectRotatingSlots(SnapshotNode source, List<SnapshotNode> directories)
+    {
+        if (directories.Count < MinRotationSlots)
+            return null;
+
+        var vocabulary = MatchRotationVocabulary(directories.Select(d => d.Name).ToList());
+        if (vocabulary is null)
+            return null;
+
+        // 时间判据（主判据）：各槽位「最新文件 mtime」明显错开，而不是聚集。
+        // N 个账套是同一批跑的，最新时间聚集在同一天；N 个轮转槽位的最新时间
+        // 大致等间隔铺开 N 个周期。任一槽位取不到 mtime 就整体不成立——
+        // 缺一个点，「错开」这件事就没法证明，而没法证明时的正确答案是「不认」。
+        var slotTimes = directories
+            .Select(d => (Dir: d, Time: NewestFileTime(d)))
+            .ToList();
+        if (slotTimes.Any(x => x.Time is null))
+            return null;
+
+        var times = slotTimes.Select(x => x.Time!.Value).OrderBy(t => t).ToList();
+        var spread = (times[^1] - times[0]).TotalDays;
+        var intervals = new List<double>(times.Count - 1);
+        for (var i = 1; i < times.Count; i++)
+            intervals.Add((times[i] - times[i - 1]).TotalDays);
+
+        var median = intervals.OrderBy(v => v).ElementAt(intervals.Count / 2);
+
+        // 间隔必须有绝对下限，不能只看「是不是均匀铺开」。
+        // 只比相对分布的话这条判据是尺度无关的：18 个账套在同一批里依次跑完，
+        // 彼此相差几十秒到几分钟，同样是「均匀铺开 N 个间隔」，会被判成轮转。
+        // 而轮转槽位按定义是**不同周期**写的——日轮转差一天、周轮转差一周，
+        // 以小时计的下限足以把「同一批跑完」和「隔一个周期覆盖一次」分开。
+        if (median < MinRotationIntervalDays)
+            return null;
+
+        if (spread < (directories.Count - 1) * median * 0.5)
+            return null;
+
+        var current = slotTimes.OrderByDescending(x => x.Time!.Value).First().Dir;
+        var clean = spread >= (directories.Count - 1) * median * 0.8;
+
+        var evidence = new List<string>
+        {
+            $"{source.Name} 下的 {directories.Count} 个目录（{PreviewNames(directories)}）"
+            + $"名字全部落在同一个固定词表里：{vocabulary}，且互不重复",
+            $"各目录里最新文件的时间依次错开（最早 {times[0]:yyyy-MM-dd HH:mm}、"
+            + $"最晚 {times[^1]:yyyy-MM-dd HH:mm}，相邻间隔中位数约 {DescribeInterval(median)}），"
+            + "说明每次只覆盖其中一个，而不是 N 个业务同时在备份",
+            // 逃生门：自适应判定没有逃生门就是死局。
+            "如果这其实是 " + directories.Count + " 个不同的业务（而不是同一份备份的轮换副本），"
+            + "请改选「子目录单元」模板，每个子目录会各自成为一个业务单元"
+        };
+
+        var required = InferRequiredFiles(directories, evidence);
+        var config = new JsonObject();
+        AddRequired(config, required);
+
+        return Build(
+            source, "latest_directory", config,
+            // 名字命中但时间分布勉强过线时给 62：低于 70 会连带把 NeedsDeeperScan 打开，
+            // 让向导再抓一次看得更清楚，而不是拿一个勉强的结论往下走。
+            confidence: clean ? 78 : 62,
+            summary: $"{source.Name} 下的 {directories.Count} 个目录（{PreviewNames(directories)}）"
+                     + $"是同一份备份的轮换副本，不是 {directories.Count} 个不同的业务："
+                     + $"它们的最新文件时间依次错开约 {DescribeInterval(median)}，说明每次覆盖其中一个。"
+                     + $"每次只认最新的那个（当前是 {current.Name}）"
+                     + DescribeRequired(required),
+            evidence, required, directories);
+    }
+
+    /// <summary>
+    /// 整组名字是否落在同一个词表里且互不重复。判的是「整组」，不是「某个名字像星期几」——
+    /// 单个名字撞上没有意义。命中返回词表名，否则 null。
+    /// </summary>
+    private static string? MatchRotationVocabulary(IReadOnlyList<string> names)
+    {
+        var distinct = names.Select(n => n.Trim().ToLowerInvariant()).ToList();
+        if (distinct.Distinct().Count() != distinct.Count)
+            return null;
+
+        foreach (var (label, words) in RotationVocabularies)
+        {
+            var set = words.Select(w => w.ToLowerInvariant()).ToHashSet();
+            if (distinct.All(set.Contains))
+                return label;
+        }
+
+        // 纯序号：额外要求个数 ≥ 3 且最大值 ≤ 31。不加上限的话，
+        // 1…18 这种账套编号会撞进来（时间判据也能挡，但在名字这一层先收一道更稳）。
+        if (distinct.Count >= MinRotationSlots && distinct.All(n => n.Length is 1 or 2 && n.All(char.IsAsciiDigit)))
+        {
+            var values = distinct.Select(int.Parse).ToList();
+            if (values.Max() <= 31 && values.Min() >= 0)
+                return "纯序号";
+        }
+
+        return null;
+    }
+
+    /// <summary>该目录子树里最新文件的修改时间；一个文件都没有则为 null。</summary>
+    private static DateTime? NewestFileTime(SnapshotNode node)
+    {
+        DateTime? newest = null;
+        foreach (var file in node.EnumerateFiles(true))
+        {
+            if (file.LastModifiedAt is null)
+                continue;
+            if (newest is null || file.LastModifiedAt > newest)
+                newest = file.LastModifiedAt;
+        }
+
+        return newest;
+    }
+
+    private static string DescribeInterval(double days) =>
+        days >= 0.9
+            ? $"{days:0.#} 天"
+            : $"{days * 24:0.#} 小时";
 
     /// <summary>源目录下只有文件、没有子目录。</summary>
     private static RecognizerProposalDto InferFlatDirectory(
@@ -273,7 +494,8 @@ public static class StructureInference
                 summary: $"{source.Name} 里每天一组备份，每组 {dated.Patterns.Count} 个"
                          + $"（{FileNamePattern.Describe(dated.Patterns)}），共 {dated.GroupCount} 组，"
                          + $"每次只认最新的一组：{dated.NewestGroupKey}",
-                evidence, dated.Candidates, [source]);
+                evidence, dated.Candidates, [source],
+                dateNames: dated.GroupKeys);
         }
 
         var byExtension = files
@@ -521,7 +743,9 @@ public static class StructureInference
         string GroupRegex,
         List<RequiredFileCandidateDto> Candidates,
         string NewestGroupKey,
-        IReadOnlyList<SnapshotNode> NewestGroupFiles);
+        IReadOnlyList<SnapshotNode> NewestGroupFiles,
+        /// <summary>所有分组的日期键，供 DateSequence 推周期与缺口。</summary>
+        IReadOnlyList<string> GroupKeys);
 
     /// <summary>
     /// 判断「一次备份 = 同一天的那几个文件」：按文件名里的日期分组，用归一化模式描述组成员。
@@ -632,7 +856,8 @@ public static class StructureInference
             groupRegex,
             candidates,
             newest.Key,
-            newest.Select(x => x.File).ToList());
+            newest.Select(x => x.File).ToList(),
+            groups.Select(g => g.Key).ToList());
     }
 
     private static List<string> DistinctExtensions(IEnumerable<SnapshotNode> files) =>
@@ -642,11 +867,11 @@ public static class StructureInference
             .ToList();
 
     /// <summary>去掉扩展名的文件名。边界与 Extension 一致：前导点的文件不算有扩展名。</summary>
-    private static string BaseName(string name)
-    {
-        var index = name.LastIndexOf('.');
-        return index <= 0 ? name : name[..index];
-    }
+    /// <summary>
+    /// 去掉扩展名之后的主干名。走 FileNamePattern.BaseName——`backup.tar.gz` 的主干是
+    /// `backup` 而不是 `backup.tar`，否则 .tar.gz 与 .tar.bz2 会被分到两个「同名组」里。
+    /// </summary>
+    private static string BaseName(string name) => FileNamePattern.BaseName(name);
 
     /// <summary>
     /// 从若干个「备份目录」里找出每次都出现的文件，分三档给出。
@@ -658,15 +883,19 @@ public static class StructureInference
     ///
     /// 三档：
     ///   1. 固定名必需  —— 精确文件名在 ≥90% 的单元里出现（UFDATA.BAK）
-    ///   2. 模式必需    —— 归一化后的模式在 ≥90% 的单元里出现，**且各单元里的个数一致**
+    ///   2. 模式必需    —— 归一化后的模式在 ≥90% 的单元里出现（UFFile_*.dat）
     ///   3. 附带文件    —— 其余，列出来但不勾选，并说明为什么
     ///
-    /// 第 2 档那个「个数一致」的条件是这套判断的关键，来自一条领域事实：
-    /// U8 的 UFFile 是按**年度**分的附件库，各账套的**启用年度不同**——
-    /// 2022 年起用的账套有 5 个，2024 年起用的只有 3 个，两者都是完整备份。
-    /// 个数在单元之间波动是这个结构的正常形态，不是缺失信号，拿它当判据只会制造假警报。
-    /// 反过来，个数一致的模式（每天恰好一个的 *_backup_*.bak）才是可靠的判据：
-    /// 少一个就是真的少了一个库。
+    /// 第 2 档曾经额外要求「各单元里的个数一致」，理由是 U8 的 UFFile 按年度分库、
+    /// 各账套启用年度不同（2022 年起用的有 5 个，2024 年起用的只有 3 个），
+    /// 拿个数当判据只会制造假警报。这条领域事实没错，但结论下过了头：
+    /// **requiredFiles 的判据从来不是个数，是「这个模式至少匹配到一个」**
+    /// （见 RecognizerRules.HasMissingRequired）。于是个数会波动的模式被整条排除在判据之外，
+    /// 后果是「附件库一个都不剩」这件事没有任何一道检查拦得住——UFDATA.BAK 还在、
+    /// 文件数下限还够、总大小还超（附件库比主库小得多），三道全过，静默入库。
+    /// 所以第 2 档只看在场率，个数区间照常显示出来，让人知道这条判据管的是哪一件事。
+    ///
+    /// 分卷归档仍然单独一把尺子，见下面 volumeGaps 那一段。
     /// </summary>
     private static List<RequiredFileCandidateDto> InferRequiredFiles(
         IReadOnlyList<SnapshotNode> leaves, List<string> evidence)
@@ -675,8 +904,8 @@ public static class StructureInference
             return [];
 
         var leafFiles = leaves
-            .Select(leaf => VisibleFiles(leaf).ToList())
-            .Where(list => list.Count > 0)
+            .Select(leaf => (Leaf: leaf, Files: VisibleFiles(leaf).ToList()))
+            .Where(x => x.Files.Count > 0)
             .ToList();
         if (leafFiles.Count == 0)
             return [];
@@ -685,7 +914,13 @@ public static class StructureInference
         var threshold = totalUnits == 1 ? 1 : (int)Math.Ceiling(totalUnits * RequiredThreshold);
 
         // ── 第一档：精确文件名 ──
-        var byName = CountAcross(leafFiles, f => f.Name);
+        //
+        // 分卷归档不走这一档：各单元卷数相同时 db.7z.001/.002/.003 三个精确名恰好都
+        // 「每个单元都有」，于是它们会被逐个写进 requiredFiles——等于把**卷数写死**。
+        // 数据量涨到四卷的那天，第四卷不在 requiredFiles 里没人管，
+        // 而数据量缩到两卷时 requiredFiles 里的第三卷永远缺失、天天假警报。
+        // 分卷该用的是第二档的主干模式 + 卷号连续性，见 FindVolumeGaps。
+        var byName = CountAcross(leafFiles, f => f.Name, skip: f => FileNamePattern.ParseVolume(f.Name) is not null);
         var exact = byName
             .Where(kv => kv.Value.Count >= threshold)
             .OrderByDescending(kv => kv.Value.Count)
@@ -707,13 +942,41 @@ public static class StructureInference
 
         // ── 第二档：归一化模式，只考察没被第一档盖住的文件 ──
         var patterns = CountPatterns(leafFiles, exactNames);
+        var volumeGaps = FindVolumeGaps(leafFiles);
         var pattern = patterns
             .OrderByDescending(kv => kv.Value.PresentIn)
             .ThenByDescending(kv => kv.Value.Size)
             .Select(kv =>
             {
-                var stable = kv.Value.CountMin == kv.Value.CountMax;
                 var present = kv.Value.PresentIn >= threshold;
+
+                // 分卷归档换一把尺子：判据是**卷号连续**，不是个数稳定。
+                //
+                // 「个数一致」那条对 U8 的 UFFile 附件库是对的（个数随账套启用年度天然不同），
+                // 但对分卷用反了：分卷数随数据量浮动，于是 db_*.7z 永远个数不一致、
+                // 永远不被推荐、缺一卷整份无法恢复却不告警。
+                // 反过来，各单元卷数不同（3 卷 / 5 卷）但各自连续时**仍然推荐**——
+                // 这正是与个数稳定性判据的区别。
+                if (volumeGaps.TryGetValue(kv.Key, out var gap))
+                {
+                    return new RequiredFileCandidateDto
+                    {
+                        Pattern = kv.Key,
+                        Kind = "pattern",
+                        PresentIn = kv.Value.PresentIn,
+                        TotalUnits = totalUnits,
+                        TypicalSizeBytes = kv.Value.Size,
+                        CountPerUnitMin = kv.Value.CountMin,
+                        CountPerUnitMax = kv.Value.CountMax,
+                        Recommended = present && gap.Length == 0,
+                        NotRecommendedReason = !present
+                            ? $"只出现在 {kv.Value.PresentIn}/{totalUnits} 个备份目录里"
+                            : gap.Length == 0
+                                ? null
+                                : gap + "。分卷缺号意味着整份归档无法解压，请先确认备份脚本"
+                    };
+                }
+
                 return new RequiredFileCandidateDto
                 {
                     Pattern = kv.Key,
@@ -723,22 +986,33 @@ public static class StructureInference
                     TypicalSizeBytes = kv.Value.Size,
                     CountPerUnitMin = kv.Value.CountMin,
                     CountPerUnitMax = kv.Value.CountMax,
-                    Recommended = present && stable,
-                    NotRecommendedReason = !present
-                        ? $"只出现在 {kv.Value.PresentIn}/{totalUnits} 个备份目录里"
-                        : stable
-                            ? null
-                            : $"各备份目录里的个数不一样（{kv.Value.CountMin}–{kv.Value.CountMax} 个），"
-                              + "不能作为完整性判据；文件本身照常上传"
+                    Recommended = present,
+                    NotRecommendedReason = present
+                        ? null
+                        : $"只出现在 {kv.Value.PresentIn}/{totalUnits} 个备份目录里"
                 };
             })
             .ToList();
+
+        VolumePatterns = volumeGaps.Keys.ToList();
 
         var candidates = exact.Concat(pattern).Take(16).ToList();
 
         var recommended = candidates.Where(c => c.Recommended).Select(c => c.Pattern).ToList();
         if (recommended.Count > 0)
             evidence.Add($"考察的 {totalUnits} 个备份目录里，每一个都有：{string.Join("、", recommended)}");
+
+        // 个数会浮动的模式，必须把判据本身说出来。不说的话，人看到「每个 2–5 个」
+        // 会以为系统要求每次都有 5 个，然后自己把这条判据取消掉——而它恰恰是
+        // 「附件库整批丢失」唯一的检出手段。
+        foreach (var item in candidates.Where(c =>
+                     c.Recommended && c.Kind == "pattern" && c.CountPerUnitMin != c.CountPerUnitMax))
+        {
+            evidence.Add(
+                $"{item.Pattern}：各备份目录里的个数不一样（{item.CountPerUnitMin}–{item.CountPerUnitMax} 个），"
+                + "这是正常的（U8 的附件库按年度分，各账套启用年度不同）。判据是「至少有一个」，"
+                + "不是个数——整批丢失才会判为不完整");
+        }
 
         foreach (var item in candidates.Where(c => !c.Recommended))
             evidence.Add($"{item.Pattern}：{item.NotRecommendedReason}，没有默认勾选");
@@ -747,16 +1021,87 @@ public static class StructureInference
     }
 
     /// <summary>
+    /// 上一次 InferRequiredFiles 认出来的分卷模式。调用方据此决定要不要往配置里写
+    /// volumeContinuity——这个键要跟着 requiredFiles 一起落盘，扫描端才会做连续性检查。
+    ///
+    /// 用一个 [ThreadStatic] 的旁路而不是改 InferRequiredFiles 的返回类型：
+    /// 那个方法有五个调用点，为一个布尔标志改五处签名不值当；
+    /// 而 StructureInference 是无状态静态类、Infer 在一次请求里同步跑完，
+    /// 线程内传一个标志是安全的。
+    /// </summary>
+    [ThreadStatic]
+    private static List<string>? VolumePatterns;
+
+    /// <summary>
+    /// 哪些归一化模式是分卷归档，以及它们缺不缺卷。
+    /// 值是空串表示各单元内部卷号都连续；非空是一句点名缺第几卷的人话。
+    /// </summary>
+    private static Dictionary<string, string> FindVolumeGaps(
+        List<(SnapshotNode Leaf, List<SnapshotNode> Files)> leafFiles)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (leaf, files) in leafFiles)
+        {
+            // 一个单元内部，按「分卷主干」把卷号收拢
+            var perStem = new Dictionary<string, (string Pattern, SortedSet<int> Indices)>(StringComparer.OrdinalIgnoreCase);
+            foreach (var file in files)
+            {
+                var volume = FileNamePattern.ParseVolume(file.Name);
+                if (volume is null)
+                    continue;
+
+                var patternKey = FileNamePattern.Normalize(file.Name);
+                if (!perStem.TryGetValue(volume.Value.Stem, out var entry))
+                    perStem[volume.Value.Stem] = entry = (patternKey, []);
+                entry.Indices.Add(volume.Value.Index);
+            }
+
+            foreach (var (stem, entry) in perStem)
+            {
+                // 卷号必须从 1 连续到最大值。少于两卷不算分卷序列——
+                // 单独一个 .001 更可能是别的命名习惯，按分卷判会把它错标成「缺卷」。
+                if (entry.Indices.Count < 2)
+                    continue;
+
+                var gap = FirstGap(entry.Indices);
+                var message = gap is null
+                    ? string.Empty
+                    : $"{leaf.Name} 缺第 {gap} 卷（现有 {string.Join("、", entry.Indices)}）";
+
+                // 任一单元缺卷就整体判缺：这是一条完整性判据，一处不成立就不该推荐。
+                if (!result.TryGetValue(entry.Pattern, out var existing) || existing.Length == 0)
+                    result[entry.Pattern] = message;
+            }
+        }
+
+        return result;
+    }
+
+    private static int? FirstGap(SortedSet<int> indices)
+    {
+        var expected = 1;
+        foreach (var index in indices)
+        {
+            if (index != expected)
+                return expected;
+            expected++;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// 按归一化模式统计：这个模式出现在多少个单元里，以及**每个单元里有几个**。
     /// 个数的最小/最大值是第二档能不能当判据的依据，见 InferRequiredFiles 的说明。
     /// </summary>
     private static Dictionary<string, (int PresentIn, int CountMin, int CountMax, long Size)> CountPatterns(
-        List<List<SnapshotNode>> leafFiles, HashSet<string> alreadyCovered)
+        List<(SnapshotNode Leaf, List<SnapshotNode> Files)> leafFiles, HashSet<string> alreadyCovered)
     {
         var result = new Dictionary<string, (int PresentIn, int CountMin, int CountMax, long Size)>(
             StringComparer.OrdinalIgnoreCase);
 
-        foreach (var files in leafFiles)
+        foreach (var (leaf, files) in leafFiles)
         {
             var perUnit = new Dictionary<string, (int Count, long Size)>(StringComparer.OrdinalIgnoreCase);
             foreach (var file in files)
@@ -767,6 +1112,17 @@ public static class StructureInference
                 perUnit[key] = perUnit.TryGetValue(key, out var seen)
                     ? (seen.Count + 1, Math.Max(seen.Size, file.SizeBytes))
                     : (1, file.SizeBytes);
+            }
+
+            // 抽样目录的修正：这个叶子里只有一种模式时，样本条数就等于该模式的真实个数——
+            // 拿 Agent 回传的 FileCount 顶掉样本条数。不修正的话，一个抽了样的账套会显示
+            // 「40 个」而没抽样的显示「57 个」，第二档的「个数一致」判据把本来一致的判成不一致，
+            // 于是一条可靠的完整性判据被抽样这件事本身弄丢了。
+            // 有多种模式时不修正：FileCount 是整个目录的总数，摊不到每个模式上，硬摊是编数据。
+            if (leaf.Sampled && perUnit.Count == 1 && leaf.FileCount is > 0)
+            {
+                var only = perUnit.First();
+                perUnit[only.Key] = (leaf.FileCount.Value, only.Value.Size);
             }
 
             foreach (var (key, value) in perUnit)
@@ -784,14 +1140,18 @@ public static class StructureInference
     }
 
     private static Dictionary<string, (int Count, long Size)> CountAcross(
-        List<List<SnapshotNode>> leafFiles, Func<SnapshotNode, string> keySelector)
+        List<(SnapshotNode Leaf, List<SnapshotNode> Files)> leafFiles,
+        Func<SnapshotNode, string> keySelector,
+        Func<SnapshotNode, bool>? skip = null)
     {
         var result = new Dictionary<string, (int Count, long Size)>(StringComparer.OrdinalIgnoreCase);
-        foreach (var files in leafFiles)
+        foreach (var (_, files) in leafFiles)
         {
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var file in files)
             {
+                if (skip is not null && skip(file))
+                    continue;
                 var key = keySelector(file);
                 if (!seen.Add(key))
                     continue;
@@ -815,6 +1175,13 @@ public static class StructureInference
         foreach (var name in recommended)
             array.Add(name);
         config["requiredFiles"] = array;
+
+        // 推荐出来的模式里有分卷归档时，扫描端要额外做一次卷号连续性检查。
+        // 不写这个键的话，requiredFiles 只保证「db_*.7z.* 这个模式有文件在场」，
+        // 而缺第 2 卷时第 1、3、4 卷仍然在场——判据会说「齐了」，整份归档却解不开。
+        var volumes = VolumePatterns;
+        if (volumes is not null && recommended.Any(p => volumes.Contains(p, StringComparer.OrdinalIgnoreCase)))
+            config["volumeContinuity"] = true;
     }
 
     private static string DescribeRequired(IReadOnlyList<RequiredFileCandidateDto> required)
@@ -822,9 +1189,15 @@ public static class StructureInference
         var recommended = required.Where(c => c.Recommended).Select(c => c.Pattern).ToList();
         if (recommended.Count == 0)
             return "";
-        return $"；每次的备份目录里固定有 {recommended.Count} 个文件：{string.Join("、", recommended)}";
+        // 说「固定有 N 个文件」会被读成「这个目录一共就 N 个文件」——而 U8 的一个日期目录里
+        // 有 7 个文件，其中 2 个是固定名、5 个是按模式认的附件库。这句话的本意是
+        // 「这几项每次都在」，就照这个意思写。
+        return $"；每次都少不了这 {recommended.Count} 项：{string.Join("、", recommended)}";
     }
 
+    /// <param name="dateNames">
+    /// 这个结构里的日期名（日期目录名，或按日期分组的组键）。给出来才能推备份周期与历史缺口。
+    /// </param>
     private static RecognizerProposalDto Build(
         SnapshotNode source,
         string recognizerType,
@@ -834,14 +1207,46 @@ public static class StructureInference
         List<string> evidence,
         IReadOnlyList<RequiredFileCandidateDto> required,
         IReadOnlyList<SnapshotNode> leaves,
-        string? sourcePathOverride = null)
+        string? sourcePathOverride = null,
+        IReadOnlyList<string>? dateNames = null)
     {
         // 快照本身没抓全时，推断依据就是不完整的，置信度必须相应下调并说明。
+        //
+        // Sampled 与 HasGaps 是两回事，刻意分开：抽样过的快照**每一层都有代表性样本**，
+        // 结论是可信的，再按「不完整」扣分等于惩罚一个已经修好的问题。
+        // 而 DepthLimited / Truncated / AccessDenied 意味着有整块结构没看见。
         if (source.HasGaps)
         {
             confidence = Math.Max(20, confidence - 20);
             evidence.Add("这个目录没有被完整抓取（层数或条目数触顶），以上结论只覆盖看得见的部分");
         }
+        else if (source.HasSampling)
+        {
+            evidence.Add(
+                "文件太多，每个目录只取了最新的一批做样本（目录本身、以及每个目录里的文件总数与总大小都是准确的）");
+        }
+
+        var application = GuessApplication(leaves);
+        confidence = ApplyApplicationPrior(application, recognizerType, confidence, leaves, evidence);
+
+        var baseline = SuggestSizeBaseline(leaves, required);
+        var sequence = dateNames is null or { Count: 0 } ? null : DateSequence.Analyze(dateNames);
+        if (sequence is not null)
+        {
+            summary += $"。这 {dateNames!.Count} 个日期跨了 {(sequence.Latest - sequence.Earliest).Days} 天，"
+                       + $"是{sequence.PeriodLabel}一备";
+            if (sequence.MissingDates.Count > 0)
+            {
+                evidence.Add(
+                    $"按{sequence.PeriodLabel}一备推算，"
+                    + string.Join("、", sequence.MissingDates.Take(10).Select(d => d.ToString("yyyy-MM-dd")))
+                    + (sequence.MissingDates.Count > 10 ? $" 等 {sequence.MissingDates.Count} 天" : $" 这 {sequence.MissingDates.Count} 天")
+                    + "没有对应的备份");
+            }
+        }
+
+        if (baseline.Note is not null)
+            evidence.Add(baseline.Note);
 
         return new RecognizerProposalDto
         {
@@ -855,9 +1260,138 @@ public static class StructureInference
             Summary = summary,
             Evidence = evidence,
             RequiredFileCandidates = required.ToList(),
-            SuggestedApplicationName = GuessApplication(leaves)
+            SuggestedApplicationName = application,
+            SuggestedMinTotalBytes = baseline.MinTotalBytes,
+            SuggestedMinFileCount = baseline.MinFileCount,
+            SizeBaselineNote = baseline.Note,
+            // 周期与缺口只陈述事实：**不因为有缺口就降低置信度**。
+            // 缺口是被识别对象的性质，不是识别质量的问题——把两者混在一起，
+            // 会让「这个目录有历史缺备」表现成「向导看不懂这个目录」。
+            DetectedPeriod = sequence?.PeriodLabel,
+            MissingBackupDates = sequence?.MissingDates.Select(d => d.ToString("yyyy-MM-dd")).ToList() ?? []
         };
     }
+
+    // ---------- B3：尺寸基线建议 ----------
+
+    /// <summary>各单元大小相差超过这个倍数时不给建议值——统一阈值对它们没有意义。</summary>
+    private const double SizeDispersionLimit = 20;
+
+    /// <summary>建议值的下限。比 1 MB 还小的阈值检不出任何东西，只会让人以为设过了。</summary>
+    private const long MinSuggestedBytes = 1024 * 1024;
+
+    /// <summary>
+    /// 从观察到的各份备份大小推一个下限建议值。
+    ///
+    /// 判据（ValidateSizeThresholds）本来就存在且告警链路完整，缺的只有这一环：
+    /// 向导不给建议值，人要凭空想一个字节数填进去，于是现场基本不会生效——
+    /// 而「备份文件突然变成 0 字节」是备份故障里最经典的一种。
+    ///
+    /// **只给下限，不给上限**：备份变大通常是业务正常增长，给上限会制造周期性假警报。
+    /// 取最小一份的一半，是留出业务波动的余量——这个数要的是「掉了一个数量级」的检出力，
+    /// 不是精确基线。
+    /// </summary>
+    private static (long? MinTotalBytes, int? MinFileCount, string? Note) SuggestSizeBaseline(
+        IReadOnlyList<SnapshotNode> leaves,
+        IReadOnlyList<RequiredFileCandidateDto> required)
+    {
+        var recommendedCount = required.Count(c => c.Recommended);
+        var minFileCount = recommendedCount > 0 ? recommendedCount : (int?)null;
+
+        var sizes = leaves.Select(TotalFileBytesOf).Where(b => b > 0).OrderBy(b => b).ToList();
+        if (sizes.Count < 3)
+        {
+            return (null, minFileCount,
+                $"只观察到 {sizes.Count} 份备份，样本太少，没有给出大小下限的建议值——"
+                + "给了就是瞎猜。需要的话请在任务里手动设置。");
+        }
+
+        var min = sizes[0];
+        var max = sizes[^1];
+
+        // 离散度闸门。MinTotalBytes 是**任务级**的单一阈值，而 ValidateSizeThresholds
+        // 拿它去比**每一个业务单元**的 TotalBytes。18 个账套里最小的 5 MB、最大的 1.5 GB 时，
+        // 任何一个统一下限要么对大账套毫无检出力，要么对小账套天天假警报。
+        // 宁可不给，也不要给一个假装有用的数。
+        if (max > min * SizeDispersionLimit)
+        {
+            return (null, minFileCount,
+                $"这 {sizes.Count} 份备份的大小相差 {max / Math.Max(1, min)} 倍"
+                + $"（最小 {FormatBytes(min)}，最大 {FormatBytes(max)}），一个统一的下限对它们没有意义。"
+                + "这一项留空，需要的话请对单个任务单独设置。");
+        }
+
+        var suggested = Math.Max(MinSuggestedBytes, min / 2 / MinSuggestedBytes * MinSuggestedBytes);
+        return (suggested, minFileCount,
+            $"观察到的 {sizes.Count} 份备份里最小的一份是 {FormatBytes(min)}，"
+            + $"建议下限设为 {FormatBytes(suggested)}。低于这个值会判「备份大小不对」并告警。");
+    }
+
+    /// <summary>
+    /// 一份备份的总字节数。优先用 Agent 回传的 TotalFileBytes（含抽样未返回的部分），
+    /// 没有就按快照里看得见的文件加总——抽样时后者会偏小，而这个数是用来定告警阈值的，
+    /// 偏小意味着阈值偏低、漏报，比偏高误报安全。
+    /// </summary>
+    private static long TotalFileBytesOf(SnapshotNode leaf) =>
+        leaf.TotalFileBytes ?? VisibleFiles(leaf).Sum(f => f.SizeBytes);
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        double value = bytes;
+        var index = 0;
+        while (value >= 1024 && index < units.Length - 1)
+        {
+            value /= 1024;
+            index++;
+        }
+
+        return $"{value:0.#} {units[index]}";
+    }
+
+    // ---------- B8.1：应用先验反哺判据 ----------
+
+    /// <summary>
+    /// 认出应用之后，用该应用的已知形态**叠加**一点置信度并补一句 Evidence。
+    ///
+    /// 三条硬约束，缺一条这个加成就会变成「用猜测取消该做的检查」：
+    ///   1. 只在通用判据**已经成立**时叠加（recognizerType 不是兜底的那两种），
+    ///      否则一个恰好有 .bak 的目录会被强行套上 SQL Server 的结构假设；
+    ///   2. 加成上限 +8；
+    ///   3. **不得把一个低于 70 的结论顶到 70 以上**——那会把 NeedsDeeperScan 关掉。
+    /// </summary>
+    private static int ApplyApplicationPrior(
+        string? application,
+        string recognizerType,
+        int confidence,
+        IReadOnlyList<SnapshotNode> leaves,
+        List<string> evidence)
+    {
+        if (application is null || leaves.Count == 0)
+            return confidence;
+
+        var names = leaves.SelectMany(VisibleFiles).Select(f => f.Name.ToLowerInvariant()).ToList();
+
+        if (application == "SQL Server" && names.Any(n => n.EndsWith(".trn")) && names.Any(n => n.EndsWith(".bak")))
+        {
+            evidence.Add(
+                "这里有完整备份（.bak）和日志备份（.trn）两类文件，"
+                + "请确认这个任务是不是应该只认 .bak——两类都收的话，每次备份的文件清单会随日志备份的频率变动");
+        }
+
+        if (application != "用友 U8" || recognizerType != "subdirectory_units")
+            return confidence;
+
+        // 低于 70 的结论一律不加成：那条线决定要不要再抓一次看清楚，
+        // 而先验回答不了「有没有看全」这个问题。
+        if (confidence < 70)
+            return confidence;
+
+        evidence.Add("文件特征符合用友 U8 的备份形态（账套目录 + UFDATA.BAK），与推断出的结构一致");
+        return Math.Min(100, confidence + 8);
+    }
+
+    /// <summary>从文件特征猜应用名。猜不出就返回 null，让人自己填——瞎猜一个名字没有价值。</summary>
 
     /// <summary>从文件特征猜应用名。猜不出就返回 null，让人自己填——瞎猜一个名字没有价值。</summary>
     private static string? GuessApplication(IReadOnlyList<SnapshotNode> leaves)
@@ -895,14 +1429,15 @@ public static class StructureInference
     /// 定位规则与 Agent 真扫时共用 BusinessUnitResolver，所以「向导说有 18 个账套」
     /// 和「实际扫描出 18 个账套」是同一段代码算出来的，不可能分叉。
     ///
-    /// 深度上限取 4：源目录 → 分组容器 → 单元 → 日期目录。再深的结构快照本身也抓不到
-    /// （向导抓 4 层），继续下探只会在 DepthLimited 的空目录上打转。
+    /// 深度上限由调用方给（来自本次快照实际抓了几层，见 Infer 的 snapshotMaxDepth）。
+    /// 这个数不能只留在这里：它必须随配置一起写成 unitMaxDepth，预演和真扫才会用同一个
+    /// 下探层数（见调用处写 config 的那段）。
     /// </summary>
-    private static List<UnitCandidate> ResolveUnits(SnapshotNode source)
+    private static List<UnitCandidate> ResolveUnits(SnapshotNode source, int unitMaxDepth)
     {
         var rules = RecognizerRules.Empty() with { UnitLayout = "date_leaf" };
         return BusinessUnitResolver
-            .Resolve(source, rules, SnapshotRecognizer.SnapshotNavigator(source), maxDepth: 4)
+            .Resolve(source, rules, SnapshotRecognizer.SnapshotNavigator(source), maxDepth: unitMaxDepth)
             .Select(unit =>
             {
                 var children = VisibleDirectories(unit.Directory).ToList();
@@ -934,11 +1469,11 @@ public static class StructureInference
                               && !f.Name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)
                               && !f.Name.EndsWith(".partial", StringComparison.OrdinalIgnoreCase));
 
-    private static string Extension(string name)
-    {
-        var index = name.LastIndexOf('.');
-        return index <= 0 ? string.Empty : name[index..];
-    }
+    /// <summary>
+    /// 文件扩展名。走 FileNamePattern.Extension，复合扩展名（.tar.gz / .sql.gz）整体识别——
+    /// 只取最后一个点会让成对检测与扩展名分组同时串味，而那正是 R1 最危险缺陷的所在区域。
+    /// </summary>
+    private static string Extension(string name) => FileNamePattern.Extension(name);
 
     private static string PreviewNames(IReadOnlyList<SnapshotNode> nodes)
     {

@@ -39,6 +39,7 @@ public class BackupTaskDeletionTests : IAsyncLifetime
         sc.AddScoped<ICommandDispatcher, UnusedCommandDispatcher>();
         sc.AddScoped<IAgentConfigService, AgentConfigService>();
         sc.AddScoped<SystemSettingsProvider>();
+        sc.AddScoped<IExecutionQueueService, ExecutionQueueService>();
         sc.AddScoped<IBackupTaskService, BackupTaskService>();
         _services = sc.BuildServiceProvider();
         return Task.CompletedTask;

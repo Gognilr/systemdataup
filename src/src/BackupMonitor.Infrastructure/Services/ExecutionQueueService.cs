@@ -31,6 +31,24 @@ public interface IExecutionQueueService
 
     Task<PagedResult<ExecutionRunDto>> ListRunsAsync(Guid? planId, PagedQuery query, CancellationToken ct = default);
 
+    /// <summary>
+    /// 为一批手动「立即备份」建一次执行（D3）。并发度取系统设置 manual_run_max_concurrent，
+    /// 而不是给每个任务各发一条独立指令——那样十个任务就是十个同时开传。
+    /// 全部任务都不可执行时返回 null。
+    /// </summary>
+    Task<ExecutionRun?> CreateManualRunAsync(
+        IReadOnlyCollection<Guid> taskIds, Guid? triggeredBy, CancellationToken ct = default);
+
+    /// <summary>
+    /// 全局上传名额已满时，把一次上传排进队列而不是当场下发（D3）。
+    /// 返回 false 表示还有名额、调用方应当照旧直接下发。
+    ///
+    /// 闸不能放在建会话那一步：Agent 对 UPLOAD_SESSION_CONFLICT 没有退避重试，
+    /// 在那里 409 等于把限流变成备份失败。
+    /// </summary>
+    Task<bool> TryDeferUploadAsync(
+        Guid clientId, Guid taskId, Guid candidateBackupSetId, CancellationToken ct = default);
+
     /// <summary>取消一次执行：还没开跑的项一律置 cancelled，已经在跑的项交给它自己跑完</summary>
     Task<ExecutionRunDto> CancelRunAsync(Guid runId, CancellationToken ct = default);
 }
@@ -40,15 +58,89 @@ public class ExecutionQueueService : IExecutionQueueService
     /// <summary>还没终结的执行（用于「这个计划已经有一次在跑」的判定）</summary>
     public static readonly BatchStatus[] ActiveRunStatuses = [BatchStatus.Pending, BatchStatus.Running];
 
+    /// <summary>手动执行的并发度 system_settings 键</summary>
+    public const string ManualMaxConcurrentKey = "manual_run_max_concurrent";
+
+    /// <summary>单项超时（分钟）：与备份计划的默认值同口径</summary>
+    private const int ManualItemTimeoutMinutes = 120;
+
     private readonly AppDbContext _db;
     private readonly IAuditRecorder _audit;
+    private readonly SystemSettingsProvider _settings;
     private readonly ILogger<ExecutionQueueService> _logger;
 
-    public ExecutionQueueService(AppDbContext db, IAuditRecorder audit, ILogger<ExecutionQueueService> logger)
+    public ExecutionQueueService(
+        AppDbContext db, IAuditRecorder audit, SystemSettingsProvider settings, ILogger<ExecutionQueueService> logger)
     {
         _db = db;
         _audit = audit;
+        _settings = settings;
         _logger = logger;
+    }
+
+    public async Task<ExecutionRun?> CreateManualRunAsync(
+        IReadOnlyCollection<Guid> taskIds, Guid? triggeredBy, CancellationToken ct = default)
+    {
+        if (taskIds.Count == 0)
+            return null;
+
+        var tasks = await _db.BackupTasks
+            .Include(t => t.Client)
+            .Where(t => taskIds.Contains(t.Id))
+            .ToListAsync(ct);
+
+        // 一个都跑不了就别建一条空执行：界面上多出一行「0 项」除了让人困惑没有别的作用，
+        // 调用方拿到 null 会退回逐个下发的老路径，那条路径会把每个任务各自的原因说清楚。
+        if (tasks.Count == 0 || tasks.All(t => SkipReason(t) is not null))
+            return null;
+
+        var now = DateTime.UtcNow;
+        var run = new ExecutionRun
+        {
+            Id = Guid.NewGuid(),
+            Kind = ExecutionRunKind.Manual,
+            Name = $"手动立即备份（{tasks.Count} 个任务）",
+            Status = BatchStatus.Pending,
+            MaxConcurrent = Math.Clamp(await _settings.GetIntAsync(ManualMaxConcurrentKey, 2, ct), 1, 32),
+            ItemTimeoutMinutes = ManualItemTimeoutMinutes,
+            TriggerSource = "manual",
+            TriggeredBy = triggeredBy,
+            CreatedAt = now
+        };
+
+        var sort = 0;
+        // 按调用方给的顺序放行，而不是按 Guid：人在界面上勾选的顺序就是他心里的优先次序。
+        foreach (var taskId in taskIds)
+        {
+            var task = tasks.FirstOrDefault(t => t.Id == taskId);
+            if (task is null)
+                continue;
+
+            var skipReason = SkipReason(task);
+            run.Items.Add(new ExecutionRunItem
+            {
+                Id = Guid.NewGuid(),
+                SortOrder = sort++,
+                ClientId = task.ClientId,
+                TaskId = task.Id,
+                CommandType = CommandType.PrecheckTask,
+                Status = skipReason is null ? ExecutionItemStatus.Pending : ExecutionItemStatus.Skipped,
+                Message = skipReason,
+                FinishedAt = skipReason is null ? null : now
+            });
+        }
+
+        run.TotalItems = run.Items.Count;
+        _db.ExecutionRuns.Add(run);
+        await _db.SaveChangesAsync(ct);
+
+        await _audit.RecordAsync("task.batch_backup_now", AuditResult.Success, "execution_run", run.Id,
+            afterData: JsonSerializer.Serialize(new { runId = run.Id, run.TotalItems, run.MaxConcurrent }), ct: ct);
+
+        _logger.LogInformation("手动批量立即备份已产生一次执行 {RunId}：共 {Total} 项，并发度 {Concurrent}",
+            run.Id, run.TotalItems, run.MaxConcurrent);
+
+        return run;
     }
 
     public async Task<ExecutionRun?> CreatePlanRunAsync(
@@ -132,6 +224,56 @@ public class ExecutionQueueService : IExecutionQueueService
             plan.Name, run.Id, run.TotalItems, run.MaxConcurrent);
 
         return run;
+    }
+
+    public async Task<bool> TryDeferUploadAsync(
+        Guid clientId, Guid taskId, Guid candidateBackupSetId, CancellationToken ct = default)
+    {
+        var limit = Math.Clamp(
+            await _settings.GetIntAsync(SequentialExecutionWorker.GlobalUploadLimitKey, 4, ct), 1, 64);
+        var active = await _db.UploadSessions
+            .CountAsync(s => UploadSessionStatuses.Active.Contains(s.Status), ct);
+        if (active < limit)
+            return false;
+
+        // 同一个候选已经排着了就别再排一次：预检结果可能被重复上报（指令重试、
+        // Agent 重启后补报），每次都排一条会让同一份备份传两遍。
+        var alreadyQueued = await _db.Set<ExecutionRunItem>().AnyAsync(i =>
+            i.CandidateBackupSetId == candidateBackupSetId
+            && (i.Status == ExecutionItemStatus.Pending || i.Status == ExecutionItemStatus.Running), ct);
+        if (alreadyQueued)
+            return true;
+
+        var now = DateTime.UtcNow;
+        var run = new ExecutionRun
+        {
+            Id = Guid.NewGuid(),
+            Kind = ExecutionRunKind.Manual,
+            Name = "排队等待上传",
+            Status = BatchStatus.Pending,
+            MaxConcurrent = 1,
+            ItemTimeoutMinutes = ManualItemTimeoutMinutes,
+            TriggerSource = "auto_upload_queued",
+            CreatedAt = now,
+            TotalItems = 1
+        };
+        run.Items.Add(new ExecutionRunItem
+        {
+            Id = Guid.NewGuid(),
+            SortOrder = 0,
+            ClientId = clientId,
+            TaskId = taskId,
+            CandidateBackupSetId = candidateBackupSetId,
+            CommandType = CommandType.UploadCandidate,
+            Status = ExecutionItemStatus.Pending
+        });
+
+        _db.ExecutionRuns.Add(run);
+        await _db.SaveChangesAsync(ct);
+
+        _logger.LogInformation(
+            "全局上传并发已达上限（{Limit}），候选 {Candidate} 排队等待名额", limit, candidateBackupSetId);
+        return true;
     }
 
     /// <summary>不参与执行的任务与它的原因；null 表示可以执行</summary>

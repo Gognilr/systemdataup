@@ -444,6 +444,67 @@ export function initCronFields(root) {
   });
 }
 
+/* 字节量输入：数值 + 单位下拉，隐藏 input 里存的仍然是字节。
+   原来只给一个「字节」输入框，"上限 50 GB" 要人自己按 1024 连乘三次再填进去；
+   算错一位就是十倍或十分之一的阈值，而这个数直接决定告不告警——
+   偏大时永不触发（等于没配），偏小时天天误报（然后人把整个大小检查关掉）。 */
+const BYTE_UNITS = [[1, 'B'], [1024, 'KB'], [1048576, 'MB'], [1073741824, 'GB'], [1099511627776, 'TB']];
+
+/* 回显时选能整除的最大单位：存进去的 53687091200 要显示成 50 GB，
+   否则人下次打开表单看到的还是那串数字，等于白改。 */
+export function splitBytes(value) {
+  const n = value === '' || value == null ? NaN : Number(value);
+  if (!Number.isFinite(n) || n < 0) return { num: '', unit: 1073741824 };
+  if (n === 0) return { num: '0', unit: 1 };
+  let pick = BYTE_UNITS[0];
+  for (const u of BYTE_UNITS) if (n % u[0] === 0) pick = u;
+  return { num: String(n / pick[0]), unit: pick[0] };
+}
+
+export function composeBytes(num, unit) {
+  const n = String(num).trim();
+  if (n === '') return '';
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 0) return '';
+  return String(Math.round(v * Number(unit)));
+}
+
+export function bytesFieldHtml(name, value, placeholder) {
+  const s = splitBytes(value);
+  const opts = BYTE_UNITS.map(([v, t]) =>
+    `<option value="${v}" ${v === s.unit ? 'selected' : ''}>${t}</option>`).join('');
+  return `<div class="bytesfield" data-bytes>
+    <input type="hidden" name="${esc(name)}" value="${esc(value == null ? '' : value)}">
+    <div class="bytesrow">
+      <input type="number" min="0" step="any" data-bytes-num value="${esc(s.num)}"
+             placeholder="${esc(placeholder || '留空表示不检查')}" aria-label="数值">
+      <select data-bytes-unit aria-label="单位">${opts}</select>
+    </div>
+    <div class="hint" data-bytes-echo></div>
+  </div>`;
+}
+
+/* 同步进隐藏 input——readValues 按 name 取值，取到的还是字节，服务端那头一点不用动。 */
+export function initBytesFields(root) {
+  root.querySelectorAll('[data-bytes]').forEach(box => {
+    const hidden = box.querySelector('input[type="hidden"]');
+    const num = box.querySelector('[data-bytes-num]');
+    const unit = box.querySelector('[data-bytes-unit]');
+    const echo = box.querySelector('[data-bytes-echo]');
+    const sync = () => {
+      const bytes = composeBytes(num.value, unit.value);
+      hidden.value = bytes;
+      // 把最终字节数摆出来：这是存进库、也是详情页会显示的那个数，
+      // 人填完能自己确认一眼有没有点错单位。
+      echo.textContent = bytes === '' ? '留空表示不检查' : `= ${Number(bytes).toLocaleString('en-US')} 字节`;
+      hidden.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    box.addEventListener('input', ev => { if (ev.target !== hidden) sync(); });
+    box.addEventListener('change', ev => { if (ev.target !== hidden) sync(); });
+    sync();
+  });
+}
+
 /* ── 表单类模态（详情类请用抽屉，§6.3） ── */
 export function openModal(title, bodyHtml, opts = {}) {
   closeModal();
@@ -510,6 +571,7 @@ export function confirmModal(msg) {
 
    type='static' 是只读展示块（html 字段直接插入），用来放实时预览这类不参与取值的内容。
    type='cron' 是扫描计划组合控件（频率 + 时刻），取值时拿到的是合成好的 cron 表达式。
+   type='bytes' 是字节量组合控件（数值 + 单位），取值时拿到的是换算好的字节数。
    opts.onMount(ov, readValues) 在渲染完成后调用一次，给需要联动的表单挂事件。
    opts.validate(vals) 返回一句话表示"这组值不能一起提交"，返回空表示通过——
    单字段的必填在下面已经管了，跨字段的约束（比如时间窗口要么都填要么都空）放这里。 */
@@ -522,6 +584,8 @@ export function formModal(title, fields, onSubmit, okText = '保存', opts = {})
     }
     if (f.type === 'cron') {
       input = cronFieldHtml(f.name, v);
+    } else if (f.type === 'bytes') {
+      input = bytesFieldHtml(f.name, f.value == null ? '' : f.value, f.placeholder);
     } else if (f.type === 'select') {
       input = `<select name="${f.name}">${(f.options || []).map(o =>
         `<option value="${esc(o.v)}" ${String(o.v) === String(v) ? 'selected' : ''}>${esc(o.t)}</option>`).join('')}</select>`;
@@ -542,6 +606,7 @@ export function formModal(title, fields, onSubmit, okText = '保存', opts = {})
       : '');
   const ov = openModal(title, html, { okText, wide: opts.wide, persistent: opts.persistent });
   initCronFields(ov);
+  initBytesFields(ov);
 
   const readValues = () => {
     const vals = {};

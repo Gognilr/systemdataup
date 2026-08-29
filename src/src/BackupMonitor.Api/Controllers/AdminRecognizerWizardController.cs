@@ -36,6 +36,29 @@ public class AdminRecognizerWizardController : ApiBaseController
         return AcceptedData(result, "浏览指令已下发");
     }
 
+    /// <summary>
+    /// 下发备份目录探测指令（B7，异步）。
+    /// 回答的是「这台机器上还有没有别的备份没被监控起来」——浏览回答不了这个问题。
+    /// </summary>
+    [HttpPost("clients/{clientId:guid}/probe-backup-dirs")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.manage")]
+    public async Task<ActionResult<ApiResponse<DispatchCommandResponse>>> Probe(
+        Guid clientId, [FromBody] ProbeBackupDirsRequest request, CancellationToken ct)
+    {
+        var result = await _wizard.ProbeAsync(clientId, request, ct);
+        return AcceptedData(result, "探测指令已下发");
+    }
+
+    /// <summary>轮询探测结果，附带「哪些候选已经被现有任务覆盖」。</summary>
+    [HttpGet("clients/probe-backup-dirs/{commandId:guid}")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.manage")]
+    public async Task<ActionResult<ApiResponse<ProbeBackupDirsResultResponse>>> ProbeResult(
+        Guid commandId, CancellationToken ct)
+    {
+        var result = await _wizard.GetProbeResultAsync(commandId, ct);
+        return OkData(result);
+    }
+
     /// <summary>轮询浏览结果。</summary>
     [HttpGet("clients/browse/{commandId:guid}")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.manage")]

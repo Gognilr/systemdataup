@@ -89,6 +89,8 @@ public class ClientConfiguration : IEntityTypeConfiguration<Client>
         builder.Property(e => e.LastRemoteIp).HasColumnName("last_remote_ip").HasMaxLength(64);
         builder.Property(e => e.Status).HasColumnName("status");
         builder.Property(e => e.EnrollmentMode).HasColumnName("enrollment_mode").HasMaxLength(16).HasDefaultValue("secure");
+        builder.Property(e => e.EnrollmentReviewedAt).HasColumnName("enrollment_reviewed_at");
+        builder.Property(e => e.EnrollmentReviewedBy).HasColumnName("enrollment_reviewed_by");
         builder.Property(e => e.ApprovedAt).HasColumnName("approved_at");
         builder.Property(e => e.ApprovedBy).HasColumnName("approved_by");
         builder.Property(e => e.LastHeartbeatAt).HasColumnName("last_heartbeat_at");

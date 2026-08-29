@@ -84,7 +84,19 @@ public enum CommandType
     /// 列出客户端上安装的 Windows 服务。
     /// 配关键服务监控时从真实列表里挑，而不是凭记忆敲 MSSQL$SQLEXPRESS 这种名字。
     /// </summary>
-    ListServices
+    ListServices,
+
+    /// <summary>
+    /// 主动探测这台机器上「像备份目录」的地方（B7）。
+    ///
+    /// 与 browse_path 的区别是方向：browse_path 是**定向**的（给一个路径，返回那棵树），
+    /// 这一条是**发现**的（给一台机器，返回候选清单）。
+    /// 它回答的问题是「这台机器上还有没有别的备份没被监控起来」——
+    /// 而这个问题此前无法回答，只能人工一层层点开找。
+    ///
+    /// 边界比 browse_path 更严：**只返回候选目录本身的统计特征，不返回任何文件名**。
+    /// </summary>
+    ProbeBackupDirs
 }
 
 /// <summary>上传会话状态</summary>
@@ -292,7 +304,13 @@ public enum PlanScheduleKind
 public enum ExecutionRunKind
 {
     BackupPlan,
-    UploadBatch
+    UploadBatch,
+
+    /// <summary>
+    /// 人在任务列表里多选后点「立即备份」（D3）。单个任务点一次仍然走直接下发以保持即时反馈，
+    /// 多选才建执行——十个任务发十条独立指令等于十个同时开传，服务端暂存盘扛不住。
+    /// </summary>
+    Manual
 }
 
 /// <summary>

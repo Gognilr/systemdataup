@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
@@ -21,6 +21,12 @@ public interface IRecognizerWizardService
 
     /// <summary>查询浏览结果。指令未完成时返回状态，完成时带上目录快照。</summary>
     Task<BrowseClientPathResultDto> GetBrowseResultAsync(Guid commandId, CancellationToken ct = default);
+
+    /// <summary>下发一条 probe_backup_dirs 指令：让 Agent 主动找「像备份目录」的地方。</summary>
+    Task<DispatchCommandResponse> ProbeAsync(Guid clientId, ProbeBackupDirsRequest request, CancellationToken ct = default);
+
+    /// <summary>查询探测结果，并标出哪些候选已经被现有任务覆盖。</summary>
+    Task<ProbeBackupDirsResultResponse> GetProbeResultAsync(Guid commandId, CancellationToken ct = default);
 
     /// <summary>在某次快照的某个目录上推断识别规则，并附带按该规则跑出来的预演结果。</summary>
     Task<RecognizerProposalDto> InferAsync(InferRecognizerRequest request, CancellationToken ct = default);
@@ -108,6 +114,125 @@ public class RecognizerWizardService : IRecognizerWizardService
         return new DispatchCommandResponse { CommandId = command.Id };
     }
 
+    public async Task<DispatchCommandResponse> ProbeAsync(
+        Guid clientId, ProbeBackupDirsRequest request, CancellationToken ct = default)
+    {
+        var client = await _db.Clients.AsNoTracking().FirstOrDefaultAsync(c => c.Id == clientId, ct)
+            ?? throw new NotFoundException("客户端", clientId);
+
+        if (client.Status == ClientStatus.PendingApproval)
+            throw new BusinessException("CONFLICT", "客户端尚未审批通过，不能探测其目录", 409);
+        if (client.Status is ClientStatus.Disabled or ClientStatus.Revoked)
+            throw new BusinessException("CONFLICT", "客户端已禁用或已注销，不能探测其目录", 409);
+
+        var command = await _commands.CreateCommandAsync(
+            clientId,
+            CommandType.ProbeBackupDirs,
+            payload: new ProbeBackupDirsCommandPayload
+            {
+                Roots = request.Roots is { Count: > 0 } ? request.Roots : null,
+                MaxDepth = Math.Clamp(request.MaxDepth, 1, 6),
+                MaxCandidates = Math.Clamp(request.MaxCandidates, 1, 100)
+            },
+            priority: 10,
+            // 与浏览同一个理由：它是交互式的，人在界面上等结果。
+            // 留一条 24 小时的僵尸指令没有意义——客户端下次上线时突然扫一遍全盘更没有意义。
+            ttl: BrowseTtl,
+            createdBy: _context.UserId,
+            ct: ct);
+
+        // 与 browse_path 同等留痕。理由一致：这是一个「从管理界面枚举客户端文件系统」的能力，
+        // 留痕是它可被接受的前提。
+        await _audit.RecordAsync(
+            "client.probe_backup_dirs", AuditResult.Success, "client", clientId,
+            afterData: JsonSerializer.Serialize(new { roots = request.Roots, commandId = command.Id }),
+            ct: ct);
+
+        return new DispatchCommandResponse { CommandId = command.Id };
+    }
+
+    public async Task<ProbeBackupDirsResultResponse> GetProbeResultAsync(Guid commandId, CancellationToken ct = default)
+    {
+        var command = await _db.Commands.AsNoTracking().FirstOrDefaultAsync(c => c.Id == commandId, ct)
+            ?? throw new NotFoundException("指令", commandId);
+
+        if (command.CommandType != CommandType.ProbeBackupDirs)
+            throw new BusinessException("INVALID_REQUEST", "该指令不是备份目录探测指令", 400);
+
+        var response = new ProbeBackupDirsResultResponse
+        {
+            CommandId = command.Id,
+            Status = EnumMapping.ToSnakeCase(command.Status),
+            CreatedAt = command.CreatedAt,
+            CompletedAt = command.CompletedAt,
+            ResultCode = command.ResultCode,
+            ResultMessage = command.ResultMessage
+        };
+
+        if (command.Status != CommandStatus.Succeeded || string.IsNullOrWhiteSpace(command.ResultPayload))
+            return response;
+
+        try
+        {
+            response.Result = JsonSerializer.Deserialize<ProbeBackupDirsResultDto>(command.ResultPayload, SnapshotJson);
+        }
+        catch (JsonException)
+        {
+            return response;
+        }
+
+        if (response.Result is null)
+            return response;
+
+        var sources = await _db.BackupTasks.AsNoTracking()
+            .Where(t => t.ClientId == command.ClientId)
+            .Select(t => new { t.Id, t.Name, t.SourcePath })
+            .ToListAsync(ct);
+
+        response.Coverage = response.Result.Candidates
+            .Select(candidate =>
+            {
+                var owner = sources.FirstOrDefault(t => Covers(t.SourcePath, candidate.Path));
+                return new ProbeCandidateCoverageDto
+                {
+                    Path = candidate.Path,
+                    Monitored = owner is not null,
+                    TaskId = owner?.Id,
+                    TaskName = owner?.Name
+                };
+            })
+            .ToList();
+
+        return response;
+    }
+
+    /// <summary>
+    /// 某个任务的源路径是不是已经覆盖了这个候选目录。
+    ///
+    /// 「覆盖」按前缀算而不是相等：任务盯着 D:\自动备份\ 时，D:\自动备份\ZT001 显然
+    /// 也在监控范围内，再把它列成「未监控」只会让人去建一个重复的任务。
+    /// 源路径带通配时（D:\Backup\*\*）取通配之前的那一段比——比不准的代价是
+    /// 「把已监控的说成未监控」，那只是多一行噪声；反过来把未监控的说成已监控，
+    /// 会让一份真的没人管的备份被划掉，那才是这个功能存在的意义所在。
+    /// </summary>
+    private static bool Covers(string sourcePath, string candidatePath)
+    {
+        var source = sourcePath.Replace('/', '\\').TrimEnd('\\');
+        var wildcard = source.IndexOf('*');
+        if (wildcard >= 0)
+        {
+            var lastSeparator = source.LastIndexOf('\\', wildcard);
+            source = lastSeparator > 0 ? source[..lastSeparator] : source[..wildcard];
+        }
+
+        if (source.Length == 0)
+            return false;
+
+        var candidate = candidatePath.Replace('/', '\\').TrimEnd('\\');
+        return candidate.Equals(source, StringComparison.OrdinalIgnoreCase)
+               || candidate.StartsWith(source + "\\", StringComparison.OrdinalIgnoreCase);
+    }
+
     public async Task<BrowseClientPathResultDto> GetBrowseResultAsync(Guid commandId, CancellationToken ct = default)
     {
         var command = await _db.Commands.AsNoTracking().FirstOrDefaultAsync(c => c.Id == commandId, ct)
@@ -131,7 +256,9 @@ public class RecognizerWizardService : IRecognizerWizardService
     public async Task<RecognizerProposalDto> InferAsync(InferRecognizerRequest request, CancellationToken ct = default)
     {
         var (snapshot, source) = await ResolveScopeAsync(request, ct);
-        var proposal = StructureInference.Infer(source, snapshot.CapturedAt);
+        // 把本次快照实际抓了几层一并交进去：向导在结构没看懂时会用更大的深度重抓一次，
+        // 推断若仍按默认层数找业务单元，那一次重抓就白花了。
+        var proposal = StructureInference.Infer(source, snapshot.CapturedAt, snapshot.MaxDepth);
 
         // 推断出来的规则立刻在同一份快照上跑一遍。
         // 只给结论不给结果，人没有办法判断这条规则对不对——而他一眼就能认出

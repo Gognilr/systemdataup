@@ -7,6 +7,7 @@ using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace BackupMonitor.Infrastructure.Tests;
 
@@ -32,6 +33,9 @@ public class UploadProgressQueryTests : IAsyncLifetime
         sc.AddLogging();
         sc.AddDbContext<AppDbContext>(o => o.UseNpgsql(_fixture.ConnectionString));
         sc.AddSingleton<UploadRateSampler>();
+        sc.AddSingleton(sp => new SystemSettingsProvider(
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            sp.GetRequiredService<ILogger<SystemSettingsProvider>>()));
         sc.AddScoped<IUploadProgressService, UploadProgressService>();
         _services = sc.BuildServiceProvider();
         return Task.CompletedTask;

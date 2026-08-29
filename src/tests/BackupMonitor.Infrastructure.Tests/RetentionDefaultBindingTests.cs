@@ -60,6 +60,7 @@ public class RetentionDefaultBindingTests : IAsyncLifetime
         sc.AddSingleton(sp => new SystemSettingsProvider(
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetRequiredService<ILogger<SystemSettingsProvider>>()));
+        sc.AddScoped<IExecutionQueueService, ExecutionQueueService>();
         sc.AddScoped<IBackupTaskService, BackupTaskService>();
         sc.AddScoped<IRetentionPolicyService, RetentionPolicyService>();
         _services = sc.BuildServiceProvider();

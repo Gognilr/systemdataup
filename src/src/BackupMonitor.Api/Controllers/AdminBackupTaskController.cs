@@ -84,13 +84,30 @@ public class AdminBackupTaskController : ApiBaseController
         return OkData(result, "任务已恢复");
     }
 
-    /// <summary>手动下发预检指令</summary>
+    /// <summary>
+    /// 手动下发预检指令（界面上的「立即备份」）。
+    /// forceFullHash 对应界面的「强制完整校验」：跳过快速指纹基线，重算全量 SHA-256。
+    /// </summary>
     [HttpPost("{taskId:guid}/precheck")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.precheck")]
-    public async Task<ActionResult<ApiResponse<DispatchCommandResponse>>> DispatchPrecheck(Guid taskId, CancellationToken ct)
+    public async Task<ActionResult<ApiResponse<DispatchCommandResponse>>> DispatchPrecheck(
+        Guid taskId, [FromQuery] bool forceFullHash, CancellationToken ct)
     {
-        var result = await _taskService.DispatchPrecheckAsync(taskId, ct);
+        var result = await _taskService.DispatchPrecheckAsync(taskId, forceFullHash, ct);
         return OkData(result, "预检指令已下发");
+    }
+
+    /// <summary>
+    /// 批量「立即备份」（D3）：建一次执行，由顺序执行器按并发度放行，
+    /// 而不是给每个任务各发一条独立指令。
+    /// </summary>
+    [HttpPost("batch-precheck")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.precheck")]
+    public async Task<ActionResult<ApiResponse<BatchBackupNowResponse>>> DispatchPrecheckBatch(
+        [FromBody] BatchBackupNowRequest request, CancellationToken ct)
+    {
+        var result = await _taskService.DispatchPrecheckBatchAsync(request, ct);
+        return OkData(result, "已排队");
     }
 
     /// <summary>下发上传指令（16.7，候选审批通过后调用）</summary>

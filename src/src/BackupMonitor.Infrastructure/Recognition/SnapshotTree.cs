@@ -26,6 +26,18 @@ public sealed class SnapshotNode
     /// <summary>该目录的子项因限额未能全部返回。</summary>
     public bool Truncated { get; init; }
 
+    /// <summary>该目录的文件做过抽样：看得见全貌，只是明细没全带回来。不等于没抓全。</summary>
+    public bool Sampled { get; init; }
+
+    /// <summary>该目录下的文件总数（含抽样未返回的部分）；未知为 null。</summary>
+    public int? FileCount { get; init; }
+
+    /// <summary>该目录下文件的总字节数（含抽样未返回的部分）；未知为 null。</summary>
+    public long? TotalFileBytes { get; init; }
+
+    /// <summary>junction / 符号链接，未下探。</summary>
+    public bool IsReparsePoint { get; init; }
+
     public bool AccessDenied { get; init; }
 
     public List<SnapshotNode> Children { get; init; } = [];
@@ -33,9 +45,18 @@ public sealed class SnapshotNode
     public IEnumerable<SnapshotNode> Directories => Children.Where(c => c.IsDirectory);
     public IEnumerable<SnapshotNode> Files => Children.Where(c => !c.IsDirectory);
 
-    /// <summary>这棵子树里是否存在没抓全的地方——预演结论要据此声明自己不完整。</summary>
+    /// <summary>
+    /// 这棵子树里是否存在没抓全的地方——预演结论要据此声明自己不完整。
+    ///
+    /// **不含 Sampled**：抽样过的目录每一层都有代表性样本，结论是可信的。
+    /// 把两者混在一起，等于对一个已经修好的问题继续扣分。
+    /// </summary>
     public bool HasGaps =>
         DepthLimited || Truncated || AccessDenied || Children.Any(c => c.HasGaps);
+
+    /// <summary>这棵子树里是否做过文件抽样。要在 Evidence 里说明，但不扣置信度。</summary>
+    public bool HasSampling =>
+        Sampled || Children.Any(c => c.HasSampling);
 
     /// <summary>按绝对路径在子树里查找节点，大小写不敏感（Windows 路径）。</summary>
     public SnapshotNode? Resolve(string absolutePath)
@@ -93,6 +114,9 @@ public sealed class SnapshotNode
             FullPath = root,
             IsDirectory = true,
             Truncated = snapshot.Truncated,
+            Sampled = snapshot.RootSampled,
+            FileCount = snapshot.RootFileCount,
+            TotalFileBytes = snapshot.RootTotalFileBytes,
             Children = snapshot.Entries.Select(e => FromEntry(root, e)).ToList()
         };
         return node;
@@ -115,6 +139,10 @@ public sealed class SnapshotNode
             IsHidden = entry.IsHidden,
             DepthLimited = entry.DepthLimited,
             Truncated = entry.Truncated,
+            Sampled = entry.Sampled,
+            FileCount = entry.FileCount,
+            TotalFileBytes = entry.TotalFileBytes,
+            IsReparsePoint = entry.IsReparsePoint,
             AccessDenied = entry.AccessDenied,
             Children = entry.Children.Select(c => FromEntry(root, c)).ToList()
         };

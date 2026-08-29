@@ -1,4 +1,3 @@
-using System.Text;
 using System.Text.RegularExpressions;
 
 namespace BackupMonitor.Shared.Recognition;
@@ -59,6 +58,14 @@ public static class FileNamePattern
     {
         if (string.IsNullOrWhiteSpace(fileName))
             return fileName;
+
+        // 分卷归档先走专门的形态：按「最后一个点」切的话，db.7z.001 的扩展名会被当成
+        // .001，主干 db.7z 里没有 ≥3 位数字段可归一化，于是三卷变成三个互不相同的模式。
+        // 三个模式各出现一次，「个数一致」判成立、PresentIn 却只有 1/3——
+        // 这个结构在候选列表里会碎成一地，谁都不推荐，缺卷更无从谈起。
+        var volumePattern = VolumePattern(fileName);
+        if (volumePattern is not null)
+            return volumePattern;
 
         var dot = fileName.LastIndexOf('.');
         // 前导点的文件（.gitignore）不算有扩展名——与 RecognizerRules 的边界保持一致。
@@ -153,16 +160,139 @@ public static class FileNamePattern
     }
 
     /// <summary>一组模式的可读描述，用于摘要文案：`beeServer_backup_*.bak`、`dzwl_product_backup_*.bak`。</summary>
-    public static string Describe(IEnumerable<string> patterns)
+    public static string Describe(IEnumerable<string> patterns) => string.Join('、', patterns);
+
+    // ---------- 分卷归档 ----------
+
+    /// <summary>`db.7z.001` / `data.zip.002`：主扩展名之后再跟一个三位卷号。</summary>
+    private static readonly Regex NumberedVolume = new(
+        @"^(?<stem>.+\.[A-Za-z0-9]{1,5})\.(?<index>\d{2,3})$",
+        RegexOptions.CultureInvariant | RegexOptions.IgnoreCase, MatchTimeout);
+
+    /// <summary>`db.z01` / `db.r01`：WinZip / WinRAR 的分卷扩展名；末卷是 `.zip` / `.rar`。</summary>
+    private static readonly Regex LetteredVolume = new(
+        @"^(?<stem>.+)\.(?<kind>z|r)(?<index>\d{2,3})$",
+        RegexOptions.CultureInvariant | RegexOptions.IgnoreCase, MatchTimeout);
+
+    /// <summary>`db.part1.rar` / `db.part01.rar`。</summary>
+    private static readonly Regex PartVolume = new(
+        @"^(?<stem>.+)\.part(?<index>\d{1,3})\.(?<ext>[A-Za-z0-9]{1,5})$",
+        RegexOptions.CultureInvariant | RegexOptions.IgnoreCase, MatchTimeout);
+
+    /// <summary>
+    /// 分卷归档的一卷：主干名 + 卷号。不是分卷则返回 null。
+    ///
+    /// 存在的理由：分卷数**天然随数据量浮动**，而 InferRequiredFiles 第二档的判据是
+    /// 「各单元里的个数一致」。那条判据对 U8 的 UFFile 附件库是对的（个数随启用年度不同，
+    /// 拿它当判据只会制造假警报），但对分卷用反了——`db_*.7z` 永远个数不一致、
+    /// 永远不被推荐、于是**缺一卷整份无法恢复却不告警**。
+    ///
+    /// 分卷该用的尺子是**连续性**：卷号从 1 连续到 max，中间不缺号。
+    /// </summary>
+    public static (string Stem, int Index)? ParseVolume(string? fileName)
     {
-        var builder = new StringBuilder();
-        foreach (var pattern in patterns)
+        if (string.IsNullOrWhiteSpace(fileName))
+            return null;
+
+        var part = PartVolume.Match(fileName);
+        if (part.Success && int.TryParse(part.Groups["index"].Value, out var partIndex))
+            return ($"{part.Groups["stem"].Value}.{part.Groups["ext"].Value}", partIndex);
+
+        var numbered = NumberedVolume.Match(fileName);
+        if (numbered.Success && int.TryParse(numbered.Groups["index"].Value, out var numberedIndex))
+            return (numbered.Groups["stem"].Value, numberedIndex);
+
+        var lettered = LetteredVolume.Match(fileName);
+        if (lettered.Success && int.TryParse(lettered.Groups["index"].Value, out var letteredIndex))
         {
-            if (builder.Length > 0)
-                builder.Append('、');
-            builder.Append(pattern);
+            // .z01 的末卷是 .zip、.r01 的末卷是 .rar：主干统一成末卷的名字，
+            // 这样 `db.z01`、`db.z02`、`db.zip` 会归到同一个主干下。
+            var suffix = lettered.Groups["kind"].Value.Equals("z", StringComparison.OrdinalIgnoreCase) ? ".zip" : ".rar";
+            return ($"{lettered.Groups["stem"].Value}{suffix}", letteredIndex);
         }
 
-        return builder.ToString();
+        return null;
+    }
+
+    /// <summary>
+    /// 分卷文件的归一化模式：`db.7z.001` → `db.7z.*`、`db.z01` → `db.z*`、
+    /// `db.part1.rar` → `db.part*.rar`。不是分卷返回 null。
+    ///
+    /// 卷号是可变段，主干才是这一组的身份——这与 Normalize 对日期、长数字段的处理是同一条尺度。
+    /// </summary>
+    public static string? VolumePattern(string? fileName)
+    {
+        if (string.IsNullOrWhiteSpace(fileName))
+            return null;
+
+        var part = PartVolume.Match(fileName);
+        if (part.Success)
+            return $"{part.Groups["stem"].Value}.part*.{part.Groups["ext"].Value}";
+
+        var numbered = NumberedVolume.Match(fileName);
+        if (numbered.Success)
+            return $"{numbered.Groups["stem"].Value}.*";
+
+        var lettered = LetteredVolume.Match(fileName);
+        return lettered.Success
+            ? $"{lettered.Groups["stem"].Value}.{lettered.Groups["kind"].Value}*"
+            : null;
+    }
+
+    /// <summary>
+    /// 分卷序列的末卷（`db.zip` 之于 `db.z01`、`db.rar` 之于 `db.r01`）也算这一卷序列的一员，
+    /// 它的卷号按「最大卷号 + 1」算。返回它所属的主干名，不是末卷则返回 null。
+    /// </summary>
+    public static string? VolumeTailStem(string? fileName)
+    {
+        if (string.IsNullOrWhiteSpace(fileName))
+            return null;
+        var lower = fileName.ToLowerInvariant();
+        return lower.EndsWith(".zip") || lower.EndsWith(".rar") ? fileName : null;
+    }
+
+    // ---------- 复合扩展名 ----------
+
+    /// <summary>
+    /// 整体识别的复合扩展名。
+    ///
+    /// 只取最后一个点的话，`backup.tar.gz` 的扩展名是 `.gz`、主干是 `backup.tar`，
+    /// 于是成对检测（按主干分组）会把 `backup.tar.gz` 和 `backup.tar.bz2` 分到两组，
+    /// 而扩展名分组又把所有 `.gz` 混成一类——两处都串。
+    ///
+    /// 白名单而不是「凡是两段都合并」：`2026-08-30@02_00.zip` 的主干里有点，
+    /// 无条件合并会把 `@02_00.zip` 当成扩展名。
+    /// </summary>
+    private static readonly string[] CompoundExtensions =
+    [
+        ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".sql.gz", ".sql.bz2", ".sql.xz"
+    ];
+
+    /// <summary>文件扩展名（含点），复合扩展名整体返回。没有扩展名返回空串。</summary>
+    public static string Extension(string? fileName)
+    {
+        if (string.IsNullOrWhiteSpace(fileName))
+            return string.Empty;
+
+        foreach (var compound in CompoundExtensions)
+        {
+            if (fileName.EndsWith(compound, StringComparison.OrdinalIgnoreCase)
+                && fileName.Length > compound.Length)
+            {
+                return fileName[^compound.Length..];
+            }
+        }
+
+        var dot = fileName.LastIndexOf('.');
+        return dot <= 0 ? string.Empty : fileName[dot..];
+    }
+
+    /// <summary>去掉扩展名之后的主干名，复合扩展名整体去掉：`backup.tar.gz` → `backup`。</summary>
+    public static string BaseName(string? fileName)
+    {
+        if (string.IsNullOrWhiteSpace(fileName))
+            return string.Empty;
+        var extension = Extension(fileName);
+        return extension.Length == 0 ? fileName : fileName[..^extension.Length];
     }
 }

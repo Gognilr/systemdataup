@@ -204,12 +204,42 @@ public class DispatchUploadRequest
 }
 
 /// <summary>下发指令响应（预检/上传通用）</summary>
+/// <summary>批量「立即备份」（D3）：一次请求带上所有选中的任务</summary>
+public class BatchBackupNowRequest
+{
+    public List<Guid> TaskIds { get; set; } = [];
+}
+
+// 这里刻意没有 forceFullHash。批量走的是执行队列，指令由 SequentialExecutionWorker
+// 在放行那一刻才生成，而队列项上没有存放指令参数的地方——加一个字段只为了透传一个
+// 极少用到的开关不划算。「强制完整校验」是单个任务的逃生门，对单条走 DispatchPrecheckAsync
+// 的路径有效；批量要用它就一个一个点。宁可它在批量里不存在，也不要它在批量里被静默忽略。
+
+/// <summary>批量「立即备份」的结果</summary>
+public class BatchBackupNowResponse
+{
+    /// <summary>建出来的执行记录；退化成逐个下发时为 null</summary>
+    public Guid? ExecutionRunId { get; set; }
+
+    /// <summary>已排队的任务数</summary>
+    public int QueuedTasks { get; set; }
+
+    /// <summary>被跳过的任务数（停用 / 暂停 / 客户端不可用）</summary>
+    public int SkippedTasks { get; set; }
+
+    /// <summary>这次执行同时放行几项</summary>
+    public int MaxConcurrent { get; set; }
+}
+
 public class DispatchCommandResponse
 {
     public Guid CommandId { get; set; }
 
-    /// <summary>pending</summary>
-    public string Status { get; set; } = "pending";
+    /// <summary>
+    /// accepted：新下发（或上一条已终结、这次复位重下）；
+    /// already_running：同一个任务已经有一条同类指令正在跑，返回的是它，界面应当接着轮询这一条。
+    /// </summary>
+    public string Status { get; set; } = "accepted";
 }
 
 /// <summary>

@@ -56,3 +56,19 @@ public class UploadProgressDto
     /// </summary>
     public bool Stalled { get; set; }
 }
+
+/// <summary>
+/// 全局上传闸的当前状态（D3）。限流如果在界面上看不见，它的表现就是「点了没反应」，
+/// 那比不限流更糟——人会以为系统坏了，然后去点更多次。
+/// </summary>
+public class UploadQueueStatusDto
+{
+    /// <summary>当前占着全局名额的上传会话数（含暂停中的：它仍然占着暂存空间）</summary>
+    public int ActiveUploads { get; set; }
+
+    /// <summary>执行队列里还没放行的项数</summary>
+    public int QueuedItems { get; set; }
+
+    /// <summary>系统设置 max_concurrent_uploads_total</summary>
+    public int GlobalLimit { get; set; }
+}
