@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -56,11 +56,30 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
     /// <summary>result_message 列宽 2000，留 100 余量（与 UploadCommitWorker 对 ErrorMessage 同口径）</summary>
     private const int MaxResultMessageLength = 1900;
 
+    /// <summary>业务单元名的长度上限。账套名是人起的，正常都在 20 字以内。</summary>
+    private const int MaxUnitNameLength = 200;
+
+    /// <summary>一次扫描最多记多少个业务单元名。18 个账套是常态，500 已经宽得离谱——
+    /// 它挡的不是正常使用，是一份构造出来的十万条名单把 jsonb 撑坏。</summary>
+    private const int MaxUnitRosterSize = 500;
+
     /// <summary>
     /// Agent 因「管理员暂停了这次传输」而退出时回报的结果码。
     /// 与 AgentWorker 侧的同名常量必须一致——它是一次人为操作的正常结局，不是故障。
     /// </summary>
     public const string PausedUploadResultCode = "UPLOAD_PAUSED";
+
+    /// <summary>
+    /// 以「失败」收场但不该报警的结果码。
+    ///
+    /// UPLOAD_PAUSED 是管理员自己按的暂停；no_new_backup / still_changing 是预检最常见的
+    /// 正常结局（今天还没产生新备份、备份文件正在写）。把它们报成故障，
+    /// 等于每天给自己制造一批假告警——告警中心的可信度就是这么被磨没的。
+    /// </summary>
+    private static readonly HashSet<string> NonFailureResultCodes = new(StringComparer.Ordinal)
+    {
+        PausedUploadResultCode, "no_new_backup", "still_changing"
+    };
 
     /// <summary>
     /// result_payload 上限（UTF-8 字节）。browse_path 原先最多能返回 20000 个条目，
@@ -81,17 +100,20 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
     private readonly AppDbContext _db;
     private readonly CommandSigner _signer;
     private readonly IAlertingService _alerting;
+    private readonly SystemSettingsProvider _settings;
     private readonly ILogger<CommandService> _logger;
 
     public CommandService(
         AppDbContext db,
         CommandSigner signer,
         IAlertingService alerting,
+        SystemSettingsProvider settings,
         ILogger<CommandService> logger)
     {
         _db = db;
         _signer = signer;
         _alerting = alerting;
+        _settings = settings;
         _logger = logger;
     }
 
@@ -114,22 +136,45 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
                 .FirstOrDefaultAsync(c => c.IdempotencyKey == idempotencyKey, ct);
             if (existing is not null)
             {
-                var uploadAcceptedButCommitFailed = existing.Status == CommandStatus.Succeeded
+                var now = DateTime.UtcNow;
+
+                // 这条上传「已完成」，但那份备份在服务端一点影子都没有：
+                // 会话失败/取消/过期，或者根本没建起来（指令在客户端就出错了）。
+                // 判据从「存在一条 failed 会话」放宽到「没有任何在传或已入库的痕迹」——
+                // 窄判据漏掉的正是最常见的一种：会话压根没建成，于是这个候选的上传
+                // 从此再也发不出去（幂等键命中一条 succeeded 指令，原样返回，什么都不做）。
+                var uploadNeverLanded = existing.Status == CommandStatus.Succeeded
                     && existing.CommandType is CommandType.UploadCandidate or CommandType.UploadLatest
                     && existing.CandidateBackupSetId is not null
-                    && await _db.UploadSessions.AnyAsync(s =>
+                    && !await _db.UploadSessions.AnyAsync(s =>
                         s.CandidateBackupSetId == existing.CandidateBackupSetId
-                        && s.Status == UploadStatus.Failed, ct);
+                        && (s.Status == UploadStatus.Committed
+                            || UploadSessionStatuses.InFlight.Contains(s.Status)), ct)
+                    && !await _db.BackupSets.AnyAsync(
+                        b => b.SourceCandidateId == existing.CandidateBackupSetId, ct);
 
-                // 幂等键命中一条不可能再被执行的指令：已经成功完结（结果是上一次的），
-                // 或还挂着 pending 但 expires_at 已过（认领查询会跳过它，等于永远不会跑）。
-                // 调用方声明了 restartIfNotActive 就复位重下，否则维持原样返回旧指令。
-                var notActiveForRestart = restartIfNotActive
-                    && (existing.Status == CommandStatus.Succeeded
-                        || (existing.Status == CommandStatus.Pending && existing.ExpiresAt <= DateTime.UtcNow));
+                // 还挂着 pending 但 expires_at 已过：认领查询要求 expires_at > now，
+                // 它永远不会被任何客户端领走。把它原样返回等于告诉调用方「已下发」，
+                // 而实际上这条指令已经死了——这个谎话不该由 restartIfNotActive 来决定说不说。
+                var expiredPending = existing.Status == CommandStatus.Pending && existing.ExpiresAt <= now;
+
+                // 领走之后迟迟没有下文：客户端在领取和回报之间挂了/被重启了。
+                // 与 LifecycleExpiryWorker 的退回判据同口径同设置项，只是不必等它下一轮巡检——
+                // 人正站在界面前面点「立即备份」，让他等 15 分钟没有道理。
+                var claimTimeoutSeconds = Math.Max(60,
+                    await _settings.GetIntAsync(LifecycleExpiryWorker.ClaimTimeoutKey, 900, ct));
+                var staleClaim = existing.Status == CommandStatus.Claimed
+                    && existing.ClaimedAt is not null
+                    && existing.ClaimedAt < now.AddSeconds(-claimTimeoutSeconds);
+
+                // 幂等键命中一条已经成功完结的指令（结果是上一次的）：
+                // 调用方声明了 restartIfNotActive 才复位重下。
+                var notActiveForRestart = restartIfNotActive && existing.Status == CommandStatus.Succeeded;
 
                 if (existing.Status is CommandStatus.Failed or CommandStatus.Cancelled or CommandStatus.Expired or CommandStatus.Rejected
-                    || uploadAcceptedButCommitFailed
+                    || uploadNeverLanded
+                    || expiredPending
+                    || staleClaim
                     || notActiveForRestart)
                 {
                     existing.Status = CommandStatus.Pending;
@@ -148,6 +193,14 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
                     existing.Nonce = TokenHasher.GenerateToken(16);
                     existing.Signature = _signer.SignCommand(existing);
                     await _db.SaveChangesAsync(ct);
+                }
+                else if (existing.Status is not (CommandStatus.Pending or CommandStatus.Claimed or CommandStatus.Running))
+                {
+                    // 既没复位也不在途：这一次调用其实什么都没发生。调用方必须知道，
+                    // 否则界面会照常说「已开始上传」，而传输中永远是空的。
+                    _logger.LogWarning(
+                        "幂等键 {Key} 命中指令 {CommandId}（{Status}），本次没有新下发",
+                        idempotencyKey, existing.Id, existing.Status);
                 }
                 return existing;
             }
@@ -273,16 +326,29 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
         // 键名走 camelCase：result_payload 里其余内容（candidateBackupSetId 等）都是
         // Agent 自己按 camelCase 写的，浏览器端按同一套读。默认的 PascalCase 会让
         // 同一个字段在同一列里有两种拼法，界面读进度时必然踩空。
-        command.ResultPayload = NormalizeResultPayload(JsonSerializer.Serialize(new
+        // 整块覆盖会把预检已经攒下的候选清单抹掉——一个任务有多少个业务单元就有多少条结果，
+        // 而它们之间夹着进度上报。PrecheckResultPayload.WithProgress 只动 progress 这一支。
+        var payload = PrecheckResultPayload.WithProgress(command.ResultPayload, new
         {
-            progress = new
-            {
-                request.Percent,
-                request.Stage,
-                Message = Truncate(request.Message, MaxResultMessageLength),
-                updatedAt = DateTime.UtcNow
-            }
-        }, ProgressJson), commandId);
+            request.Percent,
+            request.Stage,
+            Message = Truncate(request.Message, MaxResultMessageLength),
+            Unit = Truncate(request.Unit, MaxUnitNameLength),
+            updatedAt = DateTime.UtcNow
+        }, ProgressJson);
+
+        // 业务单元名单只在第一条进度里带一次，之后的进度不带它、也就不会把它冲掉。
+        // 同样按 D-06 收口：条数与单个名字的长度都不信客户端——一台机器 18 个账套是常态，
+        // 但一份构造出来的名单可以有十万条，而这一列是 jsonb。
+        if (request.Units is { Count: > 0 })
+        {
+            payload = PrecheckResultPayload.WithUnits(payload, request.Units
+                .Where(unit => !string.IsNullOrWhiteSpace(unit))
+                .Take(MaxUnitRosterSize)
+                .Select(unit => Truncate(unit, MaxUnitNameLength)!));
+        }
+
+        command.ResultPayload = NormalizeResultPayload(payload, commandId);
         await _db.SaveChangesAsync(ct);
     }
 
@@ -307,7 +373,32 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
         // 再报一次、再 500 → 这条指令永远停在 running，正好接上 D-05。
         command.ResultCode = Truncate(request.ResultCode, MaxResultCodeLength);
         command.ResultMessage = Truncate(request.ResultMessage, MaxResultMessageLength);
-        command.ResultPayload = NormalizeResultPayload(request.Result, commandId);
+
+        // Agent 对预检指令回报的 Result 是空的（结果走 precheck-results 那条接口逐个单元上报），
+        // 照原样覆盖等于把整份候选清单抹掉，界面拿不到候选也就没有上传可发。
+        var normalized = NormalizeResultPayload(request.Result, commandId);
+        if (string.IsNullOrWhiteSpace(normalized) && PrecheckResultPayload.HasCandidates(command.ResultPayload))
+            normalized = PrecheckResultPayload.WithoutProgress(command.ResultPayload);
+        command.ResultPayload = normalized;
+
+        // 预检指令的结论由**整次扫描的全部业务单元**汇总，不能由第一个单元决定。
+        // 原先是第一个单元的结果一到就把指令判成终态：后面单元的进度上报全部 409、
+        // 结果被当成重复提交丢弃，第一个单元恰好是 no_new_backup 时，
+        // 另外那些有新备份的账套一个都不会传。
+        if (request.Success && command.CommandType is CommandType.PrecheckTask or CommandType.PrecheckAll)
+        {
+            var entries = PrecheckResultPayload.Entries(command.ResultPayload);
+            if (entries.Count > 0)
+            {
+                var passed = entries.Count(e => e.Status == PrecheckResultPayload.StatePassed);
+                command.Status = passed > 0 ? CommandStatus.Succeeded : CommandStatus.Failed;
+                command.ResultCode = Truncate(
+                    passed > 0 ? PrecheckResultPayload.StatePassed : entries[0].Status, MaxResultCodeLength);
+                command.ResultMessage = Truncate(
+                    $"扫描完成：{entries.Count} 个业务单元，{passed} 个有新备份", MaxResultMessageLength);
+            }
+        }
+
         await _db.SaveChangesAsync(ct);
 
         await HandleCompletionSideEffectsAsync(command, ct);
@@ -390,7 +481,7 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
         // 「上传失败」告警，等于用户每按一次暂停就给自己制造一条故障——
         // 告警中心的可信度就是这么被磨没的。
         if (command.Status == CommandStatus.Failed &&
-            !string.Equals(command.ResultCode, PausedUploadResultCode, StringComparison.Ordinal) &&
+            !NonFailureResultCodes.Contains(command.ResultCode ?? "") &&
             command.CommandType is CommandType.PrecheckTask or CommandType.PrecheckAll or CommandType.UploadCandidate)
         {
             var category = command.CommandType == CommandType.UploadCandidate ? "upload_failed" : "precheck_failed";

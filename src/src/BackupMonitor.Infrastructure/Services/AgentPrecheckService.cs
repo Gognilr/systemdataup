@@ -84,31 +84,28 @@ public class AgentPrecheckService : IAgentPrecheckService
             }
         }
 
-        // 幂等：同一预检指令重复上报返回原结果
+        // 幂等：同一个业务单元重复上报（指令重试、Agent 重启后补报）返回原结果。
+        //
+        // 去重键是 commandId + candidateKey，不能只认 commandId：
+        // 一条预检指令说的是「这个任务扫一遍」，而一个任务下有多少个业务单元
+        // （U8 一台机器 18 个账套是常态），Agent 就分多少次上报。只认 commandId 的那一版里，
+        // 第 1 个账套写完就把闸关上，第 2..18 个全部被当成重复提交丢掉——
+        // 不建候选、不下发上传、不告警，界面上一点痕迹都没有。
         if (request.CommandId is not null)
         {
-            var command = await _db.Commands.FirstOrDefaultAsync(c => c.Id == request.CommandId, ct);
-            if (command is not null && command.ClientId == clientId
-                && !string.IsNullOrWhiteSpace(command.ResultPayload))
+            var command = await _db.Commands.AsNoTracking()
+                .FirstOrDefaultAsync(c => c.Id == request.CommandId, ct);
+            if (command is not null && command.ClientId == clientId)
             {
-                try
+                var already = PrecheckResultPayload.FindCandidate(command.ResultPayload, request.CandidateKey);
+                if (already is not null)
                 {
-                    using var doc = JsonDocument.Parse(command.ResultPayload);
-                    if (doc.RootElement.TryGetProperty("candidateBackupSetId", out var el)
-                        && el.ValueKind == JsonValueKind.String
-                        && Guid.TryParse(el.GetString(), out var existingId))
+                    return new SubmitPrecheckResultResponse
                     {
-                        return new SubmitPrecheckResultResponse
-                        {
-                            CandidateBackupSetId = existingId,
-                            Accepted = true,
-                            NextAction = "duplicate_submission"
-                        };
-                    }
-                }
-                catch (JsonException)
-                {
-                    // 非结构化结果，按首次上报处理
+                        CandidateBackupSetId = already,
+                        Accepted = true,
+                        NextAction = "duplicate_submission"
+                    };
                 }
             }
         }
@@ -238,23 +235,6 @@ public class AgentPrecheckService : IAgentPrecheckService
 
         await _db.SaveChangesAsync(ct);
 
-        // 指令结果回填（幂等依据）
-        if (request.CommandId is not null)
-        {
-            var command = await _db.Commands.FirstOrDefaultAsync(c => c.Id == request.CommandId, ct);
-            if (command is not null && command.ClientId == clientId && command.TaskId == taskId)
-            {
-                command.ResultPayload = JsonSerializer.Serialize(new { candidateBackupSetId = candidate.Id });
-                if (command.Status is CommandStatus.Claimed or CommandStatus.Running)
-                {
-                    command.Status = status == PrecheckStatus.Passed ? CommandStatus.Succeeded : CommandStatus.Failed;
-                    command.CompletedAt = now;
-                    command.ResultCode = EnumMapping.ToSnakeCase(status);
-                }
-                await _db.SaveChangesAsync(ct);
-            }
-        }
-
         // 失败告警
         if (status == PrecheckStatus.SizeAbnormal)
         {
@@ -309,27 +289,83 @@ public class AgentPrecheckService : IAgentPrecheckService
         // 自动模式：预检通过立即下发上传指令。
         // 全局上传名额满了就改为排队（D3）——只堵手动点击那一条路的话，
         // 自动模式照样能把服务端暂存盘打满。名额腾出来时由 SequentialExecutionWorker 放行。
-        if (accepted && task.TaskMode == TaskMode.Automatic
-            && !await _queue.TryDeferUploadAsync(clientId, task.Id, candidate.Id, ct))
+        //
+        // 下发结果必须记下来。原先这里是「发了就当成了」，而 CreateCommandAsync 在幂等键
+        // 命中一条还没跑完的旧指令时是原样返回、什么都不做的——于是界面照样说「已开始上传」，
+        // 传输中却一直是空的，谁也说不出它卡在哪一步。
+        Guid? uploadCommandId = null;
+        string? uploadState = null;
+        if (accepted && task.TaskMode == TaskMode.Automatic)
         {
-            await _dispatcher.CreateCommandAsync(
-                clientId,
-                CommandType.UploadCandidate,
-                taskId: task.Id,
-                candidateBackupSetId: candidate.Id,
-                payload: new
+            if (await _queue.TryDeferUploadAsync(clientId, task.Id, candidate.Id, ct))
+            {
+                uploadState = PrecheckResultPayload.StateQueued;
+            }
+            else
+            {
+                var uploadCommand = await _dispatcher.CreateCommandAsync(
+                    clientId,
+                    CommandType.UploadCandidate,
+                    taskId: task.Id,
+                    candidateBackupSetId: candidate.Id,
+                    payload: new
+                    {
+                        candidateBackupSetId = candidate.Id,
+                        bandwidthLimitKbps = task.BandwidthLimitKbps,
+                        chunkSizeBytes = task.ChunkSizeBytes
+                    },
+                    priority: task.Priority,
+                    idempotencyKey: $"auto-upload:{candidate.Id}",
+                    ct: ct);
+
+                uploadCommandId = uploadCommand.Id;
+                uploadState = uploadCommand.Status switch
                 {
-                    candidateBackupSetId = candidate.Id,
-                    bandwidthLimitKbps = task.BandwidthLimitKbps
-                },
-                priority: task.Priority,
-                idempotencyKey: $"auto-upload:{candidate.Id}",
-                ct: ct);
+                    CommandStatus.Pending => PrecheckResultPayload.StateDispatched,
+                    CommandStatus.Claimed or CommandStatus.Running => PrecheckResultPayload.StateAlreadyRunning,
+                    CommandStatus.Succeeded => PrecheckResultPayload.StateAlreadyDone,
+                    _ => PrecheckResultPayload.StateNotDispatched
+                };
+
+                if (uploadState != PrecheckResultPayload.StateDispatched)
+                {
+                    _logger.LogWarning(
+                        "候选 {Candidate} 的上传没有新下发：幂等键命中的指令 {Command} 处于 {Status}",
+                        candidate.Id, uploadCommand.Id, uploadCommand.Status);
+                }
+            }
+        }
+        else if (accepted)
+        {
+            uploadState = PrecheckResultPayload.StateNotDispatched;
+        }
+
+        // 指令结果回填。
+        //
+        // 这里只往清单里加一项，不再改指令状态——一个任务有多少个业务单元就有多少次上报，
+        // 在第 1 个单元就把指令判成终态的那一版里：后面单元的进度上报全部 409 被吞
+        // （界面进度就此定格），界面把第 1 个单元的结论当成整个任务的结论，
+        // 第 1 个单元恰好是 no_new_backup 时，另外 17 个有新备份的账套一个都不会传。
+        // 指令的终结交给 Agent 扫完之后的 ReportCompleted，由它汇总全部单元。
+        if (request.CommandId is not null)
+        {
+            var command = await _db.Commands.FirstOrDefaultAsync(c => c.Id == request.CommandId, ct);
+            if (command is not null && command.ClientId == clientId && command.TaskId == taskId)
+            {
+                command.ResultPayload = PrecheckResultPayload.Upsert(command.ResultPayload, new PrecheckResultPayload.Entry(
+                    request.CandidateKey,
+                    candidate.Id,
+                    EnumMapping.ToSnakeCase(status),
+                    uploadCommandId,
+                    uploadState,
+                    request.BusinessUnit?.DisplayName));
+                await _db.SaveChangesAsync(ct);
+            }
         }
 
         _logger.LogInformation(
-            "预检结果已提交 task={TaskId} candidate={CandidateKey} status={Status}",
-            task.Id, candidate.CandidateKey, status);
+            "预检结果已提交 task={TaskId} candidate={CandidateKey} status={Status} upload={UploadState}",
+            task.Id, candidate.CandidateKey, status, uploadState ?? "-");
 
         return new SubmitPrecheckResultResponse
         {

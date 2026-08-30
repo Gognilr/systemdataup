@@ -953,10 +953,29 @@ public sealed class AgentWorker : BackgroundService
 
         foreach (var command in response.Commands)
         {
+            ct.ThrowIfCancellationRequested();
             _activeCommands[command.Id] = 0;
             try
             {
                 await ExecuteCommandAsync(command, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // 一条指令炸了绝不能把同一批的其余指令带走。
+                //
+                // 这不是防御性编程，是一次真实故障的根因：一条预检指令的「上报完成」
+                // 撞上 409（服务端那一侧它已经被判终态或被复位），异常从
+                // ExecuteCommandAsync 的兜底 catch 里再次抛出，越过这里原先只有
+                // try/finally 的 foreach，把同一批认领的两条 upload_candidate 一起丢掉。
+                // 那两条上传在服务端停在 claimed，巡检退回 pending 之后下一轮再被同样丢掉——
+                // 现象就是「预检说通过了，传输中永远是空的」，而且日志里一行上传痕迹都没有。
+                _logger.LogError(ex, "Agent 指令执行异常，跳过这一条继续下一条 commandId={CommandId} type={Type}",
+                    command.Id, command.Type);
+                _stateStore.Update(s => s.LastError = ex.Message);
             }
             finally
             {
@@ -1025,23 +1044,47 @@ public sealed class AgentWorker : BackgroundService
                 _ => CommandResult.FromFailure("COMMAND_UNSUPPORTED", $"不支持的指令类型：{command.Type}")
             };
 
-            await _api.ReportCompletedAsync(command.Id, new CommandCompletedRequest
+            try
             {
-                Success = result.Success,
-                ResultCode = result.Code,
-                ResultMessage = result.Message,
-                Result = result.ResultJson
-            }, ct);
+                await _api.ReportCompletedAsync(command.Id, new CommandCompletedRequest
+                {
+                    Success = result.Success,
+                    ResultCode = result.Code,
+                    ResultMessage = result.Message,
+                    Result = result.ResultJson
+                }, ct);
+            }
+            catch (AgentApiException ex) when (ex.StatusCode == 409)
+            {
+                // 指令跑完了，只是服务端那一侧它已经不在「等结果」的状态上
+                // （被判终态、或人在界面上又点了一次把它复位）。这一次的结果没地方放，
+                // 但这条指令本身没有失败——按失败记会让日志把「谁真的出错了」埋掉。
+                _logger.LogWarning(
+                    "指令结果无处可放 commandId={CommandId} type={Type}：{Message}",
+                    command.Id, command.Type, ex.Message);
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Agent 指令执行失败 commandId={CommandId} type={Type}", command.Id, command.Type);
-            await _api.ReportCompletedAsync(command.Id, new CommandCompletedRequest
+
+            // 兜底上报是收尾动作，它自己失败不能再往上抛。
+            // 最常见的失败正是 409「指令当前状态 X 不允许上报完成」——服务端那一侧
+            // 这条指令已经被判终态或被人再点一次复位了，这一次的结果本来就没地方放。
+            // 让它冒出去的代价是整批指令被丢掉（见 ClaimAndExecuteCommandsAsync）。
+            try
             {
-                Success = false,
-                ResultCode = ex is AgentApiException api ? api.ErrorCode ?? "API_ERROR" : "AGENT_ERROR",
-                ResultMessage = ex.Message
-            }, ct);
+                await _api.ReportCompletedAsync(command.Id, new CommandCompletedRequest
+                {
+                    Success = false,
+                    ResultCode = ex is AgentApiException api ? api.ErrorCode ?? "API_ERROR" : "AGENT_ERROR",
+                    ResultMessage = ex.Message
+                }, ct);
+            }
+            catch (Exception reportEx) when (reportEx is not OperationCanceledException)
+            {
+                _logger.LogWarning(reportEx, "指令失败结果上报未成功 commandId={CommandId}（服务端巡检会兜底）", command.Id);
+            }
         }
     }
 
@@ -1790,6 +1833,20 @@ public sealed class AgentWorker : BackgroundService
 
         public async Task Report(ScanProgress p, CancellationToken ct)
         {
+            // 名单这一条必须绕开节流，也不动节流状态：它是后面所有进度的坐标系，
+            // 被吞掉一次界面就永远等不到总数了——这一次扫描不会再报第二遍。
+            if (p.Units is { Count: > 0 })
+            {
+                await _send(new CommandProgressRequest
+                {
+                    Percent = 0,
+                    Stage = "enumerated",
+                    Message = $"共 {p.UnitCount} 个业务单元，开始逐个扫描",
+                    Units = p.Units.ToList()
+                }, ct);
+                return;
+            }
+
             var unitChanged = p.UnitIndex != _lastUnitIndex;
             if (!unitChanged && _clock.Elapsed - _lastReportedAt < MinInterval)
                 return;
@@ -1815,7 +1872,10 @@ public sealed class AgentWorker : BackgroundService
             {
                 Percent = percent,
                 Stage = p.Stage == "hashing" ? "hashing" : "scanning",
-                Message = $"{where} · {what}"
+                Message = $"{where} · {what}",
+                // 名字单独带一份，界面拿它和名单对位。从 Message 里反解显示文本
+                // 是另一种「同一件事写两遍」，改一次措辞就对不上了。
+                Unit = p.Unit
             }, ct);
         }
     }

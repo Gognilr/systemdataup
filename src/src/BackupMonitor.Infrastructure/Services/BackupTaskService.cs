@@ -654,7 +654,20 @@ public class BackupTaskService : IBackupTaskService
         await _audit.RecordAsync("task.dispatch_upload", AuditResult.Success, "backup_task", task.Id,
             afterData: JsonSerializer.Serialize(new { CandidateId = candidate.Id, CommandId = command.Id, Force = request.Force }), ct: ct);
 
-        return new DispatchCommandResponse { CommandId = command.Id };
+        // 如实说明这一次到底发生了什么。原先固定不填 Status，界面于是无论如何都说
+        // 「已开始上传」——包括「幂等键命中了一条还在跑/早就跑完的旧指令，这次什么都没发」
+        // 那一种，而那正是「说传了、传输中却永远是空的」的来源之一。
+        return new DispatchCommandResponse
+        {
+            CommandId = command.Id,
+            Status = command.Status switch
+            {
+                CommandStatus.Pending => "accepted",
+                CommandStatus.Claimed or CommandStatus.Running => "already_running",
+                CommandStatus.Succeeded => "already_done",
+                _ => "not_dispatched"
+            }
+        };
     }
 
     /// <summary>

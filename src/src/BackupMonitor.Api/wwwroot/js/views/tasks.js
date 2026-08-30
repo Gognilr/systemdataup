@@ -190,8 +190,10 @@ function describeRecognizerConfig(json) {
   if (cfg.include.length) rows.push(['只看这些文件', cfg.include.join('、')]);
   if (cfg.exclude.length) rows.push(['忽略这些文件', cfg.exclude.join('、')]);
   if (cfg.excludeDirs.length) rows.push(['忽略这些子目录', cfg.excludeDirs.join('、')]);
-  if (cfg.unitDaily) rows.push(['单元内结构', '每个单元下面每次备份再建一个目录，只取最新的那个']);
-  if (cfg.depth > 1) rows.push(['业务单元层级', `第 ${cfg.depth} 层`]);
+  if (cfg.unitLayout) rows.push(['单元内结构', UNIT_LAYOUT_TEXT[cfg.unitLayout]]);
+  // date_leaf 是按结构自动认的，固定层数对它不起作用（BusinessUnitResolver 里它排在
+  // businessUnitDepth 前面），照报会让人以为层数还在管事。
+  if (cfg.unitLayout !== 'date_leaf' && cfg.depth > 1) rows.push(['业务单元层级', `第 ${cfg.depth} 层`]);
   if (!cfg.recursive) rows.push(['子目录', '不深入子目录']);
   if (cfg.batchRegex) rows.push(['目录名筛选', cfg.batchRegex]);
   if (cfg.groupBy === 'basename') rows.push(['目录里的历次备份', '每次备份是一组同名文件，只取最新的那一组']);
@@ -203,6 +205,22 @@ function describeRecognizerConfig(json) {
 
 /* 一行一个（也容忍逗号分隔，中英文逗号都认）。 */
 const cfgLines = v => String(v || '').split(/[\n,，]/).map(x => x.trim()).filter(Boolean);
+
+/* 「单元内结构」的两种取值，与 BusinessUnitResolver 的找法一一对应：
+   latest_directory —— 按固定层数找到单元，单元下面每次备份再建一个目录；
+   date_leaf        —— 单元不都在同一层，按「下面是日期目录」这个结构自己认。
+
+   下拉里必须两个都在。只认 latest_directory 的话，推断给出的 date_leaf 在表单里
+   解析成「没配」，保存一次就被抹掉，整个账套目录退回「一份备份」——用友 U8 那种
+   层级不齐的结构上，16 个账套会被并成一份，目录里堆着的几天文件每次全量重传。 */
+const UNIT_LAYOUT_TEXT = {
+  latest_directory: '每个单元下面每次备份再建一个目录，只取最新的那个',
+  date_leaf: '单元不都在同一层，按「下面是日期目录」自动认'
+};
+const normalizeUnitLayout = value => {
+  const key = String(value || '').trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(UNIT_LAYOUT_TEXT, key) ? key : '';
+};
 
 /* 识别规则 JSON → 结构化字段值。别名键（includes / required / excludeDirs …）一并认，
    写回时统一成规范键名。 */
@@ -224,35 +242,124 @@ function parseRecognizerConfig(json) {
     excludeDirs: list('excludeDirectories', 'excludeDirs'),
     recursive: cfg.recursive !== false,
     depth: Number.isInteger(cfg.businessUnitDepth) && cfg.businessUnitDepth > 0 ? cfg.businessUnitDepth : 1,
-    unitDaily: String(cfg.unitLayout || '').toLowerCase() === 'latest_directory',
+    unitLayout: normalizeUnitLayout(cfg.unitLayout),
     batchRegex: typeof cfg.batchRegex === 'string' ? cfg.batchRegex : '',
     groupBy: typeof cfg.groupBy === 'string' ? cfg.groupBy.trim() : ''
   };
 }
 
-/* 结构化字段值 → 识别规则 JSON。只写出真正有值的键，不制造一堆空数组噪音。 */
-function composeRecognizerConfig(vals) {
-  const cfg = {};
-  const required = cfgLines(vals.cfgRequired);
-  const include = cfgLines(vals.cfgInclude);
-  const exclude = cfgLines(vals.cfgExclude);
-  const excludeDirs = cfgLines(vals.cfgExcludeDirs);
+/* 结构化字段值 → 识别规则 JSON。
+   在 baseConfig 上**增量覆盖**，不是从零重拼一份。
+
+   从零重拼要求「表单认得的键」与「系统认得的键」永远一致，而这两份清单一分叉
+   就是一次静默的配置丢失：表单不认识的键在保存的那一刻被删掉，界面上没有任何痕迹。
+   已经这么丢过的有 unitLayout: date_leaf（层级不齐的账套被并成一份备份）、
+   unitMaxDepth（向导预演与 Agent 真扫的下探层数不再是同一个）、
+   businessUnitPaths（人手指的单元被无视）、volumeContinuity（分卷连续性检查静默
+   关掉，缺第 2 卷仍判「齐了」）。而且丢在**新建**任务那一刻——向导的推断结果是
+   当作 prefill 走同一张表单的，不是直接落库。
+
+   所以这里只碰表单真正管得到的那几个键，其余原样留着：以后推断再加新键也不会被抹掉。 */
+function composeRecognizerConfig(vals, baseConfig) {
+  let cfg = {};
+  try { cfg = JSON.parse(baseConfig || '{}') || {}; } catch (e) { cfg = {}; }
+
+  /* 有值就写规范键名，没值就删；别名键一律清掉——规范键与别名同时在场时两份都会生效，
+     含义不清（与 applyRequiredFiles 里那条规矩一致）。 */
+  const put = (value, key, ...aliases) => {
+    for (const alias of aliases) delete cfg[alias];
+    if (value === undefined) delete cfg[key];
+    else cfg[key] = value;
+  };
+  const lines = value => { const list = cfgLines(value); return list.length ? list : undefined; };
+
+  put(lines(vals.cfgRequired), 'requiredFiles', 'requiredPatterns', 'required');
+  put(lines(vals.cfgInclude), 'includePatterns', 'includes');
+  put(lines(vals.cfgExclude), 'excludePatterns', 'excludes');
+  put(lines(vals.cfgExcludeDirs), 'excludeDirectories', 'excludeDirs');
+  put(vals.cfgRecursive === false ? false : undefined, 'recursive');
+  put(vals.cfgBatchRegex || undefined, 'batchRegex');
+  put(vals.cfgGroupBy || undefined, 'groupBy');
 
   if (vals.recognizerType === 'subdirectory_units') {
+    const layout = normalizeUnitLayout(vals.cfgUnitLayout);
     const depth = parseInt(vals.cfgDepth, 10);
-    cfg.businessUnitDepth = depth > 0 ? depth : 1;
-    if (vals.cfgUnitDaily) cfg.unitLayout = 'latest_directory';
+    put(layout || undefined, 'unitLayout');
+    // date_leaf 自己按结构找单元，固定层数对它不起作用；一并写出来只会让人误读。
+    put(layout === 'date_leaf' ? undefined : (depth > 0 ? depth : 1), 'businessUnitDepth');
+  } else {
+    // 识别器换掉之后这两个键不再有意义；留着的话，下次换回子目录单元会冒出一个没人设过的值。
+    put(undefined, 'unitLayout');
+    put(undefined, 'businessUnitDepth');
   }
-  if (required.length) cfg.requiredFiles = required;
-  if (include.length) cfg.includePatterns = include;
-  if (exclude.length) cfg.excludePatterns = exclude;
-  if (excludeDirs.length) cfg.excludeDirectories = excludeDirs;
-  if (vals.cfgRecursive === false) cfg.recursive = false;
-  if (vals.cfgBatchRegex) cfg.batchRegex = vals.cfgBatchRegex;
-  // groupBy 必须在这里写回。表单是「从零拼一份 JSON」而不是「改一份 JSON」，
-  // 漏掉一个键 = 保存一次就把它悄悄删掉——手写进去的配置活不过下一次编辑。
-  if (vals.cfgGroupBy) cfg.groupBy = vals.cfgGroupBy;
+
   return JSON.stringify(cfg, null, 2);
+}
+
+/* ── 保存之后把服务端真正存下来的识别规则读回来核对一遍 ──
+
+   要防的不是某一个具体的写错，而是这类错误的**性质**：识别规则没存对不会报错、
+   不会告警、界面上一切正常，一直到某天真要恢复数据才发现。此前 unitLayout 在保存时
+   被丢掉，从配好那天起没有任何一处显示不对，是靠人去翻仓库目录、觉得「看不明白」
+   才偶然发现的——中间隔了整整一个月，而这一个月里那个任务每天都判「成功」。
+
+   所以这里不假设写入路径都是对的，而是每次保存都当场核对：提交了什么、存下来什么。
+   这条防线不依赖「下次谁记得把新键也写进表单」，新增写入路径时照样管用。 */
+
+/* 比解析后的键值，不比 JSON 文本。服务端是原样落库、理论上逐字相同，但拿文本比
+   会让将来任何一次格式化都变成假警报——而假警报会训练人忽略这条提示，
+   那时它就等于不存在。 */
+function diffRecognizerConfig(sent, stored) {
+  const parse = json => { try { return JSON.parse(json || '{}') || {}; } catch (e) { return null; } };
+  const before = parse(sent);
+  const after = parse(stored);
+  if (after === null) return ['整段配置没能存成合法 JSON'];
+  if (before === null) return [];  // 提交的就不是合法 JSON：那是别处的毛病，这里不越权报
+
+  const problems = [];
+  for (const key of Object.keys(before)) {
+    if (!(key in after)) { problems.push(`${key}：提交了，但没有存下来`); continue; }
+    const from = JSON.stringify(before[key]);
+    const to = JSON.stringify(after[key]);
+    if (from !== to) problems.push(`${key}：提交的是 ${from}，存下来的是 ${to}`);
+  }
+  for (const key of Object.keys(after)) {
+    if (!(key in before)) problems.push(`${key}：没提交过，却凭空多出来 ${JSON.stringify(after[key])}`);
+  }
+  return problems;
+}
+
+/* 用弹窗而不是 toast：toast 几秒后自己消失，而这条消息的含义是「你以为配好的东西
+   没配上」，错过一次就又回到静默失效。persistent 是同一个理由——点到空白处
+   不该等于把它读过了。关闭仍有「知道了」和 Esc 两条明路。 */
+function acknowledgeModal(title, bodyHtml) {
+  return new Promise(resolve => {
+    const ov = openModal(title, bodyHtml, { okText: '知道了', persistent: true });
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      ov.removeEventListener('bm:dismiss', settle);
+      resolve();
+    };
+    ov.addEventListener('bm:dismiss', settle);
+    ov.querySelector('[data-ok]').addEventListener('click', () => { settle(); closeModal(ov); });
+  });
+}
+
+/* stored 为 undefined 表示这次的响应里压根没带识别规则（核对不了），不是「存丢了」，
+   静默跳过；空字符串和 '{}' 都是真值，照常参与比对。 */
+async function verifyStoredRecognizerConfig(sent, stored) {
+  if (stored === undefined || stored === null) return;
+  const problems = diffRecognizerConfig(sent, stored);
+  if (problems.length === 0) return;
+
+  await acknowledgeModal('识别规则没有完整保存', `
+    <p style="line-height:1.7">任务本身已经保存，但服务端存下来的识别规则与刚提交的<b>不一致</b>。
+    在查清楚之前，这个任务的识别规则不能当作配好了——它可能会认错「一份备份」是什么。</p>
+    <ul style="line-height:1.8">${problems.map(p => `<li>${esc(p)}</li>`).join('')}</ul>
+    <div class="hint">这通常意味着界面上有一项配置在保存的过程中被丢掉了。
+    请把上面这几行原样交给维护者，并在修好之前先用「详情 → 原始配置（JSON）」核对实际生效的规则。</div>`);
 }
 
 async function taskFormFields(initial, template, prefill, client) {
@@ -290,6 +397,12 @@ async function taskFormFields(initial, template, prefill, client) {
   ];
   if (cfg.groupBy && cfg.groupBy !== 'basename')
     groupByOpts.push({ v: cfg.groupBy, t: `自定义正则：${cfg.groupBy}` });
+
+  const unitLayoutOpts = [
+    { v: '', t: '单元目录本身就是一份备份' },
+    { v: 'latest_directory', t: UNIT_LAYOUT_TEXT.latest_directory },
+    { v: 'date_leaf', t: UNIT_LAYOUT_TEXT.date_leaf }
+  ];
 
   const fields = [];
   // 建任务只有四件事必须由人决定：哪台机器、叫什么、备份的是什么应用、备份文件落在哪个目录。
@@ -365,8 +478,10 @@ async function taskFormFields(initial, template, prefill, client) {
     { name: 'cfgRecursive', label: '子目录', labelText: '深入子目录查找文件', type: 'checkbox', value: cfg.recursive, advanced: true },
     { name: 'cfgDepth', label: '业务单元在第几层', type: 'number', value: cfg.depth, advanced: true,
       hint: 'F:\\autobak\\ZT001 是第 1 层，F:\\autobak\\华东\\ZT001 是第 2 层。仅识别器为「子目录单元」时生效' },
-    { name: 'cfgUnitDaily', label: '单元内结构', labelText: '每个单元下面每次备份再建一个目录', type: 'checkbox', value: cfg.unitDaily, advanced: true,
-      hint: '例如 ZT001\\20260825\\…。仅识别器为「子目录单元」时生效' },
+    { name: 'cfgUnitLayout', label: '单元内结构', type: 'select', value: cfg.unitLayout, options: unitLayoutOpts, advanced: true,
+      hint: '例如 ZT001\\20260825\\…。账套不都在同一层时选「自动认」——'
+            + '源目录下既有 ZT001，又有 ZT201-ZT216\\ZT201 这种套了一层的，就是这一种。'
+            + '仅识别器为「子目录单元」时生效' },
     { name: 'cfgBatchRegex', label: '目录名筛选（正则）', type: 'text', value: cfg.batchRegex, advanced: true,
       placeholder: '^\\d{8}$', hint: '只处理名字匹配该正则的目录。留空表示不筛选' },
     { name: 'cfgPreview', type: 'static', label: '识别规则（自动生成，只读）',
@@ -389,13 +504,19 @@ function validateTaskForm(vals) {
   return '';
 }
 
-const TASK_FORM_OPTS = { onMount: mountConfigPreview, persistent: true, validate: validateTaskForm };
+/* 预览必须拿到与保存时同一份底稿，否则界面上显示的 JSON 和真正落库的不是同一份——
+   而「看到的」与「存下去的」分叉，正是这里要修的那类毛病本身。 */
+const taskFormOpts = baseConfig => ({
+  onMount: (ov, readValues) => mountConfigPreview(ov, readValues, baseConfig),
+  persistent: true,
+  validate: validateTaskForm
+});
 
 /* 表单联动：任何一个字段变了就重算一次 JSON 预览。 */
-function mountConfigPreview(ov, readValues) {
+function mountConfigPreview(ov, readValues, baseConfig) {
   const preview = ov.querySelector('[data-cfg-preview]');
   if (!preview) return;
-  const update = () => { preview.textContent = composeRecognizerConfig(readValues()); };
+  const update = () => { preview.textContent = composeRecognizerConfig(readValues(), baseConfig); };
   ov.querySelectorAll('input, select, textarea').forEach(el => {
     el.addEventListener('input', update);
     el.addEventListener('change', update);
@@ -407,7 +528,7 @@ function mountConfigPreview(ov, readValues) {
    此前编辑任务只回传表单上的十来个字段，而 PUT 的请求模型对未提供的字段一律取默认值——
    于是改一次任务名，稳定观察窗口被重置成 600、重试次数被重置成 3、告警配置被清空，
    而且没有任何提示。凡是表单不管的字段，一律用详情里的原值回填。 */
-function taskFormValues(vals, base) {
+function taskFormValues(vals, base, baseConfig) {
   const carried = base ? {
     scheduleTimezone: base.scheduleTimezone,
     stabilityIntervalSeconds: base.stabilityIntervalSeconds,
@@ -432,7 +553,7 @@ function taskFormValues(vals, base) {
     minTotalBytes: numOrNull(vals.minTotalBytes), maxTotalBytes: numOrNull(vals.maxTotalBytes),
     minFileCount: numOrNull(vals.minFileCount),
     randomDelayMinutes: vals.randomDelayMinutes === '' || vals.randomDelayMinutes == null ? 0 : Number(vals.randomDelayMinutes),
-    recognizerConfig: composeRecognizerConfig(vals)
+    recognizerConfig: composeRecognizerConfig(vals, baseConfig !== undefined ? baseConfig : base && base.recognizerConfig)
   });
 }
 
@@ -535,7 +656,7 @@ async function runBackupNow(taskId) {
   // background：窗口关掉也接着等，按钮跟着一直锁到这次备份真的有结论为止。
   const already = dispatched.status === 'already_running' ? '（这一次是先前那条备份）' : '';
   const cmd = await pollCommand(dispatched.commandId, 7200000, body,
-    c => say(`<div class="hint">${backupProgressText(c, already)}</div>`),
+    c => say(`<div class="hint">${backupProgressText(c, already)}</div>${unitQueueHtml(c)}`),
     { background: true });
   if (cmd === null) return;                       // 连续取不到指令状态，放弃等待
   if (cmd === 'timeout') {
@@ -552,25 +673,46 @@ async function runBackupNow(taskId) {
     return;
   }
 
-  // 自动模式：服务端在收到预检结果时已经把上传指令发出去了，这里不要重复发。
-  if (detail.taskMode === 'automatic') {
-    say('<div class="hint">扫描通过，已开始上传。进度在「传输中」页面。</div>');
-    toast('已开始备份', 'ok');
-    LOADERS.tasks();
-    return;
-  }
-
-  const candidateId = candidateIdOf(cmd.resultPayload);
-  if (!candidateId) {
+  // 一个任务可以有很多个业务单元（U8 一台机器 18 个账套是常态），
+  // 每一个都是独立的一份备份、独立的一个候选。只认第一个的那一版里，
+  // 其余账套扫过就扔了——人看到「已开始上传」，实际只传了 1/18。
+  const passed = passedCandidatesOf(cmd.resultPayload);
+  if (!passed.length) {
     say('<div class="hint">扫描完成，但这次没有发现需要备份的新文件。</div>');
     if (!body()) toast(`${detail.name}：没有发现需要备份的新文件`, 'ok');
     LOADERS.tasks();
     return;
   }
+  const many = passed.length > 1 ? `${passed.length} 个备份集：` : '';
+
+  // 自动模式：服务端在收到每一个单元的预检结果时就把它的上传指令发出去了，这里不重复发，
+  // 但要如实说清到底发出去几个。服务端把每个候选的下发结果写在指令结果里
+  // （dispatched / queued / already_running / ...）——原先这里不看它，
+  // 无论如何都说一句「已开始上传」，于是「一条都没发出去」也长这个样子。
+  if (detail.taskMode === 'automatic') {
+    const started = passed.filter(c => c.uploadState === 'dispatched' || c.uploadState === 'queued');
+    const queued = passed.filter(c => c.uploadState === 'queued').length;
+    if (!started.length) {
+      const why = passed[0].uploadState === 'already_running'
+        ? '上一次的上传还没结束，这次不重复发；进度在「传输中」页面。'
+        : passed[0].uploadState === 'already_done'
+          ? '这份备份先前已经传完入库了，没有需要重传的内容。'
+          : '服务端没有下发上传，请看这个任务的告警。';
+      say(`<div class="hint">扫描通过（${many}${passed.length} 个），但这次没有新的上传：${esc(why)}</div>`);
+      if (!body()) toast(`${detail.name}：扫描通过，但这次没有新的上传`, 'err');
+      LOADERS.tasks();
+      return;
+    }
+    const queuedNote = queued ? `（其中 ${queued} 个在排队等名额）` : '';
+    say(`<div class="hint">扫描通过，已开始上传 ${started.length} 个备份集${queuedNote}。进度在「传输中」页面。</div>`);
+    toast('已开始备份', 'ok');
+    LOADERS.tasks();
+    return;
+  }
 
   try {
-    await dispatchUpload(taskId, candidateId, false);
-    say('<div class="hint">已开始上传。进度在「传输中」页面。</div>');
+    await dispatchUploads(taskId, passed, false);
+    say(`<div class="hint">已开始上传 ${many}${passed.length} 个。进度在「传输中」页面。</div>`);
     toast('已开始备份', 'ok');
   } catch (e) {
     // 上传窗口和「客户端正忙」是配置意图，不是故障：问一句再强制，而不是默默绕过，
@@ -595,8 +737,8 @@ async function runBackupNow(taskId) {
       : '当前不在这个任务配置的上传窗口内。仍然现在就传吗？';
     if (!await confirmModal(question)) { say('<div class="hint">已取消，扫描结果保留着，之后可以再传。</div>'); return; }
     try {
-      await dispatchUpload(taskId, candidateId, true);
-      say('<div class="hint">已开始上传。进度在「传输中」页面。</div>');
+      await dispatchUploads(taskId, passed, true);
+      say(`<div class="hint">已开始上传 ${many}${passed.length} 个。进度在「传输中」页面。</div>`);
       toast('已开始备份', 'ok');
     } catch (e2) {
       say(`<div class="hint">下发上传失败：${esc(e2.message)}</div>`);
@@ -625,13 +767,93 @@ function describeBackupOutcome(cmd) {
 const dispatchUpload = (taskId, candidateBackupSetId, force) =>
   api(`/api/v1/admin/backup-tasks/${taskId}/upload`, { method: 'POST', body: { candidateBackupSetId, force } });
 
-/* 预检指令的结构化结果里带着这次扫出来的候选备份集 ID。 */
-function candidateIdOf(resultPayload) {
-  if (!resultPayload) return null;
+/* 逐个下发，串行而不是 Promise.all：并发发过去只会撞上「客户端已有活动上传」，
+   把一次本来能全部排上队的备份变成一串 409。第一个失败就抛出去，
+   由调用方走「问一句再强制」那条路——它问的是同一个问题。 */
+async function dispatchUploads(taskId, candidates, force) {
+  for (const c of candidates)
+    await dispatchUpload(taskId, c.candidateBackupSetId, force);
+}
+
+/* 预检指令的结构化结果里带着这次扫出来的**每一个**业务单元的候选。
+   老格式（只有一个顶层 candidateBackupSetId）仍然认——升级期间 Agent 与服务端
+   不是同一刻换的，读不出清单就退回那一个，总比一个都不传强。 */
+function passedCandidatesOf(resultPayload) {
+  if (!resultPayload) return [];
+  let parsed;
+  try { parsed = JSON.parse(resultPayload); } catch (e) { return []; }
+
+  if (Array.isArray(parsed.candidates)) {
+    return parsed.candidates
+      .filter(c => c && c.status === 'passed' && typeof c.candidateBackupSetId === 'string')
+      .map(c => ({ candidateBackupSetId: c.candidateBackupSetId, uploadState: c.uploadState || null }));
+  }
+
+  return typeof parsed.candidateBackupSetId === 'string'
+    ? [{ candidateBackupSetId: parsed.candidateBackupSetId, uploadState: null }]
+    : [];
+}
+
+/* Agent 一开始列一次目录就把全部账套报上来了，服务端放在 resultPayload.units。
+   老版本 Agent 不报这一项，返回空数组，调用方退回到只显示一行进度。 */
+function unitRosterOf(cmd) {
+  if (!cmd || !cmd.resultPayload) return [];
   try {
-    const parsed = JSON.parse(resultPayload);
-    return typeof parsed.candidateBackupSetId === 'string' ? parsed.candidateBackupSetId : null;
-  } catch (e) { return null; }
+    const units = JSON.parse(cmd.resultPayload).units;
+    return Array.isArray(units) ? units.filter(u => typeof u === 'string' && u) : [];
+  } catch (e) { return []; }
+}
+
+/* 已经扫完的那些单元，按显示名索引。 */
+function scannedUnitsOf(cmd) {
+  const done = new Map();
+  if (!cmd || !cmd.resultPayload) return done;
+  let parsed;
+  try { parsed = JSON.parse(cmd.resultPayload); } catch (e) { return done; }
+  if (!Array.isArray(parsed.candidates)) return done;
+  for (const c of parsed.candidates)
+    if (c && typeof c.businessUnit === 'string' && c.businessUnit) done.set(c.businessUnit, c);
+  return done;
+}
+
+/* 一个单元此刻处在哪一步。这几个词是给运维看的，不是状态机的名字：
+   他要判断的是「这个账套到底备着了没有」，而不是它内部走到了哪个枚举值。 */
+function unitStateText(entry) {
+  if (!entry) return null;
+  if (entry.status !== 'passed') return entry.status === 'no_new_backup' ? '无新备份' : '未通过';
+  switch (entry.uploadState) {
+    case 'queued': return '排队上传';
+    case 'dispatched': return '已下发上传';
+    case 'already_running': return '上传进行中';
+    case 'already_done': return '已上传';
+    default: return '待上传';
+  }
+}
+
+/* 「共 18 个账套，3 个扫完、1 个在扫、14 个等着」，底下把每一个列出来。
+
+   这一屏回答的是「还剩多少」。账套是 Agent 边扫边发现的，在这份名单出现之前，
+   界面上只能看着它们一个一个冒出来——既没有总数，也没有次序，
+   人只能盯着「传输中」猜自己还要等多久。 */
+function unitQueueHtml(cmd) {
+  const roster = unitRosterOf(cmd);
+  if (roster.length < 2) return '';   // 只有一个单元时这份名单没有信息量
+
+  const scanned = scannedUnitsOf(cmd);
+  const current = (progressOf(cmd) || {}).unit || '';
+
+  let waiting = 0;
+  const rows = roster.map(name => {
+    const state = unitStateText(scanned.get(name));
+    if (!state && name !== current) waiting++;
+    const text = state || (name === current ? '扫描中' : '等待');
+    return `<div class="row"><div class="k">${esc(name)}</div><div class="v">${esc(text)}</div></div>`;
+  }).join('');
+
+  const running = current ? 1 : 0;
+  return `<div class="hint" style="margin-top:10px">共 ${roster.length} 个业务单元 ·
+      ${scanned.size} 个已扫完 · ${running} 个扫描中 · ${waiting} 个等待</div>
+    <div class="kv" style="margin-top:6px">${rows}</div>`;
 }
 
 /* 轮询一条指令直到有结论。
@@ -878,7 +1100,8 @@ async function applyRequiredFiles(taskId, patterns) {
   delete cfg.required;
   cfg.requiredFiles = patterns;
 
-  await api(`/api/v1/admin/backup-tasks/${taskId}`, {
+  const sent = JSON.stringify(cfg, null, 2);
+  const saved = await api(`/api/v1/admin/backup-tasks/${taskId}`, {
     method: 'PUT',
     body: {
       name: detail.name, applicationName: detail.applicationName, sourcePath: detail.sourcePath,
@@ -894,10 +1117,11 @@ async function applyRequiredFiles(taskId, patterns) {
       chunkSizeBytes: detail.chunkSizeBytes, retryCount: detail.retryCount,
       retryIntervalSeconds: detail.retryIntervalSeconds, retentionPolicyId: detail.retentionPolicyId,
       alertConfig: detail.alertConfig,
-      recognizerConfig: JSON.stringify(cfg, null, 2),
+      recognizerConfig: sent,
       rowVersion: detail.rowVersion
     }
   });
+  await verifyStoredRecognizerConfig(sent, saved && saved.recognizerConfig);
 }
 
 /* 第 0 步：在哪台机器上。
@@ -1011,18 +1235,21 @@ ACTIONS['tasks:create'] = async () => {
 
   const fields = await taskFormFields(null, template, prefill, client);
   formModal('新建备份任务', fields, async vals => {
-    const body = taskFormValues(vals, null);
+    const body = taskFormValues(vals, null, prefill && prefill.recognizerConfig);
     body.clientId = client.id;
     const d = await api('/api/v1/admin/backup-tasks', { method: 'POST', body });
     toast(`任务「${d.name}」已创建`, 'ok');
     LOADERS.tasks();
+    // 必须 await：下面那句 confirmModal 会走 openModal，而 openModal 开头就是 closeModal()，
+    // 不等的话这条提示会被下一个弹窗顶掉，等于没提示过。
+    await verifyStoredRecognizerConfig(body.recognizerConfig, d.recognizerConfig);
     // 建完立刻验证：这是唯一一个能在"等到需要恢复时才发现规则写错"之前发现问题的时机。
     // 走过向导的任务已经在快照上预演过一遍，就不必再问一次。
     if (!prefill && await confirmModal('任务已创建。现在让客户端试扫一次，看看能识别到哪些文件吗？'))
       await runRecognitionTest(d.id);
     // persistent：这张表单里装着刚刚一路点出来的结果和手填的名字，
     // 点到弹窗外面不该等于把它们全丢掉。
-  }, '创建', TASK_FORM_OPTS);
+  }, '创建', taskFormOpts(prefill && prefill.recognizerConfig));
 };
 
 ACTIONS['tasks:edit'] = async id => {
@@ -1033,7 +1260,8 @@ ACTIONS['tasks:edit'] = async id => {
     body.rowVersion = detail.rowVersion;
     const d = await api(`/api/v1/admin/backup-tasks/${id}`, { method: 'PUT', body });
     toast(`任务「${d.name}」已保存`, 'ok'); LOADERS.tasks();
-  }, '保存', TASK_FORM_OPTS);
+    await verifyStoredRecognizerConfig(body.recognizerConfig, d.recognizerConfig);
+  }, '保存', taskFormOpts(detail.recognizerConfig));
 };
 
 function leafName(path) {

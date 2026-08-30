@@ -52,7 +52,8 @@ public sealed class BackupScanResult
 public delegate Task ScanProgressCallback(ScanProgress progress, CancellationToken ct);
 
 public readonly record struct ScanProgress(
-    int UnitIndex, int UnitCount, string? Unit, string Stage, string? File, int FileIndex, int FileCount);
+    int UnitIndex, int UnitCount, string? Unit, string Stage, string? File, int FileIndex, int FileCount,
+    IReadOnlyList<string>? Units = null);
 
 public sealed class BackupScanner
 {
@@ -143,6 +144,20 @@ public sealed class BackupScanner
         }
 
         var roots = SelectRoots(source, task.RecognizerType, rules);
+
+        // 先把名单报上去，再开始读盘。SelectRoots 到这里已经把全部业务单元解出来了——
+        // 那只是一次列目录，不读文件内容、不算哈希，几十毫秒的事。
+        //
+        // 不报的话，服务端要等第一个账套整读完（一个账套就是好几个 GB）才知道这次一共有几个，
+        // 界面上就只能是「一个跑完，下一个才冒出来」：看不到总数，也说不出还剩多少。
+        // 单元只有一个时不报——那份名单没有任何信息量，只会在界面上多出一行噪音。
+        var unitNames = roots
+            .Select(r => r.BusinessUnit?.DisplayName)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!)
+            .ToList();
+        if (unitNames.Count > 1)
+            await Report(progress, new ScanProgress(0, roots.Count, null, "enumerated", null, 0, 0, unitNames), ct);
 
         for (var unitIndex = 0; unitIndex < roots.Count; unitIndex++)
         {

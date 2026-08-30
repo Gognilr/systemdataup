@@ -464,6 +464,76 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
         }
     }
 
+    // ---------- 用例三之三：份数按业务单元分组（U8 多账套） ----------
+
+    /// <summary>
+    /// U8 一个任务下 18 个账套是常态：18 个账套的备份集全挂在同一个任务下，
+    /// 「保留最近 N 份」必须理解成每个账套各留 N 份。按任务整体算的话，一次扫描产出的
+    /// 18 份里只有最新的几份能活下来，其余账套一份不剩地进回收站。
+    /// 这里用两个账套 × 3 份、KeepLastCount=2 复现：账套 B 整体比账套 A 旧，
+    /// 按任务算会把 B 全部回收；按账套算则各自留最新 2 份、各回收最旧 1 份。
+    /// </summary>
+    [Fact]
+    public async Task 份数按业务单元分组计算()
+    {
+        var now = DateTime.UtcNow;
+        var unitAKept = new List<Guid>();
+        var unitBKept = new List<Guid>();
+        Guid unitAOldest, unitBOldest;
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var policy = new RetentionPolicy
+            {
+                Id = Guid.NewGuid(),
+                Name = $"it3-unit-{Guid.NewGuid():N}",
+                KeepLastCount = 2,
+                MinimumRetentionDays = 0,
+                RecycleBinDays = 7,
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+            (var clientId, var taskId) = await SeedClientAndTaskAsync(db, policy, now);
+
+            var unitA = await SeedBusinessUnitAsync(db, taskId, "ZT001", now);
+            var unitB = await SeedBusinessUnitAsync(db, taskId, "ZT002", now);
+
+            // 账套 A 的三份全都比账套 B 新：只按上传时间取「最近 2 份」的话，两个名额都落在 A 上，
+            // 账套 B 会被整体回收——这正是要防的那个结果。
+            unitAKept.Add(await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-1), now, businessUnitId: unitA));
+            unitAKept.Add(await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-2), now, businessUnitId: unitA));
+            unitAOldest = await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-3), now, businessUnitId: unitA);
+
+            unitBKept.Add(await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-4), now, businessUnitId: unitB));
+            unitBKept.Add(await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-5), now, businessUnitId: unitB));
+            unitBOldest = await SeedBackupSetAsync(db, clientId, taskId, now.AddDays(-6), now, businessUnitId: unitB);
+
+            await db.SaveChangesAsync();
+        }
+
+        await RunWorkerUntilAsync(async () =>
+        {
+            await using var scope = _services.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            return await db.BackupSets.AsNoTracking()
+                .CountAsync(s => (s.Id == unitAOldest || s.Id == unitBOldest)
+                    && s.Status == BackupSetStatus.RecycleBin) == 2;
+        });
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            // 每个账套各留最新 2 份：账套 B 整体更旧，也不能被账套 A 挤掉
+            foreach (var id in unitAKept.Concat(unitBKept))
+                Assert.Equal(BackupSetStatus.Available, await StatusAsync(db, id));
+
+            Assert.Equal(BackupSetStatus.RecycleBin, await StatusAsync(db, unitAOldest));
+            Assert.Equal(BackupSetStatus.RecycleBin, await StatusAsync(db, unitBOldest));
+        }
+    }
+
     // ---------- 用例四：物理删除的仓库根围栏 ----------
 
     /// <summary>
@@ -621,11 +691,30 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
         return (client.Id, task.Id);
     }
 
+    /// <summary>种子：任务下的一个业务单元（账套）</summary>
+    private static async Task<Guid> SeedBusinessUnitAsync(AppDbContext db, Guid taskId, string externalKey, DateTime now)
+    {
+        var unit = new BusinessUnit
+        {
+            Id = Guid.NewGuid(),
+            TaskId = taskId,
+            ExternalKey = externalKey,
+            DisplayName = externalKey,
+            SourceRelativePath = externalKey,
+            LastDiscoveredAt = now,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+        db.BusinessUnits.Add(unit);
+        await db.SaveChangesAsync();
+        return unit.Id;
+    }
+
     /// <summary>种子：可用（或指定状态）备份集；每个备份集配独立候选（uq_backup_sets_candidate）</summary>
     private static async Task<Guid> SeedBackupSetAsync(
         AppDbContext db, Guid clientId, Guid taskId, DateTime uploadedAt, DateTime now,
         bool locked = false, BackupSetStatus status = BackupSetStatus.Available,
-        DateTime? retentionUntil = null, string? repositoryPath = null)
+        DateTime? retentionUntil = null, string? repositoryPath = null, Guid? businessUnitId = null)
     {
         var suffix = Guid.NewGuid().ToString("N");
         var candidate = new CandidateBackupSet
@@ -634,6 +723,7 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
             ClientId = clientId,
             TaskId = taskId,
             CandidateKey = $"it3-{suffix}",
+            BusinessUnitId = businessUnitId,
             SourceRoot = @"D:\data\2026",
             DiscoveredAt = uploadedAt,
             PrecheckStatus = PrecheckStatus.Passed,
@@ -670,6 +760,7 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
             Id = Guid.NewGuid(),
             ClientId = clientId,
             TaskId = taskId,
+            BusinessUnitId = businessUnitId,
             SourceCandidateId = candidate.Id,
             UploadSessionId = session.Id,
             BackupSetCode = $"BS-IT3-{suffix[..12]}",

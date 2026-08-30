@@ -54,7 +54,7 @@ function retentionFields(v = {}) {
   return [
     { name: 'name', label: '策略名称', type: 'text', value: v.name, required: true, placeholder: '如 只留最近 7 份' },
     { name: 'keepLastCount', label: '保留最近 N 份', type: 'number', value: v.keepLastCount ?? 7,
-      hint: '超出这个份数的旧备份会被移进回收站。留空则改由下面高级选项里的周/月/年规则决定' },
+      hint: '超出这个份数的旧备份会被移进回收站。份数按业务单元分别算：U8 这类一个任务下 18 个账套的，填 7 表示每个账套各留 7 份。留空则改由下面高级选项里的周/月/年规则决定' },
     { name: 'recycleBinDays', label: '删掉的先放回收站几天', type: 'number', value: v.recycleBinDays ?? 7,
       hint: '这段时间内还能捞回来，到期才真正从磁盘上删除' },
     { name: 'keepWeeklyCount', label: '保留周版本数', type: 'number', value: v.keepWeeklyCount ?? '', advanced: true,

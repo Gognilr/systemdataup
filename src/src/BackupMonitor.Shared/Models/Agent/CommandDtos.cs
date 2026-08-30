@@ -55,6 +55,19 @@ public class CommandProgressRequest
 
     public string? Stage { get; set; }
     public string? Message { get; set; }
+
+    /// <summary>当前正在处理的业务单元名。界面靠它把「正在跑的是哪一个」和下面那份名单对上。</summary>
+    public string? Unit { get; set; }
+
+    /// <summary>
+    /// 本次扫描一开始就枚举出来的全部业务单元名，只在第一条进度里带一次。
+    ///
+    /// 存在的理由：账套是 Agent 边扫边发现的，服务端在扫完之前不知道一共有几个——
+    /// 于是界面上只能看着它们一个一个冒出来，既不知道总数，也不知道还剩多少。
+    /// 而枚举本身只是列一次目录（毫秒级，不读文件内容、不算哈希），
+    /// 先把这份名单送上来，「共 18 个、第 3 个在跑、15 个等着」才有得显示。
+    /// </summary>
+    public List<string>? Units { get; set; }
 }
 
 /// <summary>上报指令完成（设计书 12.4）</summary>

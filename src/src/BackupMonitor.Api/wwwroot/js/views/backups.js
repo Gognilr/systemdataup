@@ -53,7 +53,9 @@ LOADERS.backups = async function () {
       : emptyState('filter', { key: 'backups', title: `没有匹配「${st.keyword || L.backup_set_status[st.status] || ''}」的备份集` });
     wrap.innerHTML = tableHtml([
       { l: '备份集编号', k: 'backupSetCode', sort: true, render: r => `<a href="#/backups/${esc(r.id)}"><b class="mono">${esc(r.backupSetCode)}</b></a>` },
-      { l: '客户端 / 任务', render: r => `${esc(r.clientHostname)}<span class="sub">${esc(r.taskName)}</span>` },
+      // 账套（业务单元）必须写在这一列里：U8 一个任务下 18 个账套，18 行的客户端和任务名
+      // 长得一模一样，不显示单元就分不清哪一行是哪个账套——而保留份数正是按账套各算各的。
+      { l: '客户端 / 任务', render: r => `${esc(r.clientHostname)}<span class="sub">${esc(r.taskName)}${r.businessUnitName ? ' · ' + esc(r.businessUnitName) : ''}</span>` },
       { l: '应用', k: 'applicationName' },
       { l: '状态', k: 'status', sort: true, render: r => status('backup_set_status', r.status) },
       // 「3 天前」回答不了「这份是不是周二那次」——精确时间当主行，相对时间降为副行。

@@ -17,6 +17,7 @@ namespace BackupMonitor.Infrastructure.Services;
 /// 阶段零：清扫过期恢复请求（ready 且令牌已过期、downloading 且超过宽限期、ready 且从未签发令牌超过最长等待天数 → expired），防止僵尸请求永久堆积；
 /// 阶段一：回收站到期 → 物理删除仓库目录并置 deleted；
 /// 阶段二：按任务绑定的策略做 GFS 保留标记（最近 N / 周 / 月 / 年），
+/// 份数在任务内**按业务单元分组**计算（U8 一个任务 18 个账套 = 18 组，各留各的 N 份）；
 /// 未保留且超过最短保留天数、未锁定的 available 备份集移入回收站（recycle_bin + retention_until）。
 /// 锁定（backup_sets.locked 或活动 retention_locks）的备份集一律跳过；
 /// 存在活动恢复请求（verifying/downloading，或已签发令牌的 ready）的备份集同样跳过，防止恢复进行中被回收。
@@ -316,7 +317,7 @@ public class RetentionCleanupWorker : BackgroundService
         return count;
     }
 
-    /// <summary>阶段二：GFS 保留计算，未保留且过最短天数的版本移入回收站</summary>
+    /// <summary>阶段二：GFS 保留计算（任务内按业务单元分组），未保留且过最短天数的版本移入回收站</summary>
     private async Task<int> ApplyGfsRetentionAsync(
         AppDbContext db,
         IAuditRecorder audit,
@@ -369,28 +370,41 @@ public class RetentionCleanupWorker : BackgroundService
             if (sets.Count == 0)
                 continue;
 
-            var keepIds = MarkGfsRetained(sets, policy);
             var minCutoff = now.AddDays(-policy.MinimumRetentionDays);
-
             var candidates = new List<BackupSet>();
-            foreach (var set in sets)
-            {
-                if (keepIds.Contains(set.Id))
-                    continue;
-                if (set.UploadedAt >= minCutoff)
-                    continue;
-                if (restoreProtectedIds.Contains(set.Id))
-                {
-                    _logger.LogInformation("备份集 {Code} 超出保留范围但存在活动恢复请求，跳过", set.BackupSetCode);
-                    continue;
-                }
-                if (IsLocked(set, now))
-                {
-                    _logger.LogInformation("备份集 {Code} 超出保留范围但被锁定，跳过", set.BackupSetCode);
-                    continue;
-                }
 
-                candidates.Add(set);
+            // 份数规则按业务单元分别算。U8 一台机器 18 个账套是常态，这 18 个账套的备份集
+            // 全都挂在同一个任务下，而「保留最近 7 份」说的是每个账套各留 7 份，
+            // 不是这个任务一共留 7 份。按任务整体算的那一版里，一次扫描产出的 18 份
+            // （每个账套 1 份）按上传时间排下来只有最新的 7 份被保住，另外 11 个账套
+            // 一份不剩地进了回收站——界面上就是「可用 7 / 回收站 11」，
+            // 而那 11 个账套此刻在服务端一份可用备份都没有。
+            // 分组键取 business_unit_id：单业务单元的任务（全是 null）只有一组，行为与从前一致。
+            foreach (var unitSets in sets.GroupBy(s => s.BusinessUnitId))
+            {
+                // GroupBy 保持源顺序，组内仍是 UploadedAt 倒序——MarkGfsRetained 依赖这个前提
+                var unitGroup = unitSets.ToList();
+                var keepIds = MarkGfsRetained(unitGroup, policy);
+
+                foreach (var set in unitGroup)
+                {
+                    if (keepIds.Contains(set.Id))
+                        continue;
+                    if (set.UploadedAt >= minCutoff)
+                        continue;
+                    if (restoreProtectedIds.Contains(set.Id))
+                    {
+                        _logger.LogInformation("备份集 {Code} 超出保留范围但存在活动恢复请求，跳过", set.BackupSetCode);
+                        continue;
+                    }
+                    if (IsLocked(set, now))
+                    {
+                        _logger.LogInformation("备份集 {Code} 超出保留范围但被锁定，跳过", set.BackupSetCode);
+                        continue;
+                    }
+
+                    candidates.Add(set);
+                }
             }
 
             if (candidates.Count == 0)
@@ -461,7 +475,8 @@ public class RetentionCleanupWorker : BackgroundService
         return count;
     }
 
-    /// <summary>GFS 标记：最近 N 个 + 周代表 + 月代表 + 年代表（均按上传时间倒序取首个）</summary>
+    /// <summary>GFS 标记：最近 N 个 + 周代表 + 月代表 + 年代表（均按上传时间倒序取首个）。
+    /// 入参是**单个业务单元**的备份集（调用方已分组），份数因此是每个单元各算各的</summary>
     private static HashSet<Guid> MarkGfsRetained(IReadOnlyList<BackupSet> setsDescending, Core.Entities.Retention.RetentionPolicy policy)
     {
         var keep = new HashSet<Guid>();
