@@ -38,6 +38,19 @@ public class LifecycleExpiryWorker : BackgroundService
     /// </summary>
     public const int DefaultSessionTimeoutSeconds = 21600;
 
+    /// <summary>
+    /// retry_wait 会话的回收时限（秒）system_settings 键。
+    ///
+    /// retry_wait 保留的是断点，不是正在进行的传输——Agent 上传出错后把会话留在这个状态，
+    /// 好让下一次重试能续上。拿「多久没动静才算废了」的 6 小时去卡它，
+    /// 一次失败就把这台机器锁住半天：它既占单客户端上限（默认 2）也占全局上限（默认 4），
+    /// 而 U8 这类一台机器 18 个账套的任务，只要两个单元失败就再也传不动第三个。
+    /// </summary>
+    public const string RetryWaitTimeoutKey = "upload_retry_wait_timeout_seconds";
+
+    /// <summary>retry_wait 回收时限的兜底默认值（秒）：30 分钟</summary>
+    public const int DefaultRetryWaitTimeoutSeconds = 1800;
+
     /// <summary>指令领取后未上报开始的退回阈值（秒）system_settings 键（V022 新增，默认 900）</summary>
     public const string ClaimTimeoutKey = "command_claim_timeout_seconds";
 
@@ -146,15 +159,25 @@ public class LifecycleExpiryWorker : BackgroundService
 
         // 下限 60 秒：配得太小会把正在正常传输、只是块间隔略长的会话误杀。
         var timeoutSeconds = Math.Max(60, await settings.GetIntAsync(SessionTimeoutKey, DefaultSessionTimeoutSeconds, ct));
+
+        // retry_wait 单独一条更短的线。这两个数问的不是同一个问题：
+        // 6 小时问的是「一个还在传的会话多久没动静才算废了」，
+        // 30 分钟问的是「一个只剩断点的会话还值不值得替它占着名额」。
+        var retryWaitSeconds = Math.Max(60,
+            await settings.GetIntAsync(RetryWaitTimeoutKey, DefaultRetryWaitTimeoutSeconds, ct));
+
         var now = DateTime.UtcNow;
         var deadline = now.AddSeconds(-timeoutSeconds);
+        var retryWaitDeadline = now.AddSeconds(-retryWaitSeconds);
 
         // 用 LastActivityAt 判定：它在每个分块写入时刷新（UploadChunkAsync），
         // 是「这个会话还有没有人在推进」的唯一可靠依据。
         // 为空（建了会话一个块都没传）时退回 CreatedAt。
         var stale = await db.UploadSessions
             .Where(s => WritableStatuses.Contains(s.Status)
-                        && (s.LastActivityAt ?? s.CreatedAt) < deadline)
+                        && (s.Status == UploadStatus.RetryWait
+                            ? (s.LastActivityAt ?? s.CreatedAt) < retryWaitDeadline
+                            : (s.LastActivityAt ?? s.CreatedAt) < deadline))
             .ToListAsync(ct);
 
         if (stale.Count == 0)
@@ -162,15 +185,20 @@ public class LifecycleExpiryWorker : BackgroundService
 
         foreach (var session in stale)
         {
+            var applied = session.Status == UploadStatus.RetryWait ? retryWaitSeconds : timeoutSeconds;
             session.Status = UploadStatus.Expired;
             session.ErrorCode = "SESSION_TIMEOUT";
-            session.ErrorMessage = $"超过 {timeoutSeconds} 秒无分块写入，已自动过期";
+            session.ErrorMessage = $"超过 {applied} 秒无分块写入，已自动过期";
             session.CompletedAt = now;
             session.UpdatedAt = now;
         }
 
+        // 暂存目录不在这里删：staging_cleanup_retention_hours 那条保留期照旧，
+        // 30 分钟内 Agent 重试时仍然能从断点续上——这条更短的线要收回的是名额，不是数据。
         await db.SaveChangesAsync(ct);
-        _logger.LogInformation("上传会话超时回收 {Count} 个（阈值 {Timeout} 秒）", stale.Count, timeoutSeconds);
+        _logger.LogInformation(
+            "上传会话超时回收 {Count} 个（阈值 {Timeout} 秒，retry_wait {RetryWait} 秒）",
+            stale.Count, timeoutSeconds, retryWaitSeconds);
     }
 
     /// <summary>

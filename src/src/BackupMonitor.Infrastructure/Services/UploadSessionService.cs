@@ -123,6 +123,13 @@ public class UploadSessionService : IUploadSessionService
         if (candidate.SupersededById is not null)
             throw new BusinessException("CANDIDATE_CHANGED", "候选已被新候选替代", 409);
 
+        // 管理员取消过这一份的上传。不挡在这里的话，Agent 拿着一条复位重发的指令回来
+        // 就能建一个全新会话从 0 重传——取消于是变成「几分钟后从头再传一遍」。
+        // 解除方式：源文件变化后重新预检，或管理员在界面上显式再点一次上传。
+        if (candidate.CancelledAt is not null)
+            throw new BusinessException("UPLOAD_NOT_PERMITTED",
+                "这一份的上传已被管理员取消。需要重新上传请在管理端重新下发，或等源文件变化后重新预检", 409);
+
         // 是否已入库（一个候选同时只能有一个活着的正式版本）。
         // 判据必须带状态过滤：软删的备份集行还在，不过滤就等于「删了再也备不回来」。
         if (await _db.BackupSets.AnyAsync(
@@ -155,10 +162,12 @@ public class UploadSessionService : IUploadSessionService
                 throw new BusinessException("UPLOAD_NOT_PERMITTED", "指令类型不是上传指令", 409);
         }
 
-        // 并发与空间
+        // 并发与空间。数的是「这台机器同时有几路在往上传」，retry_wait 一路都没在传，
+        // 所以用 CountedPerClient 而不是 Active——两者的差别与理由见 UploadSessionStatuses。
         var maxConcurrent = await _settings.GetIntAsync("max_concurrent_uploads", 2, ct);
         var activeSessions = await _db.UploadSessions
-            .CountAsync(s => s.ClientId == clientId && ActiveStatuses.Contains(s.Status), ct);
+            .CountAsync(s => s.ClientId == clientId
+                && UploadSessionStatuses.CountedPerClient.Contains(s.Status), ct);
         if (activeSessions >= maxConcurrent)
             throw new BusinessException("UPLOAD_SESSION_CONFLICT", $"客户端活动上传已达上限（{maxConcurrent}）", 409);
 

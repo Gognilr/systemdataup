@@ -156,6 +156,8 @@ public class CandidateBackupSetConfiguration : IEntityTypeConfiguration<Candidat
         builder.Property(e => e.FailureMessage).HasColumnName("failure_message").HasMaxLength(2000);
         builder.Property(e => e.ExpiresAt).HasColumnName("expires_at");
         builder.Property(e => e.SupersededById).HasColumnName("superseded_by_id");
+        builder.Property(e => e.CancelledAt).HasColumnName("cancelled_at");
+        builder.Property(e => e.CancelledBy).HasColumnName("cancelled_by");
         builder.Property(e => e.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("now()").ValueGeneratedOnAdd();
         builder.Property(e => e.UpdatedAt).HasColumnName("updated_at").HasDefaultValueSql("now()").ValueGeneratedOnAddOrUpdate();
 

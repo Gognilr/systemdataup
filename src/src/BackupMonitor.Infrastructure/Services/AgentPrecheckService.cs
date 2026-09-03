@@ -192,6 +192,17 @@ public class AgentPrecheckService : IAgentPrecheckService
         var fingerprintChanged = !string.Equals(
             candidate.QuickFingerprint, request.QuickFingerprint, StringComparison.OrdinalIgnoreCase);
         candidate.QuickFingerprint = request.QuickFingerprint;
+
+        // 源文件变了就清掉取消标记：管理员取消的是「刚才那一份」，不是「这个目录以后都别传」。
+        // 内容没变时保留标记——那正是他刚刚说不要的那一份，重新扫一遍不构成新的意愿。
+        if (!manifestUnchanged && candidate.CancelledAt is not null)
+        {
+            _logger.LogInformation(
+                "候选 {Candidate} 的内容已变化，清除此前的取消标记", candidate.Id);
+            candidate.CancelledAt = null;
+            candidate.CancelledBy = null;
+        }
+
         candidate.FailureCode = failureCode;
         candidate.FailureMessage = failureMessage;
         candidate.UpdatedAt = now;
@@ -298,7 +309,15 @@ public class AgentPrecheckService : IAgentPrecheckService
         // 传输中却一直是空的，谁也说不出它卡在哪一步。
         Guid? uploadCommandId = null;
         string? uploadState = null;
-        if (accepted && task.TaskMode == TaskMode.Automatic)
+        if (accepted && candidate.CancelledAt is not null)
+        {
+            // 管理员刚刚取消过这一份，而内容没有变化（变了的话上面已经把标记清掉了）。
+            // 自动下发在这里必须停住：取消之后几分钟又自动重传一遍，
+            // 使用者会认为取消这个按钮根本没有用。
+            uploadState = PrecheckResultPayload.StateNotDispatched;
+            _logger.LogInformation("候选 {Candidate} 已被管理员取消上传，本次不自动下发", candidate.Id);
+        }
+        else if (accepted && task.TaskMode == TaskMode.Automatic)
         {
             if (await _queue.TryDeferUploadAsync(clientId, task.Id, candidate.Id, ct))
             {

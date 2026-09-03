@@ -54,3 +54,37 @@ CREATE UNIQUE INDEX uq_backup_sets_candidate_live
 COMMENT ON INDEX uq_backup_sets_candidate_live IS
     '一个候选同时只能有一个「活着」的正式版本；回收站里的和已删除的不参与判定，'
     '否则删掉一份备份之后源文件没变就再也备不回来。';
+
+-- =====================================================================
+-- 批次三：队列与取消
+-- =====================================================================
+
+-- C6/C7：取消一次传输，必须记在「这一份备份」上，而不是只记在会话上。
+--
+-- 原先取消只把 upload_sessions.status 改成 cancelled。随后的自动链路会这样走：
+-- CommandService 判「这个候选没有 committed、也没有 InFlight 会话」→ 结论是「上传从没落地」
+-- → 指令复位重发；建会话时旧会话是 cancelled，幂等键被释放 → 建一个全新会话从 0 重传。
+-- 于是「取消」的实际效果是「几分钟后从头再传一遍」。
+ALTER TABLE candidate_backup_sets
+    ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ NULL,
+    ADD COLUMN IF NOT EXISTS cancelled_by UUID NULL REFERENCES users(id);
+
+COMMENT ON COLUMN candidate_backup_sets.cancelled_at IS
+    '管理员主动取消这一份的上传。取消若只落在会话上，下一轮预检会因为「没有已入库的痕迹」'
+    '把上传指令复位重发，于是取消变成「几分钟后从头重传」。'
+    '清除时机：源文件变了（清单哈希变化）重新预检，或管理员显式再点一次上传。';
+COMMENT ON COLUMN candidate_backup_sets.cancelled_by IS '执行取消的操作人';
+
+CREATE INDEX IF NOT EXISTS idx_candidate_backup_sets_cancelled
+    ON candidate_backup_sets (task_id)
+    WHERE cancelled_at IS NOT NULL;
+
+-- C2：retry_wait 会话的回收时限。
+--
+-- upload_session_timeout_seconds（6 小时）问的是「一个还在传的会话多久没动静才算废了」；
+-- retry_wait 保留的是断点、一路都没在传，拿 6 小时去卡它，一次失败就把这台机器锁住半天
+-- ——它既占单客户端上限（默认 2）也占全局上限（默认 4），
+-- 而 U8 这类一台机器 18 个账套的任务，只要两个单元失败就再也传不动第三个。
+INSERT INTO system_settings (setting_key, setting_value, encrypted, updated_by)
+VALUES ('upload_retry_wait_timeout_seconds', '1800'::jsonb, false, NULL)
+ON CONFLICT (setting_key) DO NOTHING;

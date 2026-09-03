@@ -207,7 +207,10 @@ public class SequentialExecutionWorker : BackgroundService
 
             // 取消掉的执行不再放行新项，只等在跑的那几项跑完
             if (run.Status != BatchStatus.Cancelled)
+            {
                 await StartPendingItemsAsync(db, commands, run, globalUploadLimit, now, ct);
+                await ExpireStalePendingItemsAsync(db, alerting, run, now, ct);
+            }
 
             await FinalizeRunAsync(db, run, now, ct);
         }
@@ -260,9 +263,20 @@ public class SequentialExecutionWorker : BackgroundService
         if (command is null || command.Status != CommandStatus.Succeeded)
             return;
 
-        var session = await FindSessionAsync(db, item, startedAt, ct);
-        if (session is null)
+        var sessions = await FindSessionsAsync(db, item, startedAt, ct);
+        if (sessions.Count == 0)
         {
+            // 这个任务的上传正排在队列里等名额时，「没有新备份」这个结论是错的——
+            // 恰恰相反，有新备份、只是还没轮到它传。宽限期一到就报成功的话，
+            // 界面上这次计划显示「全部成功」，而一个字节都还没传。
+            var queuedUpload = await db.Set<ExecutionRunItem>().AnyAsync(i =>
+                i.TaskId == item.TaskId
+                && i.Id != item.Id
+                && ConsumesUploadSlot(i.CommandType)
+                && (i.Status == ExecutionItemStatus.Pending || i.Status == ExecutionItemStatus.Running), ct);
+            if (queuedUpload)
+                return;
+
             // 预检通过却一直没有上传会话，最常见的原因就是「这次压根没有新备份」。
             // 等一个宽限期再下这个结论，避免抢在服务端下发上传指令之前。
             var since = command.CompletedAt ?? startedAt;
@@ -271,29 +285,49 @@ public class SequentialExecutionWorker : BackgroundService
             return;
         }
 
-        item.UploadSessionId = session.Id;
-        switch (session.Status)
+        // 界面上「点过去看」只能落到一个会话，取最新那个；结论则由全部会话汇总。
+        item.UploadSessionId = sessions[^1].Id;
+
+        // 还有任何一个在途就继续等——这一项的结论必须等所有单元都有了结果，
+        // 否则先跑完的那个单元会替另外 17 个下结论。
+        if (sessions.Any(s => UploadSessionStatuses.InFlight.Contains(s.Status)))
         {
-            case UploadStatus.Committed:
-                await FinishItemAsync(db, item, ExecutionItemStatus.Succeeded, "备份已入库", now, ct);
-                break;
-            case UploadStatus.Failed:
-            case UploadStatus.Cancelled:
-            case UploadStatus.Expired:
-                await FinishItemAsync(db, item, ExecutionItemStatus.Failed,
-                    $"上传{EnumMapping.ToSnakeCase(session.Status)}", now, ct);
-                break;
-            default:
-                await db.SaveChangesAsync(ct);   // 只是把会话 ID 记下来，界面上能点过去
-                break;
+            await db.SaveChangesAsync(ct);   // 只是把会话 ID 记下来，界面上能点过去
+            return;
         }
+
+        var committed = sessions.Count(s => s.Status == UploadStatus.Committed);
+        if (committed == sessions.Count)
+        {
+            await FinishItemAsync(db, item, ExecutionItemStatus.Succeeded,
+                sessions.Count == 1 ? "备份已入库" : $"{sessions.Count} 个单元全部入库", now, ct);
+            return;
+        }
+
+        // 剩下的都是终态且至少有一个不是 committed。逐个单元把失败原因写出来：
+        // 「5 个单元中 4 个失败」这句话本身就是这条缺陷此前吞掉的全部信息。
+        var failed = sessions.Where(s => s.Status != UploadStatus.Committed).ToList();
+        var reasons = string.Join("；", failed
+            .GroupBy(s => EnumMapping.ToSnakeCase(s.Status))
+            .Select(g => $"{g.Key} {g.Count()} 个"));
+
+        await FinishItemAsync(db, item, ExecutionItemStatus.Failed,
+            sessions.Count == 1
+                ? $"上传{EnumMapping.ToSnakeCase(failed[0].Status)}"
+                : $"{sessions.Count} 个单元中 {failed.Count} 个失败（{reasons}）",
+            now, ct);
     }
 
     /// <summary>
-    /// 这一项对应的上传会话。批量上传按候选定位；计划驱动的任务只能按「这一项开跑之后
-    /// 该任务新建的会话」定位——预检产生的候选 ID 在下发预检时还不存在。
+    /// 这一项对应的**全部**上传会话。批量上传按候选定位；计划驱动的任务只能按
+    /// 「这一项开跑之后该任务新建的会话」定位——预检产生的候选 ID 在下发预检时还不存在。
+    ///
+    /// 返回集合而不是单个：一个任务可以有很多个业务单元（U8 一台机器 18 个账套是常态），
+    /// 每个单元一个候选、一个会话。原先这里是 OrderByDescending(CreatedAt).FirstOrDefault()，
+    /// 于是这一项的结论由「最后一个账套」单方面决定——最后一个成功就报成功，
+    /// 另外 17 个失败一声不响，界面上这次计划显示「全部成功」。
     /// </summary>
-    private static async Task<Core.Entities.Upload.UploadSession?> FindSessionAsync(
+    private static async Task<List<Core.Entities.Upload.UploadSession>> FindSessionsAsync(
         AppDbContext db, ExecutionRunItem item, DateTime startedAt, CancellationToken ct)
     {
         var sessions = db.UploadSessions.AsNoTracking();
@@ -301,13 +335,13 @@ public class SequentialExecutionWorker : BackgroundService
         if (item.CandidateBackupSetId is not null)
             return await sessions
                 .Where(s => s.CandidateBackupSetId == item.CandidateBackupSetId)
-                .OrderByDescending(s => s.CreatedAt)
-                .FirstOrDefaultAsync(ct);
+                .OrderBy(s => s.CreatedAt)
+                .ToListAsync(ct);
 
         return await sessions
             .Where(s => s.TaskId == item.TaskId && s.CreatedAt >= startedAt)
-            .OrderByDescending(s => s.CreatedAt)
-            .FirstOrDefaultAsync(ct);
+            .OrderBy(s => s.CreatedAt)
+            .ToListAsync(ct);
     }
 
     private static async Task FinishItemAsync(
@@ -356,13 +390,21 @@ public class SequentialExecutionWorker : BackgroundService
 
             ct.ThrowIfCancellationRequested();
 
-            var activeUploads = await CountActiveUploadsAsync(db, ct);
-            if (activeUploads >= globalUploadLimit)
+            // 全局上传闸只对真的会建上传会话的项生效。预检只是让客户端扫一遍目录算哈希，
+            // 一个上传名额都不占；拿上传闸挡住它，等于「服务端有 4 个会话在传」
+            // 就让所有计划连扫描都不许开始。而 Pending 项此前没有超时、
+            // CreatePlanRunAsync 又规定「上一次没跑完就不再建新的」，
+            // 于是这一挡是永久的——现场表现是计划停在「排队中」，此后再也不执行。
+            if (ConsumesUploadSlot(item.CommandType))
             {
-                _logger.LogInformation(
-                    "全局上传并发已达上限（{Active}/{Limit}），执行 {RunId} 的剩余项继续排队",
-                    activeUploads, globalUploadLimit, run.Id);
-                break;
+                var activeUploads = await CountActiveUploadsAsync(db, ct);
+                if (activeUploads >= globalUploadLimit)
+                {
+                    _logger.LogInformation(
+                        "全局上传并发已达上限（{Active}/{Limit}），执行 {RunId} 的剩余上传项继续排队",
+                        activeUploads, globalUploadLimit, run.Id);
+                    break;
+                }
             }
 
             try
@@ -422,6 +464,55 @@ public class SequentialExecutionWorker : BackgroundService
     /// </summary>
     private static Task<int> CountActiveUploadsAsync(AppDbContext db, CancellationToken ct) =>
         db.UploadSessions.CountAsync(s => UploadSessionStatuses.Active.Contains(s.Status), ct);
+
+    /// <summary>
+    /// 这一项下发之后会不会建上传会话，也就是它占不占全局上传名额。
+    /// 预检项（PrecheckTask）不占——它只让客户端扫目录算哈希。
+    /// </summary>
+    private static bool ConsumesUploadSlot(CommandType commandType) =>
+        commandType is CommandType.UploadCandidate or CommandType.UploadLatest;
+
+    /// <summary>
+    /// Pending 项的兜底超时。
+    ///
+    /// ItemTimeoutMinutes 原先只对 Running 项生效，Pending 项没有任何时限——
+    /// 而计划不允许叠一次执行（CreatePlanRunAsync 见到未终结的 run 就返回 null），
+    /// 所以一项永远排不上就等于这个计划永远不再执行，且没有任何告警。
+    /// 上传闸修好之后这条路窄了很多，但「排队排到天荒地老」仍然要有个尽头：
+    /// 判失败、发告警、让这次执行能收尾，下一次到点才建得出新的。
+    ///
+    /// 阈值取 2 倍单项超时：正常排队等的是别人跑完，一个单项超时的时长足够轮到它；
+    /// 等了两倍还没轮到，说明名额没有在正常释放。
+    /// </summary>
+    private async Task ExpireStalePendingItemsAsync(
+        AppDbContext db, IAlertingService alerting, ExecutionRun run, DateTime now, CancellationToken ct)
+    {
+        var pendingLimit = TimeSpan.FromMinutes(run.ItemTimeoutMinutes * 2);
+        var queuedSince = run.StartedAt ?? run.CreatedAt;
+        if (now - queuedSince < pendingLimit)
+            return;
+
+        foreach (var item in run.Items.Where(i => i.Status == ExecutionItemStatus.Pending).ToList())
+        {
+            ct.ThrowIfCancellationRequested();
+
+            await FinishItemAsync(db, item, ExecutionItemStatus.Failed,
+                $"排队超过 {pendingLimit.TotalMinutes:0} 分钟仍未开始，已判定失败让本次执行收尾", now, ct);
+
+            var task = await db.BackupTasks.AsNoTracking().FirstOrDefaultAsync(t => t.Id == item.TaskId, ct);
+            await alerting.RaiseAsync(
+                $"execution_item:{item.Id}:queue_timeout",
+                AlertLevel.Warning,
+                "execution_item_queue_timeout",
+                $"备份计划里的这一项一直没能开始（{task?.Name ?? item.TaskId.ToString()}）",
+                $"「{run.Name}」里的这一项排队等了 {pendingLimit.TotalMinutes:0} 分钟仍然没轮到，" +
+                "多半是上传名额一直没有释放。这一项按失败处理，让这次执行结束——" +
+                "否则这个计划下一次到点也不会执行。",
+                clientId: item.ClientId,
+                taskId: item.TaskId,
+                ct: ct);
+        }
+    }
 
     /// <summary>全部项终结时收尾：completed / partial / failed，并回写计数</summary>
     private async Task FinalizeRunAsync(AppDbContext db, ExecutionRun run, DateTime now, CancellationToken ct)

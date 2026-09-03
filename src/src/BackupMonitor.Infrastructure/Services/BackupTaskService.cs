@@ -759,6 +759,18 @@ public class BackupTaskService : IBackupTaskService
                 throw new BusinessException("OUT_OF_UPLOAD_WINDOW", "当前不在任务配置的上传窗口内，可使用强制下发忽略", 409);
         }
 
+        // 管理员在界面上显式点了「上传这一份」，这就是解除取消标记的那个明确动作。
+        // 没有这条路的话，取消标记是一道没有出口的闸：源文件不变的那一份从此再也传不上去，
+        // 而「取消之后想想还是要传」是个完全正常的念头。
+        if (candidate.CancelledAt is not null)
+        {
+            _logger.LogInformation("候选 {Candidate} 的取消标记由本次手动下发解除", candidate.Id);
+            candidate.CancelledAt = null;
+            candidate.CancelledBy = null;
+            candidate.UpdatedAt = DateTime.UtcNow;
+            await _db.SaveChangesAsync(ct);
+        }
+
         var command = await _commands.CreateCommandAsync(
             task.ClientId, CommandType.UploadCandidate,
             taskId: task.Id,

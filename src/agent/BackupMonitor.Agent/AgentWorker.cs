@@ -1986,6 +1986,10 @@ public sealed class AgentWorker : BackgroundService
     private static readonly HashSet<string> NonRetryableUploadErrorCodes = new(StringComparer.Ordinal)
     {
         PausedSessionErrorCode,
+        // 会话状态不允许写入（被取消、已终结）。退避重试对它没有意义——
+        // 状态不会因为等 4 秒就变回可写，重试只是让「取消」多花十几秒才生效，
+        // 而每一块都要白等三轮。
+        "UPLOAD_SESSION_CONFLICT",
         "CANDIDATE_EXPIRED", "CANDIDATE_CHANGED", "CANDIDATE_ALREADY_ARCHIVED",
         "MANIFEST_MISMATCH", "CHUNK_INVALID", "FILE_HASH_MISMATCH",
         "UPLOAD_NOT_PERMITTED", "FORBIDDEN"

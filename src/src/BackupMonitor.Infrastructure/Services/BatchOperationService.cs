@@ -196,6 +196,16 @@ public class BatchOperationService : IBatchOperationService
             throw new BusinessException("INVALID_REQUEST",
                 $"没有可上传的候选备份集。跳过原因：{string.Join("；", skippedReasons)}", 422);
 
+        // 与单个手动下发同一条理由：管理员显式勾选了这些候选去上传，
+        // 这就是解除取消标记的那个明确动作。不解除的话，被取消过的候选在批量里
+        // 会走到建会话那一步才 409，而它此刻在界面上看起来是「已接受」。
+        foreach (var candidate in accepted.Where(c => c.CancelledAt is not null))
+        {
+            candidate.CancelledAt = null;
+            candidate.CancelledBy = null;
+            candidate.UpdatedAt = now;
+        }
+
         var batch = new Core.Entities.Upload.UploadBatch
         {
             Id = Guid.NewGuid(),

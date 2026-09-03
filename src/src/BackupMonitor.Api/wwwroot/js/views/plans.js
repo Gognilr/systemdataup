@@ -317,7 +317,7 @@ ACTIONS['plans:run'] = async runId => {
     cancel.className = 'small danger';
     cancel.textContent = '取消这次执行';
     cancel.addEventListener('click', async () => {
-      if (!await confirmModal('取消这次执行？还没开跑的项会被取消，正在跑的那几项会自己跑完。')) return;
+      if (!await confirmModal('取消这次执行？还没开跑的项会被取消，正在跑的那几项也会被停掉：它们的指令会被取消，已经开始的上传会中断，这一轮扫出来的备份不会再自动上传。')) return;
       try {
         await api(`/api/v1/admin/execution-runs/${runId}/cancel`, { method: 'POST' });
         toast('已取消', 'ok');

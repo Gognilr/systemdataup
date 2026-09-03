@@ -147,9 +147,14 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
                 // 备份集行还在（软删）、它那条 committed 会话也还在，
                 // 于是「这个候选没有入库痕迹」永远不成立，上传指令再也不会被复位重发。
                 // 问的是「这个候选现在有没有一份活着的备份，或者有没有在途的上传」。
+                //
+                // 「被管理员取消过」直接排除在复位重发之外。少了这一条，取消一次传输的实际效果
+                // 是几分钟后从头重传一遍：取消让会话变成 cancelled，于是下面这两个判据双双成立。
                 var uploadNeverLanded = existing.Status == CommandStatus.Succeeded
                     && existing.CommandType is CommandType.UploadCandidate or CommandType.UploadLatest
                     && existing.CandidateBackupSetId is not null
+                    && !await _db.CandidateBackupSets.AnyAsync(
+                        c => c.Id == existing.CandidateBackupSetId && c.CancelledAt != null, ct)
                     && !await _db.UploadSessions.AnyAsync(s =>
                         s.CandidateBackupSetId == existing.CandidateBackupSetId
                         && ((s.Status == UploadStatus.Committed

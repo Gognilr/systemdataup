@@ -29,6 +29,22 @@ public static class UploadSessionStatuses
     public static readonly UploadStatus[] Active =
         [UploadStatus.Created, UploadStatus.Uploading, UploadStatus.Paused, UploadStatus.RetryWait];
 
+    /// <summary>
+    /// 单客户端并发上限要数的状态：「这台机器同时有几路在往上传」。
+    ///
+    /// 与 <see cref="Active"/> 的差别只有 retry_wait，而这一个差别是有代价的：
+    /// retry_wait 保留的是断点，一路都没在传。把它算进来的后果是——
+    /// 一次失败留下的断点会挡住这台机器接下来所有单元的上传，
+    /// 而多账套任务（U8 一台机器 18 个账套）必然踩中：两个单元失败，
+    /// 这台机器接下来 6 小时（会话超时线）所有上传一律 409。
+    ///
+    /// paused 仍然算：它确实占着暂存空间，而且是人为的，不该被绕过。
+    /// 全局闸（SequentialExecutionWorker）问的是另一个问题——「服务端暂存盘同时被几路读写」——
+    /// 那边继续用 <see cref="Active"/>，两者不共用不是疏忽。
+    /// </summary>
+    public static readonly UploadStatus[] CountedPerClient =
+        [UploadStatus.Created, UploadStatus.Uploading, UploadStatus.Paused];
+
     /// <summary>能被暂停的状态：还在传或等着传的。</summary>
     public static readonly UploadStatus[] Pausable =
         [UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading, UploadStatus.RetryWait];

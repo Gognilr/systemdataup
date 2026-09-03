@@ -49,7 +49,11 @@ public interface IExecutionQueueService
     Task<bool> TryDeferUploadAsync(
         Guid clientId, Guid taskId, Guid candidateBackupSetId, CancellationToken ct = default);
 
-    /// <summary>取消一次执行：还没开跑的项一律置 cancelled，已经在跑的项交给它自己跑完</summary>
+    /// <summary>
+    /// 取消一次执行，并且真的停住：还没开跑的项置 cancelled，在跑的项取消它的指令、
+    /// 取消这次执行已产生的在途上传会话，并给相关候选打上取消标记。
+    /// 少了后面那几步，「取消」的实际行为是「在跑的预检继续扫，扫完照样自动下发全部上传」。
+    /// </summary>
     Task<ExecutionRunDto> CancelRunAsync(Guid runId, CancellationToken ct = default);
 }
 
@@ -67,14 +71,23 @@ public class ExecutionQueueService : IExecutionQueueService
     private readonly AppDbContext _db;
     private readonly IAuditRecorder _audit;
     private readonly SystemSettingsProvider _settings;
+
+    /// <summary>取消一次执行时要记下「是谁取消的」（写进候选的 cancelled_by）</summary>
+    private readonly ICurrentContext _context;
+
     private readonly ILogger<ExecutionQueueService> _logger;
 
     public ExecutionQueueService(
-        AppDbContext db, IAuditRecorder audit, SystemSettingsProvider settings, ILogger<ExecutionQueueService> logger)
+        AppDbContext db,
+        IAuditRecorder audit,
+        SystemSettingsProvider settings,
+        ICurrentContext context,
+        ILogger<ExecutionQueueService> logger)
     {
         _db = db;
         _audit = audit;
         _settings = settings;
+        _context = context;
         _logger = logger;
     }
 
@@ -229,13 +242,6 @@ public class ExecutionQueueService : IExecutionQueueService
     public async Task<bool> TryDeferUploadAsync(
         Guid clientId, Guid taskId, Guid candidateBackupSetId, CancellationToken ct = default)
     {
-        var limit = Math.Clamp(
-            await _settings.GetIntAsync(SequentialExecutionWorker.GlobalUploadLimitKey, 4, ct), 1, 64);
-        var active = await _db.UploadSessions
-            .CountAsync(s => UploadSessionStatuses.Active.Contains(s.Status), ct);
-        if (active < limit)
-            return false;
-
         // 同一个候选已经排着了就别再排一次：预检结果可能被重复上报（指令重试、
         // Agent 重启后补报），每次都排一条会让同一份备份传两遍。
         var alreadyQueued = await _db.Set<ExecutionRunItem>().AnyAsync(i =>
@@ -243,6 +249,9 @@ public class ExecutionQueueService : IExecutionQueueService
             && (i.Status == ExecutionItemStatus.Pending || i.Status == ExecutionItemStatus.Running), ct);
         if (alreadyQueued)
             return true;
+
+        if (!await ShouldQueueUploadAsync(taskId, ct))
+            return false;
 
         var now = DateTime.UtcNow;
         var run = new ExecutionRun
@@ -271,9 +280,37 @@ public class ExecutionQueueService : IExecutionQueueService
         _db.ExecutionRuns.Add(run);
         await _db.SaveChangesAsync(ct);
 
-        _logger.LogInformation(
-            "全局上传并发已达上限（{Limit}），候选 {Candidate} 排队等待名额", limit, candidateBackupSetId);
+        _logger.LogInformation("候选 {Candidate} 的上传已排进队列等待放行", candidateBackupSetId);
         return true;
+    }
+
+    /// <summary>
+    /// 这次自动上传该不该排队，而不是当场下发。两个理由，任一成立就排队：
+    ///
+    /// 一、这次预检本身是执行队列下发的。多单元任务的上传必须回到队列里按名额放行——
+    ///     预检结果一到就逐个单元当场下发，完全绕开了执行的并发度，
+    ///     所以「严格顺序（1）」对 U8 那种一台机器 18 个账套的任务名不副实：
+    ///     一次预检回来 18 个单元同时开传。
+    ///     刻意排进一次**独立**的执行，而不是塞回原来那次：原执行的预检项还在 Running，
+    ///     并发度 1 时它会把新加的上传项挡在门外，而它自己又在等这些上传产生的会话——
+    ///     那是一个谁也动不了的死锁。
+    ///
+    /// 二、全局上传名额已经满了（D3 原有判据）。
+    /// </summary>
+    private async Task<bool> ShouldQueueUploadAsync(Guid taskId, CancellationToken ct)
+    {
+        var queueDriven = await _db.Set<ExecutionRunItem>().AnyAsync(i =>
+            i.TaskId == taskId
+            && i.CommandType == CommandType.PrecheckTask
+            && (i.Status == ExecutionItemStatus.Pending || i.Status == ExecutionItemStatus.Running), ct);
+        if (queueDriven)
+            return true;
+
+        var limit = Math.Clamp(
+            await _settings.GetIntAsync(SequentialExecutionWorker.GlobalUploadLimitKey, 4, ct), 1, 64);
+        var active = await _db.UploadSessions
+            .CountAsync(s => UploadSessionStatuses.Active.Contains(s.Status), ct);
+        return active >= limit;
     }
 
     /// <summary>不参与执行的任务与它的原因；null 表示可以执行</summary>
@@ -344,16 +381,92 @@ public class ExecutionQueueService : IExecutionQueueService
             item.FinishedAt = now;
         }
 
-        // 已经在跑的那几项交给它们自己跑完：中途掐断上传只会留下半份数据，
-        // 而队列的作用是「不再放行新的」。
-        var stillRunning = run.Items.Any(i => i.Status == ExecutionItemStatus.Running);
+        // 在跑的那几项也要真的停住。原先这里只处理 Pending 项、把在跑的交给它们自己跑完，
+        // 于是「取消这次执行」的实际行为是：在跑的预检继续扫，扫完照样自动下发全部单元的上传。
+        // 人点取消想要的是「别再传了」，拿到的却是「再等十分钟然后开始传」。
+        var runningItems = run.Items.Where(i => i.Status == ExecutionItemStatus.Running).ToList();
+        var commandIds = runningItems.Where(i => i.CommandId is not null).Select(i => i.CommandId!.Value).ToList();
+        var taskIds = runningItems.Select(i => i.TaskId).Distinct().ToList();
+        var startedAt = runningItems.Count == 0
+            ? now
+            : runningItems.Min(i => i.StartedAt ?? run.StartedAt ?? run.CreatedAt);
+
+        var cancelledCommands = 0;
+        if (commandIds.Count > 0)
+        {
+            // 还没被客户端跑完的指令直接置 cancelled；已经终结的不动
+            cancelledCommands = await _db.Commands
+                .Where(c => commandIds.Contains(c.Id)
+                    && (c.Status == CommandStatus.Pending
+                        || c.Status == CommandStatus.Claimed
+                        || c.Status == CommandStatus.Running))
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(c => c.Status, CommandStatus.Cancelled)
+                    .SetProperty(c => c.CompletedAt, now)
+                    .SetProperty(c => c.ResultMessage, "这次执行被管理员取消"), ct);
+        }
+
+        // 这次执行已经产生的、还在途的上传会话一并取消
+        var cancelledSessions = 0;
+        var cancelledCandidates = 0;
+        if (taskIds.Count > 0)
+        {
+            var sessions = await _db.UploadSessions
+                .Where(s => taskIds.Contains(s.TaskId)
+                    && s.CreatedAt >= startedAt
+                    && UploadSessionStatuses.InFlight.Contains(s.Status))
+                .ToListAsync(ct);
+
+            foreach (var session in sessions)
+            {
+                session.Status = UploadStatus.Cancelled;
+                session.CompletedAt = now;
+                session.UpdatedAt = now;
+            }
+            cancelledSessions = sessions.Count;
+
+            // 候选上也要打标记，否则预检回来之后自动下发会把这些上传原样再发一遍——
+            // 「取消」在那条路径上是看不见的，它只认「有没有已入库的痕迹」。
+            var candidates = await _db.CandidateBackupSets
+                .Where(c => taskIds.Contains(c.TaskId)
+                    && c.CancelledAt == null
+                    && (c.PrecheckedAt >= startedAt || sessions.Select(s => s.CandidateBackupSetId).Contains(c.Id)))
+                .ToListAsync(ct);
+
+            foreach (var candidate in candidates)
+            {
+                candidate.CancelledAt = now;
+                candidate.CancelledBy = _context.UserId;
+                candidate.UpdatedAt = now;
+            }
+            cancelledCandidates = candidates.Count;
+        }
+
+        foreach (var item in runningItems)
+        {
+            item.Status = ExecutionItemStatus.Cancelled;
+            item.Message = "执行被取消";
+            item.FinishedAt = now;
+        }
+
         run.Status = BatchStatus.Cancelled;
-        run.FinishedAt = stillRunning ? null : now;
+        run.FinishedAt = now;
 
         await _db.SaveChangesAsync(ct);
 
         await _audit.RecordAsync("execution_run.cancel", AuditResult.Success, "execution_run", run.Id,
-            afterData: JsonSerializer.Serialize(new { stillRunning }), ct: ct);
+            afterData: JsonSerializer.Serialize(new
+            {
+                cancelledItems = runningItems.Count,
+                cancelledCommands,
+                cancelledSessions,
+                cancelledCandidates
+            }), ct: ct);
+
+        _logger.LogInformation(
+            "执行 {RunId} 已取消：停掉 {Items} 个在跑的项、{Commands} 条指令、{Sessions} 个上传会话，"
+            + "并给 {Candidates} 个候选打上取消标记",
+            run.Id, runningItems.Count, cancelledCommands, cancelledSessions, cancelledCandidates);
 
         return await GetRunAsync(runId, ct);
     }

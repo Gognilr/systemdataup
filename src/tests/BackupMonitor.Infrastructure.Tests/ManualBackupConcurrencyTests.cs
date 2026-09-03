@@ -221,30 +221,26 @@ public class ManualBackupConcurrencyTests : IAsyncLifetime
     /// 十台不同客户端同时点「立即备份」：任一时刻全局活动上传会话数不超过
     /// max_concurrent_uploads_total，其余排队。按客户端的那条检查在这里一次都不会触发——
     /// 这正是它管不了的那个场景。
+    ///
+    /// C1：这条原先播种的是**预检**项，断言「预检项也被上传闸挡住」。
+    /// 那个行为本身是缺陷——预检只让客户端扫目录算哈希，一个上传名额都不占，
+    /// 而 Pending 项当时没有超时、计划又不允许叠一次执行，于是一挡就是永久的。
+    /// 现在播种真实的上传项来验证闸仍然有效，预检项不受闸影响由下面那条单独钉住。
     /// </summary>
     [Fact]
-    public async Task 全局上传并发达到上限时不再放行新项()
+    public async Task 全局上传并发达到上限时不再放行新的上传项()
     {
-        var taskIds = new List<Guid>();
-        var clientIds = new List<Guid>();
+        var clients = new List<(Guid ClientId, Guid TaskId)>();
         for (var i = 0; i < 4; i++)
-        {
-            var (clientId, taskId) = await SeedClientTaskAsync();
-            clientIds.Add(clientId);
-            taskIds.Add(taskId);
-        }
+            clients.Add(await SeedClientTaskAsync());
 
         await SetSettingAsync(SequentialExecutionWorker.GlobalUploadLimitKey, "2");
-        await SetSettingAsync(ExecutionQueueService.ManualMaxConcurrentKey, "10");
 
-        Guid runId;
-        await using (var scope = _services.CreateAsyncScope())
-            runId = (await scope.ServiceProvider.GetRequiredService<IBackupTaskService>()
-                .DispatchPrecheckBatchAsync(new BatchBackupNowRequest { TaskIds = taskIds })).ExecutionRunId!.Value;
+        var runId = await SeedUploadRunAsync(clients);
 
         // 两台客户端已经在传（各自一个会话，按客户端的检查不会拦——它们不是同一台）
-        await SeedActiveUploadAsync(clientIds[0], taskIds[0]);
-        await SeedActiveUploadAsync(clientIds[1], taskIds[1]);
+        await SeedActiveUploadAsync(clients[0].ClientId, clients[0].TaskId);
+        await SeedActiveUploadAsync(clients[1].ClientId, clients[1].TaskId);
 
         await RunPassAsync();
 
@@ -261,6 +257,39 @@ public class ManualBackupConcurrencyTests : IAsyncLifetime
         await RunPassAsync();
         Assert.True(await CountAsync(runId, ExecutionItemStatus.Running) > 0,
             "名额释放之后排队的项必须能开跑，否则限流就变成了饿死");
+    }
+
+    /// <summary>
+    /// C1：全局上传名额满了，计划/批量里的**预检**项仍然要能开跑。
+    ///
+    /// 预检只是让客户端扫一遍目录算哈希，一个上传名额都不占。拿上传闸挡住它，
+    /// 等于「服务端有 4 个会话在传」就让所有计划连扫描都不许开始；
+    /// 而 CreatePlanRunAsync 规定「上一次没跑完就不再建新的」，
+    /// 于是一次卡住 = 这个计划永久不再执行，现场表现是它停在「排队中」。
+    /// </summary>
+    [Fact]
+    public async Task 全局上传名额满时预检项仍然能开跑()
+    {
+        var taskIds = new List<Guid>();
+        for (var i = 0; i < 4; i++)
+        {
+            var (clientId, taskId) = await SeedClientTaskAsync();
+            taskIds.Add(taskId);
+            await SeedActiveUploadAsync(clientId, taskId);   // 四个活动会话，名额占满
+        }
+
+        await SetSettingAsync(SequentialExecutionWorker.GlobalUploadLimitKey, "4");
+        await SetSettingAsync(ExecutionQueueService.ManualMaxConcurrentKey, "10");
+
+        Guid runId;
+        await using (var scope = _services.CreateAsyncScope())
+            runId = (await scope.ServiceProvider.GetRequiredService<IBackupTaskService>()
+                .DispatchPrecheckBatchAsync(new BatchBackupNowRequest { TaskIds = taskIds })).ExecutionRunId!.Value;
+
+        await RunPassAsync();
+
+        Assert.Equal(4, await CountAsync(runId, ExecutionItemStatus.Running));
+        Assert.Equal(0, await CountAsync(runId, ExecutionItemStatus.Pending));
     }
 
     /// <summary>上限设为 1：行为退化成串行，且不会死锁——放不出去就等下一轮，而不是判失败。</summary>
@@ -351,6 +380,65 @@ public class ManualBackupConcurrencyTests : IAsyncLifetime
 
         // SystemSettingsProvider 带缓存，改完要让它重新读一遍，否则测试改的值根本不生效。
         scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>().Invalidate();
+    }
+
+    /// <summary>
+    /// 播一次「上传」执行：每个任务一个已通过预检的候选 + 一个 UploadCandidate 项。
+    /// 上传闸只对这类项生效，验证它就得播真的上传项，而不是预检项。
+    /// </summary>
+    private async Task<Guid> SeedUploadRunAsync(List<(Guid ClientId, Guid TaskId)> targets)
+    {
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var now = DateTime.UtcNow;
+
+        var run = new Core.Entities.Execution.ExecutionRun
+        {
+            Id = Guid.NewGuid(),
+            Kind = ExecutionRunKind.Manual,
+            Name = "上传闸测试",
+            Status = BatchStatus.Pending,
+            MaxConcurrent = 10,
+            ItemTimeoutMinutes = 120,
+            TriggerSource = "test",
+            CreatedAt = now,
+            TotalItems = targets.Count
+        };
+
+        var sort = 0;
+        foreach (var (clientId, taskId) in targets)
+        {
+            var candidate = new CandidateBackupSet
+            {
+                Id = Guid.NewGuid(),
+                ClientId = clientId,
+                TaskId = taskId,
+                CandidateKey = $"gate-{Guid.NewGuid():N}",
+                SourceRoot = @"D:\data",
+                DiscoveredAt = now,
+                PrecheckStatus = PrecheckStatus.Passed,
+                TotalFiles = 1,
+                TotalBytes = 1,
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+            db.CandidateBackupSets.Add(candidate);
+
+            run.Items.Add(new Core.Entities.Execution.ExecutionRunItem
+            {
+                Id = Guid.NewGuid(),
+                SortOrder = sort++,
+                ClientId = clientId,
+                TaskId = taskId,
+                CandidateBackupSetId = candidate.Id,
+                CommandType = CommandType.UploadCandidate,
+                Status = ExecutionItemStatus.Pending
+            });
+        }
+
+        db.ExecutionRuns.Add(run);
+        await db.SaveChangesAsync();
+        return run.Id;
     }
 
     private async Task SeedActiveUploadAsync(Guid clientId, Guid taskId)

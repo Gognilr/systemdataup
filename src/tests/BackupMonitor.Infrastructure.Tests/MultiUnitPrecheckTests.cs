@@ -43,7 +43,7 @@ public class MultiUnitPrecheckTests : IAsyncLifetime
 
     public MultiUnitPrecheckTests(PostgresDatabaseFixture fixture) => _fixture = fixture;
 
-    public Task InitializeAsync()
+    public async Task InitializeAsync()
     {
         _dispatcher = new RecordingCommandDispatcher();
 
@@ -65,7 +65,19 @@ public class MultiUnitPrecheckTests : IAsyncLifetime
             sp.GetRequiredService<IServiceScopeFactory>(),
             sp.GetRequiredService<ILogger<SystemSettingsProvider>>()));
         _services = sc.BuildServiceProvider();
-        return Task.CompletedTask;
+
+        // 这一组测的是「每个业务单元各自下发一条上传」，与全局上传名额无关。
+        // 但名额是一条**全库共享**的系统配置，而并发那一组会把它压到 1 或 2 并留下活动会话；
+        // 名额一满，自动下发就改成排队（TryDeferUploadAsync），下发计数变成 0，
+        // 这一组就会随测试执行顺序时好时坏。显式把名额顶开，让它只测自己那件事。
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await db.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO system_settings (setting_key, setting_value, encrypted, updated_by)
+            VALUES ({SequentialExecutionWorker.GlobalUploadLimitKey}, '64'::jsonb, false, NULL)
+            ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value
+            """);
+        scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>().Invalidate();
     }
 
     public async Task DisposeAsync() => await _services.DisposeAsync();

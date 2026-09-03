@@ -110,14 +110,30 @@ public class UploadSessionControlService : IUploadSessionControlService
             throw new BusinessException("CONFLICT",
                 $"会话当前状态为 {EnumMapping.ToSnakeCase(session.Status)}，不能取消", 409);
 
+        var now = DateTime.UtcNow;
         session.Status = UploadStatus.Cancelled;
-        session.CompletedAt = DateTime.UtcNow;
-        session.UpdatedAt = DateTime.UtcNow;
+        session.CompletedAt = now;
+        session.UpdatedAt = now;
+
+        // 取消必须同时记在候选上，否则它不生效：只改会话状态的话，
+        // CommandService 随后判「这个候选没有 committed、也没有 InFlight 会话」
+        // → 认定上传从没落地 → 指令复位重发 → 建会话时旧会话是 cancelled、
+        // 幂等键被释放 → 建一个全新会话从 0 重传。取消于是变成「几分钟后从头再传一遍」。
+        var candidate = await _db.CandidateBackupSets
+            .FirstOrDefaultAsync(c => c.Id == session.CandidateBackupSetId, ct);
+        if (candidate is not null && candidate.CancelledAt is null)
+        {
+            candidate.CancelledAt = now;
+            candidate.CancelledBy = _context.UserId;
+            candidate.UpdatedAt = now;
+        }
+
         await _db.SaveChangesAsync(ct);
 
         await _audit.RecordAsync("upload.session.cancel", AuditResult.Success, "upload_session", session.Id,
-            afterData: JsonSerializer.Serialize(new { by = "admin" }), ct: ct);
-        _logger.LogInformation("上传会话 {SessionId} 已被管理员取消", session.Id);
+            afterData: JsonSerializer.Serialize(new { by = "admin", candidateId = session.CandidateBackupSetId }), ct: ct);
+        _logger.LogInformation("上传会话 {SessionId} 已被管理员取消，候选 {Candidate} 已标记为取消",
+            session.Id, session.CandidateBackupSetId);
     }
 
     private async Task<Core.Entities.Upload.UploadSession> Load(Guid sessionId, CancellationToken ct) =>

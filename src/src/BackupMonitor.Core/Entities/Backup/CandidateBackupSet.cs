@@ -50,6 +50,22 @@ public class CandidateBackupSet
     /// <summary>被哪个新候选替代</summary>
     public Guid? SupersededById { get; set; }
 
+    /// <summary>
+    /// 管理员主动取消了这一份的上传（V033）。
+    ///
+    /// 取消若只落在会话上是不生效的：随后 CommandService 判「这个候选没有 committed、
+    /// 也没有 InFlight 会话」→ 认定上传从没落地 → 指令复位重发 →
+    /// 建会话时旧会话是 cancelled、幂等键被释放 → 建一个全新会话从 0 重传。
+    /// 取消于是变成「几分钟后从头再传一遍」。这个标记是让取消真的停住的那一处状态。
+    ///
+    /// 清除时机只有两个：源文件变了（清单哈希变化）重新预检，
+    /// 或管理员显式再点一次上传——都是「我确实还想要这一份」的明确表示。
+    /// </summary>
+    public DateTime? CancelledAt { get; set; }
+
+    /// <summary>执行取消的操作人</summary>
+    public Guid? CancelledBy { get; set; }
+
     public DateTime CreatedAt { get; set; }
 
     public DateTime UpdatedAt { get; set; }
