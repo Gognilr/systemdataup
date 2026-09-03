@@ -81,6 +81,10 @@ public class BackupTaskService : IBackupTaskService
     private readonly IAuditRecorder _audit;
     private readonly SystemSettingsProvider _settings;
     private readonly IExecutionQueueService _queue;
+
+    /// <summary>删除任务时要清掉回收站里那些备份集的仓库目录，需要仓库根做围栏</summary>
+    private readonly IUploadStorage _storage;
+
     private readonly ILogger<BackupTaskService> _logger;
 
     public BackupTaskService(
@@ -90,6 +94,7 @@ public class BackupTaskService : IBackupTaskService
         IAuditRecorder audit,
         SystemSettingsProvider settings,
         IExecutionQueueService queue,
+        IUploadStorage storage,
         ILogger<BackupTaskService> logger)
     {
         _db = db;
@@ -98,6 +103,7 @@ public class BackupTaskService : IBackupTaskService
         _audit = audit;
         _settings = settings;
         _queue = queue;
+        _storage = storage;
         _logger = logger;
     }
 
@@ -222,46 +228,28 @@ public class BackupTaskService : IBackupTaskService
         var task = await _db.BackupTasks.FirstOrDefaultAsync(t => t.Id == taskId, ct)
             ?? throw new NotFoundException("备份任务", taskId);
 
-        var hasSets = await _db.BackupSets.AnyAsync(s => s.TaskId == taskId, ct);
-        if (hasSets)
-            throw new BusinessException("CONFLICT", "任务已有入库备份版本，不能删除（请先处理保留策略）", 409);
-
-        var hasCandidates = await _db.CandidateBackupSets.AnyAsync(c => c.TaskId == taskId, ct);
-        if (hasCandidates)
-            throw new BusinessException("CONFLICT", "任务存在候选备份集，不能删除", 409);
+        // 只有「还活着」的备份版本才挡删除。回收站里的和已彻底删除的行仍然在表里，
+        // 拿它们挡住删除，等于任何成功备份过一次的任务永远删不掉——
+        // 而原先的提示「请先处理保留策略」指向的是一条走不通的路：
+        // 清空回收站、物理删除之后这些行照样在。
+        var hasLiveSets = await _db.BackupSets.AnyAsync(
+            s => s.TaskId == taskId && BackupSetStatuses.Live.Contains(s.Status), ct);
+        if (hasLiveSets)
+            throw new BusinessException("CONFLICT",
+                "任务下还有可用的备份版本。请先在「备份集」页面把它们删除（会进回收站），再删除任务。", 409);
 
         var hasActiveSessions = await _db.UploadSessions.AnyAsync(s =>
             s.TaskId == taskId && ActiveUploadStatuses.Contains(s.Status), ct);
         if (hasActiveSessions)
-            throw new BusinessException("CONFLICT", "任务存在活动上传会话，不能删除", 409);
+            throw new BusinessException("CONFLICT", "任务存在正在进行的上传，等它结束或先取消再删除", 409);
 
-        // 历史上传会话同样通过外键钉住任务。走到这里候选集必然已清空，
-        // 正常不会再有遗留会话；真有就明确报出来，而不是让数据库把它变成 500。
-        var hasUploadSessions = await _db.UploadSessions.AnyAsync(s => s.TaskId == taskId, ct);
-        if (hasUploadSessions)
-            throw new BusinessException("CONFLICT", "任务存在历史上传会话记录，不能删除", 409);
+        // 原先这里还有两道守卫：「存在候选备份集」和「存在历史上传会话记录」。
+        // 两条都没有可满足的路径——候选备份集全系统没有任何删除入口，
+        // 历史会话是永久保留的。它们和上面那条一起，让任何跑过一次的任务永远删不掉。
+        // 候选、历史会话、已删除的备份集都是任务的附属记录，任务没了它们也失去意义，
+        // 与下面已有的 commands / alerts 一样随任务一并清理。
 
-        // 指令和告警都由外键（ON DELETE NO ACTION）钉着任务。
-        // 原先只是把 pending 指令改成 cancelled——行还在，于是任何点过一次预检的任务
-        // 都会在删除时触发外键冲突，前端只看到「服务器内部错误」，完全无从判断。
-        // 这两类都是任务的附属记录，任务没了它们也失去意义，随任务一并清理；
-        // 删除动作本身记在审计日志里，数量一并留痕。
-        var removedCommands = await _db.Commands
-            .Where(c => c.TaskId == taskId)
-            .ExecuteDeleteAsync(ct);
-        // 审计 G-13：先把这些告警下还没发出去的通知取消掉，再删告警。
-        // notification_deliveries.alert_id 是「告警删除后置空」，删完这些投递会变成
-        // 孤儿 pending 记录——派发器只看投递自身的状态，于是任务都删掉了，
-        // 它的告警邮件还在继续重试发送。顺序不能反：删完告警就查不到 task_id 了。
-        var cancelledDeliveries = await _db.NotificationDeliveries
-            .Where(d => d.Alert != null
-                        && d.Alert.TaskId == taskId
-                        && d.Status == NotificationStatus.Pending)
-            .ExecuteUpdateAsync(s => s.SetProperty(d => d.Status, NotificationStatus.Cancelled), ct);
-
-        var removedAlerts = await _db.Alerts
-            .Where(a => a.TaskId == taskId)
-            .ExecuteDeleteAsync(ct);
+        var deleted = await CascadeDeleteTaskDependentsAsync(taskId, ct);
 
         _db.BackupTasks.Remove(task);
         await _db.SaveChangesAsync(ct);
@@ -272,10 +260,144 @@ public class BackupTaskService : IBackupTaskService
                 task.Id,
                 task.Name,
                 task.ClientId,
-                removedCommands,
-                removedAlerts,
-                cancelledDeliveries
+                deleted.RemovedCommands,
+                deleted.RemovedAlerts,
+                deleted.CancelledDeliveries,
+                deleted.RemovedBackupSets,
+                deleted.RemovedCandidates,
+                deleted.RemovedUploadSessions,
+                deleted.RemovedRestoreRequests,
+                deleted.RemovedExecutionItems,
+                deleted.RemovedRepositoryDirectories
             }), ct: ct);
+    }
+
+    /// <summary>删除任务时一并清掉的附属记录数量，落进审计日志。</summary>
+    private readonly record struct TaskCascadeResult(
+        int RemovedCommands,
+        int RemovedAlerts,
+        int CancelledDeliveries,
+        int RemovedBackupSets,
+        int RemovedCandidates,
+        int RemovedUploadSessions,
+        int RemovedRestoreRequests,
+        int RemovedExecutionItems,
+        int RemovedRepositoryDirectories);
+
+    /// <summary>
+    /// 级联清理任务的全部附属记录。
+    ///
+    /// 顺序由外键决定，不能调整：这些表之间大多是 ON DELETE NO ACTION，
+    /// 顺序错了不会得到一句「顺序不对」，而是一条外键冲突异常，
+    /// 前端看到的是「服务器内部错误」——正是这条缺陷原来的表现。
+    /// 每一步都说明它为什么必须在这个位置。
+    /// </summary>
+    private async Task<TaskCascadeResult> CascadeDeleteTaskDependentsAsync(Guid taskId, CancellationToken ct)
+    {
+        // 走到这里剩下的备份集只可能是 recycle_bin / deleted（活着的已被守卫挡住）。
+        // 先取出来：物理目录要在删行之前清掉，删完行就再也不知道路径了。
+        var setIds = await _db.BackupSets
+            .Where(s => s.TaskId == taskId)
+            .Select(s => new { s.Id, s.Status, s.RepositoryPath, s.BackupSetCode })
+            .ToListAsync(ct);
+
+        var unitIds = await _db.BusinessUnits
+            .Where(u => u.TaskId == taskId)
+            .Select(u => u.Id)
+            .ToListAsync(ct);
+
+        // 一、通知与告警。必须在删备份集/业务单元之前：alerts.backup_set_id 与
+        // alerts.business_unit_id 都是 NO ACTION，留着它们就删不掉被引用的行。
+        // 而删告警之前要先取消它下面还没发出去的投递——notification_deliveries.alert_id
+        // 是「告警删除后置空」，删完告警这些投递会变成孤儿 pending 记录，
+        // 派发器只看投递自身的状态，于是任务都删掉了，它的告警邮件还在继续重试发送。
+        // 这两步的顺序也不能反：删完告警就查不到 task_id 了。
+        var cancelledDeliveries = await _db.NotificationDeliveries
+            .Where(d => d.Alert != null
+                        && (d.Alert.TaskId == taskId
+                            || (d.Alert.BackupSetId != null && setIds.Select(s => s.Id).Contains(d.Alert.BackupSetId.Value))
+                            || (d.Alert.BusinessUnitId != null && unitIds.Contains(d.Alert.BusinessUnitId.Value)))
+                        && d.Status == NotificationStatus.Pending)
+            .ExecuteUpdateAsync(s => s.SetProperty(d => d.Status, NotificationStatus.Cancelled), ct);
+
+        var removedAlerts = await _db.Alerts
+            .Where(a => a.TaskId == taskId
+                || (a.BackupSetId != null && setIds.Select(s => s.Id).Contains(a.BackupSetId.Value))
+                || (a.BusinessUnitId != null && unitIds.Contains(a.BusinessUnitId.Value)))
+            .ExecuteDeleteAsync(ct);
+
+        // 二、指令。commands.task_id 与 commands.candidate_backup_set_id 都是 NO ACTION，
+        // 必须在候选之前删掉。原先只是把 pending 指令改成 cancelled——行还在，
+        // 于是任何点过一次预检的任务都会在删除时触发外键冲突。
+        var removedCommands = await _db.Commands
+            .Where(c => c.TaskId == taskId)
+            .ExecuteDeleteAsync(ct);
+
+        // 三、执行队列项。execution_run_items.task_id 本身是 CASCADE，但它同时引用候选和会话
+        // （SET NULL），显式先删掉，免得依赖两条级联规则的相对顺序。
+        var removedExecutionItems = await _db.ExecutionRunItems
+            .Where(i => i.TaskId == taskId)
+            .ExecuteDeleteAsync(ct);
+
+        // 四、恢复请求。restore_requests.backup_set_id 是 NO ACTION，
+        // 必须在备份集之前删。EnsureRemovable 那类守卫只挡住「正在恢复」的，
+        // 历史上完成过的恢复请求会一直留着——不清它，删任务照样撞外键。
+        var setIdList = setIds.Select(s => s.Id).ToList();
+        var removedRestoreRequests = setIdList.Count == 0
+            ? 0
+            : await _db.RestoreRequests
+                .Where(r => setIdList.Contains(r.BackupSetId))
+                .ExecuteDeleteAsync(ct);
+
+        // 五、物理目录。回收站里的备份集目录还在磁盘上，删完行就没人知道它的路径了，
+        // 只能等 RepositoryReconcileWorker 事后把它报成孤儿目录。
+        var removedDirectories = 0;
+        var recyclable = setIds.Where(s => s.Status == BackupSetStatus.RecycleBin
+            && !string.IsNullOrWhiteSpace(s.RepositoryPath)).ToList();
+        if (recyclable.Count > 0)
+        {
+            var repositoryRoot = await _storage.GetRepositoryRootAsync(ct);
+            foreach (var s in recyclable)
+            {
+                if (RepositoryDirectory.DeleteUnderRoot(s.RepositoryPath, repositoryRoot))
+                    removedDirectories++;
+                else
+                    _logger.LogWarning("删除任务时备份集 {Code} 的仓库目录不存在，只做逻辑删除：{Path}",
+                        s.BackupSetCode, s.RepositoryPath);
+            }
+        }
+
+        // 六、备份集。backup_files 与 retention_locks 是 CASCADE，随它一起走。
+        // 必须在候选与上传会话之前：backup_sets 同时引用这两者（NO ACTION）。
+        var removedBackupSets = await _db.BackupSets
+            .Where(s => s.TaskId == taskId)
+            .ExecuteDeleteAsync(ct);
+
+        // 七、上传会话。upload_files → upload_chunks 都是 CASCADE。
+        // 必须在候选之前：upload_sessions.candidate_backup_set_id 是 NOT NULL 的 NO ACTION。
+        var removedUploadSessions = await _db.UploadSessions
+            .Where(s => s.TaskId == taskId)
+            .ExecuteDeleteAsync(ct);
+
+        // 八、候选备份集。candidate_files 是 CASCADE；superseded_by_id 是同表自引用，
+        // 一条 DELETE 里一起删掉不会互相挡住。
+        var removedCandidates = await _db.CandidateBackupSets
+            .Where(c => c.TaskId == taskId)
+            .ExecuteDeleteAsync(ct);
+
+        // business_units.task_id 是 ON DELETE CASCADE，随任务自己走——
+        // 但引用它的候选与备份集必须先清掉（上面两步），否则这条级联会被外键挡住。
+
+        return new TaskCascadeResult(
+            removedCommands,
+            removedAlerts,
+            cancelledDeliveries,
+            removedBackupSets,
+            removedCandidates,
+            removedUploadSessions,
+            removedRestoreRequests,
+            removedExecutionItems,
+            removedDirectories);
     }
 
     public async Task<PagedResult<BackupTaskListItemDto>> GetListAsync(BackupTaskQuery query, CancellationToken ct = default)
@@ -620,7 +742,9 @@ public class BackupTaskService : IBackupTaskService
         if (candidate.SupersededById is not null)
             throw new BusinessException("CANDIDATE_SUPERSEDED", "候选备份集已被新候选替代", 409);
 
-        var archived = await _db.BackupSets.AnyAsync(s => s.SourceCandidateId == candidate.Id, ct);
+        // 状态过滤不能省：删掉的备份集行仍在表里，不过滤就是「删了再也备不回来」
+        var archived = await _db.BackupSets.AnyAsync(
+            s => s.SourceCandidateId == candidate.Id && BackupSetStatuses.Live.Contains(s.Status), ct);
         if (archived)
             throw new BusinessException("CANDIDATE_ALREADY_ARCHIVED", "候选备份集已入库", 409);
 

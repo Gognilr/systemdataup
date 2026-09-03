@@ -123,10 +123,19 @@ public class UploadSessionService : IUploadSessionService
         if (candidate.SupersededById is not null)
             throw new BusinessException("CANDIDATE_CHANGED", "候选已被新候选替代", 409);
 
-        // 是否已入库（一个候选只能产生一个正式版本）
-        if (await _db.BackupSets.AnyAsync(b => b.SourceCandidateId == candidate.Id, ct))
+        // 是否已入库（一个候选同时只能有一个活着的正式版本）。
+        // 判据必须带状态过滤：软删的备份集行还在，不过滤就等于「删了再也备不回来」。
+        if (await _db.BackupSets.AnyAsync(
+                b => b.SourceCandidateId == candidate.Id && BackupSetStatuses.Live.Contains(b.Status), ct))
             throw new BusinessException("CANDIDATE_ALREADY_ARCHIVED", "该候选已正式入库", 409);
-        if (await _db.UploadSessions.AnyAsync(s => s.CandidateBackupSetId == candidate.Id && s.Status == UploadStatus.Committed, ct))
+
+        // 同理由：committed 会话是永久保留的，光看会话会把「已删除的那次入库」也算进来。
+        // 这里要问的是「这个候选现在有没有一份活着的备份」，会话只是它的证据之一。
+        var committedAndLive = await _db.UploadSessions.AnyAsync(
+            s => s.CandidateBackupSetId == candidate.Id
+                && s.Status == UploadStatus.Committed
+                && _db.BackupSets.Any(b => b.UploadSessionId == s.Id && BackupSetStatuses.Live.Contains(b.Status)), ct);
+        if (committedAndLive)
             throw new BusinessException("CANDIDATE_ALREADY_ARCHIVED", "该候选已正式入库", 409);
 
         // manifest 一致性

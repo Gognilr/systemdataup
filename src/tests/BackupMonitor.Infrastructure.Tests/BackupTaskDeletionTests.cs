@@ -5,6 +5,7 @@ using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Exceptions;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace BackupMonitor.Infrastructure.Tests;
@@ -12,25 +13,35 @@ namespace BackupMonitor.Infrastructure.Tests;
 /// <summary>
 /// 删除备份任务的回归测试。
 ///
-/// 背景：commands 和 alerts 都以 ON DELETE NO ACTION 指向 backup_tasks。
+/// 背景一：commands 和 alerts 都以 ON DELETE NO ACTION 指向 backup_tasks。
 /// 删除逻辑原先只把 pending 指令改成 cancelled——行仍然留在表里，
 /// 于是任何被点过一次预检的任务在删除时都会撞上外键约束，
 /// 异常兜底成 500「服务器内部错误，请稍后重试」，而重试永远不会成功。
-/// 这条路径此前完全没有测试覆盖：已有测试都在删一个刚建出来、没有任何附属记录的任务。
+///
+/// 背景二（D4）：三道守卫（有备份集 / 有候选 / 有历史会话）都没有状态过滤，
+/// 也都没有可满足的路径——候选备份集全系统没有删除入口，历史会话永久保留，
+/// 而备份集是软删、行永远在。合起来的效果是「成功备份过一次的任务永远删不掉」，
+/// 提示还写着「请先处理保留策略」，指向一条走不通的路。
+/// 现在只有「还活着的备份版本」挡删除，其余附属记录随任务级联清理。
 /// </summary>
 [Collection("postgres")]
 public class BackupTaskDeletionTests : IAsyncLifetime
 {
     private readonly PostgresDatabaseFixture _fixture;
     private ServiceProvider _services = null!;
+    private string _repositoryRoot = null!;
 
     public BackupTaskDeletionTests(PostgresDatabaseFixture fixture) => _fixture = fixture;
 
-    public Task InitializeAsync()
+    public async Task InitializeAsync()
     {
+        _repositoryRoot = Path.Combine(Path.GetTempPath(), "bm-taskdel-test", Guid.NewGuid().ToString("N"), "repo");
+        Directory.CreateDirectory(_repositoryRoot);
+
         var sc = new ServiceCollection();
         sc.AddLogging();
         sc.AddDbContext<AppDbContext>(o => o.UseNpgsql(_fixture.ConnectionString));
+        sc.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
         sc.AddSingleton<ICurrentContext, NullCurrentContext>();
         sc.AddScoped<IAuditRecorder, DbAuditRecorder>();
         sc.AddScoped<IAgentNotificationService, AgentNotificationService>();
@@ -40,9 +51,18 @@ public class BackupTaskDeletionTests : IAsyncLifetime
         sc.AddScoped<IAgentConfigService, AgentConfigService>();
         sc.AddScoped<SystemSettingsProvider>();
         sc.AddScoped<IExecutionQueueService, ExecutionQueueService>();
+        // D4：删除任务要清掉回收站里那些备份集的仓库目录，围栏以仓库根为准
+        sc.AddScoped<IUploadStorage, UploadStorage>();
         sc.AddScoped<IBackupTaskService, BackupTaskService>();
         _services = sc.BuildServiceProvider();
-        return Task.CompletedTask;
+
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        await db.Database.ExecuteSqlInterpolatedAsync($"""
+            UPDATE system_settings
+            SET setting_value = to_jsonb({_repositoryRoot}::text)
+            WHERE setting_key = 'repository_path'
+            """);
     }
 
     public async Task DisposeAsync() => await _services.DisposeAsync();
@@ -157,11 +177,15 @@ public class BackupTaskDeletionTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// 候选备份集仍然必须挡住删除，并且要给出 409 和能读懂的原因——
-    /// 「删不掉」和「服务器故障」是两回事，放宽指令清理不能把这条守卫一起放掉。
+    /// D4：候选备份集不再挡住删除。
+    ///
+    /// 这条断言原先反过来——「有候选就 409」。改回来的理由不是放宽守卫，
+    /// 而是那道守卫没有可满足的路径：候选备份集全系统没有任何删除入口，
+    /// 于是「先把候选清掉再删任务」这句提示做不到，任何点过一次预检的任务永远删不掉。
+    /// 候选是任务的附属记录，任务没了它也失去意义，随任务一并清理。
     /// </summary>
     [Fact]
-    public async Task 有候选备份集的任务仍然拒绝删除()
+    public async Task 有候选备份集的任务可以删除并清掉候选()
     {
         var (clientId, taskId) = await CreateTaskAsync();
 
@@ -183,10 +207,134 @@ public class BackupTaskDeletionTests : IAsyncLifetime
 
         await using (var scope = _services.CreateAsyncScope())
         {
-            var tasks = scope.ServiceProvider.GetRequiredService<IBackupTaskService>();
-            var ex = await Assert.ThrowsAsync<BusinessException>(() => tasks.DeleteAsync(taskId));
-            Assert.Equal(409, ex.StatusCode);
+            await scope.ServiceProvider.GetRequiredService<IBackupTaskService>().DeleteAsync(taskId);
         }
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.False(await db.BackupTasks.AnyAsync(t => t.Id == taskId));
+            Assert.False(await db.CandidateBackupSets.AnyAsync(c => c.TaskId == taskId));
+        }
+    }
+
+    /// <summary>
+    /// 还活着的备份版本仍然必须挡住删除，并且要给出 409 和一条走得通的提示——
+    /// 「删不掉」和「服务器故障」是两回事，放宽其余守卫不能把这一条一起放掉。
+    /// </summary>
+    [Fact]
+    public async Task 有可用备份版本的任务仍然拒绝删除()
+    {
+        var (clientId, taskId) = await CreateTaskAsync();
+        await SeedBackupSetAsync(clientId, taskId, BackupSetStatus.Available, repositoryPath: null);
+
+        await using var scope = _services.CreateAsyncScope();
+        var tasks = scope.ServiceProvider.GetRequiredService<IBackupTaskService>();
+        var ex = await Assert.ThrowsAsync<BusinessException>(() => tasks.DeleteAsync(taskId));
+
+        Assert.Equal(409, ex.StatusCode);
+        // 原先的提示是「请先处理保留策略」，那条路走不通（清完回收站行照样在）。
+        // 现在必须指向一个真的能做到的动作。
+        Assert.Contains("备份集", ex.Message);
+    }
+
+    /// <summary>
+    /// D4：回收站里的备份集不挡删除，行与磁盘目录都要跟着清掉。
+    /// 留下目录的话只能等 RepositoryReconcileWorker 事后报成孤儿，那是事后补救。
+    /// </summary>
+    [Fact]
+    public async Task 备份集在回收站的任务可以删除并清掉仓库目录()
+    {
+        var (clientId, taskId) = await CreateTaskAsync();
+
+        var repositoryPath = Path.Combine(_repositoryRoot, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(repositoryPath);
+        File.WriteAllText(Path.Combine(repositoryPath, "data.bin"), "task-delete-test");
+
+        var setId = await SeedBackupSetAsync(clientId, taskId, BackupSetStatus.RecycleBin, repositoryPath);
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            await scope.ServiceProvider.GetRequiredService<IBackupTaskService>().DeleteAsync(taskId);
+        }
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.False(await db.BackupTasks.AnyAsync(t => t.Id == taskId));
+            Assert.False(await db.BackupSets.AnyAsync(s => s.Id == setId));
+            Assert.False(await db.UploadSessions.AnyAsync(s => s.TaskId == taskId));
+            Assert.False(await db.CandidateBackupSets.AnyAsync(c => c.TaskId == taskId));
+        }
+
+        Assert.False(Directory.Exists(repositoryPath));
+    }
+
+    /// <summary>种子：候选 + 上传会话 + 指定状态的备份集（三者的外键链条正是级联顺序要处理的）</summary>
+    private async Task<Guid> SeedBackupSetAsync(
+        Guid clientId, Guid taskId, BackupSetStatus status, string? repositoryPath)
+    {
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var now = DateTime.UtcNow;
+        var suffix = Guid.NewGuid().ToString("N");
+
+        var candidate = new CandidateBackupSet
+        {
+            Id = Guid.NewGuid(),
+            ClientId = clientId,
+            TaskId = taskId,
+            CandidateKey = $"taskdel-{suffix}",
+            SourceRoot = @"D:\backup\test",
+            DiscoveredAt = now,
+            PrecheckStatus = PrecheckStatus.Passed,
+            TotalFiles = 1,
+            TotalBytes = 16,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+        db.CandidateBackupSets.Add(candidate);
+        await db.SaveChangesAsync();
+
+        var session = new BackupMonitor.Core.Entities.Upload.UploadSession
+        {
+            Id = Guid.NewGuid(),
+            ClientId = clientId,
+            TaskId = taskId,
+            CandidateBackupSetId = candidate.Id,
+            Status = UploadStatus.Committed,
+            TotalFiles = 1,
+            TotalBytes = 16,
+            StartedAt = now,
+            LastActivityAt = now,
+            CompletedAt = now,
+            CommittedAt = now,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+        db.UploadSessions.Add(session);
+        await db.SaveChangesAsync();
+
+        var set = new BackupSet
+        {
+            Id = Guid.NewGuid(),
+            ClientId = clientId,
+            TaskId = taskId,
+            SourceCandidateId = candidate.Id,
+            UploadSessionId = session.Id,
+            BackupSetCode = $"BS-TD-{suffix[..12]}",
+            Status = status,
+            DiscoveredAt = now,
+            UploadedAt = now,
+            RepositoryPath = repositoryPath,
+            TotalFiles = 1,
+            TotalBytes = 16,
+            CreatedAt = now
+        };
+        db.BackupSets.Add(set);
+        await db.SaveChangesAsync();
+        return set.Id;
     }
 }
 

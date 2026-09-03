@@ -358,6 +358,8 @@ public class BackupSetService : IBackupSetService
         set.RetentionUntil = now.AddDays(days);
         await _db.SaveChangesAsync(ct);
 
+        await InvalidateScanBaselineAsync(set, ct);
+
         await _audit.RecordAsync("backup.recycle", AuditResult.Success, "backup_set", set.Id,
             beforeData: JsonSerializer.Serialize(new { Status = EnumMapping.ToSnakeCase(previousStatus) }),
             afterData: JsonSerializer.Serialize(new { set.BackupSetCode, retentionUntil = set.RetentionUntil }), ct: ct);
@@ -373,6 +375,18 @@ public class BackupSetService : IBackupSetService
 
         if (set.Status != BackupSetStatus.RecycleBin)
             throw new BusinessException("CONFLICT", "只有回收站里的备份集才能还原", 409);
+
+        // 删掉之后允许重新备份（V033），于是同一个候选可能已经有一份新的活着的版本了。
+        // 不挡住的话，还原会撞上 uq_backup_sets_candidate_live，
+        // 使用者拿到的是一句数据库唯一约束错误，看不出发生了什么。
+        var hasLive = await _db.BackupSets.AnyAsync(
+            b => b.SourceCandidateId == set.SourceCandidateId
+                && b.Id != set.Id
+                && BackupSetStatuses.Live.Contains(b.Status), ct);
+        if (hasLive)
+            throw new BusinessException("CONFLICT",
+                "这份备份删除之后已经重新备份过了，还原会和新版本冲突。"
+                + "需要旧版本的话请先处理掉新的那一份。", 409);
 
         set.Status = BackupSetStatus.Available;
         set.RetentionUntil = null;
@@ -405,10 +419,33 @@ public class BackupSetService : IBackupSetService
         set.Status = BackupSetStatus.Deleted;
         await _db.SaveChangesAsync(ct);
 
+        await InvalidateScanBaselineAsync(set, ct);
+
         await _audit.RecordAsync("backup.purge", AuditResult.Success, "backup_set", set.Id,
             afterData: JsonSerializer.Serialize(new { set.BackupSetCode, set.RepositoryPath }), ct: ct);
 
         _logger.LogInformation("备份 {Code} 已彻底删除：{Path}", set.BackupSetCode, set.RepositoryPath);
+    }
+
+    /// <summary>
+    /// 备份集删掉之后，让 Agent 那边的两段式扫描基线失效。
+    ///
+    /// 不做这一步的话，放开六处应用层闸和数据库唯一索引都没有用：源文件没变
+    /// → Agent 的快速指纹命中上一次的候选 → 直接回 no_new_backup，
+    /// 人在界面上看到的是「没有新备份」，而他刚刚删掉的正是那一份。
+    ///
+    /// ConfigVersion + 1 是必须的：Agent 只在配置版本变高时才重新拉配置，
+    /// 只清指纹不推版本号，新的基线要等到下一次别的配置变更才到得了客户端。
+    /// </summary>
+    private async Task InvalidateScanBaselineAsync(BackupSet set, CancellationToken ct)
+    {
+        await _db.CandidateBackupSets
+            .Where(c => c.Id == set.SourceCandidateId)
+            .ExecuteUpdateAsync(s => s.SetProperty(c => c.QuickFingerprint, (string?)null), ct);
+
+        await _db.BackupTasks
+            .Where(t => t.Id == set.TaskId)
+            .ExecuteUpdateAsync(s => s.SetProperty(t => t.ConfigVersion, t => t.ConfigVersion + 1), ct);
     }
 
     /// <summary>

@@ -143,15 +143,22 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
                 // 判据从「存在一条 failed 会话」放宽到「没有任何在传或已入库的痕迹」——
                 // 窄判据漏掉的正是最常见的一种：会话压根没建成，于是这个候选的上传
                 // 从此再也发不出去（幂等键命中一条 succeeded 指令，原样返回，什么都不做）。
+                // 两个判据都要带状态过滤，否则只解了一半。删掉一份备份之后：
+                // 备份集行还在（软删）、它那条 committed 会话也还在，
+                // 于是「这个候选没有入库痕迹」永远不成立，上传指令再也不会被复位重发。
+                // 问的是「这个候选现在有没有一份活着的备份，或者有没有在途的上传」。
                 var uploadNeverLanded = existing.Status == CommandStatus.Succeeded
                     && existing.CommandType is CommandType.UploadCandidate or CommandType.UploadLatest
                     && existing.CandidateBackupSetId is not null
                     && !await _db.UploadSessions.AnyAsync(s =>
                         s.CandidateBackupSetId == existing.CandidateBackupSetId
-                        && (s.Status == UploadStatus.Committed
+                        && ((s.Status == UploadStatus.Committed
+                                && _db.BackupSets.Any(b => b.UploadSessionId == s.Id
+                                    && BackupSetStatuses.Live.Contains(b.Status)))
                             || UploadSessionStatuses.InFlight.Contains(s.Status)), ct)
                     && !await _db.BackupSets.AnyAsync(
-                        b => b.SourceCandidateId == existing.CandidateBackupSetId, ct);
+                        b => b.SourceCandidateId == existing.CandidateBackupSetId
+                            && BackupSetStatuses.Live.Contains(b.Status), ct);
 
                 // 还挂着 pending 但 expires_at 已过：认领查询要求 expires_at > now，
                 // 它永远不会被任何客户端领走。把它原样返回等于告诉调用方「已下发」，

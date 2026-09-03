@@ -171,7 +171,9 @@ public class BatchOperationService : IBatchOperationService
                 skippedReasons.Add($"{candidate.CandidateKey}: 已被新候选替代");
                 continue;
             }
-            if (await _db.BackupSets.AnyAsync(s => s.SourceCandidateId == candidate.Id, ct))
+            // 状态过滤不能省：删掉的备份集行仍在表里，不过滤就是「删了再也备不回来」
+            if (await _db.BackupSets.AnyAsync(
+                    s => s.SourceCandidateId == candidate.Id && BackupSetStatuses.Live.Contains(s.Status), ct))
             {
                 skippedReasons.Add($"{candidate.CandidateKey}: 已入库");
                 continue;

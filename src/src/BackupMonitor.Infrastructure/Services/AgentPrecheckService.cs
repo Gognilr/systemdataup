@@ -119,7 +119,10 @@ public class AgentPrecheckService : IAgentPrecheckService
 
         if (candidate is not null)
         {
-            if (await _db.BackupSets.AnyAsync(b => b.SourceCandidateId == candidate.Id, ct))
+            // 只有「还活着」的版本才算已入库。删掉的（回收站/已删除）行仍在表里，
+            // 拿它们挡住重复预检，等于删掉一份备份之后源文件没变就再也备不回来。
+            if (await _db.BackupSets.AnyAsync(
+                    b => b.SourceCandidateId == candidate.Id && BackupSetStatuses.Live.Contains(b.Status), ct))
                 throw new BusinessException("CANDIDATE_ALREADY_ARCHIVED", "该候选已正式入库，不可重复预检", 409);
         }
         else

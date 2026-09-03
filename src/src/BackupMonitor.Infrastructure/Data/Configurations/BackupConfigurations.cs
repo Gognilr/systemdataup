@@ -305,7 +305,13 @@ public class BackupSetConfiguration : IEntityTypeConfiguration<BackupSet>
         builder.Property(e => e.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("now()").ValueGeneratedOnAdd();
 
         builder.HasIndex(e => e.BackupSetCode).IsUnique().HasDatabaseName("uq_backup_sets_code");
-        builder.HasIndex(e => e.SourceCandidateId).IsUnique().HasDatabaseName("uq_backup_sets_candidate");
+        // V033：只有「还活着」的版本参与唯一性判定。无条件唯一时，删掉一份备份之后
+        // 源文件没变就再也备不回来——软删的行仍然占着这个候选的位置。
+        // 过滤条件与 BackupSetStatuses.Live 是同一个口径，改一边就会对不上。
+        builder.HasIndex(e => e.SourceCandidateId)
+            .IsUnique()
+            .HasDatabaseName("uq_backup_sets_candidate_live")
+            .HasFilter("status NOT IN ('recycle_bin', 'deleted')");
         builder.HasIndex(e => new { e.TaskId, e.BusinessUnitId, e.BackupBusinessTime })
             .IsDescending(false, false, true)
             .HasDatabaseName("idx_backup_sets_task_bu_time");
