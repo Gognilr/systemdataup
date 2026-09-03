@@ -4,6 +4,7 @@ using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Models.Admin;
+using BackupMonitor.Shared.Scheduling;
 using MailKit.Net.Smtp;
 using MailKit.Security;
 using Microsoft.EntityFrameworkCore;
@@ -146,7 +147,7 @@ public class NotificationDispatchWorker : BackgroundService
 
         _logger.LogInformation("通知发送：本轮待投递 {Count} 条", pending.Count);
 
-        var reportTimezone = ResolveTimeZone(_configuration["Reports:Timezone"]);
+        var reportTimezone = PlanSchedule.ResolveTimeZone(_configuration["Reports:Timezone"]);
 
         var alerting = scope.ServiceProvider.GetRequiredService<IAlertingService>();
 
@@ -380,45 +381,6 @@ public class NotificationDispatchWorker : BackgroundService
         }
     }
 
-    /// <summary>
-    /// 解析报表时区（与 ReportService.ResolveTimeZone 相同的回退链）：
-    /// IANA ID 优先，找不到时尝试常见 Windows 时区 ID 映射，都失败则退回 UTC。
-    /// </summary>
-    private static TimeZoneInfo ResolveTimeZone(string? id)
-    {
-        if (string.IsNullOrWhiteSpace(id))
-            return TimeZoneInfo.Utc;
-
-        try
-        {
-            return TimeZoneInfo.FindSystemTimeZoneById(id.Trim());
-        }
-        catch (TimeZoneNotFoundException)
-        {
-            var windowsId = id.Trim() switch
-            {
-                "Asia/Tokyo" => "Tokyo Standard Time",
-                "Asia/Shanghai" => "China Standard Time",
-                "Asia/Singapore" => "Singapore Standard Time",
-                "Europe/London" => "GMT Standard Time",
-                "America/New_York" => "Eastern Standard Time",
-                "America/Los_Angeles" => "Pacific Standard Time",
-                _ => null
-            };
-
-            if (windowsId is not null)
-            {
-                try { return TimeZoneInfo.FindSystemTimeZoneById(windowsId); }
-                catch (TimeZoneNotFoundException) { }
-            }
-
-            return TimeZoneInfo.Utc;
-        }
-        catch (InvalidTimeZoneException)
-        {
-            return TimeZoneInfo.Utc;
-        }
-    }
 
     private static string Truncate(string value, int max) =>
         value.Length <= max ? value : value[..max];

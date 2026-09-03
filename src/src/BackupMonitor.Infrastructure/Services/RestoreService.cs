@@ -277,8 +277,11 @@ public class RestoreService : IRestoreService
         if (entity.DownloadExpiresAt is null || entity.DownloadExpiresAt <= DateTime.UtcNow)
             throw new BusinessException("CONFLICT", "下载链接已过期，请重新签发令牌", 409);
 
-        if (entity.Status is RestoreRequestStatus.Requested or RestoreRequestStatus.Verifying
-            or RestoreRequestStatus.Failed or RestoreRequestStatus.Expired)
+        // 守卫改成白名单。原先是黑名单，漏掉了 completed / cancelled——
+        // 一个已经完成的恢复请求，只要下载令牌还没过期就能被重新拉回 downloading，
+        // 而 DownloadedBytes 是累加的，于是「这次恢复传了多少字节」会随着重复下载不断膨胀，
+        // 最后变成一个没有意义的数。黑名单漏项是静默的，白名单不会。
+        if (entity.Status is not (RestoreRequestStatus.Ready or RestoreRequestStatus.Downloading))
             throw new BusinessException("CONFLICT",
                 $"恢复请求状态为 {EnumMapping.ToSnakeCase(entity.Status)}，不能下载", 409);
 
@@ -291,6 +294,12 @@ public class RestoreService : IRestoreService
 
         if (set.Status is not BackupSetStatus.Available)
             throw new BusinessException("CONFLICT", "备份版本当前状态不可用，不能下载", 409);
+
+        // 从 ready 迈进 downloading 才是「这次恢复开始了」，字节数从这里起算。
+        // 单文件恢复要多次调进来（一个文件一次），那时状态已经是 downloading，
+        // 计数必须继续累加而不是清零——清零会让「集齐全部文件」的进度永远走不完。
+        if (entity.Status == RestoreRequestStatus.Ready)
+            entity.DownloadedBytes = 0;
 
         entity.Status = RestoreRequestStatus.Downloading;
         entity.ClientIp = clientIp;

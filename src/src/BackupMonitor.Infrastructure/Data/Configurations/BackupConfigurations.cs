@@ -297,6 +297,7 @@ public class BackupSetConfiguration : IEntityTypeConfiguration<BackupSet>
         builder.Property(e => e.DiscoveredAt).HasColumnName("discovered_at");
         builder.Property(e => e.UploadedAt).HasColumnName("uploaded_at");
         builder.Property(e => e.VerifiedAt).HasColumnName("verified_at");
+        builder.Property(e => e.VerifyingSince).HasColumnName("verifying_since");
         builder.Property(e => e.RepositoryPath).HasColumnName("repository_path").HasMaxLength(2048);
         builder.Property(e => e.ManifestPath).HasColumnName("manifest_path").HasMaxLength(2048);
         builder.Property(e => e.ManifestSha256).HasColumnName("manifest_sha256").HasMaxLength(64);

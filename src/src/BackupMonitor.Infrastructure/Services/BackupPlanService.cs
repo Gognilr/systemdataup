@@ -172,7 +172,13 @@ public class BackupPlanService : IBackupPlanService
         plan.DaysOfWeek = plan.ScheduleKind == PlanScheduleKind.Weekly
             ? PlanSchedule.FormatDays(request.DaysOfWeek)
             : null;
-        plan.Timezone = string.IsNullOrWhiteSpace(request.Timezone) ? "Asia/Shanghai" : request.Timezone.Trim();
+        // 与任务同一个理由：运行期退回 UTC 是看不见的失败，
+        // 凌晨 2:00 的计划会变成北京时间上午 10:00 执行，撞上白天的业务。
+        var timezone = string.IsNullOrWhiteSpace(request.Timezone) ? "Asia/Shanghai" : request.Timezone.Trim();
+        if (!PlanSchedule.IsKnownTimeZone(timezone))
+            throw new BusinessException("INVALID_REQUEST",
+                $"时区 {timezone} 在服务端解析不了。请用 IANA 时区 ID（如 Asia/Shanghai）。", 400);
+        plan.Timezone = timezone;
         plan.MaxConcurrent = Math.Clamp(request.MaxConcurrent, 1, 50);
         plan.ItemTimeoutMinutes = Math.Clamp(request.ItemTimeoutMinutes, 5, 10080);
         plan.UpdatedAt = DateTime.UtcNow;

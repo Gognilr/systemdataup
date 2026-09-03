@@ -1,4 +1,4 @@
-﻿using System.Buffers;
+using System.Buffers;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Net.Sockets;
@@ -1390,6 +1390,16 @@ public sealed class AgentWorker : BackgroundService
                 (payload, token) => _api.ReportProgressAsync(commandId.Value, payload, token),
                 task.Name).Report;
 
+        // D12：上一次上传因为「本地候选没了」失败过的任务，这一轮必须走全量哈希。
+        // 不这么做的话，源文件没变 → 快速指纹命中服务端下发的基线 → 直接回 no_new_backup
+        // → 候选永远重建不出来，这份备份再也传不上去，而界面上写的是「没有新备份」。
+        if (!forceFullHash && _stateStore.ConsumeFullScanRequest(task.TaskId))
+        {
+            forceFullHash = true;
+            _logger.LogInformation(
+                "任务 {Task} 上一次上传时本地候选缺失，本轮强制全量重扫以重建候选", task.Name);
+        }
+
         var scans = _scanner.ScanAsync(task, forceFullHash, progress, ct);
         return await SubmitScansWithRestabilizeAsync(task, scans, commandId, ct);
     }
@@ -1622,19 +1632,44 @@ public sealed class AgentWorker : BackgroundService
         IsTestScan = scan.IsTestScan
     };
 
+    /// <summary>
+    /// 候选在本地已经不存在时，给它所属的任务记上「下一次强制全量重扫」。
+    /// 任务 ID 优先取指令自带的；指令没带就退回配置里那条含有这个候选的任务——
+    /// 两者都拿不到时只能放弃，但那种情况下这条指令本来也无从执行。
+    /// </summary>
+    private void RequestFullScanForCandidate(CommandDto command, Guid? candidateId)
+    {
+        if (command.TaskId is { } taskId)
+        {
+            _stateStore.RequestFullScan(taskId);
+            return;
+        }
+
+        _logger.LogWarning(
+            "候选 {Candidate} 在本地已不存在，且指令没有带任务 ID，无法安排强制全量重扫", candidateId);
+    }
+
     private async Task<CommandResult> ExecuteUploadAsync(CommandDto command, CancellationToken ct)
     {
         var candidateId = command.CandidateBackupSetId ?? ReadGuid(command.Payload, "candidateBackupSetId");
         var state = _stateStore.Snapshot();
         var candidate = state.Candidates.Values.FirstOrDefault(c => c.CandidateBackupSetId == candidateId);
         if (candidate is null)
+        {
+            // D12：候选没了就必须重扫一遍重建它，而重扫会被快速指纹基线挡住
+            // （源文件没变，指纹当然命中）。在这里记一笔，让下一轮扫描跳过基线。
+            // 只回一句失败的话，这份备份从此再也传不上去，界面上却写着「没有新备份」。
+            RequestFullScanForCandidate(command, candidateId);
             return CommandResult.FromFailure("CANDIDATE_NOT_FOUND", $"本地没有候选集：{candidateId}");
+        }
 
         // 审计 F-08：文件清单不再随 state.json 一起加载，只在真正要传的时候读一次。
         // 读不出来就明确失败，绝不带着半份清单去建会话——那会传上去一个不完整的备份集。
         var candidateFiles = _candidateFiles.Load(candidate.CandidateKey);
         if (candidateFiles.Count == 0)
         {
+            // 同上：清单没了，这个候选已经没有用处，必须靠一次全量重扫重建。
+            _stateStore.RequestFullScan(candidate.TaskId);
             return CommandResult.FromFailure(
                 "CANDIDATE_FILES_MISSING",
                 $"本地候选文件清单缺失或损坏：{candidate.CandidateKey}，请重新预检");

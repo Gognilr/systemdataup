@@ -1,7 +1,8 @@
-﻿using BackupMonitor.Core.Enums;
+using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Models.Admin;
+using BackupMonitor.Shared.Scheduling;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 
@@ -25,8 +26,12 @@ public class ReportService : IReportService
     private static readonly AlertStatus[] ActiveStatuses =
         [AlertStatus.Open, AlertStatus.Acknowledged, AlertStatus.InProgress];
 
-    private static readonly UploadStatus[] ActiveUploadStatuses =
-        [UploadStatus.Created, UploadStatus.WaitingPermission, UploadStatus.Uploading, UploadStatus.Paused, UploadStatus.RetryWait, UploadStatus.Verifying];
+    /// <summary>
+    /// 报表里的「在传」口径。就地写数组的那一版漏了 received——
+    /// 分块全部传完、还没走完入库校验的会话在报表里凭空消失，
+    /// 而其余四处都是引用 UploadSessionStatuses.InFlight 的。这里跟上。
+    /// </summary>
+    private static readonly UploadStatus[] ActiveUploadStatuses = UploadSessionStatuses.InFlight;
 
     private readonly AppDbContext _db;
     private readonly IUploadStorage _storage;
@@ -68,7 +73,7 @@ public class ReportService : IReportService
             .Select(g => new { Count = g.Count(), Bytes = g.Sum(s => s.TotalBytes) })
             .FirstOrDefaultAsync(ct);
 
-        var reportTimezone = ResolveTimeZone(_configuration["Reports:Timezone"]);
+        var reportTimezone = PlanSchedule.ResolveTimeZone(_configuration["Reports:Timezone"]);
         var reportToday = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, reportTimezone).Date;
         var since = reportToday.AddDays(-13);
         var until = reportToday.AddDays(1);
@@ -128,7 +133,7 @@ public class ReportService : IReportService
         var totalTasks = await _db.BackupTasks.CountAsync(ct);
 
         var now = DateTime.UtcNow;
-        var reportTimezone = ResolveTimeZone(_configuration["Reports:Timezone"]);
+        var reportTimezone = PlanSchedule.ResolveTimeZone(_configuration["Reports:Timezone"]);
         var today = TimeZoneInfo.ConvertTimeFromUtc(now, reportTimezone).Date;
         var sinceDate = today.AddDays(-13);
         var untilDate = today.AddDays(1);
@@ -184,7 +189,7 @@ public class ReportService : IReportService
 
         var taskTimezones = taskSources.ToDictionary(
             task => task.Id,
-            task => ResolveTimeZone(task.ScheduleTimezone));
+            task => PlanSchedule.ResolveTimeZone(task.ScheduleTimezone));
         var backupByDay = new Dictionary<(Guid TaskId, DateTime Date), DayAggregate>();
         foreach (var backup in backupEvents)
         {
@@ -455,42 +460,6 @@ public class ReportService : IReportService
         public int FailedCount { get; set; }
     }
 
-    private static TimeZoneInfo ResolveTimeZone(string? id)
-    {
-        if (string.IsNullOrWhiteSpace(id))
-            return TimeZoneInfo.Utc;
-
-        try
-        {
-            return TimeZoneInfo.FindSystemTimeZoneById(id.Trim());
-        }
-        catch (TimeZoneNotFoundException)
-        {
-            // Windows hosts may expose the same zones under Windows IDs.
-            var windowsId = id.Trim() switch
-            {
-                "Asia/Tokyo" => "Tokyo Standard Time",
-                "Asia/Shanghai" => "China Standard Time",
-                "Asia/Singapore" => "Singapore Standard Time",
-                "Europe/London" => "GMT Standard Time",
-                "America/New_York" => "Eastern Standard Time",
-                "America/Los_Angeles" => "Pacific Standard Time",
-                _ => null
-            };
-
-            if (windowsId is not null)
-            {
-                try { return TimeZoneInfo.FindSystemTimeZoneById(windowsId); }
-                catch (TimeZoneNotFoundException) { }
-            }
-
-            return TimeZoneInfo.Utc;
-        }
-        catch (InvalidTimeZoneException)
-        {
-            return TimeZoneInfo.Utc;
-        }
-    }
 
     private static DateTime MapTaskDateToReportDate(
         DateTime taskLocalDate,

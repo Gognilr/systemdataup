@@ -106,6 +106,9 @@ public static class DependencyInjection
         services.AddHostedService<LifecycleExpiryWorker>();
         services.AddHostedService<RepositoryReconcileWorker>();
         services.AddHostedService<SequentialExecutionWorker>();
+        // D8：定期复查备份完整性。校验失败的告警文案一直写着「定期复查没通过」，
+        // 而在这条注册之前，系统里根本没有任何东西在定期复查。
+        services.AddHostedService<BackupReverifyWorker>();
 
         return services;
     }

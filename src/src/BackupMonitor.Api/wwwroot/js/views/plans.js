@@ -10,6 +10,8 @@ import {
   confirmModal, formModal, openModal
 } from '../ui.js';
 import { shell, loading } from '../app.js';
+// C11：业务单元清单与「立即备份」弹窗共用同一份实现。
+import { unitQueueHtml } from './unit-roster.js';
 
 const WEEK = ['一', '二', '三', '四', '五', '六', '日'];
 
@@ -291,7 +293,53 @@ ACTIONS['plans:run'] = async runId => {
   try { run = await api(`/api/v1/admin/execution-runs/${runId}`); }
   catch (e) { errToast(e); return; }
 
-  const body = `
+  const ov = openModal(`执行详情：${run.name || ''}`, await runBodyHtml(run), { wide: true });
+  attachCancelButton(ov, run, runId);
+
+  // 这个弹窗原先是一张静态快照：打开的那一刻是什么样，之后就一直是什么样。
+  // 而它恰恰是人盯着看「这次计划跑到第几项了」的地方——pending 项的「说明」列
+  // 永远是空的，看起来就像卡住了。跑完就停下来，不做无谓的轮询。
+  const timer = setInterval(async () => {
+    if (!ov.isConnected) { clearInterval(timer); return; }
+    let fresh;
+    try { fresh = await api(`/api/v1/admin/execution-runs/${runId}`); }
+    catch (e) { return; }   // 一次抖动不该把已经显示出来的内容抹掉
+
+    const mbody = ov.querySelector('.mbody');
+    if (mbody) mbody.innerHTML = await runBodyHtml(fresh);
+    if (fresh.status !== 'pending' && fresh.status !== 'running') {
+      clearInterval(timer);
+      ov.querySelector('.mfoot [data-run-cancel]')?.remove();
+    }
+  }, 5000);
+  // 关掉弹窗（关闭按钮 / 点遮罩 / Esc）都走 closeModal，它派发 bm:dismiss。
+  // 不停这个定时器的话，人关掉窗口之后它还在每 5 秒打一次接口，直到刷新页面为止。
+  ov.addEventListener('bm:dismiss', () => clearInterval(timer));
+};
+
+/* 执行详情的正文。每一项的业务单元清单跟着一起显示——
+   一个计划项对应一个任务，而一个任务可以有 18 个账套，
+   只看「这一项成功了」是看不出其中 4 个账套一个字节都没传的。 */
+async function runBodyHtml(run) {
+  const items = run.items || [];
+
+  // 每一项的预检指令结果各拉一次。并行发，任何一条失败都只是这一项没有清单，
+  // 不该让整个弹窗打不开。
+  const rosters = await Promise.all(items.map(async i => {
+    if (!i.commandId) return { item: i, html: '' };
+    try {
+      const cmd = await api(`/api/v1/admin/backup-tasks/commands/${i.commandId}`);
+      return { item: i, html: unitQueueHtml(cmd, { live: i.status === 'running' }) };
+    } catch (e) { return { item: i, html: '' }; }
+  }));
+
+  const unitsHtml = rosters.filter(r => r.html).map(r => `
+    <details class="fadv">
+      <summary>${esc(r.item.taskName)} · 业务单元</summary>
+      ${r.html}
+    </details>`).join('');
+
+  return `
     <div class="kv">
       <div class="row"><div class="k">状态</div><div class="v">${statusPill(RUN_STATUS, run.status)}</div></div>
       <div class="row"><div class="k">并发度</div><div class="v">${run.maxConcurrent === 1 ? '严格顺序（1）' : esc(run.maxConcurrent)}</div></div>
@@ -308,25 +356,27 @@ ACTIONS['plans:run'] = async runId => {
       { l: '开始', render: i => i.startedAt ? fmtDT(i.startedAt) : '—' },
       { l: '结束', render: i => i.finishedAt ? fmtDT(i.finishedAt) : '—' },
       { l: '说明', render: i => esc(i.message || '') }
-    ], run.items || [])}`;
+    ], items)}
+    ${unitsHtml ? `<h3>各项的业务单元</h3>${unitsHtml}` : ''}`;
+}
 
-  const ov = openModal(`执行详情：${run.name || ''}`, body, { wide: true });
+function attachCancelButton(ov, run, runId) {
+  if (run.status !== 'pending' && run.status !== 'running') return;
 
-  if (run.status === 'pending' || run.status === 'running') {
-    const cancel = document.createElement('button');
-    cancel.className = 'small danger';
-    cancel.textContent = '取消这次执行';
-    cancel.addEventListener('click', async () => {
-      if (!await confirmModal('取消这次执行？还没开跑的项会被取消，正在跑的那几项也会被停掉：它们的指令会被取消，已经开始的上传会中断，这一轮扫出来的备份不会再自动上传。')) return;
-      try {
-        await api(`/api/v1/admin/execution-runs/${runId}/cancel`, { method: 'POST' });
-        toast('已取消', 'ok');
-        LOADERS.plans();
-      } catch (e) { errToast(e); }
-    });
-    ov.querySelector('.mfoot')?.prepend(cancel);
-  }
-};
+  const cancel = document.createElement('button');
+  cancel.className = 'small danger';
+  cancel.dataset.runCancel = '1';
+  cancel.textContent = '取消这次执行';
+  cancel.addEventListener('click', async () => {
+    if (!await confirmModal('取消这次执行？还没开跑的项会被取消，正在跑的那几项也会被停掉：它们的指令会被取消，已经开始的上传会中断，这一轮扫出来的备份不会再自动上传。')) return;
+    try {
+      await api(`/api/v1/admin/execution-runs/${runId}/cancel`, { method: 'POST' });
+      toast('已取消', 'ok');
+      LOADERS.plans();
+    } catch (e) { errToast(e); }
+  });
+  ov.querySelector('.mfoot')?.prepend(cancel);
+}
 
 ACTIONS['plans:history'] = async planId => {
   try {

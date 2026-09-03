@@ -209,6 +209,68 @@ public class SequentialExecutionWorkerTests : IAsyncLifetime
         Assert.NotNull(runs[0].ScheduledFor);
     }
 
+    /// <summary>
+    /// D10：到点了但产生不出执行时（上一次还没跑完），也要把 last_run_at 推到这一次的时刻。
+    ///
+    /// 不推的话 PromoteDuePlansAsync 的判据（last_run_at 早于 due）一直成立：
+    /// 执行器每 15 秒重算一次、重新走到这里、重新打一条同样的日志，一整晚刷几千行。
+    /// 更麻烦的是第二个后果——卡住的那次执行一结束，同一个到期时刻立刻被补跑一次，
+    /// 而那个时刻可能已经是白天的业务高峰了。
+    /// </summary>
+    [Fact]
+    public async Task 上一次没跑完时到期时刻也要标记为已处理()
+    {
+        var (planId, _) = await SeedPlanAsync(taskCount: 2, maxConcurrent: 1);
+
+        // 先造一次「还没跑完」的执行占住这个计划
+        await TriggerAsync(planId);
+
+        var due = DateTime.UtcNow.AddHours(-1);
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var queue = scope.ServiceProvider.GetRequiredService<IExecutionQueueService>();
+            var run = await queue.CreatePlanRunAsync(planId, due, "schedule", null);
+            Assert.Null(run);   // 上一次还没跑完，这一次不该叠一条
+        }
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var plan = await db.BackupPlans.AsNoTracking().SingleAsync(p => p.Id == planId);
+            Assert.NotNull(plan.LastRunAt);
+            Assert.True(plan.LastRunAt >= due,
+                "这一次到期已经处理过了（虽然没跑），last_run_at 必须跟上，否则每一轮都会重来一遍");
+        }
+    }
+
+    /// <summary>手动「立即执行」传的 scheduledFor 是 null，它不该影响下一次到点的判定。</summary>
+    [Fact]
+    public async Task 手动触发失败不影响到点判定()
+    {
+        var (planId, _) = await SeedPlanAsync(taskCount: 2, maxConcurrent: 1);
+        await TriggerAsync(planId);
+
+        DateTime? before;
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            before = (await db.BackupPlans.AsNoTracking().SingleAsync(p => p.Id == planId)).LastRunAt;
+        }
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var queue = scope.ServiceProvider.GetRequiredService<IExecutionQueueService>();
+            Assert.Null(await queue.CreatePlanRunAsync(planId, null, "manual", null));
+        }
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var after = (await db.BackupPlans.AsNoTracking().SingleAsync(p => p.Id == planId)).LastRunAt;
+            Assert.Equal(before, after);
+        }
+    }
+
     // ---------- 基础设施 ----------
 
     private async Task RunPassAsync()

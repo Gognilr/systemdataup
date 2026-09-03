@@ -66,8 +66,27 @@ public class UploadQueueStatusDto
     /// <summary>当前占着全局名额的上传会话数（含暂停中的：它仍然占着暂存空间）</summary>
     public int ActiveUploads { get; set; }
 
-    /// <summary>执行队列里还没放行的项数</summary>
+    /// <summary>
+    /// 执行队列里还没放行的项数（两种排队之和，保留给旧调用方）。
+    ///
+    /// 把两种排队混成一个数会读出错误的结论：界面显示
+    /// 「0 个正在传 / 2 个排队中 · 有空余名额」，看起来就是系统卡住了——
+    /// 而实际情况多半是那两项在等**本次执行**的并发度，与全局名额毫无关系。
+    /// 新代码请用下面两个分开的字段。
+    /// </summary>
     public int QueuedItems { get; set; }
+
+    /// <summary>
+    /// 在等全局上传名额的项数。只有这个数与 <see cref="GlobalLimit"/> 是同一件事，
+    /// 「排队中但有空余名额」这句自相矛盾的话说的就是它。
+    /// </summary>
+    public int WaitingForUploadSlot { get; set; }
+
+    /// <summary>
+    /// 在等本次执行并发度的项数（前一项没跑完，按 max_concurrent 排着）。
+    /// 这是计划「严格按顺序」的正常表现，不是异常。
+    /// </summary>
+    public int WaitingInRun { get; set; }
 
     /// <summary>系统设置 max_concurrent_uploads_total</summary>
     public int GlobalLimit { get; set; }

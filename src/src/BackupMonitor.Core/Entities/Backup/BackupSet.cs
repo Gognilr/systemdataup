@@ -42,6 +42,17 @@ public class BackupSet
 
     public DateTime? VerifiedAt { get; set; }
 
+    /// <summary>
+    /// 正在重新校验的开始时刻（V033）；非空即「校验中」。
+    ///
+    /// 刻意不借用 <see cref="Status"/> 来表示校验中。借用有两个后果：
+    /// 一是原状态丢了——对一个人工隔离的备份点重新校验，哈希对得上就变回可用，
+    /// 而当初隔离的理由并不会因为哈希对得上就消失；
+    /// 二是校验过程里任何一条提前退出的路径都会把它永久留在 verifying，
+    /// 那份备份从此既不可用也删不掉。
+    /// </summary>
+    public DateTime? VerifyingSince { get; set; }
+
     /// <summary>仓库存储路径</summary>
     public string? RepositoryPath { get; set; }
 

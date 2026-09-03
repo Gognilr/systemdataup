@@ -55,7 +55,7 @@ public class UploadProgressSamplerTests
     }
 
     [Fact]
-    public void 字节数回退时速度按零处理而不是负数()
+    public void 字节数回退时给不出速度而不是负数或零()
     {
         var sampler = new UploadRateSampler();
         var id = Guid.NewGuid();
@@ -65,7 +65,23 @@ public class UploadProgressSamplerTests
         // 不兜住会算出负速度，界面上就是一个「-3.2 MB/s」。
         var rate = sampler.Observe(id, 10 * 1024 * 1024, T0.AddSeconds(10));
 
-        Assert.Equal(0, rate);
+        // C8：这里断言的从 0 改成 null，与「第一次观测给不出速度」同一个理由。
+        // 调用方写的是 `Observe(...) ?? averageRate`——返回 0 的话这个回退根本不生效
+        // （0 不是 null），界面直接显示「0 B/s、预计剩余 —」。而这一刻的真相不是
+        // 「速度是零」，是「这一次采样算不出速度」，该退回全程平均值。
+        Assert.Null(rate);
+    }
+
+    [Fact]
+    public void 采样窗口内计数没动时给不出速度()
+    {
+        var sampler = new UploadRateSampler();
+        var id = Guid.NewGuid();
+        sampler.Observe(id, 8 * 1024 * 1024, T0);
+
+        // 分块 8MB 才推进一次计数，而界面 5 秒一刷——两次采样之间计数没动是常态，
+        // 不是异常。返回 0 会把一条正常传输显示成卡死。
+        Assert.Null(sampler.Observe(id, 8 * 1024 * 1024, T0.AddSeconds(10)));
     }
 
     [Fact]

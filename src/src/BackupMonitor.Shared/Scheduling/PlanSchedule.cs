@@ -78,21 +78,41 @@ public static class PlanSchedule
     }
 
     /// <summary>
-    /// 解析时区 ID。服务端存 IANA ID（默认 Asia/Shanghai），部分 Windows 主机只认 Windows ID，
-    /// 保持与 MissedBackupWorker / ReportService 相同的回退链；最终解析不了退回 UTC。
+    /// 解析时区 ID，全系统唯一的一份。服务端存 IANA ID（默认 Asia/Shanghai），
+    /// 部分 Windows 主机只认 Windows ID，因此带一段回退映射；最终解析不了退回 UTC。
+    ///
+    /// 这段回退链此前在 MissedBackupWorker / ReportService / NotificationDispatchWorker
+    /// 各复制了一份。复制的代价不是重复代码本身，而是它们会慢慢分家——
+    /// 「上一次本该备份的时刻」在巡检和报表里算出不同的答案，
+    /// 而这个差值恰好是「有没有漏备份」的判据。
     /// </summary>
-    public static TimeZoneInfo ResolveTimeZone(string? id)
+    public static TimeZoneInfo ResolveTimeZone(string? id) =>
+        TryResolveTimeZone(id, out var tz) ? tz : tz;
+
+    /// <summary>
+    /// 同上，但告诉调用方有没有真的解析成功。
+    ///
+    /// 返回 false 表示退回了 UTC——凌晨 2:00 的计划会因此变成北京时间上午 10:00 执行，
+    /// 这是个必须被人看见的偏差，有日志的调用方应当记一条告警级日志。
+    /// 空字符串按「没配」处理，返回 true + UTC：那是正常的默认值，不是错误。
+    /// </summary>
+    public static bool TryResolveTimeZone(string? id, out TimeZoneInfo timeZone)
     {
         if (string.IsNullOrWhiteSpace(id))
-            return TimeZoneInfo.Utc;
+        {
+            timeZone = TimeZoneInfo.Utc;
+            return true;
+        }
 
+        var trimmed = id.Trim();
         try
         {
-            return TimeZoneInfo.FindSystemTimeZoneById(id.Trim());
+            timeZone = TimeZoneInfo.FindSystemTimeZoneById(trimmed);
+            return true;
         }
         catch (TimeZoneNotFoundException)
         {
-            var windowsId = id.Trim() switch
+            var windowsId = trimmed switch
             {
                 "Asia/Tokyo" => "Tokyo Standard Time",
                 "Asia/Shanghai" => "China Standard Time",
@@ -105,17 +125,26 @@ public static class PlanSchedule
 
             if (windowsId is not null)
             {
-                try { return TimeZoneInfo.FindSystemTimeZoneById(windowsId); }
+                try
+                {
+                    timeZone = TimeZoneInfo.FindSystemTimeZoneById(windowsId);
+                    return true;
+                }
                 catch (TimeZoneNotFoundException) { }
             }
 
-            return TimeZoneInfo.Utc;
+            timeZone = TimeZoneInfo.Utc;
+            return false;
         }
         catch (InvalidTimeZoneException)
         {
-            return TimeZoneInfo.Utc;
+            timeZone = TimeZoneInfo.Utc;
+            return false;
         }
     }
+
+    /// <summary>这个时区 ID 在本机解析得出来吗。保存计划/任务时用它把错误挡在运行期之前。</summary>
+    public static bool IsKnownTimeZone(string? id) => TryResolveTimeZone(id, out _);
 
     /// <summary>"1,3,5" → [1,3,5]；空/脏数据返回空集合</summary>
     public static List<int> ParseDays(string? raw) =>

@@ -98,8 +98,31 @@ public class VerificationWorker : BackgroundService
             .Include(b => b.Files)
             .Include(b => b.Client)
             .FirstOrDefaultAsync(b => b.Id == backupSetId, ct);
-        if (backupSet is null || string.IsNullOrWhiteSpace(backupSet.RepositoryPath))
+        if (backupSet is null)
+            return;   // 行都没了，没有状态可以写回
+
+        // 提前退出的分支同样要把「校验中」摘掉并说明原因。原先这里直接 return，
+        // 于是这份备份永久停在 verifying：界面上既不可用也删不掉，
+        // 而没有任何一条日志或告警说过它为什么停在那里。
+        if (string.IsNullOrWhiteSpace(backupSet.RepositoryPath))
+        {
+            backupSet.VerifyingSince = null;
+            backupSet.Status = BackupSetStatus.VerificationFailed;
+            await db.SaveChangesAsync(ct);
+
+            _logger.LogError("备份集 {Code} 没有仓库路径，无法校验", backupSet.BackupSetCode);
+            await alerting.RaiseAsync(
+                $"backup_set:{backupSet.Id}:verify_failed",
+                AlertLevel.Critical,
+                "verification_failed",
+                $"备份 {backupSet.BackupSetCode} 没法校验",
+                "这一份在库里没有记录仓库路径，文件可能从来没有落到正式目录。",
+                clientId: backupSet.ClientId,
+                taskId: backupSet.TaskId,
+                backupSetId: backupSet.Id,
+                ct: ct);
             return;
+        }
 
         var allVerified = true;
         foreach (var file in backupSet.Files)
@@ -134,8 +157,13 @@ public class VerificationWorker : BackgroundService
             }
         }
 
-        backupSet.Status = allVerified ? BackupSetStatus.Available : BackupSetStatus.VerificationFailed;
+        // 隔离过的备份不参与状态回写：入队那一步已经把 quarantined 挡在外面了，
+        // 这里再挡一次是因为自动巡检（D8）也会往这个队列里放东西。
+        if (backupSet.Status is not BackupSetStatus.Quarantined)
+            backupSet.Status = allVerified ? BackupSetStatus.Available : BackupSetStatus.VerificationFailed;
+
         backupSet.VerifiedAt = DateTime.UtcNow;
+        backupSet.VerifyingSince = null;
         await db.SaveChangesAsync(ct);
 
         if (!allVerified)

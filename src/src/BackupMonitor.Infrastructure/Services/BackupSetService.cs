@@ -131,6 +131,7 @@ public class BackupSetService : IBackupSetService
                 s.BusinessUnitId,
                 BusinessUnitName = s.BusinessUnit != null ? s.BusinessUnit.DisplayName : null,
                 s.Status,
+                s.VerifyingSince,
                 s.BackupBusinessTime,
                 s.UploadedAt,
                 s.TotalFiles,
@@ -152,6 +153,7 @@ public class BackupSetService : IBackupSetService
             BusinessUnitId = s.BusinessUnitId,
             BusinessUnitName = s.BusinessUnitName,
             Status = EnumMapping.ToSnakeCase(s.Status),
+            VerifyingSince = s.VerifyingSince,
             BackupBusinessTime = s.BackupBusinessTime,
             UploadedAt = s.UploadedAt,
             TotalFiles = s.TotalFiles,
@@ -186,6 +188,7 @@ public class BackupSetService : IBackupSetService
             BusinessUnitId = set.BusinessUnitId,
             BusinessUnitName = set.BusinessUnit?.DisplayName,
             Status = EnumMapping.ToSnakeCase(set.Status),
+            VerifyingSince = set.VerifyingSince,
             BackupBusinessTime = set.BackupBusinessTime,
             UploadedAt = set.UploadedAt,
             TotalFiles = set.TotalFiles,
@@ -476,12 +479,22 @@ public class BackupSetService : IBackupSetService
         var set = await _db.BackupSets.FirstOrDefaultAsync(s => s.Id == backupSetId, ct)
             ?? throw new NotFoundException("备份版本", backupSetId);
 
-        if (set.Status is BackupSetStatus.Verifying)
+        if (set.VerifyingSince is not null)
             throw new BusinessException("CONFLICT", "备份版本正在校验中", 409);
         if (set.Status is BackupSetStatus.RecycleBin or BackupSetStatus.Deleted)
             throw new BusinessException("CONFLICT", "备份版本已进入回收站/已删除，不能校验", 409);
 
-        set.Status = BackupSetStatus.Verifying;
+        // 隔离是「我怀疑这一份有问题，先别用也别删」的人工判断。哈希对得上并不代表
+        // 当初隔离的理由消失了——校验只能证明「文件和存进来时一样」，
+        // 而隔离的理由通常是「存进来的那一份本身就可疑」。让重新校验把它变回可用，
+        // 等于给了一个绕过人工判断的后门，而且没有任何提示。
+        if (set.Status is BackupSetStatus.Quarantined)
+            throw new BusinessException("CONFLICT",
+                "这一份已被人工隔离。重新校验只能证明文件没被改动，不能解除隔离；"
+                + "确认没问题请先在详情里解除隔离。", 409);
+
+        // 不动 Status：原状态要留着，校验完按原状态之上的结论回写。
+        set.VerifyingSince = DateTime.UtcNow;
         await _db.SaveChangesAsync(ct);
 
         await _workChannel.Writer.WriteAsync(new WorkItem(WorkKind.ReverifyBackupSet, set.Id), ct);

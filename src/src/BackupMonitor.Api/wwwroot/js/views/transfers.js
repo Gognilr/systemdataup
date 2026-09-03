@@ -59,12 +59,27 @@ LOADERS.transfers = async function () {
 function queueHtml(q) {
   if (!q || (!q.queuedItems && q.activeUploads < q.globalLimit)) return '';
   const full = q.activeUploads >= q.globalLimit;
+  // 两种「排队中」分开说。合成一个数的那一版会写出
+  // 「0 个正在传 / 2 个排队中 · 有空余名额」——这句话自相矛盾，
+  // 读起来就是系统卡住了，而实际上那两项只是在等本次执行的并发度。
+  const parts = [];
+  if (q.waitingForUploadSlot) parts.push(`${esc(q.waitingForUploadSlot)} 个等名额`);
+  if (q.waitingInRun) parts.push(`${esc(q.waitingInRun)} 个等前一项跑完`);
+  const queued = parts.length ? parts.join(' / ') : `${esc(q.queuedItems)} 个排队中`;
+
+  // 「有空余名额」只在确实有人在等名额时才值得说；
+  // 剩下的都在等前一项时，该说的是「这是顺序执行的正常表现」。
+  let hint;
+  if (full) hint = '已达上限，等名额的会在有空位时自动开始';
+  else if (q.waitingInRun) hint = '按执行的并发度依次放行，不是卡住';
+  else hint = '有空余名额';
+
   return `<div class="dashboard-statusbar${full ? ' has-work' : ''}" role="status">
     <span class="status-mark" aria-hidden="true">⧖</span>
-    <strong class="status-title">${esc(q.activeUploads)} 个正在传 / ${esc(q.queuedItems)} 个排队中</strong>
+    <strong class="status-title">${esc(q.activeUploads)} 个正在传 / ${queued}</strong>
     <span class="status-meta">
       <span>全局上限 ${esc(q.globalLimit)}</span>
-      <span>${full ? '已达上限，排队的会在有名额时自动开始' : '有空余名额'}</span>
+      <span>${hint}</span>
     </span>
   </div>`;
 }

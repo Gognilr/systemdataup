@@ -114,3 +114,43 @@ UPDATE alerts
 INSERT INTO system_settings (setting_key, setting_value, encrypted, updated_by)
 VALUES ('alert_renotify_hours', '24'::jsonb, false, NULL)
 ON CONFLICT (setting_key) DO NOTHING;
+
+-- =====================================================================
+-- 批次五：状态残留与显示
+-- =====================================================================
+
+-- D7：重新校验不再借用 status 字段。
+--
+-- 原先「重新校验」把 status 改成 verifying，校验完再按结果写回 available /
+-- verification_failed。两个后果：一是原状态丢了——对一个人工隔离（quarantined）的备份
+-- 点一下重新校验，哈希对得上就变回 available，当初隔离的理由不声不响地消失了；
+-- 二是校验过程中提前 return 的分支（备份集没了、仓库路径为空）不写回状态，
+-- 这份备份就永久卡在 verifying，界面上既不可用也删不掉。
+--
+-- 改成不动 status，只用一个时间戳标记「正在校验」。原状态因此永远不会丢。
+ALTER TABLE backup_sets
+    ADD COLUMN IF NOT EXISTS verifying_since TIMESTAMPTZ NULL;
+
+COMMENT ON COLUMN backup_sets.verifying_since IS
+    '这一份正在重新校验的开始时刻；非空即「校验中」，界面据此显示。'
+    '刻意不借用 status：借用会丢掉原状态（隔离尤其不能丢），'
+    '而且任何一条提前退出的路径都会把它永久留在 verifying。';
+
+-- 存量卡在 verifying 的备份集捞回来：它们进不了任何一条正常路径。
+-- 有校验时间就按当时的结论回落到 available，从没校验过的按校验失败处理等人看。
+UPDATE backup_sets
+   SET status = CASE WHEN verified_at IS NOT NULL THEN 'available' ELSE 'verification_failed' END
+ WHERE status = 'verifying';
+
+-- D8：定期复查的间隔。
+--
+-- 校验失败的告警文案写着「定期复查没通过」，而系统里根本没有任何东西在定期复查——
+-- WorkKind.ReverifyBackupSet 唯一的入队点是界面上那个手工按钮。
+-- 承诺了却没做的事比没承诺更糟：人会以为备份的完整性一直有人在看着。
+INSERT INTO system_settings (setting_key, setting_value, encrypted, updated_by)
+VALUES ('backup_reverify_interval_hours', '24'::jsonb, false, NULL)
+ON CONFLICT (setting_key) DO NOTHING;
+
+INSERT INTO system_settings (setting_key, setting_value, encrypted, updated_by)
+VALUES ('backup_reverify_batch_size', '5'::jsonb, false, NULL)
+ON CONFLICT (setting_key) DO NOTHING;

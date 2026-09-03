@@ -1,4 +1,4 @@
-﻿using BackupMonitor.Infrastructure.Services;
+using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Models.Agent;
@@ -138,6 +138,18 @@ public class AdminBackupTaskController : ApiBaseController
     public async Task<ActionResult<ApiResponse<CommandResultDto?>>> LatestTestRecognition(Guid taskId, CancellationToken ct)
     {
         var result = await _taskService.GetLatestRecognitionTestAsync(taskId, ct);
+        return OkData(result);
+    }
+
+    /// <summary>
+    /// 最近一条预检指令的结果，含业务单元清单。任务详情据此显示「共 18 个账套、各自扫成什么样」——
+    /// 这份名单原先只在「立即备份」的弹窗里出现，窗口一关就再也找不回来。
+    /// </summary>
+    [HttpGet("{taskId:guid}/precheck/latest")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.read")]
+    public async Task<ActionResult<ApiResponse<CommandResultDto?>>> LatestPrecheck(Guid taskId, CancellationToken ct)
+    {
+        var result = await _taskService.GetLatestPrecheckAsync(taskId, ct);
         return OkData(result);
     }
 

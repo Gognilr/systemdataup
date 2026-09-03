@@ -9,6 +9,10 @@ import {
 } from '../ui.js';
 import { shell, loading, syncInFlightButtons } from '../app.js';
 import { runDirectoryWizard } from './recognizer-wizard.js';
+// C11：业务单元清单抽成共享模块，任务详情与执行详情同样要用它。
+import {
+  passedCandidatesOf, unitQueueHtml, progressOf
+} from './unit-roster.js';
 
 export async function vTasks() {
   App.state.tasks = App.state.tasks || { page: 1, pageSize: 20, mode: '', totalCount: 0, selected: [] , sortKey: 'createdAt', sortDesc: true, forceFullHash: false };
@@ -566,6 +570,11 @@ function numOrNull(v) {
 export async function openTaskDrawer(id, viaNav = false) {
   try {
     const d = await api(`/api/v1/admin/backup-tasks/${id}`);
+    // C11：最近一次预检的业务单元清单。这份名单原先只在「立即备份」的弹窗里出现，
+    // 窗口一关就找不回来——而「18 个账套扫出来 14 个」在别的任何页面上
+    // 都表现为「这个任务备份成功了」。取不到不该让详情页打不开。
+    const lastPrecheck = await api(`/api/v1/admin/backup-tasks/${id}/precheck/latest`).catch(() => null);
+    const unitsHtml = unitQueueHtml(lastPrecheck, { live: false });
     openDrawer({
       title: `任务详情：${d.name}`,
       wide: true,
@@ -598,6 +607,7 @@ export async function openTaskDrawer(id, viaNav = false) {
       <div class="row"><div class="k">最近扫描 / 成功</div><div class="v">${fmtDT(d.lastScanAt)} / ${fmtDT(d.lastSuccessAt)}</div></div>
       <div class="row"><div class="k">配置版本</div><div class="v">${esc(d.configVersion)}<span class="sub">每改一次任务配置加一，客户端据此判断要不要重新拉取</span></div></div>
     </div>
+    ${unitsHtml ? `<h3>业务单元（最近一次检查）</h3>${unitsHtml}` : ''}
     <h3>识别规则</h3>${describeRecognizerConfig(d.recognizerConfig)}
     <details class="fadv"><summary>原始配置（JSON）</summary><pre class="json">${esc(prettyJson(d.recognizerConfig))}</pre></details>
     ${d.alertConfig ? `<h3>告警配置</h3><pre class="json">${esc(prettyJson(d.alertConfig))}</pre>` : ''}`
@@ -775,86 +785,10 @@ async function dispatchUploads(taskId, candidates, force) {
     await dispatchUpload(taskId, c.candidateBackupSetId, force);
 }
 
-/* 预检指令的结构化结果里带着这次扫出来的**每一个**业务单元的候选。
-   老格式（只有一个顶层 candidateBackupSetId）仍然认——升级期间 Agent 与服务端
-   不是同一刻换的，读不出清单就退回那一个，总比一个都不传强。 */
-function passedCandidatesOf(resultPayload) {
-  if (!resultPayload) return [];
-  let parsed;
-  try { parsed = JSON.parse(resultPayload); } catch (e) { return []; }
 
-  if (Array.isArray(parsed.candidates)) {
-    return parsed.candidates
-      .filter(c => c && c.status === 'passed' && typeof c.candidateBackupSetId === 'string')
-      .map(c => ({ candidateBackupSetId: c.candidateBackupSetId, uploadState: c.uploadState || null }));
-  }
 
-  return typeof parsed.candidateBackupSetId === 'string'
-    ? [{ candidateBackupSetId: parsed.candidateBackupSetId, uploadState: null }]
-    : [];
-}
 
-/* Agent 一开始列一次目录就把全部账套报上来了，服务端放在 resultPayload.units。
-   老版本 Agent 不报这一项，返回空数组，调用方退回到只显示一行进度。 */
-function unitRosterOf(cmd) {
-  if (!cmd || !cmd.resultPayload) return [];
-  try {
-    const units = JSON.parse(cmd.resultPayload).units;
-    return Array.isArray(units) ? units.filter(u => typeof u === 'string' && u) : [];
-  } catch (e) { return []; }
-}
 
-/* 已经扫完的那些单元，按显示名索引。 */
-function scannedUnitsOf(cmd) {
-  const done = new Map();
-  if (!cmd || !cmd.resultPayload) return done;
-  let parsed;
-  try { parsed = JSON.parse(cmd.resultPayload); } catch (e) { return done; }
-  if (!Array.isArray(parsed.candidates)) return done;
-  for (const c of parsed.candidates)
-    if (c && typeof c.businessUnit === 'string' && c.businessUnit) done.set(c.businessUnit, c);
-  return done;
-}
-
-/* 一个单元此刻处在哪一步。这几个词是给运维看的，不是状态机的名字：
-   他要判断的是「这个账套到底备着了没有」，而不是它内部走到了哪个枚举值。 */
-function unitStateText(entry) {
-  if (!entry) return null;
-  if (entry.status !== 'passed') return entry.status === 'no_new_backup' ? '无新备份' : '未通过';
-  switch (entry.uploadState) {
-    case 'queued': return '排队上传';
-    case 'dispatched': return '已下发上传';
-    case 'already_running': return '上传进行中';
-    case 'already_done': return '已上传';
-    default: return '待上传';
-  }
-}
-
-/* 「共 18 个账套，3 个扫完、1 个在扫、14 个等着」，底下把每一个列出来。
-
-   这一屏回答的是「还剩多少」。账套是 Agent 边扫边发现的，在这份名单出现之前，
-   界面上只能看着它们一个一个冒出来——既没有总数，也没有次序，
-   人只能盯着「传输中」猜自己还要等多久。 */
-function unitQueueHtml(cmd) {
-  const roster = unitRosterOf(cmd);
-  if (roster.length < 2) return '';   // 只有一个单元时这份名单没有信息量
-
-  const scanned = scannedUnitsOf(cmd);
-  const current = (progressOf(cmd) || {}).unit || '';
-
-  let waiting = 0;
-  const rows = roster.map(name => {
-    const state = unitStateText(scanned.get(name));
-    if (!state && name !== current) waiting++;
-    const text = state || (name === current ? '扫描中' : '等待');
-    return `<div class="row"><div class="k">${esc(name)}</div><div class="v">${esc(text)}</div></div>`;
-  }).join('');
-
-  const running = current ? 1 : 0;
-  return `<div class="hint" style="margin-top:10px">共 ${roster.length} 个业务单元 ·
-      ${scanned.size} 个已扫完 · ${running} 个扫描中 · ${waiting} 个等待</div>
-    <div class="kv" style="margin-top:6px">${rows}</div>`;
-}
 
 /* 轮询一条指令直到有结论。
    返回指令对象 / 'timeout' / null（放弃等待）。
@@ -893,15 +827,6 @@ async function pollCommand(commandId, timeoutMs, body, onProgress, opts = {}) {
   return 'timeout';
 }
 
-/* Agent 在扫描途中报上来的进度，服务端原样放在 resultPayload 里。
-   没有进度（老版本 Agent、或指令还没被领走）时返回 null，调用方退回到只报状态。 */
-function progressOf(cmd) {
-  if (!cmd || !cmd.resultPayload) return null;
-  try {
-    const p = JSON.parse(cmd.resultPayload).progress;
-    return p && p.message ? p : null;
-  } catch (e) { return null; }
-}
 
 /* 一句话说清「现在在干什么」。
    状态词（running）对使用者没有信息量——他要判断的是「这东西还在动吗、还要多久」，

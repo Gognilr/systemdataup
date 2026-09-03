@@ -187,7 +187,11 @@ public class MissedBackupWorker : BackgroundService
             if (!CronExpression.TryParse(task.ScanSchedule, out var cron, out _) || cron is null)
                 continue;
 
-            var tz = ResolveTimeZone(task.ScheduleTimezone);
+            // 解析不了就退回 UTC，但必须留下痕迹：凌晨 2:00 的计划会因此按
+            // 北京时间上午 10:00 判定，而那正是「有没有漏备份」的基准。
+            if (!PlanSchedule.TryResolveTimeZone(task.ScheduleTimezone, out var tz))
+                _logger.LogWarning("任务 {Task} 的时区 {Zone} 在本机解析不了，本轮按 UTC 判定",
+                    task.Name, task.ScheduleTimezone);
 
             var prevDue = cron.GetPreviousOccurrence(now, tz);
             if (prevDue is null)
@@ -262,45 +266,4 @@ public class MissedBackupWorker : BackgroundService
             _logger.LogInformation("漏备份巡检完成：触发 {Raised} 条，恢复 {Recovered} 条", raised, recovered);
     }
 
-    /// <summary>
-    /// 解析任务时区。服务端存的是 IANA ID（默认 Asia/Shanghai），部分 Windows 主机只认
-    /// Windows 时区 ID，这里保持与 ReportService.ResolveTimeZone 相同的回退链——
-    /// 两处判的是同一个「任务的计划时刻」，算出不同的答案没有意义。
-    /// 最终仍解析不了就退回 UTC：服务端不能按本机时区猜，但也不能因此不做判定。
-    /// </summary>
-    private static TimeZoneInfo ResolveTimeZone(string? id)
-    {
-        if (string.IsNullOrWhiteSpace(id))
-            return TimeZoneInfo.Utc;
-
-        try
-        {
-            return TimeZoneInfo.FindSystemTimeZoneById(id.Trim());
-        }
-        catch (TimeZoneNotFoundException)
-        {
-            var windowsId = id.Trim() switch
-            {
-                "Asia/Tokyo" => "Tokyo Standard Time",
-                "Asia/Shanghai" => "China Standard Time",
-                "Asia/Singapore" => "Singapore Standard Time",
-                "Europe/London" => "GMT Standard Time",
-                "America/New_York" => "Eastern Standard Time",
-                "America/Los_Angeles" => "Pacific Standard Time",
-                _ => null
-            };
-
-            if (windowsId is not null)
-            {
-                try { return TimeZoneInfo.FindSystemTimeZoneById(windowsId); }
-                catch (TimeZoneNotFoundException) { }
-            }
-
-            return TimeZoneInfo.Utc;
-        }
-        catch (InvalidTimeZoneException)
-        {
-            return TimeZoneInfo.Utc;
-        }
-    }
 }

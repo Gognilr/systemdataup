@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -38,6 +38,14 @@ public interface IBackupTaskService
 
     /// <summary>该任务最近一次识别测试的指令（含结果）；从未测过返回 null。</summary>
     Task<CommandResultDto?> GetLatestRecognitionTestAsync(Guid taskId, CancellationToken ct = default);
+
+    /// <summary>
+    /// 该任务最近一条预检指令（含 result_payload 里的业务单元清单）；从未预检过返回 null。
+    ///
+    /// 「这个任务有几个账套、上一次各自扫成什么样」此前只在「立即备份」的弹窗里出现过一次，
+    /// 窗口一关就找不回来了——而这正是多账套任务排障时第一个要看的东西。
+    /// </summary>
+    Task<CommandResultDto?> GetLatestPrecheckAsync(Guid taskId, CancellationToken ct = default);
 }
 
 /// <summary>备份任务服务实现（CRUD 乐观锁 + 暂停/恢复 + 指令下发 + 识别测试）</summary>
@@ -864,6 +872,21 @@ public class BackupTaskService : IBackupTaskService
         return command is null ? null : ToCommandResultDto(command);
     }
 
+    public async Task<CommandResultDto?> GetLatestPrecheckAsync(Guid taskId, CancellationToken ct = default)
+    {
+        // 识别测试也是 precheck_task 类型，但它带 testOnly 标记、走固定幂等键，
+        // 结果里没有业务单元清单，混进来只会让详情页显示一份过时的名单。
+        var testKey = RecognitionTestKey(taskId);
+        var command = await _db.Commands.AsNoTracking()
+            .Where(c => c.TaskId == taskId
+                && c.CommandType == CommandType.PrecheckTask
+                && c.IdempotencyKey != testKey)
+            .OrderByDescending(c => c.CreatedAt)
+            .FirstOrDefaultAsync(ct);
+
+        return command is null ? null : ToCommandResultDto(command);
+    }
+
     private static string RecognitionTestKey(Guid taskId) => $"test-recognition:{taskId:N}";
 
     // ---------- 私有辅助 ----------
@@ -1012,7 +1035,14 @@ public class BackupTaskService : IBackupTaskService
         task.ScanSchedule = NormalizeScanSchedule(scanSchedule);
         task.UploadWindowStart = ParseTimeOfDay(uploadWindowStart, nameof(uploadWindowStart));
         task.UploadWindowEnd = ParseTimeOfDay(uploadWindowEnd, nameof(uploadWindowEnd));
-        task.ScheduleTimezone = string.IsNullOrWhiteSpace(scheduleTimezone) ? "Asia/Shanghai" : scheduleTimezone.Trim();
+        // 时区在保存这一刻就要校验。运行期偷偷退回 UTC 的代价是看不见的：
+        // 凌晨 2:00 的计划变成按北京时间上午 10:00 判定，扫描落在业务高峰，
+        // 而「有没有漏备份」的基准也跟着错了八个小时——没有任何一处会报错。
+        var timezone = string.IsNullOrWhiteSpace(scheduleTimezone) ? "Asia/Shanghai" : scheduleTimezone.Trim();
+        if (!PlanSchedule.IsKnownTimeZone(timezone))
+            throw new BusinessException("INVALID_REQUEST",
+                $"时区 {timezone} 在服务端解析不了。请用 IANA 时区 ID（如 Asia/Shanghai）。", 400);
+        task.ScheduleTimezone = timezone;
         task.RandomDelayMinutes = Math.Clamp(randomDelayMinutes, 0, 1440);
         task.StabilityIntervalSeconds = stabilityIntervalSeconds;
         task.MaxStabilityWaitSeconds = Math.Max(maxStabilityWaitSeconds, stabilityIntervalSeconds);

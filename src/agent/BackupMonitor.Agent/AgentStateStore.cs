@@ -1,4 +1,4 @@
-﻿using System.Security.Cryptography;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -55,6 +55,17 @@ public sealed class AgentState
     /// </summary>
     public Dictionary<string, RestabilizeEntry> PendingRestabilizeScans { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 下一次扫描必须跳过快速指纹基线、强制走全量哈希的任务（D12）。键为 taskId 的字符串形式。
+    ///
+    /// 触发条件是「服务端说这个候选没了」（CANDIDATE_NOT_FOUND / CANDIDATE_FILES_MISSING）：
+    /// 本地候选被剪枝掉、或清单文件损坏之后，这份备份必须重建候选才能再传。
+    /// 而重建的唯一入口是扫描，扫描第一件事就是拿快速指纹和服务端下发的基线比——
+    /// 源文件没变，指纹当然命中，于是直接回 no_new_backup，候选永远重建不出来。
+    /// 现场表现是这份备份再也传不上去，而界面上写的是「没有新备份」。
+    /// </summary>
+    public List<string> ForceFullScanTaskIds { get; set; } = [];
 }
 
 /// <summary>
@@ -136,6 +147,13 @@ public sealed class AgentStateStore
 
     /// <summary>候选条目总量上限（审计 F-08），按 UpdatedAt 淘汰最旧的</summary>
     private const int MaxCandidates = 200;
+
+    /// <summary>
+    /// 剪枝的保护窗口（D12）：这段时间内更新过的候选不按总量淘汰。
+    /// 7 天足够覆盖「扫出来了但一直没传上去」的各种情况（客户端离线、上传排队、
+    /// 管理员暂停后忘了恢复），而候选被剪掉的代价是那份备份彻底传不上去。
+    /// </summary>
+    private static readonly TimeSpan RecentCandidateWindow = TimeSpan.FromDays(7);
     private static readonly byte[] ProtectionEntropy = SHA256.HashData(
         System.Text.Encoding.UTF8.GetBytes("BackupMonitor.Agent.State.v1"));
 
@@ -263,6 +281,46 @@ public sealed class AgentStateStore
     }
 
     /// <summary>
+    /// 记下「这个任务下一次扫描必须走全量哈希」（D12）。
+    ///
+    /// 服务端说候选没了（CANDIDATE_NOT_FOUND / CANDIDATE_FILES_MISSING）时调用。
+    /// 不记的话，下一轮扫描的快速指纹会命中服务端下发的基线 → 直接回 no_new_backup
+    /// → 候选永远重建不出来 → 这份备份再也传不上去，而界面上写的是「没有新备份」。
+    /// </summary>
+    public void RequestFullScan(Guid taskId)
+    {
+        lock (_sync)
+        {
+            var key = taskId.ToString();
+            if (_state.ForceFullScanTaskIds.Contains(key, StringComparer.OrdinalIgnoreCase))
+                return;
+
+            _state.ForceFullScanTaskIds.Add(key);
+            SaveUnsafe();
+        }
+    }
+
+    /// <summary>
+    /// 取出并清掉「下一次强制全量」的标记。取走即消费：全量扫一遍之后候选就重建好了，
+    /// 标记留着只会让接下来每一轮都白读一遍整份备份。
+    /// </summary>
+    public bool ConsumeFullScanRequest(Guid taskId)
+    {
+        lock (_sync)
+        {
+            var key = taskId.ToString();
+            var index = _state.ForceFullScanTaskIds.FindIndex(
+                id => string.Equals(id, key, StringComparison.OrdinalIgnoreCase));
+            if (index < 0)
+                return false;
+
+            _state.ForceFullScanTaskIds.RemoveAt(index);
+            SaveUnsafe();
+            return true;
+        }
+    }
+
+    /// <summary>
     /// 淘汰不再属于任何在线任务的候选，并返回要删清单文件的 candidateKey（审计 F-08）。
     ///
     /// Candidates 原先只写不删——ScheduledScans 和 PendingRestabilizeScans 都有清理僵尸条目的
@@ -282,11 +340,21 @@ public sealed class AgentStateStore
 
             // 再加一道总量闸：CandidateKey 里含有状态段，同一个任务反复扫描会
             // 不断产生新键，光靠「任务还在不在」是收敛不了的。按 UpdatedAt 淘汰最旧的。
+            //
+            // 但最近更新过的一律不动，哪怕总量超了（D12）。只按总量截断的话，
+            // 一台多账套机器一轮扫描就能产出十几个候选，把还没来得及上传的那几个挤掉——
+            // 而候选一旦被剪掉，服务端下发的上传指令就会撞 CANDIDATE_NOT_FOUND。
+            // 保护窗口取「够跑完一次上传」的量级：候选是这次备份唯一的凭据，
+            // 让 state.json 大一点，远好过让一份刚扫出来的备份传不上去。
+            var protectedSince = DateTime.UtcNow - RecentCandidateWindow;
             var survivors = _state.Candidates
                 .Where(kv => liveTaskIds.Contains(kv.Value.TaskId))
                 .OrderByDescending(kv => kv.Value.UpdatedAt)
                 .ToList();
-            removed.AddRange(survivors.Skip(maxEntries).Select(kv => kv.Key));
+            removed.AddRange(survivors
+                .Skip(maxEntries)
+                .Where(kv => kv.Value.UpdatedAt < protectedSince)
+                .Select(kv => kv.Key));
 
             if (removed.Count == 0)
                 return [];

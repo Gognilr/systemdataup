@@ -169,14 +169,18 @@ public class ExecutionQueueService : IExecutionQueueService
             .AnyAsync(r => r.PlanId == planId && ActiveRunStatuses.Contains(r.Status), ct);
         if (hasActive)
         {
-            _logger.LogWarning("备份计划 {Plan} 上一次执行尚未结束，本次触发跳过", plan.Name);
+            _logger.LogWarning("备份计划 {Plan} 上一次执行尚未结束，{Due} 这一次跳过",
+                plan.Name, scheduledFor);
+            await MarkDueHandledAsync(plan, scheduledFor, ct);
             return null;
         }
 
         var taskIds = plan.Items.OrderBy(i => i.SortOrder).Select(i => i.TaskId).ToList();
         if (taskIds.Count == 0)
         {
-            _logger.LogInformation("备份计划 {Plan} 里没有任何任务，不产生执行记录", plan.Name);
+            _logger.LogInformation("备份计划 {Plan} 里没有任何任务，{Due} 这一次不产生执行记录",
+                plan.Name, scheduledFor);
+            await MarkDueHandledAsync(plan, scheduledFor, ct);
             return null;
         }
 
@@ -237,6 +241,28 @@ public class ExecutionQueueService : IExecutionQueueService
             plan.Name, run.Id, run.TotalItems, run.MaxConcurrent);
 
         return run;
+    }
+
+    /// <summary>
+    /// 把「这一次到期已经处理过了」记下来。
+    ///
+    /// 两条 return null 的分支原先什么都不写，于是 PromoteDuePlansAsync 的判据
+    /// （last_run_at 早于 due）一直成立：执行器每 15 秒重算一次、重新走到这里、
+    /// 重新打一条同样的日志，一整晚刷几千行。附带的第二个后果更麻烦——
+    /// 卡住的那次执行一结束，同一个到期时刻立刻就被补跑一次，
+    /// 而那个时刻可能已经是白天的业务高峰了。
+    ///
+    /// 只在 scheduledFor 有值（按计划触发）时推进；手动「立即执行」传的是 null，
+    /// 它不该影响下一次到点的判定。
+    /// </summary>
+    private async Task MarkDueHandledAsync(BackupPlan plan, DateTime? scheduledFor, CancellationToken ct)
+    {
+        if (scheduledFor is null || (plan.LastRunAt is not null && plan.LastRunAt >= scheduledFor))
+            return;
+
+        await _db.BackupPlans
+            .Where(p => p.Id == plan.Id)
+            .ExecuteUpdateAsync(s => s.SetProperty(p => p.LastRunAt, scheduledFor.Value), ct);
     }
 
     public async Task<bool> TryDeferUploadAsync(

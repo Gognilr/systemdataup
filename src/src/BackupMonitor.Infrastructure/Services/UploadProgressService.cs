@@ -58,16 +58,49 @@ public class UploadProgressService : IUploadProgressService
         var active = await _db.UploadSessions
             .CountAsync(s => UploadSessionStatuses.Active.Contains(s.Status), ct);
 
-        var queued = await _db.Set<Core.Entities.Execution.ExecutionRunItem>()
-            .CountAsync(i => i.Status == ExecutionItemStatus.Pending
-                && (i.Run.Status == BatchStatus.Pending || i.Run.Status == BatchStatus.Running), ct);
+        var globalLimit = Math.Clamp(
+            await _settings.GetIntAsync(SequentialExecutionWorker.GlobalUploadLimitKey, 4, ct), 1, 64);
+
+        // 两种「排队中」必须分开数，它们等的根本不是一回事：
+        //   一、等全局上传名额——只有上传项会被这道闸挡住（预检项一个名额都不占），
+        //       而且只有在名额真的满了的时候；
+        //   二、等本次执行自己的并发度——前一项还没跑完，这是「严格按顺序」的正常表现。
+        // 混成一个数的后果是界面显示「0 个正在传 / 2 个排队中 · 有空余名额」，
+        // 读起来就是系统卡住了，而实际上那两项在正常排队。
+        var pending = await _db.Set<Core.Entities.Execution.ExecutionRunItem>()
+            .Where(i => i.Status == ExecutionItemStatus.Pending
+                && (i.Run.Status == BatchStatus.Pending || i.Run.Status == BatchStatus.Running))
+            .Select(i => new { i.CommandType, RunId = i.RunId, i.Run.MaxConcurrent })
+            .ToListAsync(ct);
+
+        var slotFull = active >= globalLimit;
+        var runningPerRun = await _db.Set<Core.Entities.Execution.ExecutionRunItem>()
+            .Where(i => i.Status == ExecutionItemStatus.Running)
+            .GroupBy(i => i.RunId)
+            .Select(g => new { RunId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(g => g.RunId, g => g.Count, ct);
+
+        var waitingForSlot = 0;
+        var waitingInRun = 0;
+        foreach (var item in pending)
+        {
+            var running = runningPerRun.TryGetValue(item.RunId, out var n) ? n : 0;
+            if (running >= item.MaxConcurrent)
+                waitingInRun++;
+            else if (slotFull
+                && item.CommandType is CommandType.UploadCandidate or CommandType.UploadLatest)
+                waitingForSlot++;
+            else
+                waitingInRun++;   // 本轮就该被放行了，归到「等这次执行」而不是「等名额」
+        }
 
         return new UploadQueueStatusDto
         {
             ActiveUploads = active,
-            QueuedItems = queued,
-            GlobalLimit = Math.Clamp(
-                await _settings.GetIntAsync(SequentialExecutionWorker.GlobalUploadLimitKey, 4, ct), 1, 64)
+            QueuedItems = pending.Count,
+            WaitingForUploadSlot = waitingForSlot,
+            WaitingInRun = waitingInRun,
+            GlobalLimit = globalLimit
         };
     }
 
@@ -208,8 +241,13 @@ public sealed class UploadRateSampler
                 return previous.LastRate;
 
             // 续传会话重建后 uploaded_bytes 可能变小，此时差值为负，按 0 处理。
+            //
+            // 采样窗口内计数没动就返回 null，让调用方退回全程平均值。
+            // 返回 0 的话 `Observe(...) ?? averageRate` 这个回退根本不生效（0 不是 null），
+            // 一次正常的采样间隔就把「正在传」显示成「0 B/s、预计剩余 —」。
+            // 分块 8MB 才推进一次计数，而界面 5 秒一刷，采到 0 是常态而不是异常。
             var delta = Math.Max(0, uploadedBytes - previous.Bytes);
-            var rate = (long)(delta / gap.TotalSeconds);
+            long? rate = delta > 0 ? (long)(delta / gap.TotalSeconds) : null;
             _samples[sessionId] = new Sample(uploadedBytes, nowUtc, rate);
             return rate;
         }

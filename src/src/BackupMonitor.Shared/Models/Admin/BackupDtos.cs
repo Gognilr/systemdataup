@@ -33,6 +33,12 @@ public class BackupSetListItemDto
     /// <summary>备份版本状态（snake_case）</summary>
     public string Status { get; set; } = null!;
 
+    /// <summary>
+    /// 非空表示这一份正在重新校验。校验刻意不改 Status（改了会丢掉原状态，
+    /// 隔离尤其不能丢），所以「校验中」这件事要靠这个字段单独告诉界面。
+    /// </summary>
+    public DateTime? VerifyingSince { get; set; }
+
     public DateTime? BackupBusinessTime { get; set; }
     public DateTime UploadedAt { get; set; }
     public int TotalFiles { get; set; }
