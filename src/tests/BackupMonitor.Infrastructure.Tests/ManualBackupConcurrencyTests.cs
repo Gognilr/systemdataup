@@ -292,6 +292,59 @@ public class ManualBackupConcurrencyTests : IAsyncLifetime
         Assert.Equal(0, await CountAsync(runId, ExecutionItemStatus.Pending));
     }
 
+    /// <summary>
+    /// 队列真的不动了才判失败：一个项都没在跑、名额也一直没释放，超过 2 倍单项超时之后
+    /// 排队中的项判失败并发告警，让这次执行能收尾——否则计划不允许叠一次执行，
+    /// 一次卡住就等于这个计划永远不再执行，且没有任何告警。
+    ///
+    /// 这条与 SequentialExecutionWorkerTests 里「有项在跑时不判失败」是一对：
+    /// 兜底要杀的是「不动」，不是「慢」，两边各钉一半。
+    /// </summary>
+    [Fact]
+    public async Task 队列完全停滞超过阈值后排队项判失败并让执行收尾()
+    {
+        var clients = new List<(Guid ClientId, Guid TaskId)>();
+        for (var i = 0; i < 2; i++)
+            clients.Add(await SeedClientTaskAsync());
+
+        await SetSettingAsync(SequentialExecutionWorker.GlobalUploadLimitKey, "1");
+
+        var runId = await SeedUploadRunAsync(clients);
+
+        // 名额被别人占满，这次执行一个项都放行不出去
+        var (blockerClientId, blockerTaskId) = await SeedClientTaskAsync();
+        await SeedActiveUploadAsync(blockerClientId, blockerTaskId);
+
+        await RunPassAsync();
+        Assert.Equal(0, await CountAsync(runId, ExecutionItemStatus.Running));
+        Assert.Equal(2, await CountAsync(runId, ExecutionItemStatus.Pending));
+
+        // 把这次执行推到 5 小时前（单项超时 120 分钟 → 阈值 240 分钟）
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            await db.ExecutionRuns.Where(r => r.Id == runId)
+                .ExecuteUpdateAsync(s => s.SetProperty(r => r.CreatedAt, DateTime.UtcNow.AddHours(-5)));
+        }
+
+        await RunPassAsync();
+
+        Assert.Equal(2, await CountAsync(runId, ExecutionItemStatus.Failed));
+        Assert.Equal(0, await CountAsync(runId, ExecutionItemStatus.Pending));
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            // 执行必须终结，否则下一次到点仍然建不出新的
+            var run = await db.ExecutionRuns.AsNoTracking().SingleAsync(r => r.Id == runId);
+            Assert.NotNull(run.FinishedAt);
+
+            Assert.True(await db.Alerts.AnyAsync(a => a.Category == "execution_item_queue_timeout"),
+                "队列停滞必须留下告警，否则这次收尾在界面上和「正常跑完」没有区别");
+        }
+    }
+
     /// <summary>上限设为 1：行为退化成串行，且不会死锁——放不出去就等下一轮，而不是判失败。</summary>
     [Fact]
     public async Task 全局上限为一时退化成串行且不判失败()

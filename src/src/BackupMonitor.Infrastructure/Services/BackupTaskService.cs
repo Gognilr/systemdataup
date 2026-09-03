@@ -257,10 +257,25 @@ public class BackupTaskService : IBackupTaskService
         // 候选、历史会话、已删除的备份集都是任务的附属记录，任务没了它们也失去意义，
         // 与下面已有的 commands / alerts 一样随任务一并清理。
 
-        var deleted = await CascadeDeleteTaskDependentsAsync(taskId, ct);
+        // 级联清理是九步独立的 DELETE / UPDATE。不包事务的话，任何一步失败
+        // （没预见到的外键、数据库瞬断）留下的是「任务行还在，但它的备份集、候选、
+        // 上传会话、指令、告警全没了」——这个半截状态比删不掉严重得多，
+        // 而且没有任何一条路径能把它修回去。要么全删掉，要么什么都别动。
+        var deleted = await _db.Database.CreateExecutionStrategy().ExecuteAsync(async () =>
+        {
+            await using var tx = await _db.Database.BeginTransactionAsync(ct);
 
-        _db.BackupTasks.Remove(task);
-        await _db.SaveChangesAsync(ct);
+            var result = await CascadeDeleteTaskDependentsAsync(taskId, ct);
+
+            _db.BackupTasks.Remove(task);
+            await _db.SaveChangesAsync(ct);
+
+            await tx.CommitAsync(ct);
+            return result;
+        });
+
+        // 目录删除刻意在提交之后：文件系统操作回滚不了。见 DeleteRepositoryDirectoriesAsync。
+        var removedDirectories = await DeleteRepositoryDirectoriesAsync(deleted.PendingDirectories, ct);
 
         await _audit.RecordAsync("task.delete", AuditResult.Success, "backup_task", taskId,
             beforeData: JsonSerializer.Serialize(new
@@ -276,7 +291,7 @@ public class BackupTaskService : IBackupTaskService
                 deleted.RemovedUploadSessions,
                 deleted.RemovedRestoreRequests,
                 deleted.RemovedExecutionItems,
-                deleted.RemovedRepositoryDirectories
+                RemovedRepositoryDirectories = removedDirectories
             }), ct: ct);
     }
 
@@ -290,7 +305,10 @@ public class BackupTaskService : IBackupTaskService
         int RemovedUploadSessions,
         int RemovedRestoreRequests,
         int RemovedExecutionItems,
-        int RemovedRepositoryDirectories);
+        IReadOnlyList<PendingDirectoryDeletion> PendingDirectories);
+
+    /// <summary>待删除的仓库目录：路径在删行之前取出，删除动作在事务提交之后执行。</summary>
+    private readonly record struct PendingDirectoryDeletion(string Path, string BackupSetCode);
 
     /// <summary>
     /// 级联清理任务的全部附属记录。
@@ -357,23 +375,15 @@ public class BackupTaskService : IBackupTaskService
                 .Where(r => setIdList.Contains(r.BackupSetId))
                 .ExecuteDeleteAsync(ct);
 
-        // 五、物理目录。回收站里的备份集目录还在磁盘上，删完行就没人知道它的路径了，
-        // 只能等 RepositoryReconcileWorker 事后把它报成孤儿目录。
-        var removedDirectories = 0;
-        var recyclable = setIds.Where(s => s.Status == BackupSetStatus.RecycleBin
-            && !string.IsNullOrWhiteSpace(s.RepositoryPath)).ToList();
-        if (recyclable.Count > 0)
-        {
-            var repositoryRoot = await _storage.GetRepositoryRootAsync(ct);
-            foreach (var s in recyclable)
-            {
-                if (RepositoryDirectory.DeleteUnderRoot(s.RepositoryPath, repositoryRoot))
-                    removedDirectories++;
-                else
-                    _logger.LogWarning("删除任务时备份集 {Code} 的仓库目录不存在，只做逻辑删除：{Path}",
-                        s.BackupSetCode, s.RepositoryPath);
-            }
-        }
+        // 五、物理目录只在这里**登记**，删除动作留到事务提交之后（见 DeleteAsync）。
+        // 文件系统操作回滚不了：在事务里删目录再回滚，数据库说备份还在、磁盘上已经没了，
+        // 那比留下几个孤儿目录严重得多——孤儿目录 RepositoryReconcileWorker 会报出来，
+        // 而「记录在、数据没了」要等到有人真的去恢复那一刻才发现。
+        // 路径必须在删行之前取出来，删完行就再也不知道它在哪。
+        var pendingDirectories = setIds
+            .Where(s => s.Status == BackupSetStatus.RecycleBin && !string.IsNullOrWhiteSpace(s.RepositoryPath))
+            .Select(s => new PendingDirectoryDeletion(s.RepositoryPath!, s.BackupSetCode))
+            .ToList();
 
         // 六、备份集。backup_files 与 retention_locks 是 CASCADE，随它一起走。
         // 必须在候选与上传会话之前：backup_sets 同时引用这两者（NO ACTION）。
@@ -405,7 +415,39 @@ public class BackupTaskService : IBackupTaskService
             removedUploadSessions,
             removedRestoreRequests,
             removedExecutionItems,
-            removedDirectories);
+            pendingDirectories);
+    }
+
+    /// <summary>
+    /// 提交之后再删仓库目录。失败只记日志：数据库那一侧已经提交，任务确实删掉了，
+    /// 这里再抛异常只会让调用方以为删除失败。删不掉的目录会被
+    /// RepositoryReconcileWorker 当成孤儿目录报出来，有人工处置的路径。
+    /// </summary>
+    private async Task<int> DeleteRepositoryDirectoriesAsync(
+        IReadOnlyList<PendingDirectoryDeletion> pending, CancellationToken ct)
+    {
+        if (pending.Count == 0)
+            return 0;
+
+        var removed = 0;
+        try
+        {
+            var repositoryRoot = await _storage.GetRepositoryRootAsync(ct);
+            foreach (var entry in pending)
+            {
+                if (RepositoryDirectory.DeleteUnderRoot(entry.Path, repositoryRoot))
+                    removed++;
+                else
+                    _logger.LogWarning("删除任务时备份集 {Code} 的仓库目录不存在，跳过：{Path}",
+                        entry.BackupSetCode, entry.Path);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "删除任务后清理仓库目录失败，剩余目录将由仓库对帐报为孤儿目录");
+        }
+
+        return removed;
     }
 
     public async Task<PagedResult<BackupTaskListItemDto>> GetListAsync(BackupTaskQuery query, CancellationToken ct = default)

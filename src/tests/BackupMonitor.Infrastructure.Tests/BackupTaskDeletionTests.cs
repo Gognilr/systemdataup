@@ -270,6 +270,64 @@ public class BackupTaskDeletionTests : IAsyncLifetime
         Assert.False(Directory.Exists(repositoryPath));
     }
 
+    /// <summary>
+    /// 仓库根解析不了时，任务仍然要被完整删除，不能留下半截状态。
+    ///
+    /// 级联清理是九步独立的 DELETE/UPDATE，而目录删除原先夹在第五步——
+    /// 也就是说 GetRepositoryRootAsync 一抛（盘掉了、路径没权限），
+    /// 前四步已经把告警、指令、执行项、恢复请求删掉了，任务行却还在。
+    /// 这个半截状态没有任何一条路径能修回去。
+    ///
+    /// 现在库里的九步在一个事务里，目录删除挪到提交之后并自己吞掉异常：
+    /// 删不掉的目录由 RepositoryReconcileWorker 报成孤儿目录，有人工处置的路径。
+    /// </summary>
+    [Fact]
+    public async Task 仓库根解析失败时任务仍被完整删除且不留半截状态()
+    {
+        var (clientId, taskId) = await CreateTaskAsync();
+
+        var repositoryPath = Path.Combine(_repositoryRoot, Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(repositoryPath);
+        File.WriteAllText(Path.Combine(repositoryPath, "data.bin"), "task-delete-test");
+
+        var setId = await SeedBackupSetAsync(clientId, taskId, BackupSetStatus.RecycleBin, repositoryPath);
+
+        // 只替换存储实现，其余依赖与正常路径完全一致
+        var sc = new ServiceCollection();
+        sc.AddLogging();
+        sc.AddDbContext<AppDbContext>(o => o.UseNpgsql(_fixture.ConnectionString));
+        sc.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        sc.AddSingleton<ICurrentContext, NullCurrentContext>();
+        sc.AddScoped<IAuditRecorder, DbAuditRecorder>();
+        sc.AddScoped<IAgentNotificationService, AgentNotificationService>();
+        sc.AddScoped<IAlertingService, AlertingService>();
+        sc.AddScoped<ICommandDispatcher, UnusedCommandDispatcher>();
+        sc.AddScoped<IAgentConfigService, AgentConfigService>();
+        sc.AddScoped<SystemSettingsProvider>();
+        sc.AddScoped<IExecutionQueueService, ExecutionQueueService>();
+        sc.AddScoped<IUploadStorage, ThrowingUploadStorage>();
+        sc.AddScoped<IBackupTaskService, BackupTaskService>();
+        await using var broken = sc.BuildServiceProvider();
+
+        await using (var scope = broken.CreateAsyncScope())
+        {
+            await scope.ServiceProvider.GetRequiredService<IBackupTaskService>().DeleteAsync(taskId);
+        }
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.False(await db.BackupTasks.AnyAsync(t => t.Id == taskId));
+            Assert.False(await db.BackupSets.AnyAsync(s => s.Id == setId));
+            Assert.False(await db.UploadSessions.AnyAsync(s => s.TaskId == taskId));
+            Assert.False(await db.CandidateBackupSets.AnyAsync(c => c.TaskId == taskId));
+            Assert.False(await db.Commands.AnyAsync(c => c.TaskId == taskId));
+        }
+
+        // 目录删不掉是可接受的结局（仓库对帐会报出来），删了半个任务不是
+        Assert.True(Directory.Exists(repositoryPath));
+    }
+
     /// <summary>种子：候选 + 上传会话 + 指定状态的备份集（三者的外键链条正是级联顺序要处理的）</summary>
     private async Task<Guid> SeedBackupSetAsync(
         Guid clientId, Guid taskId, BackupSetStatus status, string? repositoryPath)
@@ -354,4 +412,28 @@ internal sealed class UnusedCommandDispatcher : ICommandDispatcher
         bool restartIfNotActive = false,
         CancellationToken ct = default) =>
         throw new NotSupportedException("删除备份任务不应下发指令");
+}
+
+/// <summary>
+/// 仓库根解析必定失败的存储桩件：模拟盘掉了 / 路径没权限。
+/// 删除路径只会用到 GetRepositoryRootAsync，其余成员真被调用说明测试假设已经不成立。
+/// </summary>
+internal sealed class ThrowingUploadStorage : IUploadStorage
+{
+    private static Exception Unavailable() => new IOException("仓库根不可用（测试桩件）");
+
+    public Task<string> GetRepositoryRootAsync(CancellationToken ct = default) => throw Unavailable();
+    public Task<string> GetStagingRootAsync(CancellationToken ct = default) => throw Unavailable();
+    public Task<StorageRootResolution> ResolveRootAsync(string settingKey, CancellationToken ct = default) => throw Unavailable();
+    public Task<string> GetSessionDirectoryAsync(Guid sessionId, CancellationToken ct = default) => throw Unavailable();
+    public Task<string> EnsureSessionDirectoryAsync(Guid sessionId, CancellationToken ct = default) => throw Unavailable();
+    public Task<long> GetStagingFreeBytesAsync(CancellationToken ct = default) => throw Unavailable();
+    public Task<(string Hash, long BytesWritten)> WriteChunkAsync(
+        Guid sessionId, Guid uploadFileId, int chunkIndex, long offset, Stream data, CancellationToken ct = default)
+        => throw Unavailable();
+    public Task<string> ComputeFileHashAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default) => throw Unavailable();
+    public Task<(bool Exists, long Length)> GetStagedFileInfoAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default) => throw Unavailable();
+    public Task<Stream> OpenStagedFileAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default) => throw Unavailable();
+    public Task<string> GetStagedFilePathAsync(Guid sessionId, Guid uploadFileId, CancellationToken ct = default) => throw Unavailable();
+    public Task CleanupSessionAsync(Guid sessionId, CancellationToken ct = default) => throw Unavailable();
 }

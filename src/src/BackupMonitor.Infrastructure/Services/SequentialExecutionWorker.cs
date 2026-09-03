@@ -483,13 +483,34 @@ public class SequentialExecutionWorker : BackgroundService
     ///
     /// 阈值取 2 倍单项超时：正常排队等的是别人跑完，一个单项超时的时长足够轮到它；
     /// 等了两倍还没轮到，说明名额没有在正常释放。
+    ///
+    /// 「等了多久」必须从**队列上一次推进**算起，不能从整次执行开始算，而且还有项在跑时
+    /// 一律不判——这两条缺一条，这道兜底就会去杀正常但慢的执行：
+    /// 计划默认单项超时 240 分钟、阈值 8 小时，而严格顺序的计划挂 5 个 U8 级任务
+    /// （单个扫描+哈希+上传 2~3 小时）串行跑满 12 小时是完全正常的。
+    /// 拿整次执行的开始时刻当基准的话，第 3 项还在正常跑，第 4、5 项就被判失败并发告警了。
+    /// 要挡的是「名额不流转」，不是「跑得慢」——这两者的区别就是有没有项在推进。
     /// </summary>
     private async Task ExpireStalePendingItemsAsync(
         AppDbContext db, IAlertingService alerting, ExecutionRun run, DateTime now, CancellationToken ct)
     {
+        // 有项在跑 = 队列在推进，后面的项只是还没轮到，不是排不上
+        if (run.Items.Any(i => i.Status == ExecutionItemStatus.Running))
+            return;
+
         var pendingLimit = TimeSpan.FromMinutes(run.ItemTimeoutMinutes * 2);
-        var queuedSince = run.StartedAt ?? run.CreatedAt;
-        if (now - queuedSince < pendingLimit)
+
+        // 起算点是最后一项终结的时刻——那才是当前这些 Pending 项开始「等不到」的时点。
+        // 一项都还没终结时退回执行开始时刻（含跳过的项：它们建出来就是终态、
+        // 带着 FinishedAt，不该被当成一次推进，但把起点抬到那一刻也没有坏处，
+        // 因为放行是在同一轮里紧接着发生的）。
+        var lastProgress = run.Items
+            .Where(i => i.FinishedAt is not null)
+            .Select(i => i.FinishedAt!.Value)
+            .DefaultIfEmpty(run.StartedAt ?? run.CreatedAt)
+            .Max();
+
+        if (now - lastProgress < pendingLimit)
             return;
 
         foreach (var item in run.Items.Where(i => i.Status == ExecutionItemStatus.Pending).ToList())
@@ -497,7 +518,7 @@ public class SequentialExecutionWorker : BackgroundService
             ct.ThrowIfCancellationRequested();
 
             await FinishItemAsync(db, item, ExecutionItemStatus.Failed,
-                $"排队超过 {pendingLimit.TotalMinutes:0} 分钟仍未开始，已判定失败让本次执行收尾", now, ct);
+                $"队列已停滞超过 {pendingLimit.TotalMinutes:0} 分钟且没有任何项在跑，已判定失败让本次执行收尾", now, ct);
 
             var task = await db.BackupTasks.AsNoTracking().FirstOrDefaultAsync(t => t.Id == item.TaskId, ct);
             await alerting.RaiseAsync(
@@ -505,7 +526,7 @@ public class SequentialExecutionWorker : BackgroundService
                 AlertLevel.Warning,
                 "execution_item_queue_timeout",
                 $"备份计划里的这一项一直没能开始（{task?.Name ?? item.TaskId.ToString()}）",
-                $"「{run.Name}」里的这一项排队等了 {pendingLimit.TotalMinutes:0} 分钟仍然没轮到，" +
+                $"「{run.Name}」已经 {pendingLimit.TotalMinutes:0} 分钟没有任何一项在跑，这一项也始终没轮到，" +
                 "多半是上传名额一直没有释放。这一项按失败处理，让这次执行结束——" +
                 "否则这个计划下一次到点也不会执行。",
                 clientId: item.ClientId,

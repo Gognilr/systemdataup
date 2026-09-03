@@ -271,6 +271,53 @@ public class SequentialExecutionWorkerTests : IAsyncLifetime
         }
     }
 
+    // ---------- 用例四：排队兜底超时不能误杀「慢但在推进」的执行 ----------
+
+    /// <summary>
+    /// Pending 项的兜底超时只该杀「队列不动了」，不该杀「跑得慢」。
+    ///
+    /// 这道兜底是为了防止一次卡住的执行让计划永久不再执行（CreatePlanRunAsync 见到
+    /// 未终结的 run 就返回 null）。但它最初把「等了多久」从整次执行的开始时刻算起，
+    /// 而且不看有没有项在跑——计划默认单项超时 240 分钟、阈值因此是 8 小时，
+    /// 而严格顺序的计划挂 5 个 U8 级任务（单个扫描+哈希+上传 2~3 小时）
+    /// 串行跑满 12 小时是完全正常的。于是第 3 项还在正常跑，第 4、5 项就被判失败并发告警。
+    ///
+    /// 现在起算点是「队列上一次推进」，且有项在跑时一律不判。
+    /// </summary>
+    [Fact]
+    public async Task 有项在跑时排队中的项不因整次执行超时而被判失败()
+    {
+        var (planId, _) = await SeedPlanAsync(taskCount: 5, maxConcurrent: 1);
+        var runId = await TriggerAsync(planId);
+
+        await RunPassAsync();
+        Assert.Equal(ExecutionItemStatus.Running, (await ItemStatusesAsync(runId))[0]);
+
+        // 整次执行开始于 10 小时前（超过 2×240 分钟的阈值），
+        // 但第一项是刚刚才开始跑的——队列一直在推进，只是每一项都很慢。
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var now = DateTime.UtcNow;
+
+            await db.ExecutionRuns.Where(r => r.Id == runId)
+                .ExecuteUpdateAsync(s => s
+                    .SetProperty(r => r.StartedAt, now.AddHours(-10))
+                    .SetProperty(r => r.CreatedAt, now.AddHours(-10)));
+
+            // 在跑的那一项本身没有超时（单项超时 240 分钟）
+            await db.ExecutionRunItems.Where(i => i.RunId == runId && i.SortOrder == 0)
+                .ExecuteUpdateAsync(s => s.SetProperty(i => i.StartedAt, now.AddMinutes(-10)));
+        }
+
+        await RunPassAsync();
+
+        var statuses = await ItemStatusesAsync(runId);
+        Assert.Equal(ExecutionItemStatus.Running, statuses[0]);
+        Assert.All(statuses.Skip(1), s => Assert.Equal(ExecutionItemStatus.Pending, s));
+        Assert.DoesNotContain(ExecutionItemStatus.Failed, statuses);
+    }
+
     // ---------- 基础设施 ----------
 
     private async Task RunPassAsync()
