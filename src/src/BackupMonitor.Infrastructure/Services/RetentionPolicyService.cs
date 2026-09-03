@@ -172,10 +172,48 @@ public class RetentionPolicyService : IRetentionPolicyService
         return Map(policy, boundTaskCount, await GetDefaultPolicyIdAsync(_settings, ct));
     }
 
-    public async Task<RetentionPolicyDto> CreateAsync(RetentionPolicyUpsertDto request, CancellationToken ct = default)
+    /// <summary>
+    /// 保留策略的合法性校验。
+    ///
+    /// 四项份数全空时 MarkGfsRetained 会返回空的保留集合，配合默认为 0 的最短保留天数，
+    /// 效果是「这个策略下的每一份备份都要删」。这不是一个人会有意配出来的策略，
+    /// 而表单里这四项都折叠在高级选项里、默认留空——也就是说照默认值点保存就能配出它。
+    /// 因此这道校验不是防御性编程，它挡的是最容易发生的那一种误操作。
+    ///
+    /// DTO 上已经有等价的 [Range] 与 IValidatableObject，但那一层只在 API 模型绑定时生效；
+    /// 服务被其他代码（种子数据、后台任务、测试）直接调用时绕过它，所以这里再挡一次。
+    /// </summary>
+    private static void Validate(RetentionPolicyUpsertDto request)
     {
         if (string.IsNullOrWhiteSpace(request.Name))
             throw new ValidationFailedException("name 必填");
+
+        static int? Positive(int? value) => value is > 0 ? value : null;
+
+        var hasRule = Positive(request.KeepLastCount) is not null
+            || Positive(request.KeepWeeklyCount) is not null
+            || Positive(request.KeepMonthlyCount) is not null
+            || Positive(request.KeepYearlyCount) is not null;
+        if (!hasRule)
+            throw new ValidationFailedException(
+                "「保留最近 N 份」和周/月/年规则至少要填一项。四项都留空表示一份都不保留，"
+                + "这个策略下的全部备份都会被清掉——需要「永不清理」请把份数填一个足够大的值。");
+
+        if (request.KeepLastCount is < 0 || request.KeepWeeklyCount is < 0
+            || request.KeepMonthlyCount is < 0 || request.KeepYearlyCount is < 0)
+            throw new ValidationFailedException("保留份数不能为负数");
+
+        if (request.MinimumRetentionDays < 0)
+            throw new ValidationFailedException("最短保留天数不能为负数");
+
+        if (request.RecycleBinDays < 1)
+            throw new ValidationFailedException(
+                "回收站保留天数至少为 1 天。填 0 意味着移进回收站的备份下一轮就被物理删除，等于没有撤销窗口。");
+    }
+
+    public async Task<RetentionPolicyDto> CreateAsync(RetentionPolicyUpsertDto request, CancellationToken ct = default)
+    {
+        Validate(request);
 
         var policy = new RetentionPolicy
         {
@@ -202,8 +240,7 @@ public class RetentionPolicyService : IRetentionPolicyService
 
     public async Task<RetentionPolicyDto> UpdateAsync(Guid id, RetentionPolicyUpsertDto request, CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(request.Name))
-            throw new ValidationFailedException("name 必填");
+        Validate(request);
 
         var policy = await _db.RetentionPolicies.FirstOrDefaultAsync(p => p.Id == id, ct)
             ?? throw new NotFoundException("保留策略", id);

@@ -181,7 +181,11 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
             {
                 Id = Guid.NewGuid(),
                 Name = $"it3-lock-{Guid.NewGuid():N}",
-                KeepLastCount = null,
+                // D1：四项份数全空的策略现在被当成配置错误——写入侧拒绝，运行期按
+                // 「只保留最新一份」降级并告警。这个用例测的是锁，不该顺带依赖那条降级路径，
+                // 因此改成一条正常规则「只留最新 1 份」，再单独种一个更新的哨兵备份集去吃掉这一份。
+                // 五个参与锁判定的备份集因此仍然全部落在保留范围之外，被测对象没有变。
+                KeepLastCount = 1,
                 KeepWeeklyCount = null,
                 KeepMonthlyCount = null,
                 KeepYearlyCount = null,
@@ -191,6 +195,9 @@ public class RetentionCleanupWorkerTests : IAsyncLifetime
                 UpdatedAt = now
             };
             (var clientId, var taskId) = await SeedClientAndTaskAsync(db, policy, now);
+
+            // 哨兵：最新的一份，被 KeepLastCount = 1 保住，本用例不对它做断言
+            await SeedBackupSetAsync(db, clientId, taskId, now.AddHours(-1), now);
 
             var uploadedAt = now.AddDays(-3);
             idActiveLock = await SeedBackupSetAsync(db, clientId, taskId, uploadedAt, now);

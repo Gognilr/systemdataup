@@ -65,8 +65,13 @@ public class AgentConfigService : IAgentConfigService
 
         // 进了备份计划的任务由服务端计划驱动，它自己的扫描计划不再下发——
         // 两者都留着的话，同一个任务一天会跑两次（一次 Agent 按 cron 触发，一次计划驱动）。
+        //
+        // 只有**启用中**的计划才接管任务的扫描。停用计划时 backup_plan_items 是原样保留的，
+        // 不看这个条件的话，停用计划 = 计划不再触发（PromoteDuePlansAsync 只推进 Enabled 的计划）
+        // + 任务自己的 cron 也被抹掉，这些任务从此一次都不再备份，
+        // 而且漏备份巡检看不见它们（它只认有 cron 的任务）。
         var plannedTaskIds = await _db.BackupPlanItems
-            .Where(i => i.Task.ClientId == clientId)
+            .Where(i => i.Task.ClientId == clientId && i.Plan.Enabled)
             .Select(i => i.TaskId)
             .ToListAsync(ct);
 

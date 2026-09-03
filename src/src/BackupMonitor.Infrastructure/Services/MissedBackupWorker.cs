@@ -110,6 +110,15 @@ public class MissedBackupWorker : BackgroundService
                 && t.TaskMode != TaskMode.MonitorOnly)
             .ToListAsync(ct);
 
+        // 挂进启用中计划的任务由下面的「按计划判定」分支负责，这里要排除掉。
+        // 两边都判的话，同一个任务会按两套完全不同的时刻各判一次
+        // （任务自己的 cron 已经不再下发给 Agent，按它算出来的 prevDue 没有意义）。
+        var planManagedTaskIds = await db.BackupPlanItems
+            .Where(i => i.Plan.Enabled)
+            .Select(i => i.TaskId)
+            .ToListAsync(ct);
+        var planManaged = planManagedTaskIds.ToHashSet();
+
         // 审计 G-13：所有任务的 ID，包括上面那条 Where 排除掉的（停用 / 暂停 / 只监控）。
         // 一个任务先报了 missed，随后被停用或改成只监控，那条严重告警就再也没人恢复——
         // 而「先把这个任务停掉再说」恰恰是排障时最自然的动作，正好触发它。
@@ -122,9 +131,43 @@ public class MissedBackupWorker : BackgroundService
         var raised = 0;
         var recovered = 0;
 
+        // 判定与告警对按 cron 和按计划两条路径完全一致，只有「这个时刻是谁定的」那句说明不同。
+        // alert_key 也刻意共用：一个任务只可能属于其中一条路径，共用键保证换路径时旧告警会被恢复，
+        // 不会在告警中心留下两条同义的漏备份。
+        async Task JudgeAsync(Core.Entities.Backup.BackupTask task, DateTime prevDue, TimeZoneInfo tz, string dueSource)
+        {
+            judgedTaskIds.Add(task.Id);
+
+            var alertKey = $"task:{task.Id}:missed";
+            if (task.LastSuccessAt is null || task.LastSuccessAt < prevDue)
+            {
+                var localDue = TimeZoneInfo.ConvertTimeFromUtc(
+                    DateTime.SpecifyKind(prevDue, DateTimeKind.Utc), tz);
+
+                await alerting.RaiseAsync(
+                    alertKey,
+                    task.ImportanceLevel >= ImportanceLevel.High ? AlertLevel.Critical : AlertLevel.Warning,
+                    "backup_missed",
+                    $"任务 {task.Name} 未按计划产生备份",
+                    $"{dueSource}应该在 {localDue:yyyy-MM-dd HH:mm}（{tz.Id}）备份，已经多等了 {graceMinutes} 分钟，仍然没有备份成功",
+                    clientId: task.ClientId,
+                    taskId: task.Id,
+                    ct: ct);
+                raised++;
+            }
+            else
+            {
+                await alerting.RecoverAsync(alertKey, ct);
+                recovered++;
+            }
+        }
+
         foreach (var task in tasks)
         {
             ct.ThrowIfCancellationRequested();
+
+            if (planManaged.Contains(task.Id))
+                continue;
 
             // 坑一：新部署或长期停机后重启，所有任务都会命中「上一次计划早已过去」。
             // 任务创建至今不足一个宽限期时直接跳过，避免首轮炸一屏告警。
@@ -150,29 +193,49 @@ public class MissedBackupWorker : BackgroundService
             if (now < deadline)
                 continue;   // 还在宽限期内
 
-            judgedTaskIds.Add(task.Id);
+            await JudgeAsync(task, prevDue.Value, tz, "按计划");
+        }
 
-            var alertKey = $"task:{task.Id}:missed";
-            if (task.LastSuccessAt is null || task.LastSuccessAt < prevDue)
-            {
-                var localDue = TimeZoneInfo.ConvertTimeFromUtc(
-                    DateTime.SpecifyKind(prevDue.Value, DateTimeKind.Utc), tz);
+        // 按备份计划判定。计划驱动的任务的 scan_schedule 在下发时被抹成 null
+        // （由服务端计划触发，不再由 Agent 的 cron 触发），因此上面那条按 cron 的分支
+        // 一个都看不见——挂进计划等于退出漏备份巡检，而计划本身没触发、卡住、
+        // 或者机器整晚关机，都不会有任何一条告警。
+        var plans = await db.BackupPlans
+            .Include(p => p.Items).ThenInclude(i => i.Task).ThenInclude(t => t.Client)
+            .Where(p => p.Enabled)
+            .ToListAsync(ct);
 
-                await alerting.RaiseAsync(
-                    alertKey,
-                    task.ImportanceLevel >= ImportanceLevel.High ? AlertLevel.Critical : AlertLevel.Warning,
-                    "backup_missed",
-                    $"任务 {task.Name} 未按计划产生备份",
-                    $"按计划应该在 {localDue:yyyy-MM-dd HH:mm}（{tz.Id}）备份，已经多等了 {graceMinutes} 分钟，仍然没有备份成功",
-                    clientId: task.ClientId,
-                    taskId: task.Id,
-                    ct: ct);
-                raised++;
-            }
-            else
+        foreach (var plan in plans)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var tz = PlanSchedule.ResolveTimeZone(plan.Timezone);
+            var prevDue = PlanSchedule.GetPreviousOccurrence(
+                plan.ScheduleKind == PlanScheduleKind.Weekly,
+                plan.RunAt,
+                PlanSchedule.ParseDays(plan.DaysOfWeek),
+                tz,
+                now);
+
+            if (prevDue is null)
+                continue;
+
+            if (now < prevDue.Value + grace)
+                continue;   // 还在宽限期内
+
+            foreach (var item in plan.Items)
             {
-                await alerting.RecoverAsync(alertKey, ct);
-                recovered++;
+                var task = item.Task;
+
+                // 与按 cron 的分支同一个理由：刚建出来的任务不算漏。
+                if (now - task.CreatedAt < grace)
+                    continue;
+
+                // 队列本来就不会给这些任务下发指令，判它们「漏备份」得到的是一条永不恢复的告警。
+                if (ExecutionQueueService.SkipReason(task) is not null)
+                    continue;
+
+                await JudgeAsync(task, prevDue.Value, tz, $"计划「{plan.Name}」");
             }
         }
 

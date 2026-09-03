@@ -47,15 +47,30 @@ internal sealed class ServerInstaller
         {
             Directory.CreateDirectory(payloadTemp);
             progress.Report(new ServerInstallProgress("正在读取安装 payload…", 5));
-            var payloadRoot = await ExtractPayloadAsync(payloadTemp, ct);
-            ValidatePayload(payloadRoot);
+
+            // payload 直接从安装器里读、直接解到最终位置。
+            //
+            // 原先这一段是「把内嵌的 265MB zip 写成临时文件 → 整包解压到临时目录 → 再逐文件
+            // 复制到安装目录」，2100 多个文件每个都要落两次盘：一次进 %TEMP%，一次进安装目录。
+            // 算上那个中转 zip，一次首装光这一步就要写掉约 1.3GB，而真正需要落地的只有 506MB。
+            // 更贵的是杀软：实时防护会把同一批文件完整扫两遍，其中还包括一个 155MB 的客户端
+            // 安装程序和一个 67MB 的客户端 zip。现场反馈的「卡在读取 payload / 复制运行时」
+            // 就是这一段。
+            await using var payloadStream = await OpenPayloadStreamAsync(payloadTemp, ct);
+            using var payload = new ZipArchive(payloadStream, ZipArchiveMode.Read);
+            // 点名放在解压之前：缺东西就一个字节都不往安装目录写。
+            ValidatePayload(payload);
+
+            // 迁移脚本只有几百 KB，仍然解到本次运行的私有临时目录——理由见下面 MigrationRunner
+            // 调用处的说明：它刻意不从 ProgramData 读，免得上一次装坏留下的文件挡住重试。
+            var migrationRoot = Path.Combine(payloadTemp, "database");
 
             Directory.CreateDirectory(request.InstallDirectory);
             Directory.CreateDirectory(request.DataDirectory);
             // 覆盖安装时上一次装的服务往往还在跑，Windows 会锁住已加载的
-            // BackupMonitor.Api.dll，下面的复制必定撞共享冲突。PostgreSQL 运行时靠
-            // 「已完整就跳过复制」绕开了同一问题，但 API 目录每次都必须真的覆盖，
-            // 只能先把服务停下来。
+            // BackupMonitor.Api.dll，下面的写入必定撞共享冲突。PostgreSQL 运行时靠
+            // 「已完整就跳过」绕开了同一问题，但 API 目录每次都必须真的覆盖，
+            // 只能先把服务停下来——而且必须停在往安装目录写第一个文件之前。
             if (apiServiceExisted)
             {
                 progress.Report(new ServerInstallProgress("正在停止已有的服务端服务…", 10));
@@ -64,16 +79,15 @@ internal sealed class ServerInstaller
 
             progress.Report(new ServerInstallProgress("正在复制服务端和 PostgreSQL 运行时…", 15));
             var postgresRuntime = Path.Combine(request.InstallDirectory, "PostgreSQL");
-            // Payload extraction and recursive copying can process thousands of
-            // files. Keep that synchronous filesystem work off the WinForms UI
-            // thread so Windows does not mark the installer as unresponsive.
+            // Payload extraction can process thousands of files. Keep that
+            // synchronous filesystem work off the WinForms UI thread so Windows
+            // does not mark the installer as unresponsive.
             await Task.Run(
                 () =>
                 {
-                    CopyDirectory(Path.Combine(payloadRoot, "api"), request.InstallDirectory);
-                    EnsurePostgreSqlRuntime(
-                        Path.Combine(payloadRoot, "postgresql"),
-                        postgresRuntime);
+                    ExtractPayloadDirectory(payload, "database", migrationRoot);
+                    ExtractPayloadDirectory(payload, "api", request.InstallDirectory);
+                    EnsurePostgreSqlRuntime(payload, postgresRuntime);
                 },
                 ct);
 
@@ -127,7 +141,7 @@ internal sealed class ServerInstaller
                 // Read it directly from this run's private extraction directory so
                 // a previous partial install cannot block retry by leaving stale,
                 // protected files under ProgramData\BackupMonitor\Server\database.
-                Path.Combine(payloadRoot, "database"),
+                migrationRoot,
                 request.AdminPassword,
                 new Progress<string>(message => progress.Report(new ServerInstallProgress(message, 55))),
                 ct);
@@ -200,32 +214,82 @@ internal sealed class ServerInstaller
             throw new UnauthorizedAccessException("必须以管理员身份运行服务端安装器。");
     }
 
-    private static async Task<string> ExtractPayloadAsync(string tempRoot, CancellationToken ct)
+    /// <summary>
+    /// 拿到一条可随机读取的 payload 流。单文件发布里内嵌资源是内存映射的，本身就可定位，
+    /// 直接交给 ZipArchive 即可——那 265MB 根本不必先落一次盘。
+    /// 只有拿到的流不可定位时（宿主实现变化、或非单文件构建的某些组合）才退回老路：
+    /// 先写成临时文件再打开。慢一点，但不能为了省这一步就装不上。
+    /// </summary>
+    private static async Task<Stream> OpenPayloadStreamAsync(string tempRoot, CancellationToken ct)
     {
-        var zipPath = Path.Combine(tempRoot, "server-payload.zip");
-        await using var stream = FindPayloadStream();
-        if (stream is not null)
-        {
-            await using var file = File.Create(zipPath);
-            await stream.CopyToAsync(file, ct);
-        }
-        else
+        var resource = FindPayloadStream();
+        if (resource is null)
         {
             var fallback = Path.Combine(AppContext.BaseDirectory, "payload", "server-payload.zip");
             if (!File.Exists(fallback))
                 throw new FileNotFoundException("安装器没有内置 server-payload.zip；请使用发布打包脚本生成完整安装器。", fallback);
-            File.Copy(fallback, zipPath);
+            return File.OpenRead(fallback);
         }
 
-        var root = Path.Combine(tempRoot, "payload");
-        // ZipFile has no asynchronous extraction API. Run it on a worker thread
-        // to keep the installer window repainting while the large PostgreSQL
-        // payload is expanded.
-        await Task.Run(
-            () => ZipFile.ExtractToDirectory(zipPath, root, overwriteFiles: true),
-            ct);
-        return root;
+        if (resource.CanSeek)
+            return resource;
+
+        var zipPath = Path.Combine(tempRoot, "server-payload.zip");
+        await using (resource)
+        await using (var file = File.Create(zipPath))
+        {
+            await resource.CopyToAsync(file, ct);
+        }
+
+        return File.OpenRead(zipPath);
     }
+
+    /// <summary>
+    /// 把 payload 里某个顶层目录的全部条目解到指定根目录下，不经过任何中转目录。
+    /// 条目名来自我们自己的打包脚本，但仍然逐条核对解出来的路径没有跑到目标根之外——
+    /// 这个安装器是以管理员身份运行的，越界写入的后果不止是装错地方。
+    /// </summary>
+    private static void ExtractPayloadDirectory(ZipArchive payload, string directoryName, string targetRoot)
+    {
+        Directory.CreateDirectory(targetRoot);
+        var root = Path.GetFullPath(targetRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var prefix = directoryName + "/";
+        var extracted = 0;
+
+        foreach (var entry in payload.Entries)
+        {
+            var normalized = NormalizeEntryName(entry.FullName);
+            if (!normalized.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var relative = normalized[prefix.Length..];
+            if (relative.Length == 0)
+                continue;
+
+            var destination = Path.GetFullPath(
+                Path.Combine(targetRoot, relative.Replace('/', Path.DirectorySeparatorChar)));
+            if (!destination.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"安装 payload 内的条目越界：{entry.FullName}");
+
+            // 目录条目（Compress-Archive 会写出来）只建目录，没有内容可解。
+            if (normalized.EndsWith('/'))
+            {
+                Directory.CreateDirectory(destination);
+                continue;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            entry.ExtractToFile(destination, overwrite: true);
+            extracted++;
+        }
+
+        if (extracted == 0)
+            throw new InvalidOperationException($"安装 payload 内没有 {directoryName} 目录的内容。");
+    }
+
+    /// <summary>打包脚本用 Compress-Archive 生成，条目名里可能是反斜杠；两种分隔符都认。</summary>
+    private static string NormalizeEntryName(string fullName) =>
+        fullName.Replace(Path.DirectorySeparatorChar, '/').Replace(Path.AltDirectorySeparatorChar, '/');
 
     private static Stream? FindPayloadStream()
     {
@@ -235,13 +299,17 @@ internal sealed class ServerInstaller
         return resource is null ? null : assembly.GetManifestResourceStream(resource);
     }
 
-    private static void ValidatePayload(string root)
+    private static void ValidatePayload(ZipArchive payload)
     {
-        if (!File.Exists(Path.Combine(root, "api", "BackupMonitor.Api.exe")))
+        var entries = payload.Entries.Select(entry => NormalizeEntryName(entry.FullName)).ToList();
+        bool Has(string path) => entries.Any(name => string.Equals(name, path, StringComparison.OrdinalIgnoreCase));
+        bool HasUnder(string path) => entries.Any(name => name.StartsWith(path, StringComparison.OrdinalIgnoreCase));
+
+        if (!Has("api/BackupMonitor.Api.exe"))
             throw new InvalidOperationException("服务端 payload 缺少 BackupMonitor.Api.exe。");
-        if (!File.Exists(Path.Combine(root, "database", "V001__initial_schema.sql")))
+        if (!Has("database/V001__initial_schema.sql"))
             throw new InvalidOperationException("服务端 payload 缺少数据库迁移 V001。");
-        if (!Directory.Exists(Path.Combine(root, "postgresql", "bin")))
+        if (!HasUnder("postgresql/bin/"))
             throw new InvalidOperationException("服务端 payload 缺少 PostgreSQL Windows 运行时目录。");
     }
 
@@ -508,22 +576,7 @@ internal sealed class ServerInstaller
         }
     }
 
-    private static void CopyDirectory(string source, string target)
-    {
-        if (!Directory.Exists(source))
-            throw new DirectoryNotFoundException($"payload 目录不存在：{source}");
-        Directory.CreateDirectory(target);
-        foreach (var directory in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories))
-            Directory.CreateDirectory(Path.Combine(target, Path.GetRelativePath(source, directory)));
-        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
-        {
-            var destination = Path.Combine(target, Path.GetRelativePath(source, file));
-            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            File.Copy(file, destination, overwrite: true);
-        }
-    }
-
-    private static void EnsurePostgreSqlRuntime(string source, string target)
+    private static void EnsurePostgreSqlRuntime(ZipArchive payload, string target)
     {
         // A valid existing runtime may be in use by the PostgreSQL service and
         // Windows locks loaded executables. Reuse it on repair; first installs
@@ -531,9 +584,9 @@ internal sealed class ServerInstaller
         if (IsCompletePostgreSqlRuntime(target))
             return;
 
-        CopyDirectory(source, target);
+        ExtractPayloadDirectory(payload, "postgresql", target);
         if (!IsCompletePostgreSqlRuntime(target))
-            throw new InvalidOperationException($"PostgreSQL 运行时复制不完整：{target}");
+            throw new InvalidOperationException($"PostgreSQL 运行时解压不完整：{target}");
     }
 
     private static bool IsCompletePostgreSqlRuntime(string root) =>

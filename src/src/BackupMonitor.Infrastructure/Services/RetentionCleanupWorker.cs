@@ -359,6 +359,21 @@ public class RetentionCleanupWorker : BackgroundService
             if (policy is null)
                 continue;
 
+            // 四项份数全空的策略：MarkGfsRetained 会按「只留最新一份」兜底，但这是降级行为不是正常配置，
+            // 必须有人看见并去把策略补全。去重键落在策略上——同一份坏策略绑了 20 个任务也只有一条告警。
+            if (!HasAnyKeepRule(policy))
+            {
+                await alerting.RaiseAsync(
+                    $"retention_policy:{policy.Id}:invalid",
+                    AlertLevel.Critical,
+                    "retention_policy_invalid",
+                    $"保留策略「{policy.Name}」一条保留规则都没有",
+                    "「保留最近 N 份」和周/月/年规则四项全空，按字面含义是这个策略下的备份一份都不保留。" +
+                    "清理已降级为「每个业务单元只保留最新一份」以免清空，请尽快把份数规则补上。",
+                    taskId: task.Id,
+                    ct: ct);
+            }
+
             // D1：只取 Available 状态的备份集参与 GFS 保留计算，Quarantined（已隔离）天然被排除在外——
             // 隔离是人工怀疑有问题时的动作，不参与保留计算、不能用于恢复，但也不删除。
             var sets = await db.BackupSets
@@ -426,7 +441,10 @@ public class RetentionCleanupWorker : BackgroundService
                         && (s.Status == BackupSetStatus.RecycleBin || s.Status == BackupSetStatus.Deleted),
                     ct);
 
-                if (everCleaned)
+                // 100% 回收在任何情况下都不是正常轮换，首次豁免也不适用它：
+                // 「第一次给老任务配策略」最多是把旧版本收掉，不会连最新那一份一起收。
+                // 走到 100% 只可能是策略本身有问题，这正是熔断要挡的那一种。
+                if (everCleaned || percent >= 100)
                 {
                     _logger.LogError(
                         "保留清理熔断：任务 {Task} 本轮拟回收 {N}/{Total}（{Percent}%），达到阈值 {Threshold}%，已暂停该任务回收",
@@ -481,6 +499,15 @@ public class RetentionCleanupWorker : BackgroundService
     {
         var keep = new HashSet<Guid>();
 
+        // 兜底：四项份数都没配的策略在 D1 校验落地之前是能存进库的。真遇上时按「保留最新一份」处理
+        // 而不是按「一份都不留」，并由调用方记成一条告警——宁可清理不干净，不可清空。
+        if (!HasAnyKeepRule(policy))
+        {
+            if (setsDescending.Count > 0)
+                keep.Add(setsDescending[0].Id);
+            return keep;
+        }
+
         if (policy.KeepLastCount is > 0)
         {
             foreach (var set in setsDescending.Take(policy.KeepLastCount.Value))
@@ -499,6 +526,15 @@ public class RetentionCleanupWorker : BackgroundService
 
         return keep;
     }
+
+    /// <summary>
+    /// 这份策略是否至少有一条份数规则。四项全空的策略的保留集合恒为空，
+    /// 含义等同于「这个策略下的备份一份都不留」——判定口径只此一份，
+    /// 校验、运行期兜底、告警都引用它。
+    /// </summary>
+    private static bool HasAnyKeepRule(Core.Entities.Retention.RetentionPolicy policy)
+        => policy.KeepLastCount is > 0 || policy.KeepWeeklyCount is > 0
+            || policy.KeepMonthlyCount is > 0 || policy.KeepYearlyCount is > 0;
 
     /// <summary>按周期取代表版本：每个周期键只保留最新一个，最多 count 个周期</summary>
     private static void MarkByPeriod(

@@ -432,17 +432,35 @@ public sealed class AgentStateStore
 
     private AgentState LoadState()
     {
+        // 「文件不存在」是首次运行，正常路径；「文件存在却读不出来」是异常，两者必须分开。
+        if (!File.Exists(_statePath))
+            return new();
+
         try
         {
-            if (File.Exists(_statePath))
-                return JsonSerializer.Deserialize<AgentState>(File.ReadAllText(_statePath), JsonOptions) ?? new();
+            var state = JsonSerializer.Deserialize<AgentState>(File.ReadAllText(_statePath), JsonOptions);
+            if (state is not null)
+                return state;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "读取 Agent 状态文件失败，将创建新状态");
+            _logger.LogCritical(ex, "Agent 状态文件损坏：{Path}", _statePath);
         }
 
-        return new();
+        // 状态文件存在却读不出来时，绝不能返回空状态继续跑。
+        // 空状态里没有 ClientId，Agent 会当成「没注册过」重新登记——
+        // 于是这台机器在管理端变成一台待审批的新客户端、原客户端转离线、
+        // 它名下所有任务停摆，而没有任何一条告警在说「某台机器丢了身份」。
+        // 这里抛异常：LoadState 在构造函数里，AgentStateStore 是单例且随宿主一起解析，
+        // 于是 Windows 服务直接启动失败并写事件日志——这是能让人看见的失败。
+        // 坏文件刻意**原地保留**、不改名：ClientId 就在这个文件里，
+        // 改名留档看着更整洁，但也让人更容易顺手把「那个 .corrupt 文件」删掉重装，
+        // 那一删身份就真的没了。留在原地，下一次启动仍然以同样的方式失败，直到有人真的处理它。
+        throw new InvalidOperationException(
+            $"Agent 状态文件损坏，无法读取：{_statePath}。"
+            + "这个文件里存着本机的 ClientId 与证书引用，服务已拒绝以空状态启动"
+            + "（否则本机会重新登记成一台新的待审批客户端，原客户端转离线）。"
+            + "请从备份恢复该文件；确认这台机器需要重新登记时，手工删除它再启动服务。");
     }
 
     private void SaveUnsafe()
@@ -453,11 +471,24 @@ public sealed class AgentStateStore
             _state.SeenCommandNonces = _state.SeenCommandNonces.TakeLast(MaxSeenItems).ToList();
 
         var tempPath = _statePath + ".tmp";
+        var payload = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(_state, JsonOptions));
+
+        // 先建空文件、设 ACL，再写内容，最后刷盘——三步的顺序都不能变：
+        // ACL 要在内容写进去之前生效，而刷盘必须在改名之前完成。
+        // File.Move 保证的是改名这一步原子，它不保证临时文件的内容已经落盘；
+        // 少了 Flush(true)，掉电后拿到的是一个名字正确、内容为空或半截的 state.json，
+        // 而这样一个文件正是 LoadState 里那条「读不出来」的路径要处理的东西。
         using (File.Create(tempPath))
         {
         }
         SecureFileSystem.ApplyFileAcl(tempPath, _options.EnforceAcl);
-        File.WriteAllText(tempPath, JsonSerializer.Serialize(_state, JsonOptions));
+
+        using (var fs = new FileStream(tempPath, FileMode.Truncate, FileAccess.Write, FileShare.None))
+        {
+            fs.Write(payload, 0, payload.Length);
+            fs.Flush(flushToDisk: true);
+        }
+
         File.Move(tempPath, _statePath, true);
         SecureFileSystem.ApplyFileAcl(_statePath, _options.EnforceAcl);
     }

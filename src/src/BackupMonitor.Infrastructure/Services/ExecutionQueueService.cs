@@ -277,7 +277,14 @@ public class ExecutionQueueService : IExecutionQueueService
     }
 
     /// <summary>不参与执行的任务与它的原因；null 表示可以执行</summary>
-    private static string? SkipReason(BackupTask task)
+    /// <summary>
+    /// 这个任务此刻能不能真的跑起来；null = 能跑。
+    ///
+    /// 公开是因为漏备份巡检要用同一份判据：那边判的是「该跑却没跑成」，
+    /// 两边对「该不该跑」的定义一旦分家，就会出现「队列认为这个任务根本不该下发、
+    /// 巡检却在为它报漏备份」这种永远不会恢复的告警。调用方需要 task.Client 已加载。
+    /// </summary>
+    public static string? SkipReason(BackupTask task)
     {
         if (!task.Enabled)
             return "任务已停用";
