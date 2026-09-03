@@ -38,6 +38,15 @@ public static class PlainText
         _ => level.ToString()
     };
 
+    /// <summary>通知渠道 → 告警标题里那半句。写成 Wecom 的话没人知道那是企业微信。</summary>
+    public static string Of(NotificationChannel channel) => channel switch
+    {
+        NotificationChannel.Email => "邮件",
+        NotificationChannel.Wecom => "企业微信",
+        NotificationChannel.Dingtalk => "钉钉",
+        _ => channel.ToString()
+    };
+
     /// <summary>指令类型 → 这条指令在替使用者做什么</summary>
     public static string Of(CommandType type) => type switch
     {

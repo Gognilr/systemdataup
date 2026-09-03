@@ -66,6 +66,7 @@ public class AlertConfiguration : IEntityTypeConfiguration<Alert>
         builder.Property(e => e.FirstOccurredAt).HasColumnName("first_occurred_at").HasDefaultValueSql("now()");
         builder.Property(e => e.LastOccurredAt).HasColumnName("last_occurred_at").HasDefaultValueSql("now()");
         builder.Property(e => e.OccurrenceCount).HasColumnName("occurrence_count").HasDefaultValue(1);
+        builder.Property(e => e.LastNotifiedAt).HasColumnName("last_notified_at");
         builder.Property(e => e.AcknowledgedBy).HasColumnName("acknowledged_by");
         builder.Property(e => e.AcknowledgedAt).HasColumnName("acknowledged_at");
         builder.Property(e => e.AssignedTo).HasColumnName("assigned_to");

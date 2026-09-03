@@ -106,6 +106,49 @@ public class PlanDrivenMissedBackupTests : IAsyncLifetime
             a => a.AlertKey == $"task:{taskId}:missed" && a.Status == AlertStatus.Open));
     }
 
+    // ---------- D5：客户端不可用时不判漏备份 ----------
+
+    /// <summary>
+    /// 客户端被禁用之后，它名下任务的漏备份告警要被恢复掉，而不是永远挂着。
+    ///
+    /// 这个任务本来就不该产出备份——队列（ExecutionQueueService.SkipReason）压根不会
+    /// 给它下发指令。继续判它「漏备份」会得到一条永远不会恢复的严重告警，
+    /// 而「先把这台机器停掉再说」正是排障时最自然的动作，一停就炸一屏。
+    /// </summary>
+    [Fact]
+    public async Task 客户端被禁用后漏备份告警会被恢复()
+    {
+        // 计划时刻取 4 小时前，先让它真的报出一条漏备份
+        var (clientId, taskId, _) = await SeedPlanWithTaskAsync(
+            planEnabled: false, cron: $"{DateTime.UtcNow.AddHours(-4).Minute} {DateTime.UtcNow.AddHours(-4).Hour} * * *");
+
+        await RunMissedBackupPassAsync();
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var alert = await db.Alerts.AsNoTracking().SingleAsync(a => a.AlertKey == $"task:{taskId}:missed");
+            Assert.Equal(AlertStatus.Open, alert.Status);
+        }
+
+        // 排障时最自然的动作：先把这台机器停掉
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            await db.Clients.Where(c => c.Id == clientId)
+                .ExecuteUpdateAsync(s => s.SetProperty(c => c.Status, ClientStatus.Disabled));
+        }
+
+        await RunMissedBackupPassAsync();
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var alert = await db.Alerts.AsNoTracking().SingleAsync(a => a.AlertKey == $"task:{taskId}:missed");
+            Assert.Equal(AlertStatus.Recovered, alert.Status);
+        }
+    }
+
     // ---------- 基础设施 ----------
 
     private async Task<string?> ScanScheduleAsync(Guid clientId, Guid taskId)

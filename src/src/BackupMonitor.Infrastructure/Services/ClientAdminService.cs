@@ -877,8 +877,44 @@ public class ClientAdminService : IClientAdminService
             throw new ConcurrencyConflictException("客户端");
         }
 
+        var cancelledSessions = await CancelInFlightUploadsAsync(clientId, "客户端已被禁用", ct);
+
         await _audit.RecordAsync("client.disable", AuditResult.Success, "client", client.Id,
-            afterData: JsonSerializer.Serialize(new { status = "disabled", request.Reason }), ct: ct);
+            afterData: JsonSerializer.Serialize(new { status = "disabled", request.Reason, cancelledSessions }), ct: ct);
+    }
+
+    /// <summary>
+    /// 把这台客户端还在途的上传会话一律取消。
+    ///
+    /// 不取消的话它们会一直占着全局上传名额，直到会话超时线（默认 6 小时）才回收——
+    /// 而这台机器已经被禁用/注销，那几路传输永远不会有人来推进。
+    /// 「先把这台机器停掉」在排障时是最自然的动作，代价不该是接下来半天所有别的机器都传不动。
+    /// 返回取消的条数，落进审计。
+    /// </summary>
+    private async Task<int> CancelInFlightUploadsAsync(Guid clientId, string reason, CancellationToken ct)
+    {
+        var now = DateTime.UtcNow;
+        var sessions = await _db.UploadSessions
+            .Where(s => s.ClientId == clientId && UploadSessionStatuses.InFlight.Contains(s.Status))
+            .ToListAsync(ct);
+
+        if (sessions.Count == 0)
+            return 0;
+
+        foreach (var session in sessions)
+        {
+            session.Status = UploadStatus.Cancelled;
+            session.ErrorCode = "CLIENT_UNAVAILABLE";
+            session.ErrorMessage = reason;
+            session.CompletedAt = now;
+            session.UpdatedAt = now;
+        }
+
+        await _db.SaveChangesAsync(ct);
+
+        _logger.LogInformation(
+            "客户端 {ClientId} 的 {Count} 个在途上传会话已取消：{Reason}", clientId, sessions.Count, reason);
+        return sessions.Count;
     }
 
     /// <summary>
@@ -956,12 +992,16 @@ public class ClientAdminService : IClientAdminService
         }
 
         await _db.SaveChangesAsync(ct);
+
+        var cancelledSessions = await CancelInFlightUploadsAsync(clientId, "客户端已被注销", ct);
+
         await _audit.RecordAsync("client.revoke", AuditResult.Success, "client", client.Id,
             afterData: JsonSerializer.Serialize(new
             {
                 status = "revoked",
                 reason = request.Reason,
-                revokedCertificates = activeCertificates.Count
+                revokedCertificates = activeCertificates.Count,
+                cancelledSessions
             }), ct: ct);
     }
 

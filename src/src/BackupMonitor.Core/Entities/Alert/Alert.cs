@@ -39,6 +39,17 @@ public class Alert
     /// <summary>累计发生次数</summary>
     public int OccurrenceCount { get; set; } = 1;
 
+    /// <summary>
+    /// 最近一次为这条告警生成通知投递的时间（V033）。
+    ///
+    /// 告警此前只有两个通知触发点：新建、等级提升。一条 Critical 挂在那里三天没人处理，
+    /// 系统只在第一分钟发过一封邮件——之后完全沉默，而「没有新邮件」在收件人那里
+    /// 读起来和「已经好了」是一样的。距今超过 alert_renotify_hours 就重发一次。
+    ///
+    /// 空值表示从未通知过（命中静默规则，或建告警时渠道尚未配置）。
+    /// </summary>
+    public DateTime? LastNotifiedAt { get; set; }
+
     /// <summary>确认人</summary>
     public Guid? AcknowledgedBy { get; set; }
 

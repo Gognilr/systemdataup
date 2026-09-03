@@ -33,6 +33,13 @@ public class AlertingServiceTests : IAsyncLifetime
         sc.AddScoped<IAuditRecorder, DbAuditRecorder>();
         sc.AddScoped<IAgentNotificationService, AgentNotificationService>();
         sc.AddScoped<IAlertingService, AlertingService>();
+        // D9：AlertingService 现在用自己的作用域和 DbContext（不再借调用方那一个），
+        // 并且要读 alert_renotify_hours 判断长期未恢复的告警该不该重发通知。
+        // 少注册这一条的话，重复触发会在解析依赖时抛异常、被 RaiseAsync 的兜底 catch 吞掉，
+        // 表现是「第二次触发什么都没发生」——正好是这一组要测的东西。
+        sc.AddSingleton(sp => new SystemSettingsProvider(
+            sp.GetRequiredService<IServiceScopeFactory>(),
+            sp.GetRequiredService<ILogger<SystemSettingsProvider>>()));
         _services = sc.BuildServiceProvider();
         return Task.CompletedTask;
     }

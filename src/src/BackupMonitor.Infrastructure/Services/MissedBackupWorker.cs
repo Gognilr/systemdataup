@@ -103,11 +103,21 @@ public class MissedBackupWorker : BackgroundService
         var now = DateTime.UtcNow;
 
         // paused / monitor_only 的任务不承诺产出备份，不参与漏备份判定。
+        //
+        // 客户端被禁用 / 注销 / 还没审批时同理：这个任务本来就不该产出备份，
+        // 队列那边（ExecutionQueueService.SkipReason）压根不会给它下发指令。
+        // 继续判它「漏备份」会得到一条永远不会恢复的严重告警，
+        // 而「先把这台机器停掉再说」正是排障时最自然的动作——一停就炸一屏告警。
+        // 判据与 SkipReason 保持同一口径，两边分家就会出现「队列不发、巡检却在报」。
         var tasks = await db.BackupTasks
+            .Include(t => t.Client)
             .Where(t => t.Enabled
                 && t.ScanSchedule != null
                 && t.TaskMode != TaskMode.Paused
-                && t.TaskMode != TaskMode.MonitorOnly)
+                && t.TaskMode != TaskMode.MonitorOnly
+                && t.Client.Status != ClientStatus.Disabled
+                && t.Client.Status != ClientStatus.Revoked
+                && t.Client.Status != ClientStatus.PendingApproval)
             .ToListAsync(ct);
 
         // 挂进启用中计划的任务由下面的「按计划判定」分支负责，这里要排除掉。

@@ -345,6 +345,12 @@ public class UploadCommitWorker : BackgroundService
 
                 try
                 {
+                    // 恢复的键要与 CommandService 触发时用的那一份一模一样，否则告警永远挂着。
+                    // 那边有候选就按候选、没有就退到任务，这里必须照同一个口径，
+                    // 两个都恢复一次：这次入库既证明了「这个账套好了」，
+                    // 也证明了「这个任务好了」——后者是候选出现之前那些失败留下的键。
+                    await alerting.RecoverAsync(
+                        $"candidate:{session.CandidateBackupSetId}:upload_failed", ct);
                     await alerting.RecoverAsync($"task:{task.Id}:upload_failed", ct);
                 }
                 catch (Exception recoverEx)

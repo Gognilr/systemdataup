@@ -88,3 +88,29 @@ CREATE INDEX IF NOT EXISTS idx_candidate_backup_sets_cancelled
 INSERT INTO system_settings (setting_key, setting_value, encrypted, updated_by)
 VALUES ('upload_retry_wait_timeout_seconds', '1800'::jsonb, false, NULL)
 ON CONFLICT (setting_key) DO NOTHING;
+
+-- =====================================================================
+-- 批次四：告警与通知链路
+-- =====================================================================
+
+-- D6：长期未恢复的高等级告警要按间隔重发通知。
+--
+-- 告警模型此前只有两个通知触发点：新建、等级提升。一条 Critical 挂在那里三天没人处理，
+-- 系统只在第一分钟发过一封邮件——之后完全沉默，而「没有新邮件」在收件人那里
+-- 读起来和「已经好了」是一样的。
+ALTER TABLE alerts
+    ADD COLUMN IF NOT EXISTS last_notified_at TIMESTAMPTZ NULL;
+
+COMMENT ON COLUMN alerts.last_notified_at IS
+    '最近一次为这条告警生成通知投递的时间。距今超过 alert_renotify_hours 时重发，'
+    '空值表示从未通知过（命中静默规则，或建告警时渠道尚未配置）。';
+
+-- 已有的活动告警按「刚通知过」起算，避免升级后第一轮把存量告警全部重发一遍
+UPDATE alerts
+   SET last_notified_at = last_occurred_at
+ WHERE last_notified_at IS NULL
+   AND status IN ('open', 'acknowledged', 'in_progress');
+
+INSERT INTO system_settings (setting_key, setting_value, encrypted, updated_by)
+VALUES ('alert_renotify_hours', '24'::jsonb, false, NULL)
+ON CONFLICT (setting_key) DO NOTHING;

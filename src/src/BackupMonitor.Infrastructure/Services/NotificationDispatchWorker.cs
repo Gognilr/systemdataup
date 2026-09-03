@@ -148,16 +148,26 @@ public class NotificationDispatchWorker : BackgroundService
 
         var reportTimezone = ResolveTimeZone(_configuration["Reports:Timezone"]);
 
+        var alerting = scope.ServiceProvider.GetRequiredService<IAlertingService>();
+
         foreach (var delivery in pending)
         {
             ct.ThrowIfCancellationRequested();
-            await DispatchOneAsync(db, delivery, channelSettings, maxAttempts, reportTimezone, ct);
+            await DispatchOneAsync(db, alerting, delivery, channelSettings, maxAttempts, reportTimezone, ct);
         }
     }
+
+    /// <summary>
+    /// 「这个渠道发不出去」本身的告警键。刻意按**渠道**去重，不按投递去重——
+    /// 一条 SMTP 口令过期会让几十条投递同时失败，那不是几十件事，是一件事。
+    /// </summary>
+    private static string ChannelAlertKey(NotificationChannel channel) =>
+        $"system:notification:{EnumMapping.ToSnakeCase(channel)}:failed";
 
     /// <summary>单条投递与状态回写（异常隔离，单条失败不影响其余）</summary>
     private async Task DispatchOneAsync(
         AppDbContext db,
+        IAlertingService alerting,
         Core.Entities.Alert.NotificationDelivery delivery,
         NotificationSettingsDto settings,
         int maxAttempts,
@@ -219,6 +229,26 @@ public class NotificationDispatchWorker : BackgroundService
         }
 
         await db.SaveChangesAsync(ct);
+
+        // 「通知发不出去」这件事本身必须有人知道。原先它只写进 error_message 就结束了——
+        // SMTP 口令过期、webhook 被回收，整条告警链路可以完全静默地断掉，
+        // 而系统认为自己已经通知过了：告警中心里那条告警明明白白写着「已通知」。
+        // 这条告警只在界面上可见（它自己就是通知链路断了的那一条），这是能做到的最好情况。
+        if (delivery.Status == NotificationStatus.Failed)
+        {
+            await alerting.RaiseAsync(
+                ChannelAlertKey(delivery.Channel),
+                AlertLevel.Critical,
+                "notification_channel_failed",
+                $"{PlainText.Of(delivery.Channel)}通知发不出去",
+                $"连续 {maxAttempts} 次投递失败：{delivery.ErrorMessage}。"
+                + "在这条修好之前，所有告警都只在界面上可见。",
+                ct: ct);
+        }
+        else if (delivery.Status == NotificationStatus.Sent)
+        {
+            await alerting.RecoverAsync(ChannelAlertKey(delivery.Channel), ct);
+        }
     }
 
     /// <summary>SMTP 邮件投递（告警通知场景，正文按报表时区渲染）</summary>

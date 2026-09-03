@@ -497,8 +497,18 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
             command.CommandType is CommandType.PrecheckTask or CommandType.PrecheckAll or CommandType.UploadCandidate)
         {
             var category = command.CommandType == CommandType.UploadCandidate ? "upload_failed" : "precheck_failed";
+
+            // 去重键必须落在「出问题的那件事」上，不能落在指令 ID 上：
+            // 一条上传失败之后指令会被复位重发或新建，每一次都是新的 commandId，
+            // 于是同一个任务的同一个故障在告警中心攒出十几条一模一样的记录，
+            // 而聚合计数（occurrence_count）永远是 1，看不出它到底反复了多少次。
+            // 有候选就按候选（能区分到账套），没有就退到任务。
+            var dedupeKey = command.CandidateBackupSetId is not null
+                ? $"candidate:{command.CandidateBackupSetId}:{category}"
+                : $"task:{command.TaskId}:{category}";
+
             await _alerting.RaiseAsync(
-                $"command:{command.Id}:failed",
+                dedupeKey,
                 AlertLevel.Warning,
                 category,
                 $"{PlainText.Of(command.CommandType)}失败",
