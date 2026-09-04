@@ -460,7 +460,8 @@ public static class StructureInference
                 summary: $"{source.Name} 里每份备份由 {paired.Extensions.Count} 个同名文件组成"
                          + $"（{string.Join("、", paired.Extensions)}），共 {paired.GroupCount} 组，"
                          + $"每次只认最新的一组：{paired.NewestGroupName}",
-                evidence, paired.Candidates, [source]);
+                evidence, paired.Candidates, [source],
+                unitSizes: paired.GroupSizes);
         }
 
         // 再问一句"是不是每天一组、每组好几个库"——排在扩展名判定之前，理由同上。
@@ -495,7 +496,8 @@ public static class StructureInference
                          + $"（{FileNamePattern.Describe(dated.Patterns)}），共 {dated.GroupCount} 组，"
                          + $"每次只认最新的一组：{dated.NewestGroupKey}",
                 evidence, dated.Candidates, [source],
-                dateNames: dated.GroupKeys);
+                dateNames: dated.GroupKeys,
+                unitSizes: dated.GroupSizes);
         }
 
         var byExtension = files
@@ -518,9 +520,13 @@ public static class StructureInference
             if (!string.IsNullOrEmpty(largest.Key))
                 config["includePatterns"] = new JsonArray($"*{largest.Key}");
 
+            // 这一支的「一份备份」就是一个文件，而 leaves 说的是目录单元——它这里必然为空。
+            // 不把文件大小交出去的话，尺寸基线会拿着一个空清单得出「只观察到 0 份备份」，
+            // 紧挨着上面那句「里堆着 14 个备份文件」，自相矛盾。
             return Build(source, "latest_single_file", config, 78,
                 $"{source.Name} 里堆着 {files.Count} 个备份文件，每次取最新的那个（最新：{newest.Name}）",
-                evidence, [], []);
+                evidence, [], [],
+                unitSizes: largest.Select(f => f.SizeBytes).ToList());
         }
 
         // 几个文件凑成一份备份。
@@ -660,7 +666,9 @@ public static class StructureInference
         IReadOnlyList<string> Extensions,
         List<RequiredFileCandidateDto> Candidates,
         string NewestGroupName,
-        IReadOnlyList<SnapshotNode> NewestGroupFiles);
+        IReadOnlyList<SnapshotNode> NewestGroupFiles,
+        /// <summary>每一组的合计大小——这个结构里「一份备份」就是一组，尺寸基线按它算。</summary>
+        IReadOnlyList<long> GroupSizes);
 
     /// <summary>
     /// 判断"一份备份由同名的多个文件构成"：按去掉扩展名的文件名分组，
@@ -730,7 +738,8 @@ public static class StructureInference
             candidates.Select(c => c.Pattern).ToList(),
             candidates,
             newest.Key,
-            newest.ToList());
+            newest.ToList(),
+            groups.Select(g => g.Sum(f => f.SizeBytes)).ToList());
     }
 
     /// <summary>
@@ -745,7 +754,9 @@ public static class StructureInference
         string NewestGroupKey,
         IReadOnlyList<SnapshotNode> NewestGroupFiles,
         /// <summary>所有分组的日期键，供 DateSequence 推周期与缺口。</summary>
-        IReadOnlyList<string> GroupKeys);
+        IReadOnlyList<string> GroupKeys,
+        /// <summary>每一组的合计大小——这个结构里「一份备份」就是同一天的那几个文件。</summary>
+        IReadOnlyList<long> GroupSizes);
 
     /// <summary>
     /// 判断「一次备份 = 同一天的那几个文件」：按文件名里的日期分组，用归一化模式描述组成员。
@@ -857,7 +868,8 @@ public static class StructureInference
             candidates,
             newest.Key,
             newest.Select(x => x.File).ToList(),
-            groups.Select(g => g.Key).ToList());
+            groups.Select(g => g.Key).ToList(),
+            groups.Select(g => g.Sum(x => x.File.SizeBytes)).ToList());
     }
 
     private static List<string> DistinctExtensions(IEnumerable<SnapshotNode> files) =>
@@ -1208,7 +1220,8 @@ public static class StructureInference
         IReadOnlyList<RequiredFileCandidateDto> required,
         IReadOnlyList<SnapshotNode> leaves,
         string? sourcePathOverride = null,
-        IReadOnlyList<string>? dateNames = null)
+        IReadOnlyList<string>? dateNames = null,
+        IReadOnlyList<long>? unitSizes = null)
     {
         // 快照本身没抓全时，推断依据就是不完整的，置信度必须相应下调并说明。
         //
@@ -1229,7 +1242,8 @@ public static class StructureInference
         var application = GuessApplication(leaves);
         confidence = ApplyApplicationPrior(application, recognizerType, confidence, leaves, evidence);
 
-        var baseline = SuggestSizeBaseline(leaves, required);
+        var baseline = SuggestSizeBaseline(
+            unitSizes ?? leaves.Select(TotalFileBytesOf).ToList(), required);
         var sequence = dateNames is null or { Count: 0 } ? null : DateSequence.Analyze(dateNames);
         if (sequence is not null)
         {
@@ -1291,14 +1305,21 @@ public static class StructureInference
     /// 取最小一份的一半，是留出业务波动的余量——这个数要的是「掉了一个数量级」的检出力，
     /// 不是精确基线。
     /// </summary>
+    /// <param name="unitSizes">
+    /// 观察到的**每一份备份**有多大。一份备份是什么，由识别类型决定：目录单元结构里是
+    /// 一个业务单元目录，latest_single_file 里是一个文件，按组认的结构里是一组文件的合计。
+    /// 调用方必须按自己那种结构的口径给出来——统一按「叶子目录」算的那一版里，
+    /// 平铺目录的三条分支拿不出任何叶子，于是界面上给出「只观察到 0 份备份，样本太少」，
+    /// 而它上面一行刚说完这个目录里有 14 份备份。
+    /// </param>
     private static (long? MinTotalBytes, int? MinFileCount, string? Note) SuggestSizeBaseline(
-        IReadOnlyList<SnapshotNode> leaves,
+        IReadOnlyList<long> unitSizes,
         IReadOnlyList<RequiredFileCandidateDto> required)
     {
         var recommendedCount = required.Count(c => c.Recommended);
         var minFileCount = recommendedCount > 0 ? recommendedCount : (int?)null;
 
-        var sizes = leaves.Select(TotalFileBytesOf).Where(b => b > 0).OrderBy(b => b).ToList();
+        var sizes = unitSizes.Where(b => b > 0).OrderBy(b => b).ToList();
         if (sizes.Count < 3)
         {
             return (null, minFileCount,

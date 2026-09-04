@@ -1,4 +1,4 @@
-using System.Threading.Channels;
+﻿using System.Threading.Channels;
 using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Entities.Retention;
@@ -6,6 +6,7 @@ using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Exceptions;
+using BackupMonitor.Shared.Models.Admin;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -148,6 +149,84 @@ public class BackupSetRecycleTests : IAsyncLifetime
         var db2 = scope2.ServiceProvider.GetRequiredService<AppDbContext>();
         Assert.Equal(BackupSetStatus.Deleted,
             (await db2.BackupSets.AsNoTracking().SingleAsync(s => s.Id == setId)).Status);
+    }
+
+    [Fact]
+    public async Task 批量删除逐条成败互不牵连()
+    {
+        var (okA, _) = await SeedAsync();
+        var (lockedId, _) = await SeedAsync(locked: true);
+        var (okB, _) = await SeedAsync();
+
+        await using var scope = _services.CreateAsyncScope();
+        var svc = scope.ServiceProvider.GetRequiredService<IBackupSetService>();
+
+        var result = await svc.RecycleBatchAsync(new BackupSetBatchRequest
+        {
+            BackupSetIds = new List<Guid> { okA, lockedId, okB }
+        });
+
+        // 中间那一份被锁定，本来就该被拒——但它不该把另外两份一起拖住。
+        Assert.Equal(2, result.SuccessCount);
+        var failure = Assert.Single(result.Failed);
+        Assert.Equal(lockedId, failure.BackupSetId);
+        Assert.Contains("锁定", failure.Message);
+        Assert.False(string.IsNullOrEmpty(failure.BackupSetCode), "失败明细里要能对上是哪一份");
+
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var states = await db.BackupSets.AsNoTracking()
+            .Where(s => s.Id == okA || s.Id == lockedId || s.Id == okB)
+            .ToDictionaryAsync(s => s.Id, s => s.Status);
+        Assert.Equal(BackupSetStatus.RecycleBin, states[okA]);
+        Assert.Equal(BackupSetStatus.RecycleBin, states[okB]);
+        Assert.Equal(BackupSetStatus.Available, states[lockedId]);
+    }
+
+    [Fact]
+    public async Task 批量超过单批上限直接拒绝()
+    {
+        await using var scope = _services.CreateAsyncScope();
+        var svc = scope.ServiceProvider.GetRequiredService<IBackupSetService>();
+
+        var tooMany = Enumerable.Range(0, BackupSetService.MaxBatchSize + 1)
+            .Select(_ => Guid.NewGuid()).ToList();
+
+        var ex = await Assert.ThrowsAsync<BusinessException>(
+            () => svc.PurgeBatchAsync(new BackupSetBatchRequest { BackupSetIds = tooMany }));
+        Assert.Equal(400, ex.StatusCode);
+
+        // 空选也该被挡住：批量端点不该在一个空列表上「成功」
+        var empty = await Assert.ThrowsAsync<BusinessException>(
+            () => svc.RecycleBatchAsync(new BackupSetBatchRequest()));
+        Assert.Equal(400, empty.StatusCode);
+    }
+
+    [Fact]
+    public async Task 默认列表不含已删除但显式筛得到()
+    {
+        var (setId, clientId) = await SeedAsync(repositoryPath: MakeRepositoryDirectory());
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var svc = scope.ServiceProvider.GetRequiredService<IBackupSetService>();
+            await svc.RecycleAsync(setId);
+            await svc.PurgeAsync(setId);
+        }
+
+        await using var scope2 = _services.CreateAsyncScope();
+        var svc2 = scope2.ServiceProvider.GetRequiredService<IBackupSetService>();
+
+        // 不指定状态 = 只看还活着的。磁盘上早就没有的那一份不该再进份数和容量，
+        // 否则一个一份都不剩的任务在归拢行上仍然报「有备份、占了多少 GB」。
+        var defaultList = await svc2.GetListAsync(new BackupQuery { ClientId = clientId });
+        Assert.Empty(defaultList.Items);
+
+        var groups = await svc2.GetGroupsAsync(new BackupQuery { ClientId = clientId });
+        Assert.Empty(groups.Items);
+
+        // 记录还在：显式挑「已删除」这一档就能查到那一份去哪了。
+        var deletedList = await svc2.GetListAsync(new BackupQuery { ClientId = clientId, Status = "deleted" });
+        Assert.Equal(setId, Assert.Single(deletedList.Items).Id);
     }
 
     // ---------- 基础设施 ----------

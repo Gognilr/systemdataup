@@ -50,6 +50,14 @@ input[type=checkbox]{width:auto}
 .toolbar .spacer{flex:1}
 .toolbar select,.toolbar input{width:auto;min-width:130px}
 .toolbar .tip{color:var(--text-muted);font:var(--t-sm)}
+/* 分档切换（客户端列表的「在用 / 已注销 / 全部」）：三选一，当前档一眼看得出来。
+   用 filter-chip 那种圆角标签会和它下面按状态分布的筛选标签混成一片，
+   而这两者是两回事——这里选的是「看哪一批机器」，那里筛的是「什么状态」。 */
+.segmented{display:inline-flex;border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden}
+.segmented .seg{min-height:30px;padding:0 var(--s-2);border:0;border-right:1px solid var(--border);background:var(--surface);color:var(--text-muted);font:var(--t-sm);cursor:pointer}
+.segmented .seg:last-child{border-right:0}
+.segmented .seg:hover{color:var(--text)}
+.segmented .seg.active{background:var(--accent-weak);color:var(--accent);font-weight:600}
 .filter-chips{display:flex;align-items:center;gap:var(--s-1);flex-wrap:wrap;width:100%;margin-top:var(--s-1)}
 .filter-chip{display:inline-flex;align-items:center;gap:var(--s-1);min-height:26px;padding:0 var(--s-2);border:1px solid var(--border);border-radius:99px;background:var(--surface);color:var(--text-muted);font:var(--t-sm);cursor:pointer}
 .filter-chip:hover,.filter-chip.active{border-color:var(--accent);background:var(--accent-weak);color:var(--accent)}
@@ -221,6 +229,7 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 .matrix-cell.success{background:var(--ok-bg);color:var(--ok-fg)}
 .matrix-cell.failed{background:var(--err-bg);color:var(--err-fg)}
 .matrix-cell.in-progress{background:var(--info-bg);color:var(--info-fg)}
+.matrix-cell.deleted{background:var(--surface-sunk);color:var(--text-muted)}
 .matrix-cell.no-schedule{background:var(--surface-sunk);color:var(--text-faint)}
 .matrix-cell .cell-code{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border:1px solid currentColor;border-radius:50%;font-size:10px}
 .matrix-legend{display:flex;gap:var(--s-3);flex-wrap:wrap;margin-top:var(--s-2);color:var(--text-muted);font:var(--t-sm)}
@@ -229,6 +238,7 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 .matrix-legend .success i{background:var(--ok-bg);color:var(--ok-fg)}
 .matrix-legend .failed i{background:var(--err-bg);color:var(--err-fg)}
 .matrix-legend .in-progress i{background:var(--info-bg);color:var(--info-fg)}
+.matrix-legend .deleted i{background:var(--surface-sunk);color:var(--text-muted)}
 .matrix-legend .no-schedule i{background:var(--surface-sunk);color:var(--text-faint)}
 .matrix-a11y{margin-top:var(--s-3)}
 .matrix-a11y summary{cursor:pointer;color:var(--accent);font:var(--t-sm)}
@@ -508,3 +518,24 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
    按钮上的 30 分钟与显示出来的 24 小时窗口对不上，看起来像功能失效。 */
 .enroll-window{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s-2);margin-top:var(--s-2)}
 .enroll-window .hint{flex-basis:100%;margin:0}
+
+/* ── 备份集按任务归拢 ──
+   U8 一个任务 18 个账套，平铺一天 18 行、一周 126 行，中间还夹着别的任务。
+   折叠之后一个任务只占一行，所以那一行必须自带结论——账套数、最新一份、
+   有没有不可用的——否则收起来只是把问题藏起来，而不是回答它。 */
+.bsgroup{border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface);margin-bottom:var(--s-2)}
+.bsgroup>summary{cursor:pointer;list-style:none;padding:var(--s-2) var(--s-3);display:flex;align-items:center;gap:var(--s-3);flex-wrap:wrap;user-select:none}
+.bsgroup>summary::-webkit-details-marker{display:none}
+.bsgroup>summary::before{content:'▸';color:var(--text-muted);flex:none}
+.bsgroup[open]>summary::before{content:'▾'}
+.bsgroup>summary:hover .bsg-title{color:var(--accent-fg,var(--text))}
+.bsgroup .bsg-title{font:600 var(--t-md)}
+.bsgroup .bsg-sub{color:var(--text-muted);font:var(--t-sm)}
+.bsgroup .bsg-meta{display:flex;gap:var(--s-3);flex-wrap:wrap;margin-left:auto;color:var(--text-muted);font:var(--t-sm)}
+.bsgroup .bsg-body{padding:0 var(--s-3) var(--s-3);overflow-x:auto}
+/* 有不可用的那一组要在收起状态下就看得见，不能等展开才发现。 */
+.bsgroup.has-work{border-left:3px solid var(--err-fg)}
+.bsgroup.has-work .bsg-alarm{color:var(--err-fg);font:600 var(--t-sm)}
+@media (max-width:760px){
+  .bsgroup .bsg-meta{margin-left:0;flex-basis:100%}
+}

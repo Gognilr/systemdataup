@@ -89,6 +89,15 @@ public class AdminExecutionRunController : ApiBaseController
         [FromQuery] PagedQuery query, CancellationToken ct)
         => OkData(await _queue.ListRunsAsync(null, query, ct));
 
+    /// <summary>
+    /// 当前队列：谁在跑、谁在等、等的是名额还是前一项。
+    /// 路由放在 {runId:guid} 之前也无妨——那条被 guid 约束着，"queue" 落不进去。
+    /// </summary>
+    [HttpGet("queue")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.read")]
+    public async Task<ActionResult<ApiResponse<ExecutionQueueSnapshotDto>>> Queue(CancellationToken ct)
+        => OkData(await _queue.GetQueueAsync(ct));
+
     /// <summary>执行详情（含每一项的状态）</summary>
     [HttpGet("{runId:guid}")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:tasks.read")]

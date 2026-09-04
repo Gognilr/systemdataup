@@ -166,10 +166,24 @@ public class UploadCommitWorker : BackgroundService
             // 正式路径完全由服务端生成（设计书 23.4）
             var versionTime = candidate.BackupBusinessTime ?? session.CompletedAt ?? session.CreatedAt;
             var versionDir = versionTime.ToString("yyyy-MM-dd_HHmmss");
+            // 客户端这一层用管理员起的名字，不是 Windows 主机名。
+            // 仓库里一排 WIN-9INJ5VMRLSK\、WIN-LHF1SSRHPQN\，人打开文件夹认不出哪个是哪台机器,
+            // 而「这份备份是哪台服务器的」正是这一层目录唯一要回答的问题。
+            //
+            // 重名时补上主机名：display_name 没有唯一约束，两台机器起同一个名字
+            // 会把各自的备份混进同一个目录——那比名字难看严重得多。
+            // 已入库的版本按 backup_sets.repository_path 定位（RepositoryReconcileWorker
+            // 读的就是它），所以改名不会让旧版本失联；改名之后的新版本落进新目录。
+            var clientFolder = client.DisplayName;
+            if (string.IsNullOrWhiteSpace(clientFolder))
+                clientFolder = client.Hostname;
+            else if (await db.Clients.AnyAsync(c => c.Id != client.Id && c.DisplayName == client.DisplayName, ct))
+                clientFolder = $"{clientFolder}_{client.Hostname}";
+
             var segments = new List<string>
             {
                 repoRoot,
-                PathSafety.SanitizePathComponent(client.Hostname),
+                PathSafety.SanitizePathComponent(clientFolder),
                 PathSafety.SanitizePathComponent(task.Name)
             };
             if (candidate.BusinessUnit is not null)

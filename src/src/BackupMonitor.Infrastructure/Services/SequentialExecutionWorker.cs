@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Entities.Execution;
+﻿using BackupMonitor.Core.Entities.Execution;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
@@ -263,22 +263,42 @@ public class SequentialExecutionWorker : BackgroundService
         if (command is null || command.Status != CommandStatus.Succeeded)
             return;
 
-        var sessions = await FindSessionsAsync(db, item, startedAt, ct);
+        var sessions = await FindSessionsAsync(db, item, command, startedAt, ct);
         if (sessions.Count == 0)
         {
             // 这个任务的上传正排在队列里等名额时，「没有新备份」这个结论是错的——
             // 恰恰相反，有新备份、只是还没轮到它传。宽限期一到就报成功的话，
             // 界面上这次计划显示「全部成功」，而一个字节都还没传。
+            //
+            // 判据走 UploadSlotCommandTypes 而不是 ConsumesUploadSlot(...)：EF 翻译不了
+            // 表达式树里的方法调用，那一版会在运行时抛 InvalidOperationException，
+            // 而这一行是「预检成功、上传会话还没建出来」的必经之路——也就是每一次
+            // 正常的计划执行都会走到。异常从 AdvanceRunsAsync 一路抛到轮询的兜底 catch，
+            // 那一轮**整个中止**：这一项永远停在「执行中」，同一次执行里排在后面的项
+            // 一个都不放行，连带这一轮里其它执行（包括预检刚排出来的那次自动上传）
+            // 也全部跳过。表现就是计划一直「执行中」而「传输中」一片空白，
+            // 日志里只有一行「顺序执行器轮询异常」。
             var queuedUpload = await db.Set<ExecutionRunItem>().AnyAsync(i =>
                 i.TaskId == item.TaskId
                 && i.Id != item.Id
-                && ConsumesUploadSlot(i.CommandType)
+                && ExecutionQueueWaits.UploadSlotCommandTypes.Contains(i.CommandType)
                 && (i.Status == ExecutionItemStatus.Pending || i.Status == ExecutionItemStatus.Running), ct);
             if (queuedUpload)
                 return;
 
-            // 预检通过却一直没有上传会话，最常见的原因就是「这次压根没有新备份」。
-            // 等一个宽限期再下这个结论，避免抢在服务端下发上传指令之前。
+            // 预检自己已经把这一次的结论报上来了，不必再等一个宽限期去猜。
+            var verdict = await ClassifyPrecheckAsync(db, command, ct);
+            if (verdict is null)
+                return;   // 还在等一件确定会发生的事（上传指令刚下发、会话还没建）
+
+            if (verdict.Value.Status is { } concluded)
+            {
+                await FinishItemAsync(db, item, concluded, verdict.Value.Message!, now, ct);
+                return;
+            }
+
+            // 老版本 Agent 不报清单，只能靠等：预检通过却一直没有上传会话，
+            // 最常见的原因就是「这次压根没有新备份」。
             var since = command.CompletedAt ?? startedAt;
             if (now - since >= noUploadGrace)
                 await FinishItemAsync(db, item, ExecutionItemStatus.Succeeded, "没有需要上传的新备份", now, ct);
@@ -319,22 +339,158 @@ public class SequentialExecutionWorker : BackgroundService
     }
 
     /// <summary>
-    /// 这一项对应的**全部**上传会话。批量上传按候选定位；计划驱动的任务只能按
-    /// 「这一项开跑之后该任务新建的会话」定位——预检产生的候选 ID 在下发预检时还不存在。
+    /// 预检回报出来的结论。
+    ///
+    /// 返回 (null, null) = 这条指令没有可用的清单（老版本 Agent），退回宽限期那条老路；
+    /// 返回 null         = 有一件确定会发生的事还没发生（上传指令已下发，会话还没建出来），继续等；
+    /// 其余              = 这一项此刻就能结案，连同要写进「说明」的那句话。
+    ///
+    /// 之所以要有这一步：原先这里唯一的判据是「等满 execution_queue_no_upload_grace_minutes
+    /// （默认 10 分钟）还没有上传会话，就一律判成功、写『没有需要上传的新备份』」。
+    /// 而清单里明明白白写着这次发生了什么，于是三种截然不同的情况被压成了同一句话：
+    ///
+    ///   一、真的没有新备份 —— 结论对，但那一项要在「执行中」上白挂十分钟，
+    ///       严格顺序的计划里后面每一项都跟着顺延十分钟；
+    ///   二、预检没通过（大小异常、缺必需文件、路径不存在）—— 判成功是彻头彻尾的假话。
+    ///       告警那边已经按 size_abnormal / precheck_failed 报出去了，执行记录这边却写着成功，
+    ///       两份记录对同一件事给出相反结论，人只会相信后者；
+    ///   三、扫出了新备份但没有自动下发上传（任务不是自动模式，或这一份刚被人取消过上传）
+    ///       —— 写「没有需要上传的新备份」会让人以为今天不用管它。
+    ///
+    /// 非通过状态的分界线与 AgentPrecheckService 的告警分界线取同一条（passed / no_new_backup
+    /// 之外都算没通过）：两处对「这算不算故障」的定义一旦分家，就会出现告警中心在报警、
+    /// 执行记录说成功这种没法排查的现象。
+    /// </summary>
+    private async Task<(ExecutionItemStatus? Status, string? Message)?> ClassifyPrecheckAsync(
+        AppDbContext db, Core.Entities.Backup.Command command, CancellationToken ct)
+    {
+        var entries = PrecheckResultPayload.Entries(command.ResultPayload);
+        if (entries.Count == 0)
+            return (null, null);
+
+        var passed = entries.Where(e => e.Status == PrecheckResultPayload.StatePassed).ToList();
+        if (passed.Count == 0)
+        {
+            var noNew = EnumMapping.ToSnakeCase(PrecheckStatus.NoNewBackup);
+            if (entries.All(e => e.Status == noNew))
+                return (ExecutionItemStatus.Succeeded,
+                    entries.Count == 1 ? "这次没有新备份" : $"{entries.Count} 个单元这次都没有新备份");
+
+            var reasons = string.Join("；", entries
+                .Where(e => e.Status != noNew)
+                .GroupBy(e => e.Status)
+                .Select(g => $"{DescribePrecheckStatus(g.Key)} {g.Count()} 个"));
+            return (ExecutionItemStatus.Failed, $"预检没通过：{reasons}");
+        }
+
+        // 通过了、但一个上传都没下发出去。等下去也不会有会话，如实写清楚是哪一种。
+        var live = passed.Where(e => e.UploadState
+            is PrecheckResultPayload.StateDispatched
+            or PrecheckResultPayload.StateQueued
+            or PrecheckResultPayload.StateAlreadyRunning).ToList();
+        if (live.Count == 0)
+        {
+            if (passed.All(e => e.UploadState == PrecheckResultPayload.StateAlreadyDone))
+                return (ExecutionItemStatus.Succeeded,
+                    passed.Count == 1 ? "这一份之前已经传完入库" : $"{passed.Count} 个单元之前都已传完入库");
+
+            return (ExecutionItemStatus.Succeeded,
+                $"扫出 {passed.Count} 份新备份，但没有自动下发上传"
+                + "（任务不是自动模式，或这一份刚被取消过上传），需要人工发起");
+        }
+
+        // 上传指令已经下发了，会话还没建出来——正常情况下继续等就是了。
+        // 但那条指令如果已经死了（客户端拒收、过期、失败），等下去只会耗满单项超时：
+        // 一个立刻就能给出的准确失败，胜过 60 分钟后的一句「等超时」。
+        var commandIds = live.Where(e => e.UploadCommandId is not null)
+            .Select(e => e.UploadCommandId!.Value).ToList();
+        if (commandIds.Count > 0)
+        {
+            var dead = await db.Commands.AsNoTracking()
+                .Where(c => commandIds.Contains(c.Id) && DeadCommandStatuses.Contains(c.Status))
+                .Select(c => new { c.Status, c.ResultMessage })
+                .ToListAsync(ct);
+            if (dead.Count == commandIds.Count)
+                return (ExecutionItemStatus.Failed,
+                    $"上传指令{EnumMapping.ToSnakeCase(dead[0].Status)}：{dead[0].ResultMessage ?? "无返回信息"}");
+        }
+
+        // 排队（queued）的那几个单元没有上传指令 ID——排进队列时指令还没建出来——
+        // 上面那段检查够不着它们。而调用方进来之前已经确认「这个任务没有任何上传项
+        // 还在 pending/running」，也就是排队的那些全部终结了：再等下去不会有任何变化。
+        //
+        // 少了这一段，这一项就挂满整个单项超时（计划默认 60 分钟）才被判失败，
+        // 严格顺序时后面每一项都跟着顺延同样长的时间。会话找得到的情况已经在
+        // FindSessionsAsync 里结案了，走到这里说明队列跑完确实没留下会话，
+        // 那是个要让人看见的结果，不是「再等等」。
+        // 只认 queued。dispatched 是「指令建出来了」，即便清单里没记下它的 ID
+        // 也不能当成没人在跑——那一条仍然要等真会话。
+        var queuedIds = live
+            .Where(e => e.UploadState == PrecheckResultPayload.StateQueued && e.UploadCommandId is null)
+            .Select(e => (Guid?)e.CandidateBackupSetId)
+            .ToList();
+        if (queuedIds.Count == live.Count)
+        {
+            var detail = await db.Set<ExecutionRunItem>().AsNoTracking()
+                .Where(i => queuedIds.Contains(i.CandidateBackupSetId) && i.Message != null)
+                .OrderByDescending(i => i.FinishedAt)
+                .Select(i => i.Message)
+                .FirstOrDefaultAsync(ct);
+
+            return (ExecutionItemStatus.Failed,
+                $"{live.Count} 份备份排进了上传队列，队列已经跑完却没有留下任何上传会话"
+                + (string.IsNullOrWhiteSpace(detail) ? "" : $"（队列里那一项的结论：{detail}）"));
+        }
+
+        return null;
+    }
+
+    /// <summary>清单里存的是 snake_case，写进「说明」的要是人话。认不出来就原样放过去。</summary>
+    private static string DescribePrecheckStatus(string snakeCase) =>
+        EnumMapping.TryParseSnakeCase<PrecheckStatus>(snakeCase, out var status)
+            ? PlainText.Of(status)
+            : snakeCase;
+
+    /// <summary>
+    /// 这一项对应的**全部**上传会话。
     ///
     /// 返回集合而不是单个：一个任务可以有很多个业务单元（U8 一台机器 18 个账套是常态），
     /// 每个单元一个候选、一个会话。原先这里是 OrderByDescending(CreatedAt).FirstOrDefault()，
     /// 于是这一项的结论由「最后一个账套」单方面决定——最后一个成功就报成功，
     /// 另外 17 个失败一声不响，界面上这次计划显示「全部成功」。
+    ///
+    /// 三条定位路径，按精确度排：
+    ///   一、项自带候选 ID（批量上传）——直接按它查；
+    ///   二、预检项没有候选 ID（下发预检时候选还不存在），但预检回报的清单里
+    ///       逐单元写着候选 ID，那才是这一项真正涉及的那几份备份；
+    ///   三、都没有（老版本 Agent 不报清单）才退回时间窗。
+    ///
+    /// 第二条不是锦上添花，是必须的。只有时间窗那一版会漏掉**被复用的会话**：
+    /// Agent 建会话的幂等键是候选键（AgentWorker.CreateUploadSessionAsync），
+    /// 同一份备份先前已经传完入库时，服务端按键把那个 committed 的老会话原样交回，
+    /// 不新建行。于是会话建于本项开跑之前，s.CreatedAt >= startedAt 查出 0 条——
+    /// 上传明明在几秒内就结束了，这一项却要一直挂到单项超时（计划默认 60 分钟）
+    /// 才被判失败，严格顺序时后面每一项都跟着顺延同样长的时间。
     /// </summary>
     private static async Task<List<Core.Entities.Upload.UploadSession>> FindSessionsAsync(
-        AppDbContext db, ExecutionRunItem item, DateTime startedAt, CancellationToken ct)
+        AppDbContext db, ExecutionRunItem item, Core.Entities.Backup.Command? command, DateTime startedAt, CancellationToken ct)
     {
         var sessions = db.UploadSessions.AsNoTracking();
 
         if (item.CandidateBackupSetId is not null)
             return await sessions
                 .Where(s => s.CandidateBackupSetId == item.CandidateBackupSetId)
+                .OrderBy(s => s.CreatedAt)
+                .ToListAsync(ct);
+
+        var candidateIds = PrecheckResultPayload.Entries(command?.ResultPayload)
+            .Select(e => e.CandidateBackupSetId)
+            .Where(id => id != Guid.Empty)
+            .Distinct()
+            .ToList();
+        if (candidateIds.Count > 0)
+            return await sessions
+                .Where(s => candidateIds.Contains(s.CandidateBackupSetId))
                 .OrderBy(s => s.CreatedAt)
                 .ToListAsync(ct);
 
@@ -467,10 +623,12 @@ public class SequentialExecutionWorker : BackgroundService
 
     /// <summary>
     /// 这一项下发之后会不会建上传会话，也就是它占不占全局上传名额。
-    /// 预检项（PrecheckTask）不占——它只让客户端扫目录算哈希。
+    /// 判据与界面上那份队列名单共用一处（ExecutionQueueWaits）：
+    /// 放行的人和显示的人对「在等什么」的定义分家，就会出现
+    /// 「界面说有空余名额、队列却不放行」这种没法排查的现象。
     /// </summary>
     private static bool ConsumesUploadSlot(CommandType commandType) =>
-        commandType is CommandType.UploadCandidate or CommandType.UploadLatest;
+        ExecutionQueueWaits.ConsumesUploadSlot(commandType);
 
     /// <summary>
     /// Pending 项的兜底超时。

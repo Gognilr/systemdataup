@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Threading.Channels;
 using BackupMonitor.Core.Entities.Retention;
 using BackupMonitor.Core.Entities.Backup;
@@ -18,6 +18,12 @@ namespace BackupMonitor.Infrastructure.Services;
 public interface IBackupSetService
 {
     Task<PagedResult<BackupSetListItemDto>> GetListAsync(BackupQuery query, CancellationToken ct = default);
+
+    /// <summary>
+    /// 同样的筛选条件，但按「客户端 + 任务」归拢成一行一组。
+    /// 展开某一组时前端再带 taskId 调 GetListAsync 拿这一组的明细。
+    /// </summary>
+    Task<PagedResult<BackupSetGroupDto>> GetGroupsAsync(BackupQuery query, CancellationToken ct = default);
     Task<BackupSetDetailDto> GetDetailAsync(Guid backupSetId, CancellationToken ct = default);
     Task<List<BackupFileDto>> GetFilesAsync(Guid backupSetId, CancellationToken ct = default);
     Task LockAsync(Guid backupSetId, LockBackupRequest request, CancellationToken ct = default);
@@ -41,6 +47,15 @@ public interface IBackupSetService
 
     /// <summary>立即彻底删除（只能对回收站里的备份集执行，物理删除仓库目录，不可撤销）</summary>
     Task PurgeAsync(Guid backupSetId, CancellationToken ct = default);
+
+    /// <summary>批量移入回收站</summary>
+    Task<BackupSetBatchResult> RecycleBatchAsync(BackupSetBatchRequest request, CancellationToken ct = default);
+
+    /// <summary>批量从回收站还原</summary>
+    Task<BackupSetBatchResult> RestoreFromRecycleBinBatchAsync(BackupSetBatchRequest request, CancellationToken ct = default);
+
+    /// <summary>批量彻底删除（不可撤销）</summary>
+    Task<BackupSetBatchResult> PurgeBatchAsync(BackupSetBatchRequest request, CancellationToken ct = default);
 }
 
 /// <summary>备份查询实现（列表/详情/文件/锁定/解锁/重校验）</summary>
@@ -85,7 +100,12 @@ public class BackupSetService : IBackupSetService
         _logger = logger;
     }
 
-    public async Task<PagedResult<BackupSetListItemDto>> GetListAsync(BackupQuery query, CancellationToken ct = default)
+    /// <summary>
+    /// 列表与归拢视图共用的筛选。抽出来是因为两边一旦分家，
+    /// 归拢行上的「18 份」和展开后数出来的行数就会对不上，
+    /// 而那种对不上没有任何办法从界面上看出是筛选口径的差异还是真的少了备份。
+    /// </summary>
+    private IQueryable<BackupSet> FilterSets(BackupQuery query)
     {
         var sets = _db.BackupSets.AsNoTracking().AsQueryable();
 
@@ -104,6 +124,21 @@ public class BackupSetService : IBackupSetService
                 throw new BusinessException("INVALID_REQUEST", $"无效的备份状态：{query.Status}", 400);
             sets = sets.Where(s => s.Status == status);
         }
+        else
+        {
+            // 不指定状态时只查还活着的。
+            //
+            // 已删除的行必须留在表里——restore_requests 和 alerts 对 backup_sets 都是
+            // Restrict，物理删行等于要先删掉恢复历史和告警历史，而「这份备份被谁在什么
+            // 时候恢复过」恰恰是最不该丢的记录。留着也没有副作用：deleted 不在
+            // BackupSetStatuses.Live 里，不占「这个候选已入过库」的位置。
+            //
+            // 但它们不该混进默认视图，原因不是碍眼而是算数：归拢行的份数和容量是把
+            // 筛出来的行全加起来的，已删除的备份磁盘上早就没了却照样进 TotalBytes——
+            // 一个一份都不剩的任务，界面上报的是「36 份备份 18.11 GB」。
+            // 要查已删除/回收站的，从状态那一档显式挑，那时人问的才是「那一份哪去了」。
+            sets = sets.Where(s => BackupSetStatuses.Live.Contains(s.Status));
+        }
 
         if (query.From is not null)
             sets = sets.Where(s => s.UploadedAt >= query.From);
@@ -112,6 +147,75 @@ public class BackupSetService : IBackupSetService
 
         if (!string.IsNullOrWhiteSpace(query.Keyword))
             sets = sets.Where(s => EF.Functions.ILike(s.BackupSetCode, $"%{query.Keyword.Trim()}%"));
+
+        return sets;
+    }
+
+    public async Task<PagedResult<BackupSetGroupDto>> GetGroupsAsync(
+        BackupQuery query, CancellationToken ct = default)
+    {
+        // 客户端名、任务名、应用名都由分组键函数决定，一起放进 GROUP BY 就不必再回表查一次。
+        var groups = FilterSets(query)
+            .GroupBy(s => new
+            {
+                s.ClientId,
+                ClientHostname = s.Client.Hostname,
+                s.TaskId,
+                TaskName = s.Task.Name,
+                ApplicationName = s.Task.ApplicationName
+            });
+
+        var totalCount = await groups.LongCountAsync(ct);
+
+        var rows = await groups
+            // 最新的备份排最前：这张表是用来看「还在不在出备份」的，
+            // 最久没动静的那一组反而要靠翻到最后才看得见——所以倒序而不是正序。
+            .OrderByDescending(g => g.Max(x => x.BackupBusinessTime ?? x.UploadedAt))
+            .ThenBy(g => g.Key.TaskName)
+            .Skip((query.Page - 1) * query.PageSize)
+            .Take(query.PageSize)
+            .Select(g => new
+            {
+                g.Key.ClientId,
+                g.Key.ClientHostname,
+                g.Key.TaskId,
+                g.Key.TaskName,
+                g.Key.ApplicationName,
+                BackupSetCount = g.Count(),
+                // 单元数用 COUNT(DISTINCT business_unit_id)。单元为 null 的（单单元任务、
+                // 老数据）在 SQL 里不计入 distinct 计数，下面补成至少 1。
+                BusinessUnitCount = g.Select(x => x.BusinessUnitId).Distinct().Count(),
+                LatestBusinessTime = g.Max(x => x.BackupBusinessTime),
+                LatestUploadedAt = g.Max(x => x.UploadedAt),
+                TotalBytes = g.Sum(x => x.TotalBytes),
+                AvailableCount = g.Count(x => x.Status == BackupSetStatus.Available),
+                LockedCount = g.Count(x => x.Locked)
+            })
+            .ToListAsync(ct);
+
+        var items = rows.Select(g => new BackupSetGroupDto
+        {
+            ClientId = g.ClientId,
+            ClientHostname = g.ClientHostname,
+            TaskId = g.TaskId,
+            TaskName = g.TaskName,
+            ApplicationName = g.ApplicationName,
+            BackupSetCount = g.BackupSetCount,
+            BusinessUnitCount = Math.Max(1, g.BusinessUnitCount),
+            LatestBusinessTime = g.LatestBusinessTime,
+            LatestUploadedAt = g.LatestUploadedAt,
+            TotalBytes = g.TotalBytes,
+            AvailableCount = g.AvailableCount,
+            NotAvailableCount = g.BackupSetCount - g.AvailableCount,
+            LockedCount = g.LockedCount
+        }).ToList();
+
+        return PagedResult<BackupSetGroupDto>.Create(items, totalCount, query.Page, query.PageSize);
+    }
+
+    public async Task<PagedResult<BackupSetListItemDto>> GetListAsync(BackupQuery query, CancellationToken ct = default)
+    {
+        var sets = FilterSets(query);
 
         var totalCount = await sets.LongCountAsync(ct);
 
@@ -428,6 +532,88 @@ public class BackupSetService : IBackupSetService
             afterData: JsonSerializer.Serialize(new { set.BackupSetCode, set.RepositoryPath }), ct: ct);
 
         _logger.LogInformation("备份 {Code} 已彻底删除：{Path}", set.BackupSetCode, set.RepositoryPath);
+    }
+
+    // ---------- 批量回收站操作 ----------
+
+    /// <summary>
+    /// 单批上限。彻底删除是同步删目录的，一次几百个目录在慢盘或网络存储上
+    /// 足以把请求拖到超时；超过就让人分批，而不是给一个偶尔会半路断掉的按钮。
+    /// </summary>
+    public const int MaxBatchSize = 100;
+
+    public Task<BackupSetBatchResult> RecycleBatchAsync(
+        BackupSetBatchRequest request, CancellationToken ct = default)
+        => RunBatchAsync(request, RecycleAsync, "batch.recycle", ct);
+
+    public Task<BackupSetBatchResult> RestoreFromRecycleBinBatchAsync(
+        BackupSetBatchRequest request, CancellationToken ct = default)
+        => RunBatchAsync(request, RestoreFromRecycleBinAsync, "batch.restore_from_recycle_bin", ct);
+
+    public Task<BackupSetBatchResult> PurgeBatchAsync(
+        BackupSetBatchRequest request, CancellationToken ct = default)
+        => RunBatchAsync(request, PurgeAsync, "batch.purge", ct);
+
+    /// <summary>
+    /// 逐条执行，逐条记账。
+    ///
+    /// 刻意不包在一个事务里：选中的 36 份里有一份被锁定、或者删掉之后已经重新备份过，
+    /// 那一条本来就该被拒（守卫与单条操作完全一致），但它不该让另外 35 份也回不来。
+    /// 所以每条各自成败，最后把「成功几条、哪几条为什么没做成」一起交回去。
+    /// </summary>
+    private async Task<BackupSetBatchResult> RunBatchAsync(
+        BackupSetBatchRequest request,
+        Func<Guid, CancellationToken, Task> action,
+        string operation,
+        CancellationToken ct)
+    {
+        var ids = (request?.BackupSetIds ?? new List<Guid>()).Distinct().ToList();
+        if (ids.Count == 0)
+            throw new BusinessException("INVALID_REQUEST", "没有选中任何备份集", 400);
+        if (ids.Count > MaxBatchSize)
+            throw new BusinessException("INVALID_REQUEST",
+                $"一次最多处理 {MaxBatchSize} 份备份集，当前选中 {ids.Count} 份，请分批操作", 400);
+
+        // 备份集编号先查出来：失败明细里只给 id，界面上报出来的那几条人是对不上号的。
+        var codes = await _db.BackupSets.AsNoTracking()
+            .Where(s => ids.Contains(s.Id))
+            .Select(s => new { s.Id, s.BackupSetCode })
+            .ToDictionaryAsync(s => s.Id, s => s.BackupSetCode, ct);
+
+        var result = new BackupSetBatchResult();
+        foreach (var id in ids)
+        {
+            ct.ThrowIfCancellationRequested();
+            codes.TryGetValue(id, out var code);
+            try
+            {
+                await action(id, ct);
+                result.SuccessCount++;
+            }
+            catch (BusinessException ex)
+            {
+                result.Failed.Add(new BackupSetBatchFailure
+                {
+                    BackupSetId = id, BackupSetCode = code, ErrorCode = ex.ErrorCode, Message = ex.Message
+                });
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // 删目录撞上文件被占用这类意外，只该让这一条失败。
+                // 让它冒出去的话，前面已经提交的那些既没回滚也没人报告，
+                // 使用者拿到的是一个 500 和一份不知道删到哪一条的列表。
+                _logger.LogError(ex, "批量操作 {Operation} 处理备份集 {BackupSetId}({Code}) 失败", operation, id, code);
+                result.Failed.Add(new BackupSetBatchFailure
+                {
+                    BackupSetId = id, BackupSetCode = code, ErrorCode = "ERROR", Message = ex.Message
+                });
+            }
+        }
+
+        _logger.LogInformation("批量操作 {Operation}：共 {Total} 份，成功 {Ok} 份，失败 {Fail} 份",
+            operation, ids.Count, result.SuccessCount, result.Failed.Count);
+
+        return result;
     }
 
     /// <summary>

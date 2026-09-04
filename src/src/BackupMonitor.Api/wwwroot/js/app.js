@@ -2,7 +2,7 @@
 import { store, api, getAccessToken, clearAuth } from './api.js';
 import { App, ACTIONS, LOADERS } from './state.js';
 import {
-  $, esc, errToast, skeleton, batchBarHtml, toast,
+  $, esc, errToast, skeleton, batchBarHtml, batchSelectedRows, toast,
   openModal, closeModal, closeDrawer, drawerOpen
 } from './ui.js';
 
@@ -37,7 +37,7 @@ export const NAV_GROUPS = [
   ] },
   { key: 'manage', label: '管理', items: [
     ['settings', '存储设置', '⚙'], ['retention', '保留策略', '◫'], ['notifications', '通知', '✉'],
-    ['upgrades', '客户端升级', '↑'], ['job-history', '运行记录', '◷'], ['audit', '审计日志', '≡']
+    ['upgrades', '客户端升级', '↑'], ['runs', '运行记录', '◷'], ['audit', '审计日志', '≡']
   ] }
 ];
 const NAV_ITEMS = NAV_GROUPS.flatMap(g => g.items.map(([key, label, icon]) => ({ key, label, icon, group: g.label })));
@@ -114,20 +114,35 @@ App.batch = async function (key, actIdx) {
   const act = acts[actIdx];
   const st = App.state[key];
   if (!act || !st || !st.selected || !st.selected.length) return;
-  if (act.confirm && !await act.confirm(st.selected)) return;
-  const ids = st.selected.slice();
+
+  // 选中的行里有做不了这个动作的（已注销的机器不能刷新指标、不能再注销一次），
+  // 就只对做得了的那些执行，并把跳过了几个说出来——闷声跳过等于让人以为都做了。
+  const rows = batchSelectedRows(key);
+  let ids = st.selected.slice();
+  let skipped = 0;
+  if (rows && act.allow) {
+    const usable = rows.filter(act.allow).map(r => r.id);
+    skipped = ids.length - usable.length;
+    ids = usable;
+    if (!ids.length) { toast(act.why || '所选项目都不支持这个操作', 'err'); return; }
+  }
+
+  if (act.confirm && !await act.confirm(ids)) return;
   let okc = 0, fail = 0;
   try {
     if (act.bulk) {
       const result = await act.fn(ids);
       if (result === false) return;
-      okc = 1;
+      // 批量端点自己知道成功了几条：返回 { ok, fail } 就用它的数，
+      // 否则整批算一次（老写法，那些 fn 自己会把细节 toast 出来）。
+      if (result && typeof result === 'object') { okc = result.ok || 0; fail = result.fail || 0; }
+      else okc = 1;
     }
     else {
       for (const id of ids) { try { await act.fn(id); okc++; } catch (e) { fail++; } }
     }
   } catch (e) { fail = 1; }
-  toast(`批量完成：${okc}${fail ? `，失败 ${fail}` : ''}`, fail ? 'err' : 'ok');
+  toast(`批量完成：${okc}${fail ? `，失败 ${fail}` : ''}${skipped ? `，跳过 ${skipped}（做不了这个动作）` : ''}`, fail ? 'err' : 'ok');
   st.selected = [];
   if (LOADERS[key]) LOADERS[key]();
 };
@@ -257,7 +272,9 @@ document.addEventListener('click', e => {
     try {
       switch (action.dataset.uiAction) {
         case 'method':
-          if (typeof App[action.dataset.method] === 'function') App[action.dataset.method]();
+          // data-arg 是可选的：不带的按钮照旧调无参方法（多传一个 undefined 无害），
+          // 带的（如客户端列表的「在用 / 已注销 / 全部」）用它区分是哪一个按钮。
+          if (typeof App[action.dataset.method] === 'function') App[action.dataset.method](action.dataset.arg);
           break;
         case 'act':
           runActOnce(action);
@@ -504,7 +521,9 @@ const LEGACY_ROUTES = {
   dashboard: 'overview',
   notif: 'notifications/settings',
   deliveries: 'notifications/deliveries',
-  operations: 'job-history'
+  operations: 'runs',
+  // 这一页原先只查批量上传批次，现在是全部执行记录；老书签照旧能进来。
+  'job-history': 'runs'
 };
 /* 视图按路由加载：登录首屏只带认证与基础组件，避免把所有列表代码提前下载。 */
 const VIEW_LOADERS = {
@@ -515,14 +534,14 @@ const VIEW_LOADERS = {
   backups: () => import('./views/backups.js'), restores: () => import('./views/restores.js'),
   alerts: () => import('./views/alerts.js'), notifications: () => import('./views/notifications.js'),
   audit: () => import('./views/audit.js'), retention: () => import('./views/retention.js'),
-  'job-history': () => import('./views/job-history.js'), upgrades: () => import('./views/upgrades.js'),
+  runs: () => import('./views/runs.js'), upgrades: () => import('./views/upgrades.js'),
   settings: () => import('./views/settings.js')
 };
 const VIEW_EXPORTS = {
   overview: 'vDashboard', transfers: 'vTransfers', todo: 'vTodo', clients: 'vClients', tasks: 'vTasks', plans: 'vPlans', backups: 'vBackups',
   restores: 'vRestores', alerts: 'vAlerts', notifications: 'vNotifications', audit: 'vAudit',
   'registration-tokens': 'vRegistrationTokens',
-  retention: 'vRetention', 'job-history': 'vJobHistory', upgrades: 'vUpgrades',
+  retention: 'vRetention', runs: 'vRuns', upgrades: 'vUpgrades',
   settings: 'vSettings'
 };
 const DRAWER_EXPORTS = { tasks: 'openTaskDrawer', restores: 'openRestoreDrawer', alerts: 'openAlertDrawer', audit: 'openAuditDrawer' };

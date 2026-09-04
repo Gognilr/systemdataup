@@ -1,7 +1,8 @@
-using BackupMonitor.Core.Entities.Backup;
+﻿using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Entities.Execution;
 using BackupMonitor.Core.Enums;
+using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Infrastructure.Services;
 using Microsoft.EntityFrameworkCore;
@@ -318,7 +319,309 @@ public class SequentialExecutionWorkerTests : IAsyncLifetime
         Assert.DoesNotContain(ExecutionItemStatus.Failed, statuses);
     }
 
+    // ---------- 用例六：队列名单 ----------
+
+    /// <summary>
+    /// 「什么时候轮到我」这个问题，数字（queue-status 的几个计数）回答不了。
+    /// 并发度 1 的计划挂着十台服务器时，人要看的是名单和它的顺序——
+    /// 名单的顺序必须与执行器放行的顺序一致，否则「还要等几个」就读不出来。
+    /// </summary>
+    [Fact]
+    public async Task 队列名单按放行顺序列出在跑的和在等的项()
+    {
+        var (planId, _) = await SeedPlanAsync(taskCount: 3, maxConcurrent: 1);
+        var runId = await TriggerAsync(planId);
+
+        await RunPassAsync();
+
+        await using var scope = _services.CreateAsyncScope();
+        var queue = scope.ServiceProvider.GetRequiredService<IExecutionQueueService>();
+        var snapshot = await queue.GetQueueAsync();
+
+        // 快照是全局的（同一个库里可能还有别的执行），只看这一次的那几项
+        var mine = snapshot.Items.Where(i => i.RunId == runId).ToList();
+        Assert.Equal(3, mine.Count);
+        Assert.Equal([0, 1, 2], mine.Select(i => i.SortOrder));
+
+        Assert.Equal("running", mine[0].Status);
+        Assert.Equal(ExecutionQueueWaits.Running, mine[0].Wait);
+        Assert.All(mine.Skip(1), i =>
+        {
+            Assert.Equal("pending", i.Status);
+            // 全局上传名额一个都没占（预检项不占），这两项等的是前一项跑完
+            Assert.Equal(ExecutionQueueWaits.WaitingInRun, i.Wait);
+        });
+
+        // 名单要能指认「是谁在等」：只有 GUID 的话这张表跟数字没有区别
+        Assert.All(mine, i =>
+        {
+            Assert.False(string.IsNullOrWhiteSpace(i.TaskName));
+            Assert.False(string.IsNullOrWhiteSpace(i.ClientName));
+            Assert.Equal("precheck_task", i.CommandType);
+            Assert.Equal(1, i.RunMaxConcurrent);
+        });
+
+        // 跑完的项不留在队列里：它属于运行记录，混进来会把「还要等几个」冲淡
+        await CompleteItemAsync(runId, 0, (await TaskIdsOfAsync(runId))[0]);
+        await RunPassAsync();
+
+        var after = (await queue.GetQueueAsync()).Items.Where(i => i.RunId == runId).ToList();
+        Assert.Equal(2, after.Count);
+        Assert.Equal(1, after[0].SortOrder);
+        Assert.Equal(ExecutionQueueWaits.Running, after[0].Wait);
+    }
+
+    /// <summary>
+    /// 「等名额」和「等前一项」不是一回事，混成一个数就会写出
+    /// 「0 个正在传 / 2 个排队中 · 有空余名额」这种自相矛盾的话。
+    /// 判据只有一份（ExecutionQueueWaits），这里直接钉住它。
+    /// </summary>
+    [Fact]
+    public void 等名额与等前一项分得开()
+    {
+        // 本轮轮不到它：先说「等前一项」，与名额满不满无关
+        Assert.Equal(ExecutionQueueWaits.WaitingInRun,
+            ExecutionQueueWaits.Classify(1, 1, CommandType.UploadCandidate, uploadSlotFull: true));
+
+        // 轮得到它，但它要建上传会话而名额满了
+        Assert.Equal(ExecutionQueueWaits.WaitingForUploadSlot,
+            ExecutionQueueWaits.Classify(0, 1, CommandType.UploadCandidate, uploadSlotFull: true));
+
+        // 预检不占名额：名额满了也照样放行，挡住它等于让计划连扫描都不许开始
+        Assert.Equal(ExecutionQueueWaits.WaitingInRun,
+            ExecutionQueueWaits.Classify(0, 1, CommandType.PrecheckTask, uploadSlotFull: true));
+        Assert.False(ExecutionQueueWaits.ConsumesUploadSlot(CommandType.PrecheckTask));
+    }
+
+    // ---------- 用例七：预检自己报了结论就不再空等宽限期 ----------
+
+    /// <summary>
+    /// 预检说「这次没有新备份」时，这一项当场就该结案。
+    ///
+    /// 原先唯一的判据是「等满 no_upload_grace（默认 10 分钟）还没有上传会话就判成功」，
+    /// 于是严格顺序的计划里，每一个没有新备份的任务都要在「执行中」上白挂十分钟，
+    /// 后面每一项跟着顺延——三台服务器的计划能空转半小时，而界面上什么都不显示。
+    /// </summary>
+    [Fact]
+    public async Task 预检报没有新备份时当场结案而不是等满宽限期()
+    {
+        var (planId, _) = await SeedPlanAsync(taskCount: 2, maxConcurrent: 1);
+        var runId = await TriggerAsync(planId);
+        await RunPassAsync();
+
+        await SucceedPrecheckAsync(runId, 0, (EnumMapping.ToSnakeCase(PrecheckStatus.NoNewBackup), null));
+        await RunPassAsync();
+
+        var statuses = await ItemStatusesAsync(runId);
+        Assert.Equal(ExecutionItemStatus.Succeeded, statuses[0]);
+        // 结案了，后面那一项立刻被放行——这才是「严格顺序」该有的节奏
+        Assert.Equal(ExecutionItemStatus.Running, statuses[1]);
+        Assert.Equal("这次没有新备份", await ItemMessageAsync(runId, 0));
+    }
+
+    /// <summary>
+    /// 预检没通过时这一项必须判失败。
+    ///
+    /// 原先它同样等满宽限期，然后写「没有需要上传的新备份」并判成功——而告警中心那边
+    /// 正为同一件事报着 size_abnormal。两份记录对同一件事给出相反的结论时，
+    /// 人会相信执行记录，因为它更具体。这是备份监控系统能给出的最坏的一种答案。
+    /// </summary>
+    [Fact]
+    public async Task 预检没通过时这一项判失败而不是报成功()
+    {
+        var (planId, _) = await SeedPlanAsync(taskCount: 1, maxConcurrent: 1);
+        var runId = await TriggerAsync(planId);
+        await RunPassAsync();
+
+        await SucceedPrecheckAsync(runId, 0, (EnumMapping.ToSnakeCase(PrecheckStatus.SizeAbnormal), null));
+        await RunPassAsync();
+
+        Assert.Equal(ExecutionItemStatus.Failed, (await ItemStatusesAsync(runId))[0]);
+        Assert.Contains("备份大小超出设定范围", await ItemMessageAsync(runId, 0));
+    }
+
+    /// <summary>
+    /// 扫出了新备份、但没有下发任何上传（任务不是自动模式，或这一份刚被人取消过上传）：
+    /// 等下去不会有会话，而「没有需要上传的新备份」是假话——它会让人以为今天不用管。
+    /// </summary>
+    [Fact]
+    public async Task 扫出新备份却没下发上传时说清楚是哪一种()
+    {
+        var (planId, _) = await SeedPlanAsync(taskCount: 1, maxConcurrent: 1);
+        var runId = await TriggerAsync(planId);
+        await RunPassAsync();
+
+        await SucceedPrecheckAsync(runId, 0,
+            (PrecheckResultPayload.StatePassed, PrecheckResultPayload.StateNotDispatched));
+        await RunPassAsync();
+
+        Assert.Equal(ExecutionItemStatus.Succeeded, (await ItemStatusesAsync(runId))[0]);
+        var message = await ItemMessageAsync(runId, 0);
+        Assert.Contains("没有自动下发上传", message);
+        Assert.DoesNotContain("没有需要上传的新备份", message);
+    }
+
+    /// <summary>上传已经下发出去了就继续等真会话，不能因为「此刻还没有会话」就下结论。</summary>
+    [Fact]
+    public async Task 上传已下发时继续等会话而不是当场结案()
+    {
+        var (planId, _) = await SeedPlanAsync(taskCount: 1, maxConcurrent: 1);
+        var runId = await TriggerAsync(planId);
+        await RunPassAsync();
+
+        await SucceedPrecheckAsync(runId, 0,
+            (PrecheckResultPayload.StatePassed, PrecheckResultPayload.StateDispatched));
+        await RunPassAsync();
+
+        Assert.Equal(ExecutionItemStatus.Running, (await ItemStatusesAsync(runId))[0]);
+    }
+
+    /// <summary>
+    /// 会话建于这一项开跑**之前**时也必须找得到它。
+    ///
+    /// Agent 建会话的幂等键是候选键，同一份备份先前已经传完入库时，服务端把那个
+    /// committed 的老会话原样交回、不新建行。定位会话只靠「本项开跑之后新建的」
+    /// 那一版于是查出 0 条：上传几秒钟就结束了，这一项却一直挂到单项超时
+    /// （现场那次是计划的 60 分钟）才被判失败，严格顺序时后面每一项跟着顺延一小时。
+    /// 清单里逐单元写着候选 ID，那才是这一项真正涉及的那几份备份。
+    /// </summary>
+    [Fact]
+    public async Task 复用先前已入库的会话时这一项照样当场结案()
+    {
+        var (planId, _) = await SeedPlanAsync(taskCount: 2, maxConcurrent: 1);
+        var runId = await TriggerAsync(planId);
+        await RunPassAsync();
+
+        var candidateIds = await SucceedPrecheckAsync(runId, 0,
+            (PrecheckResultPayload.StatePassed, PrecheckResultPayload.StateQueued));
+
+        // 会话早于这一项开跑：现场那一次是 10:55 传完入库、14:03 计划再跑到同一份备份
+        await SeedCommittedSessionAsync(runId, 0, candidateIds[0], DateTime.UtcNow.AddHours(-3));
+
+        await RunPassAsync();
+
+        var statuses = await ItemStatusesAsync(runId);
+        Assert.Equal(ExecutionItemStatus.Succeeded, statuses[0]);
+        Assert.Equal("备份已入库", await ItemMessageAsync(runId, 0));
+        // 结案了，后面那一项立刻被放行——这正是原先被白白顺延掉的那一小时
+        Assert.Equal(ExecutionItemStatus.Running, statuses[1]);
+    }
+
+    /// <summary>
+    /// 排队的上传已经跑完、却一个会话都没留下时，要给结论而不是无限等下去。
+    ///
+    /// queued 的单元没有上传指令 ID（排进队列时指令还没建出来），
+    /// 「上传指令是不是已经死了」那段检查够不着它们，于是这一项永远等下去。
+    /// </summary>
+    [Fact]
+    public async Task 排队的上传跑完却没留下会话时不再无限等下去()
+    {
+        var (planId, _) = await SeedPlanAsync(taskCount: 1, maxConcurrent: 1);
+        var runId = await TriggerAsync(planId);
+        await RunPassAsync();
+
+        await SucceedPrecheckAsync(runId, 0,
+            (PrecheckResultPayload.StatePassed, PrecheckResultPayload.StateQueued));
+        await RunPassAsync();
+
+        Assert.Equal(ExecutionItemStatus.Failed, (await ItemStatusesAsync(runId))[0]);
+        Assert.Contains("没有留下任何上传会话", await ItemMessageAsync(runId, 0));
+    }
+
     // ---------- 基础设施 ----------
+
+    /// <summary>
+    /// 把某一项的预检指令置成功，并按给定的每单元结论写出 result_payload；
+    /// 返回为这些单元建出来的候选 ID。
+    ///
+    /// 候选写成真行而不是随手 Guid.NewGuid()：上传会话对它有外键，
+    /// 而「按清单里的候选 ID 去找会话」这条路正是要被验的那一条。
+    /// </summary>
+    private async Task<List<Guid>> SucceedPrecheckAsync(
+        Guid runId, int sortOrder, params (string Status, string? UploadState)[] entries)
+    {
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var item = await db.ExecutionRunItems.AsNoTracking()
+            .SingleAsync(i => i.RunId == runId && i.SortOrder == sortOrder);
+        Assert.NotNull(item.CommandId);
+
+        var now = DateTime.UtcNow;
+        var candidateIds = new List<Guid>();
+        string? payload = null;
+        var index = 0;
+        foreach (var (status, uploadState) in entries)
+        {
+            var candidate = new CandidateBackupSet
+            {
+                Id = Guid.NewGuid(),
+                ClientId = item.ClientId,
+                TaskId = item.TaskId,
+                CandidateKey = $"seq-{Guid.NewGuid():N}",
+                SourceRoot = @"D:\data",
+                DiscoveredAt = now,
+                PrecheckStatus = PrecheckStatus.Passed,
+                TotalFiles = 1,
+                TotalBytes = 1,
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+            db.CandidateBackupSets.Add(candidate);
+            candidateIds.Add(candidate.Id);
+
+            payload = PrecheckResultPayload.Upsert(payload, new PrecheckResultPayload.Entry(
+                $"unit-{index++}", candidate.Id, status, null, uploadState));
+        }
+        await db.SaveChangesAsync();
+
+        await db.Commands.Where(c => c.Id == item.CommandId)
+            .ExecuteUpdateAsync(s => s
+                .SetProperty(c => c.Status, CommandStatus.Succeeded)
+                .SetProperty(c => c.CompletedAt, now)
+                .SetProperty(c => c.ResultPayload, payload));
+
+        return candidateIds;
+    }
+
+    /// <summary>给某个候选补一个已入库的上传会话，created_at 可以早于这一项开跑的时刻。</summary>
+    private async Task SeedCommittedSessionAsync(Guid runId, int sortOrder, Guid candidateId, DateTime createdAt)
+    {
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        var item = await db.ExecutionRunItems.AsNoTracking()
+            .SingleAsync(i => i.RunId == runId && i.SortOrder == sortOrder);
+
+        db.UploadSessions.Add(new Core.Entities.Upload.UploadSession
+        {
+            Id = Guid.NewGuid(),
+            ClientId = item.ClientId,
+            TaskId = item.TaskId,
+            CandidateBackupSetId = candidateId,
+            Status = UploadStatus.Committed,
+            TotalFiles = 1,
+            TotalBytes = 1,
+            StartedAt = createdAt,
+            LastActivityAt = createdAt,
+            CompletedAt = createdAt,
+            CommittedAt = createdAt,
+            CreatedAt = createdAt,
+            UpdatedAt = createdAt
+        });
+        await db.SaveChangesAsync();
+    }
+
+    private async Task<string?> ItemMessageAsync(Guid runId, int sortOrder)
+    {
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await db.ExecutionRunItems.AsNoTracking()
+            .Where(i => i.RunId == runId && i.SortOrder == sortOrder)
+            .Select(i => i.Message)
+            .SingleAsync();
+    }
+
 
     private async Task RunPassAsync()
     {
@@ -337,6 +640,17 @@ public class SequentialExecutionWorkerTests : IAsyncLifetime
             .Where(i => i.RunId == runId)
             .OrderBy(i => i.SortOrder)
             .Select(i => i.Status)
+            .ToListAsync();
+    }
+
+    private async Task<List<Guid>> TaskIdsOfAsync(Guid runId)
+    {
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        return await db.ExecutionRunItems.AsNoTracking()
+            .Where(i => i.RunId == runId)
+            .OrderBy(i => i.SortOrder)
+            .Select(i => i.TaskId)
             .ToListAsync();
     }
 

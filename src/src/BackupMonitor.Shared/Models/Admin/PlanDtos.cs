@@ -156,3 +156,73 @@ public class ExecutionRunItemDto
     public DateTime? FinishedAt { get; set; }
     public string? Message { get; set; }
 }
+
+/// <summary>
+/// 此刻的队列快照：几个在传、谁在跑、谁在等、等的是什么。
+///
+/// queue-status 只给数字，回答不了「什么时候轮到我」——十台服务器排在
+/// 并发度 1 的计划后面时，人要看的是这份名单和它的顺序。
+/// </summary>
+public class ExecutionQueueSnapshotDto
+{
+    /// <summary>此刻占着全局上传名额的会话数</summary>
+    public int ActiveUploads { get; set; }
+
+    /// <summary>全局上传上限（max_concurrent_uploads_total）</summary>
+    public int GlobalLimit { get; set; }
+
+    /// <summary>已经开跑的项</summary>
+    public int RunningItems { get; set; }
+
+    /// <summary>在等全局上传名额的项</summary>
+    public int WaitingForUploadSlot { get; set; }
+
+    /// <summary>在等本次执行并发度的项（前一项还没跑完）</summary>
+    public int WaitingInRun { get; set; }
+
+    /// <summary>在跑的排前面，其余按「执行产生的先后 + 执行内的顺序号」——与放行顺序同一口径</summary>
+    public List<ExecutionQueueEntryDto> Items { get; set; } = [];
+}
+
+/// <summary>队列名单里的一行</summary>
+public class ExecutionQueueEntryDto
+{
+    public Guid ItemId { get; set; }
+
+    public Guid RunId { get; set; }
+
+    public string? RunName { get; set; }
+
+    /// <summary>backup_plan / upload_batch / manual</summary>
+    public string RunKind { get; set; } = null!;
+
+    /// <summary>schedule / manual / auto_upload_queued</summary>
+    public string TriggerSource { get; set; } = null!;
+
+    /// <summary>这次执行的并发度：1 就是严格一个接一个</summary>
+    public int RunMaxConcurrent { get; set; }
+
+    /// <summary>这一项在本次执行里的顺序号（0 基）</summary>
+    public int SortOrder { get; set; }
+
+    public Guid TaskId { get; set; }
+
+    public string TaskName { get; set; } = null!;
+
+    public Guid ClientId { get; set; }
+
+    public string ClientName { get; set; } = null!;
+
+    /// <summary>precheck_task / upload_candidate / upload_latest：预检不占上传名额</summary>
+    public string CommandType { get; set; } = null!;
+
+    /// <summary>pending / running</summary>
+    public string Status { get; set; } = null!;
+
+    /// <summary>running / waiting_in_run / waiting_for_slot</summary>
+    public string Wait { get; set; } = null!;
+
+    public DateTime RunCreatedAt { get; set; }
+
+    public DateTime? StartedAt { get; set; }
+}

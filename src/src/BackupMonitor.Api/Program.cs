@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Text;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.RateLimiting;
@@ -422,6 +422,10 @@ app.UseAuthentication();
 // 用到自然过期（默认 1 小时）。这里比对 token 里的 tv 与库中 users.token_version（60 秒内存缓存，
 // 缓存命中不产生额外 DB 查询），不一致直接 401，最坏 60 秒生效。
 app.UseMiddleware<TokenVersionMiddleware>();
+
+// 存活证据：Agent 的每一次已认证请求都记一次「听到它了」，供 SystemWatchdogWorker
+// 与心跳时间取较晚者。只认心跳的那一版会把正在传大文件的客户端判成离线。
+app.UseMiddleware<ClientLastSeenMiddleware>();
 
 // 强制改密闸门必须位于认证之后（需要 JWT claim）、授权之前（未改密时不应触达任何业务端点）。
 // 静态文件在上面已经短路返回，不会经过这里。

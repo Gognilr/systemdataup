@@ -1,4 +1,4 @@
-using System.Threading.Channels;
+﻿using System.Threading.Channels;
 using BackupMonitor.Infrastructure.Security;
 using BackupMonitor.Infrastructure.Services;
 using Microsoft.AspNetCore.DataProtection;
@@ -62,6 +62,9 @@ public static class DependencyInjection
         // 速度采样器必须是单例：算「现在多快」要拿这次和上一次比，
         // 按请求新建的话每次都是第一次，永远比不出增量。
         services.AddSingleton<UploadRateSampler>();
+        // 存活判定的输入：任何一次已认证的 Agent 请求都算「听到它了」。
+        // 单例是因为要在进程内记住「上次为这个客户端落库是什么时候」（写库限流）。
+        services.AddSingleton<ClientLastSeenTracker>();
         services.AddScoped<IUploadProgressService, UploadProgressService>();
         services.AddScoped<IUploadSessionControlService, UploadSessionControlService>();
         services.AddScoped<IUploadSessionService, UploadSessionService>();

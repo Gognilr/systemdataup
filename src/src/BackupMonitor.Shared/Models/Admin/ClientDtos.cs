@@ -9,6 +9,16 @@ public class ClientQuery : PagedQuery
     /// <summary>pending_approval / online / suspected_offline / offline / disabled / revoked</summary>
     public string? Status { get; set; }
 
+    /// <summary>
+    /// 是否把已注销的机器一起列出来。默认 false。
+    ///
+    /// 注销是终点：证书吊销、不再接受心跳、任何指令都会被 409 回绝。
+    /// 一台重装后重新登记的机器会在列表里留下一条同名的注销记录，
+    /// 默认列出来的后果是「新建任务时两条同名机器分不清该选哪个」。
+    /// 显式按 status=revoked 查询时不受这个开关影响。
+    /// </summary>
+    public bool IncludeRevoked { get; set; }
+
     public Guid? GroupId { get; set; }
     public string? AgentVersion { get; set; }
     public bool? HasAlert { get; set; }
@@ -36,6 +46,12 @@ public class ClientListItemDto
     public int? CertificateRemainingDays { get; set; }
 
     public DateTime? LastHeartbeatAt { get; set; }
+
+    /// <summary>
+    /// 服务端最近一次收到这台机器任何已认证请求的时间。存活判定取它与心跳的较晚者——
+    /// 界面上的「在线 / 离线」显示的是这个，而不是单看心跳。
+    /// </summary>
+    public DateTime? LastSeenAt { get; set; }
 
     /// <summary>
     /// 服务端最近一次心跳观测到的对端 IP。

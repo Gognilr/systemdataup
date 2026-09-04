@@ -8,6 +8,9 @@ const DAY_STATUS = {
   success: { label: '成功', code: '✓', className: 'success' },
   failed: { label: '失败', code: '!', className: 'failed' },
   in_progress: { label: '进行中', code: '…', className: 'in-progress' },
+  // 那天备出来过、那份备份后来被人删了。刻意用灰色而不是红色：
+  // 它不是故障，用红色会让人去查一件根本没发生的事。
+  deleted: { label: '备份已删除', code: '×', className: 'deleted' },
   no_schedule: { label: '当日无计划', code: '—', className: 'no-schedule' }
 };
 
@@ -86,7 +89,7 @@ function renderMatrix(summary) {
     <table class="matrix-table"><caption class="sr-only">任务 × 日期备份执行状态，符号和文字同时表达状态</caption><thead><tr><th class="task-head" scope="col">任务 / 客户端</th>${head}</tr></thead><tbody>${heatRows}</tbody></table>
   </div>
   <div class="matrix-legend" aria-label="状态图例">
-    <span class="success"><i aria-hidden="true"></i>成功</span><span class="failed"><i aria-hidden="true"></i>失败</span><span class="in-progress"><i aria-hidden="true"></i>进行中</span><span class="no-schedule"><i aria-hidden="true"></i>当日无计划</span>
+    <span class="success"><i aria-hidden="true"></i>成功</span><span class="failed"><i aria-hidden="true"></i>失败</span><span class="in-progress"><i aria-hidden="true"></i>进行中</span><span class="deleted"><i aria-hidden="true"></i>备份已删除</span><span class="no-schedule"><i aria-hidden="true"></i>当日无计划</span>
   </div>
   <details class="matrix-a11y"><summary>以文字表格查看（无障碍替代）</summary>
     <div class="matrix-scroll"><table><caption class="sr-only">任务 × 日期状态文字表格</caption><thead><tr><th scope="col">任务</th>${head}</tr></thead><tbody>${accessibleRows}</tbody></table></div>

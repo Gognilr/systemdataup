@@ -159,6 +159,18 @@ public class AdminClientController : ApiBaseController
         return OkMessage("客户端已注销");
     }
 
+    /// <summary>
+    /// 删除一台已注销机器的记录。只对已注销的开放，名下还有备份任务时以 409 拒绝——
+    /// 备份数据的去留由「备份任务」页决定，这里不提供绕过它的近路。
+    /// </summary>
+    [HttpDelete("{clientId:guid}")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.manage")]
+    public async Task<ActionResult<ApiResponse>> Delete(Guid clientId, CancellationToken ct)
+    {
+        await _clientService.DeleteAsync(clientId, ct);
+        return OkMessage("客户端记录已删除");
+    }
+
     /// <summary>下发刷新主机状态指令（15.6）</summary>
     [HttpPost("{clientId:guid}/refresh-metrics")]
     [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.manage")]

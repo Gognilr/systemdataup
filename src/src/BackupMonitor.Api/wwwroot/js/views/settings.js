@@ -34,6 +34,8 @@ async function render() {
       ${pathBlock('repo', '备份存放目录', s.repository, 'D:\\BackupRepository', '备份最终存这里。改完之后，新备份写入新目录，已经入库的备份仍留在原来的位置，不会被移动，也不会丢。')}
       ${pathBlock('stage', '上传暂存目录', s.staging, 'D:\\BackupStaging', '只放上传过程中的临时分块，提交后自动清理。要留出足够空间容纳单份最大的备份。')}
 
+      ${uploadLimitBlock(s)}
+
       ${s.backupSetsOutsideRoot
         ? `<div class="notice warning">有 ${esc(s.backupSetsOutsideRoot)} 份已入库备份不在当前备份存放目录之内（通常是因为改过路径）。这些备份仍然可以查看和恢复，但保留策略到期时无法自动删除它们的文件——需要人工把老目录搬到新目录下，或者手动清理。</div>`
         : ''}
@@ -49,6 +51,29 @@ async function render() {
   } catch (e) {
     body.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
   }
+}
+
+/* 同时上传的备份数上限。
+   它放在存储设置里而不是别处，是因为这道闸管的就是「服务端暂存盘同时被几路读写」——
+   跟上传暂存目录是同一件事的两面。
+
+   这个值此前只存在于 system_settings 表里，界面上没有任何入口：
+   备份计划一起跑几台服务器时，「为什么这台一直在等」这个问题在界面上无从回答，
+   而答案往往就是这个数字。 */
+function uploadLimitBlock(s) {
+  const limit = s.maxConcurrentUploadsTotal;
+  const active = s.activeUploads || 0;
+  return `<h3>同时上传的备份数上限</h3>
+    <dl class="storage-facts">
+      <dt>当前上限</dt><dd>${esc(limit)} 份</dd>
+      <dt>此刻在传</dt><dd>${esc(active)} 份${active >= limit ? ' <span class="status status--wait">已顶到上限</span>' : ''}</dd>
+    </dl>
+    <div class="frow"><label>上限（1–64）</label>
+      <input id="st_limit" type="number" min="1" max="64" step="1" value="${esc(limit)}">
+      <div class="hint">数的是<strong>上传会话</strong>，一个业务单元算一份——U8 一台机器 18 个账套时，这 18 份各算各的。
+        客户端是一条一条传的，所以一台服务器同时只占一份名额，这个数实际上约等于「最多允许几台客户端同时往上传」。
+        扫描（预检）不占名额。调大会让暂存盘同时被更多路读写，受益的是带宽、代价是磁盘 IO 和暂存空间。</div>
+    </div>`;
 }
 
 /* 一个存储根的展示块：当前生效值 + 磁盘余量 + 可写性 + 输入框 + 浏览按钮。
@@ -207,7 +232,10 @@ async function save() {
   try {
     await api('/api/v1/admin/storage-settings', { method: 'PUT', body: {
       repositoryPath: $('#st_repo').value.trim() || null,
-      stagingPath: $('#st_stage').value.trim() || null
+      stagingPath: $('#st_stage').value.trim() || null,
+      // 留空按「不改」提交 null，而不是当成 0：路径和并发共用一个表单，
+      // 把空输入框翻译成一个具体数字会在人没打算动它的时候把它改掉。
+      maxConcurrentUploadsTotal: $('#st_limit').value.trim() === '' ? null : Number($('#st_limit').value)
     } });
     toast('存储设置已保存', 'ok');
     await render();

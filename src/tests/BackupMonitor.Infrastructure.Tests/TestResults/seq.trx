@@ -1,0 +1,653 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="a263f122-8958-42b5-97a9-c28387626c8a" name="Administrator@DESKTOP-05MULHI 2026-09-04 11:00:29" runUser="DESKTOP-05MULHI\Administrator" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-04T11:00:29.7280178+09:00" queuing="2026-09-04T11:00:29.7280181+09:00" start="2026-09-04T11:00:23.8795522+09:00" finish="2026-09-04T11:00:30.5391768+09:00" />
+  <TestSettings name="default" id="d8bbf52a-b7cf-47fb-a1cd-e8ca833dd917">
+    <Deployment runDeploymentRoot="Administrator_DESKTOP-05MULHI_2026-09-04_11_00_29" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="0b1d6950-61ce-4768-b174-a398864ee051" testId="41a8ffef-0006-ec3e-c8ed-1a90c26c0878" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.上传已下发时继续等会话而不是当场结案" computerName="DESKTOP-05MULHI" duration="00:00:00.0122378" startTime="2026-09-04T11:00:29.8789255+09:00" endTime="2026-09-04T11:00:29.8789256+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="0b1d6950-61ce-4768-b174-a398864ee051">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.上传已下发时继续等会话而不是当场结案() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 470&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="59841c54-5dc0-4473-99a3-e76f06e603ab" testId="070f58e6-df9c-2e18-2ee4-e4337ff5bc8d" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.扫出新备份却没下发上传时说清楚是哪一种" computerName="DESKTOP-05MULHI" duration="00:00:00.0124814" startTime="2026-09-04T11:00:29.8544682+09:00" endTime="2026-09-04T11:00:29.8544683+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="59841c54-5dc0-4473-99a3-e76f06e603ab">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.扫出新备份却没下发上传时说清楚是哪一种() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 452&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="69caf89e-bdef-422f-82f0-d5df7a836703" testId="18e44946-068c-a771-3b3b-5abe9342bd98" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.等名额与等前一项分得开" computerName="DESKTOP-05MULHI" duration="00:00:00.0024476" startTime="2026-09-04T11:00:28.2015930+09:00" endTime="2026-09-04T11:00:28.2016035+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="69caf89e-bdef-422f-82f0-d5df7a836703" />
+    <UnitTestResult executionId="fc634fe7-42d4-44f8-bd6c-3faca40f6775" testId="221b971f-cb58-7ad6-c097-b8e175ab614c" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.并发度2时同时在跑的不超过两项" computerName="DESKTOP-05MULHI" duration="00:00:00.0189210" startTime="2026-09-04T11:00:29.8987100+09:00" endTime="2026-09-04T11:00:29.8987101+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="fc634fe7-42d4-44f8-bd6c-3faca40f6775">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.并发度2时同时在跑的不超过两项() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 142&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="d839de9a-add8-4bc2-9b2d-2a0e8188e556" testId="c4d7a9b8-5bd8-8af5-9e61-a3e73ffc4513" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.队列名单按放行顺序列出在跑的和在等的项" computerName="DESKTOP-05MULHI" duration="00:00:00.0154394" startTime="2026-09-04T11:00:29.7578194+09:00" endTime="2026-09-04T11:00:29.7578195+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d839de9a-add8-4bc2-9b2d-2a0e8188e556">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.队列名单按放行顺序列出在跑的和在等的项() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 335&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="d006cfac-60f8-4bc6-a230-68e2b869e50c" testId="01806c00-5d85-1339-49fa-b44d47c5f90c" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.卡住的一项超时后队列继续往下走" computerName="DESKTOP-05MULHI" duration="00:00:00.0148427" startTime="2026-09-04T11:00:29.9277801+09:00" endTime="2026-09-04T11:00:29.9277802+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d006cfac-60f8-4bc6-a230-68e2b869e50c">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.卡住的一项超时后队列继续往下走() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 95&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="d26af088-f51b-447e-ae3c-9465c52c40b9" testId="6169f57d-f341-a665-42b2-bf8c21899cef" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.有项在跑时排队中的项不因整次执行超时而被判失败" computerName="DESKTOP-05MULHI" duration="00:00:00.0168602" startTime="2026-09-04T11:00:29.8412076+09:00" endTime="2026-09-04T11:00:29.8412077+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d26af088-f51b-447e-ae3c-9465c52c40b9">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.有项在跑时排队中的项不因整次执行超时而被判失败() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 294&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="d98376ab-2fb1-457d-8537-50e5b777a16b" testId="4cab5293-9002-ac21-fd65-9f4a95f95c4b" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.手动触发失败不影响到点判定" computerName="DESKTOP-05MULHI" duration="00:00:00.0295152" startTime="2026-09-04T11:00:29.7865603+09:00" endTime="2026-09-04T11:00:29.7865604+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d98376ab-2fb1-457d-8537-50e5b777a16b" />
+    <UnitTestResult executionId="c69e510d-ab24-42e5-86ad-c5a2910568ed" testId="93219d87-a043-07d2-0234-11f18d8423c9" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.预检没通过时这一项判失败而不是报成功" computerName="DESKTOP-05MULHI" duration="00:00:01.5124920" startTime="2026-09-04T11:00:29.7241426+09:00" endTime="2026-09-04T11:00:29.7241426+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="c69e510d-ab24-42e5-86ad-c5a2910568ed">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.预检没通过时这一项判失败而不是报成功() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 437&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="60638b5e-749f-48ca-8527-b4cb641c41d5" testId="4879a3aa-c03d-dfbb-77f5-ee9be5a16aa1" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.停用的任务被跳过并写明原因" computerName="DESKTOP-05MULHI" duration="00:00:00.0171783" startTime="2026-09-04T11:00:29.8238858+09:00" endTime="2026-09-04T11:00:29.8238859+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="60638b5e-749f-48ca-8527-b4cb641c41d5">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.停用的任务被跳过并写明原因() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 167&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="a12119d9-8290-4408-8121-d27afef839e5" testId="00b61746-f5fa-f621-25de-201ad0251af5" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.并发度1时一次只放行一项" computerName="DESKTOP-05MULHI" duration="00:00:00.0187434" startTime="2026-09-04T11:00:29.7426694+09:00" endTime="2026-09-04T11:00:29.7426695+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a12119d9-8290-4408-8121-d27afef839e5">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.并发度1时一次只放行一项() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 62&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="2b4c68f2-9580-4dea-bc7f-1bf6e50018d5" testId="dc81a3c0-c6fb-af97-5916-0edfba5ec0fe" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.预检报没有新备份时当场结案而不是等满宽限期" computerName="DESKTOP-05MULHI" duration="00:00:00.0130435" startTime="2026-09-04T11:00:29.9125862+09:00" endTime="2026-09-04T11:00:29.9125863+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2b4c68f2-9580-4dea-bc7f-1bf6e50018d5">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.预检报没有新备份时当场结案而不是等满宽限期() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 410&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="341c093f-5181-464c-a7f1-a6a1e3256231" testId="b1e5c5b5-6ce2-dedd-f821-540a3bf6098b" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.上一次没跑完时到期时刻也要标记为已处理" computerName="DESKTOP-05MULHI" duration="00:00:00.0117670" startTime="2026-09-04T11:00:29.8653509+09:00" endTime="2026-09-04T11:00:29.8653510+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="341c093f-5181-464c-a7f1-a6a1e3256231" />
+    <UnitTestResult executionId="d334a57a-d97b-4903-b2d6-147bdb2735fd" testId="971f14ef-0917-b5af-40aa-8f1e807a5b3f" testName="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.到点的计划自动产生一次执行且不重复" computerName="DESKTOP-05MULHI" duration="00:00:00.0183524" startTime="2026-09-04T11:00:29.8064907+09:00" endTime="2026-09-04T11:00:29.8064907+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d334a57a-d97b-4903-b2d6-147bdb2735fd">
+      <Output>
+        <ErrorInfo>
+          <Message>System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+    .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.</Message>
+          <StackTrace>   at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+   at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+   at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 272&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 206&#xD;
+   at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct) in E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs:line 126&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 523&#xD;
+   at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.到点的计划自动产生一次执行且不重复() in E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs:line 201&#xD;
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.并发度2时同时在跑的不超过两项" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="221b971f-cb58-7ad6-c097-b8e175ab614c">
+      <Execution id="fc634fe7-42d4-44f8-bd6c-3faca40f6775" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="并发度2时同时在跑的不超过两项" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.并发度1时一次只放行一项" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="00b61746-f5fa-f621-25de-201ad0251af5">
+      <Execution id="a12119d9-8290-4408-8121-d27afef839e5" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="并发度1时一次只放行一项" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.上一次没跑完时到期时刻也要标记为已处理" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="b1e5c5b5-6ce2-dedd-f821-540a3bf6098b">
+      <Execution id="341c093f-5181-464c-a7f1-a6a1e3256231" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="上一次没跑完时到期时刻也要标记为已处理" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.扫出新备份却没下发上传时说清楚是哪一种" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="070f58e6-df9c-2e18-2ee4-e4337ff5bc8d">
+      <Execution id="59841c54-5dc0-4473-99a3-e76f06e603ab" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="扫出新备份却没下发上传时说清楚是哪一种" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.停用的任务被跳过并写明原因" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="4879a3aa-c03d-dfbb-77f5-ee9be5a16aa1">
+      <Execution id="60638b5e-749f-48ca-8527-b4cb641c41d5" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="停用的任务被跳过并写明原因" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.预检报没有新备份时当场结案而不是等满宽限期" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="dc81a3c0-c6fb-af97-5916-0edfba5ec0fe">
+      <Execution id="2b4c68f2-9580-4dea-bc7f-1bf6e50018d5" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="预检报没有新备份时当场结案而不是等满宽限期" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.队列名单按放行顺序列出在跑的和在等的项" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="c4d7a9b8-5bd8-8af5-9e61-a3e73ffc4513">
+      <Execution id="d839de9a-add8-4bc2-9b2d-2a0e8188e556" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="队列名单按放行顺序列出在跑的和在等的项" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.卡住的一项超时后队列继续往下走" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="01806c00-5d85-1339-49fa-b44d47c5f90c">
+      <Execution id="d006cfac-60f8-4bc6-a230-68e2b869e50c" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="卡住的一项超时后队列继续往下走" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.等名额与等前一项分得开" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="18e44946-068c-a771-3b3b-5abe9342bd98">
+      <Execution id="69caf89e-bdef-422f-82f0-d5df7a836703" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="等名额与等前一项分得开" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.到点的计划自动产生一次执行且不重复" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="971f14ef-0917-b5af-40aa-8f1e807a5b3f">
+      <Execution id="d334a57a-d97b-4903-b2d6-147bdb2735fd" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="到点的计划自动产生一次执行且不重复" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.手动触发失败不影响到点判定" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="4cab5293-9002-ac21-fd65-9f4a95f95c4b">
+      <Execution id="d98376ab-2fb1-457d-8537-50e5b777a16b" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="手动触发失败不影响到点判定" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.上传已下发时继续等会话而不是当场结案" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="41a8ffef-0006-ec3e-c8ed-1a90c26c0878">
+      <Execution id="0b1d6950-61ce-4768-b174-a398864ee051" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="上传已下发时继续等会话而不是当场结案" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.预检没通过时这一项判失败而不是报成功" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="93219d87-a043-07d2-0234-11f18d8423c9">
+      <Execution id="c69e510d-ab24-42e5-86ad-c5a2910568ed" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="预检没通过时这一项判失败而不是报成功" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.有项在跑时排队中的项不因整次执行超时而被判失败" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="6169f57d-f341-a665-42b2-bf8c21899cef">
+      <Execution id="d26af088-f51b-447e-ae3c-9465c52c40b9" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests" name="有项在跑时排队中的项不因整次执行超时而被判失败" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="41a8ffef-0006-ec3e-c8ed-1a90c26c0878" executionId="0b1d6950-61ce-4768-b174-a398864ee051" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="070f58e6-df9c-2e18-2ee4-e4337ff5bc8d" executionId="59841c54-5dc0-4473-99a3-e76f06e603ab" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="18e44946-068c-a771-3b3b-5abe9342bd98" executionId="69caf89e-bdef-422f-82f0-d5df7a836703" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="221b971f-cb58-7ad6-c097-b8e175ab614c" executionId="fc634fe7-42d4-44f8-bd6c-3faca40f6775" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="c4d7a9b8-5bd8-8af5-9e61-a3e73ffc4513" executionId="d839de9a-add8-4bc2-9b2d-2a0e8188e556" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="01806c00-5d85-1339-49fa-b44d47c5f90c" executionId="d006cfac-60f8-4bc6-a230-68e2b869e50c" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="6169f57d-f341-a665-42b2-bf8c21899cef" executionId="d26af088-f51b-447e-ae3c-9465c52c40b9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4cab5293-9002-ac21-fd65-9f4a95f95c4b" executionId="d98376ab-2fb1-457d-8537-50e5b777a16b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="93219d87-a043-07d2-0234-11f18d8423c9" executionId="c69e510d-ab24-42e5-86ad-c5a2910568ed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4879a3aa-c03d-dfbb-77f5-ee9be5a16aa1" executionId="60638b5e-749f-48ca-8527-b4cb641c41d5" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="00b61746-f5fa-f621-25de-201ad0251af5" executionId="a12119d9-8290-4408-8121-d27afef839e5" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="dc81a3c0-c6fb-af97-5916-0edfba5ec0fe" executionId="2b4c68f2-9580-4dea-bc7f-1bf6e50018d5" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="b1e5c5b5-6ce2-dedd-f821-540a3bf6098b" executionId="341c093f-5181-464c-a7f1-a6a1e3256231" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="971f14ef-0917-b5af-40aa-8f1e807a5b3f" executionId="d334a57a-d97b-4903-b2d6-147bdb2735fd" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="一覧に存在しない結果" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="読み込まれたすべての結果" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="14" executed="14" passed="3" failed="11" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v2.5.3.1+6b60a9e56a (64-bit .NET 8.0.29)&#xD;
+[xUnit.net 00:00:00.07]   Discovering: BackupMonitor.Infrastructure.Tests&#xD;
+[xUnit.net 00:00:00.16]   Discovered:  BackupMonitor.Infrastructure.Tests&#xD;
+[xUnit.net 00:00:00.17]   Starting:    BackupMonitor.Infrastructure.Tests&#xD;
+[xUnit.net 00:00:05.51]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.51]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.51]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.51]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.51]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.51]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.51]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.51]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.51]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(437,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.预检没通过时这一项判失败而不是报成功()&#xD;
+[xUnit.net 00:00:05.51]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:05.53]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.53]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.53]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.53]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.53]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.53]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.53]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.53]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.53]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(62,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.并发度1时一次只放行一项()&#xD;
+[xUnit.net 00:00:05.53]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:05.54]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.54]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.54]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.54]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.55]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.55]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.55]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.55]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.55]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(335,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.队列名单按放行顺序列出在跑的和在等的项()&#xD;
+[xUnit.net 00:00:05.55]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:05.59]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.59]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.59]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.59]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.59]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.59]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.59]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.59]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.59]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(201,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.到点的计划自动产生一次执行且不重复()&#xD;
+[xUnit.net 00:00:05.59]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:05.61]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.61]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.61]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.61]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.61]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.61]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.61]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.61]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.61]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(167,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.停用的任务被跳过并写明原因()&#xD;
+[xUnit.net 00:00:05.61]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:05.63]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.63]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.63]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.63]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.63]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.63]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.63]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.63]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.63]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(294,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.有项在跑时排队中的项不因整次执行超时而被判失败()&#xD;
+[xUnit.net 00:00:05.63]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:05.64]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.64]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.64]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.64]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.64]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.64]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.64]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.64]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.64]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(452,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.扫出新备份却没下发上传时说清楚是哪一种()&#xD;
+[xUnit.net 00:00:05.64]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:05.67]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.67]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.67]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.67]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.67]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.67]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.67]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.67]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.67]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(470,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.上传已下发时继续等会话而不是当场结案()&#xD;
+[xUnit.net 00:00:05.67]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:05.69]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.69]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.69]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.69]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.69]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.69]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.69]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.69]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.69]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(142,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.并发度2时同时在跑的不超过两项()&#xD;
+[xUnit.net 00:00:05.69]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:05.70]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.70]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.70]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.70]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.70]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.70]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.70]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.70]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.70]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(410,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.预检报没有新备份时当场结案而不是等满宽限期()&#xD;
+[xUnit.net 00:00:05.70]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:05.71]       System.InvalidOperationException : The LINQ expression 'DbSet&lt;ExecutionRunItem&gt;()&#xD;
+[xUnit.net 00:00:05.71]           .Any(e =&gt; e.TaskId == __item_TaskId_0 &amp;&amp; e.Id != __item_Id_1 &amp;&amp; SequentialExecutionWorker.ConsumesUploadSlot(e.CommandType) &amp;&amp; (int)e.Status == 0 || (int)e.Status == 1)' could not be translated. Additional information: Translation of method 'BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.ConsumesUploadSlot' failed. If this method can be mapped to your custom function, see https://go.microsoft.com/fwlink/?linkid=2132413 for more information. Either rewrite the query in a form that can be translated, or switch to client evaluation explicitly by inserting a call to 'AsEnumerable', 'AsAsyncEnumerable', 'ToList', or 'ToListAsync'. See https://go.microsoft.com/fwlink/?linkid=2101038 for more information.&#xD;
+[xUnit.net 00:00:05.71]       Stack Trace:&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.Query.QueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.Query.RelationalQueryableMethodTranslatingExpressionVisitor.Translate(Expression expression)&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.Query.QueryCompilationContext.CreateQueryExecutor[TResult](Expression query)&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.Storage.Database.CompileQuery[TResult](Expression query, Boolean async)&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.CompileQueryCore[TResult](IDatabase database, Expression query, IModel model, Boolean async)&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.&lt;&gt;c__DisplayClass12_0`1.&lt;ExecuteAsync&gt;b__0()&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.Query.Internal.CompiledQueryCache.GetOrAddQuery[TResult](Object cacheKey, Func`1 compiler)&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.Query.Internal.QueryCompiler.ExecuteAsync[TResult](Expression query, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.Query.Internal.EntityQueryProvider.ExecuteAsync[TResult](Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, Expression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.ExecuteAsync[TSource,TResult](MethodInfo operatorMethodInfo, IQueryable`1 source, LambdaExpression expression, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.71]            at Microsoft.EntityFrameworkCore.EntityFrameworkQueryableExtensions.AnyAsync[TSource](IQueryable`1 source, Expression`1 predicate, CancellationToken cancellationToken)&#xD;
+[xUnit.net 00:00:05.72]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(272,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.EvaluateRunningItemAsync(AppDbContext db, IAlertingService alerting, ExecutionRun run, ExecutionRunItem item, TimeSpan noUploadGrace, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.72]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(206,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.AdvanceRunsAsync(AppDbContext db, ICommandDispatcher commands, IAlertingService alerting, SystemSettingsProvider settings, DateTime now, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.72]         E:\GitHub\systemdataup\src\src\BackupMonitor.Infrastructure\Services\SequentialExecutionWorker.cs(126,0): at BackupMonitor.Infrastructure.Services.SequentialExecutionWorker.RunPassAsync(IServiceScope scope, CancellationToken ct)&#xD;
+[xUnit.net 00:00:05.72]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(523,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.RunPassAsync()&#xD;
+[xUnit.net 00:00:05.72]         E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\SequentialExecutionWorkerTests.cs(95,0): at BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.卡住的一项超时后队列继续往下走()&#xD;
+[xUnit.net 00:00:05.72]         --- End of stack trace from previous location ---&#xD;
+[xUnit.net 00:00:06.27]   Finished:    BackupMonitor.Infrastructure.Tests&#xD;
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.7329515+09:00">
+        <Text>[xUnit.net 00:00:05.51]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.预检没通过时这一项判失败而不是报成功 [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.7413241+09:00">
+        <Text>[xUnit.net 00:00:05.53]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.并发度1时一次只放行一项 [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.7572622+09:00">
+        <Text>[xUnit.net 00:00:05.54]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.队列名单按放行顺序列出在跑的和在等的项 [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.8059331+09:00">
+        <Text>[xUnit.net 00:00:05.59]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.到点的计划自动产生一次执行且不重复 [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.8235123+09:00">
+        <Text>[xUnit.net 00:00:05.61]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.停用的任务被跳过并写明原因 [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.8408562+09:00">
+        <Text>[xUnit.net 00:00:05.63]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.有项在跑时排队中的项不因整次执行超时而被判失败 [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.8538319+09:00">
+        <Text>[xUnit.net 00:00:05.64]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.扫出新备份却没下发上传时说清楚是哪一种 [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.8784345+09:00">
+        <Text>[xUnit.net 00:00:05.67]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.上传已下发时继续等会话而不是当场结案 [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.8983408+09:00">
+        <Text>[xUnit.net 00:00:05.69]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.并发度2时同时在跑的不超过两项 [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.9119868+09:00">
+        <Text>[xUnit.net 00:00:05.70]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.预检报没有新备份时当场结案而不是等满宽限期 [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="DESKTOP-05MULHI" outcome="Error" timestamp="2026-09-04T11:00:29.9273941+09:00">
+        <Text>[xUnit.net 00:00:05.71]     BackupMonitor.Infrastructure.Tests.SequentialExecutionWorkerTests.卡住的一项超时后队列继续往下走 [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>

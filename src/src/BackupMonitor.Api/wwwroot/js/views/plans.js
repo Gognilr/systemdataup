@@ -10,24 +10,11 @@ import {
   confirmModal, formModal, openModal
 } from '../ui.js';
 import { shell, loading } from '../app.js';
-// C11：业务单元清单与「立即备份」弹窗共用同一份实现。
-import { unitQueueHtml } from './unit-roster.js';
+// 执行详情与运行记录页共用同一份实现：同一次执行在两个页面上长得不一样，
+// 人没有办法判断哪一边是真的。
+import { openRunModal, RUN_STATUS, statusPill } from './run-detail.js';
 
 const WEEK = ['一', '二', '三', '四', '五', '六', '日'];
-
-const RUN_STATUS = {
-  pending: ['排队中', 'wait'], running: ['执行中', 'busy'], completed: ['全部完成', 'ok'],
-  partial: ['部分失败', 'wait'], failed: ['失败', 'err'], cancelled: ['已取消', 'mut']
-};
-const ITEM_STATUS = {
-  pending: ['排队中', 'wait'], running: ['执行中', 'busy'], succeeded: ['完成', 'ok'],
-  failed: ['失败', 'err'], timeout: ['等超时', 'err'], skipped: ['跳过', 'mut'], cancelled: ['已取消', 'mut']
-};
-
-function statusPill(map, key) {
-  const [text, tone] = map[key] || [key || '—', 'mut'];
-  return `<span class="status status--${tone} pill">${esc(text)}</span>`;
-}
 
 function scheduleText(p) {
   const when = p.scheduleKind === 'weekly'
@@ -67,7 +54,12 @@ LOADERS.plans = async function () {
       },
       {
         l: '操作',
-        render: p => `<button class="small" data-ui-action="act" data-view="plans" data-action="trigger" data-id="${esc(p.id)}">立即执行</button>
+        // 正在跑的时候「立即执行」必须是灰的。服务端本来就会 409 挡下来
+        // （同一个计划同时只能有一次执行），但那条路径的表现是：确认框问一遍
+        // 「现在就执行一次？」，人点了是，再弹一个红字说「要么正在执行、要么一个任务都没有」——
+        // 两种原因搅在一句话里，看完不知道自己到底做成了什么。
+        render: p => `<button class="small" data-ui-action="act" data-view="plans" data-action="trigger" data-id="${esc(p.id)}"
+            ${p.activeRun ? 'disabled title="这个计划上一次执行还没跑完。同一个计划同时只跑一次——要重来先在执行详情里取消它。"' : ''}>立即执行</button>
           <button class="small" data-ui-action="act" data-view="plans" data-action="history" data-id="${esc(p.id)}">历史</button>
           <button class="small" data-ui-action="act" data-view="plans" data-action="edit" data-id="${esc(p.id)}">编辑</button>
           <button class="small danger" data-ui-action="act" data-view="plans" data-action="del" data-id="${esc(p.id)}">删除</button>`
@@ -286,97 +278,8 @@ ACTIONS['plans:trigger'] = async id => {
   } catch (e) { errToast(e); }
 };
 
-/* ── 执行详情 ── */
-
-ACTIONS['plans:run'] = async runId => {
-  let run;
-  try { run = await api(`/api/v1/admin/execution-runs/${runId}`); }
-  catch (e) { errToast(e); return; }
-
-  const ov = openModal(`执行详情：${run.name || ''}`, await runBodyHtml(run), { wide: true });
-  attachCancelButton(ov, run, runId);
-
-  // 这个弹窗原先是一张静态快照：打开的那一刻是什么样，之后就一直是什么样。
-  // 而它恰恰是人盯着看「这次计划跑到第几项了」的地方——pending 项的「说明」列
-  // 永远是空的，看起来就像卡住了。跑完就停下来，不做无谓的轮询。
-  const timer = setInterval(async () => {
-    if (!ov.isConnected) { clearInterval(timer); return; }
-    let fresh;
-    try { fresh = await api(`/api/v1/admin/execution-runs/${runId}`); }
-    catch (e) { return; }   // 一次抖动不该把已经显示出来的内容抹掉
-
-    const mbody = ov.querySelector('.mbody');
-    if (mbody) mbody.innerHTML = await runBodyHtml(fresh);
-    if (fresh.status !== 'pending' && fresh.status !== 'running') {
-      clearInterval(timer);
-      ov.querySelector('.mfoot [data-run-cancel]')?.remove();
-    }
-  }, 5000);
-  // 关掉弹窗（关闭按钮 / 点遮罩 / Esc）都走 closeModal，它派发 bm:dismiss。
-  // 不停这个定时器的话，人关掉窗口之后它还在每 5 秒打一次接口，直到刷新页面为止。
-  ov.addEventListener('bm:dismiss', () => clearInterval(timer));
-};
-
-/* 执行详情的正文。每一项的业务单元清单跟着一起显示——
-   一个计划项对应一个任务，而一个任务可以有 18 个账套，
-   只看「这一项成功了」是看不出其中 4 个账套一个字节都没传的。 */
-async function runBodyHtml(run) {
-  const items = run.items || [];
-
-  // 每一项的预检指令结果各拉一次。并行发，任何一条失败都只是这一项没有清单，
-  // 不该让整个弹窗打不开。
-  const rosters = await Promise.all(items.map(async i => {
-    if (!i.commandId) return { item: i, html: '' };
-    try {
-      const cmd = await api(`/api/v1/admin/backup-tasks/commands/${i.commandId}`);
-      return { item: i, html: unitQueueHtml(cmd, { live: i.status === 'running' }) };
-    } catch (e) { return { item: i, html: '' }; }
-  }));
-
-  const unitsHtml = rosters.filter(r => r.html).map(r => `
-    <details class="fadv">
-      <summary>${esc(r.item.taskName)} · 业务单元</summary>
-      ${r.html}
-    </details>`).join('');
-
-  return `
-    <div class="kv">
-      <div class="row"><div class="k">状态</div><div class="v">${statusPill(RUN_STATUS, run.status)}</div></div>
-      <div class="row"><div class="k">并发度</div><div class="v">${run.maxConcurrent === 1 ? '严格顺序（1）' : esc(run.maxConcurrent)}</div></div>
-      <div class="row"><div class="k">单项超时</div><div class="v">${esc(run.itemTimeoutMinutes)} 分钟</div></div>
-      <div class="row"><div class="k">触发方式</div><div class="v">${run.triggerSource === 'manual' ? '人工立即执行' : '到点自动执行'}</div></div>
-      <div class="row"><div class="k">开始 / 结束</div><div class="v">${fmtDT(run.startedAt)} → ${run.finishedAt ? fmtDT(run.finishedAt) : '进行中'}</div></div>
-      <div class="row"><div class="k">进度</div><div class="v">成功 ${esc(run.succeededItems)} · 失败 ${esc(run.failedItems)} · 共 ${esc(run.totalItems)}</div></div>
-    </div>
-    ${tableHtml([
-      { l: '#', num: true, render: i => i.sortOrder + 1 },
-      { l: '任务', render: i => `<b>${esc(i.taskName)}</b>` },
-      { l: '客户端', render: i => esc(i.clientName) },
-      { l: '状态', render: i => statusPill(ITEM_STATUS, i.status) },
-      { l: '开始', render: i => i.startedAt ? fmtDT(i.startedAt) : '—' },
-      { l: '结束', render: i => i.finishedAt ? fmtDT(i.finishedAt) : '—' },
-      { l: '说明', render: i => esc(i.message || '') }
-    ], items)}
-    ${unitsHtml ? `<h3>各项的业务单元</h3>${unitsHtml}` : ''}`;
-}
-
-function attachCancelButton(ov, run, runId) {
-  if (run.status !== 'pending' && run.status !== 'running') return;
-
-  const cancel = document.createElement('button');
-  cancel.className = 'small danger';
-  cancel.dataset.runCancel = '1';
-  cancel.textContent = '取消这次执行';
-  cancel.addEventListener('click', async () => {
-    if (!await confirmModal('取消这次执行？还没开跑的项会被取消，正在跑的那几项也会被停掉：它们的指令会被取消，已经开始的上传会中断，这一轮扫出来的备份不会再自动上传。')) return;
-    try {
-      await api(`/api/v1/admin/execution-runs/${runId}/cancel`, { method: 'POST' });
-      toast('已取消', 'ok');
-      LOADERS.plans();
-    } catch (e) { errToast(e); }
-  });
-  ov.querySelector('.mfoot')?.prepend(cancel);
-}
+/* 执行详情走共用实现；取消成功后刷新计划列表，让「当前状态」那一列跟上。 */
+ACTIONS['plans:run'] = runId => openRunModal(runId, { onChange: () => LOADERS.plans() });
 
 ACTIONS['plans:history'] = async planId => {
   try {

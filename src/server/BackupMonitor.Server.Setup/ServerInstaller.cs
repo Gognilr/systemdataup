@@ -329,17 +329,21 @@ internal sealed class ServerInstaller
     {
         var repository = Path.Combine(dataDirectory, "repository");
         var staging = Path.Combine(dataDirectory, "staging");
-        Directory.CreateDirectory(repository);
-        Directory.CreateDirectory(staging);
 
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(ct);
 
-        await SetStoragePathAsync(connection, "repository_path", @"E:\BackupRepository", repository, ct);
-        await SetStoragePathAsync(connection, "staging_path", @"D:\BackupStaging", staging, ct);
+        // 目录只在这次真的把它写进设置时才建。管理员把仓库或暂存挪到别的盘之后，
+        // 升级不该在数据目录下再刨出两个空的 repository / staging——那两个目录
+        // 什么都不装，却让人以为备份还落在这儿。
+        if (await SetStoragePathAsync(connection, "repository_path", @"E:\BackupRepository", repository, ct))
+            Directory.CreateDirectory(repository);
+        if (await SetStoragePathAsync(connection, "staging_path", @"D:\BackupStaging", staging, ct))
+            Directory.CreateDirectory(staging);
     }
 
-    private static async Task SetStoragePathAsync(
+    /// <summary>写进去了返回 true；管理员已显式配置过的路径不会被碰，那时返回 false。</summary>
+    private static async Task<bool> SetStoragePathAsync(
         NpgsqlConnection connection,
         string key,
         string seededValue,
@@ -359,7 +363,7 @@ internal sealed class ServerInstaller
         command.Parameters.AddWithValue("key", key);
         command.Parameters.AddWithValue("value", newValue);
         command.Parameters.AddWithValue("seeded", seededValue);
-        await command.ExecuteNonQueryAsync(ct);
+        return await command.ExecuteNonQueryAsync(ct) > 0;
     }
 
     private static void WriteTurnkeyConfiguration(ServerInstallRequest request)
@@ -393,13 +397,44 @@ internal sealed class ServerInstaller
                     ["Http"] = null
                 }
             },
-            ["Storage"] = new Dictionary<string, object?>
+            // 升级时把上一次的 Storage 段原样搬过来。
+            //
+            // 这个文件每次安装都是整体重写的，而 Storage:RepositoryPath / StagingPath
+            // 是路径回退链里紧挨着数据库设置的下一环（system_settings 没配 → 用它）。
+            // 无条件写回「数据目录\Repository|Staging」，等于每升一次级就把管理员
+            // 挪过的仓库/暂存位置悄悄扳回安装默认值，而界面上看不出发生过什么。
+            ["Storage"] = ReadExistingStorageSection(path) ?? new Dictionary<string, object?>
             {
                 ["RepositoryPath"] = Path.Combine(request.DataDirectory, "Repository"),
                 ["StagingPath"] = Path.Combine(request.DataDirectory, "Staging")
             }
         };
         File.WriteAllText(path, JsonSerializer.Serialize(content, JsonOptions));
+    }
+
+    /// <summary>读上一次写下的 Storage 段；文件不在、没有这一段或内容坏了都返回 null，由调用方落回默认值。</summary>
+    private static Dictionary<string, object?>? ReadExistingStorageSection(string path)
+    {
+        if (!File.Exists(path))
+            return null;
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            if (!document.RootElement.TryGetProperty("Storage", out var storage)
+                || storage.ValueKind != JsonValueKind.Object)
+                return null;
+
+            var existing = new Dictionary<string, object?>();
+            foreach (var property in storage.EnumerateObject())
+                existing[property.Name] = property.Value.ValueKind == JsonValueKind.String
+                    ? property.Value.GetString()
+                    : null;
+            return existing.Count > 0 ? existing : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     private static async Task RegisterApiServiceAsync(string installDirectory, CancellationToken ct)

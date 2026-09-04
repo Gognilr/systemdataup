@@ -1,4 +1,4 @@
-namespace BackupMonitor.Shared.Models.Admin;
+﻿namespace BackupMonitor.Shared.Models.Admin;
 
 /// <summary>
 /// 存储设置：备份最终存放在哪、上传过程中的暂存放在哪。
@@ -25,6 +25,19 @@ public class StorageSettingsDto
     /// （RetentionCleanupWorker 的围栏只认当前仓库根），需要人工搬迁或清理。
     /// </summary>
     public int BackupSetsOutsideRoot { get; set; }
+
+    /// <summary>
+    /// 全局同时上传的备份数上限（system_settings 的 max_concurrent_uploads_total）。
+    /// 数的是上传会话，而一个会话就是一个业务单元——U8 一台机器 18 个账套时，
+    /// 这 18 份是各算各的。它约束的是服务端暂存盘同时被几路读写，所以放在存储设置里。
+    /// </summary>
+    public int MaxConcurrentUploadsTotal { get; set; }
+
+    /// <summary>
+    /// 此刻真的在传的会话数。上限该设几，只看一个孤零零的数字是判断不了的——
+    /// 要跟当前实际并发摆在一起，才知道是「一直顶着上限」还是「从来没到过」。
+    /// </summary>
+    public int ActiveUploads { get; set; }
 }
 
 /// <summary>单个存储根的当前状态</summary>
@@ -105,4 +118,10 @@ public class UpdateStorageSettingsRequest
     public string? RepositoryPath { get; set; }
 
     public string? StagingPath { get; set; }
+
+    /// <summary>
+    /// 全局同时上传上限，1–64。null 表示这次不改它——
+    /// 路径和并发是同一个表单提交的，漏传一个字段不该把它重置成默认值。
+    /// </summary>
+    public int? MaxConcurrentUploadsTotal { get; set; }
 }

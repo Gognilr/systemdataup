@@ -753,12 +753,33 @@ export function batchBarHtml(key) {
   const n = st && st.selected ? st.selected.length : 0;
   if (!n) return '';
   const acts = (App.batchActs && App.batchActs[key]) || [];
+  const rows = batchSelectedRows(key);
   return `<div class="batchbar" role="toolbar" aria-label="批量操作">
     <span class="count">已选 ${n} 项</span>
-    ${acts.map((a, i) => `<button class="small${a.primary ? ' primary' : ''}${a.danger ? ' danger' : ''}" data-ui-action="batch" data-batch-key="${esc(key)}" data-batch-index="${i}">${esc(a.t)}</button>`).join('')}
+    ${acts.map((a, i) => {
+      // 逐行判定能不能做。一个都轮不上就变灰并说明原因——已注销的机器选中后
+      // 「立即备份 / 刷新指标 / 禁用 / 注销」原先全都亮着，点下去服务端一律 409：
+      // 单行的按钮早就按 clientCaps 变灰了，批量条却是另一套，两处必须同一个判据。
+      const usable = rows === null || !a.allow ? n : rows.filter(a.allow).length;
+      const off = usable === 0;
+      const title = off ? (a.why || '所选项目不支持这个操作') : '';
+      return `<button class="small${a.primary ? ' primary' : ''}${a.danger ? ' danger' : ''}"${off ? ' disabled' : ''}${title ? ` title="${esc(title)}"` : ''} data-ui-action="batch" data-batch-key="${esc(key)}" data-batch-index="${i}">${esc(a.t)}${!off && usable < n ? `（${usable}）` : ''}</button>`;
+    }).join('')}
     <div class="spacer"></div>
     <button class="small" data-ui-action="clear-selection" data-batch-key="${esc(key)}">取消选择</button>
   </div>`;
+}
+
+/* 选中的那几行的完整数据。视图把当前页的行放在 st.rows 里才判得了；
+   放不齐（跨页选择、视图没提供）时返回 null，调用方一律按「都能做」处理——
+   判不准的时候把按钮灰掉，比让人点一下得到一句错误更让人无从下手。 */
+export function batchSelectedRows(key) {
+  const st = App.state[key];
+  const ids = (st && st.selected) || [];
+  const rows = (st && st.rows) || null;
+  if (!rows || !ids.length) return null;
+  const picked = rows.filter(r => ids.includes(r.id));
+  return picked.length === ids.length ? picked : null;
 }
 
 /* ── 搜索式选择器：输入关键字 → 服务端只返回匹配的前 N 条 → 点选。

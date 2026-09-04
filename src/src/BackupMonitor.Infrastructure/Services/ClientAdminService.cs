@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -31,6 +31,9 @@ public interface IClientAdminService
     Task DisableAsync(Guid clientId, DisableClientRequest request, CancellationToken ct = default);
     Task EnableAsync(Guid clientId, EnableClientRequest request, CancellationToken ct = default);
     Task RevokeAsync(Guid clientId, RevokeClientRequest request, CancellationToken ct = default);
+
+    /// <summary>删除一台已注销机器的记录（名下还有备份任务时拒绝）</summary>
+    Task DeleteAsync(Guid clientId, CancellationToken ct = default);
     Task<DispatchCommandResponse> RefreshMetricsAsync(Guid clientId, CancellationToken ct = default);
 }
 
@@ -96,6 +99,13 @@ public class ClientAdminService : IClientAdminService
                 throw new BusinessException("INVALID_REQUEST", $"无效的客户端状态：{query.Status}", 400);
             clients = clients.Where(c => c.Status == status);
         }
+        else if (!query.IncludeRevoked)
+        {
+            // 已注销的默认不列。一台机器重装后重新登记会留下一条同名的注销记录，
+            // 而它在任何列表里都只有干扰作用——新建任务的机器选择框里两条同名机器，
+            // 选错的那一条建出来的任务永远不会执行。要看它们请显式查 status=revoked。
+            clients = clients.Where(c => c.Status != ClientStatus.Revoked);
+        }
 
         if (query.GroupId is not null)
             clients = clients.Where(c => c.ClientGroupId == query.GroupId);
@@ -144,6 +154,7 @@ public class ClientAdminService : IClientAdminService
                 c.EnrollmentMode,
                 c.CertificateExpiresAt,
                 c.LastHeartbeatAt,
+                c.LastSeenAt,
                 c.LastRemoteIp,
                 // 自报网卡列表在列表页只为一件事服务：对端地址不是 IPv4 时，从里面挑一个能用的。
                 // 整列 jsonb 拉回来比再发一次查询便宜，也比让界面自己去猜靠谱。
@@ -201,6 +212,7 @@ public class ClientAdminService : IClientAdminService
                 ? null
                 : Math.Max(0, (int)Math.Ceiling((r.CertificateExpiresAt.Value - DateTime.UtcNow).TotalDays)),
             LastHeartbeatAt = r.LastHeartbeatAt,
+            LastSeenAt = r.LastSeenAt,
             LastRemoteIp = r.LastRemoteIp,
             Ipv4Address = ResolveIpv4(r.LastRemoteIp, r.IpAddresses),
             CreatedAt = r.CreatedAt,
@@ -364,6 +376,7 @@ public class ClientAdminService : IClientAdminService
             Status = EnumMapping.ToSnakeCase(client.Status),
             EnrollmentMode = client.EnrollmentMode,
             LastHeartbeatAt = client.LastHeartbeatAt,
+            LastSeenAt = client.LastSeenAt,
             LastRemoteIp = client.LastRemoteIp,
             Ipv4Address = ResolveIpv4(client.LastRemoteIp, client.IpAddresses),
             CreatedAt = client.CreatedAt,
@@ -1003,6 +1016,91 @@ public class ClientAdminService : IClientAdminService
                 revokedCertificates = activeCertificates.Count,
                 cancelledSessions
             }), ct: ct);
+    }
+
+    /// <summary>
+    /// 从列表里彻底删掉一台已注销的机器。
+    ///
+    /// 只对已注销的开放：注销是终点（证书吊销、心跳不再受理），删除只是把这条
+    /// 已经没有意义的记录清掉。在用的机器要先注销，这一步不该有捷径。
+    ///
+    /// 名下还有备份任务时一律拒绝，而不是连带删除。任务删除会牵动备份集与
+    /// 仓库目录里的真实文件，那套判断（哪些备份还活着、目录怎么清）在
+    /// BackupTaskService 里，不该在这里复制一份——两份判断一旦分家，
+    /// 「删机器」就会变成一条绕开备份保护的近路。
+    /// </summary>
+    public async Task DeleteAsync(Guid clientId, CancellationToken ct = default)
+    {
+        var client = await _db.Clients.FirstOrDefaultAsync(c => c.Id == clientId, ct)
+            ?? throw new NotFoundException("客户端", clientId);
+
+        if (client.Status != ClientStatus.Revoked)
+            throw new BusinessException("CONFLICT",
+                "只有已注销的客户端才能删除记录。请先注销这台机器，再删除它的记录。", 409);
+
+        var taskCount = await _db.BackupTasks.CountAsync(t => t.ClientId == clientId, ct);
+        if (taskCount > 0)
+            throw new BusinessException("CONFLICT",
+                $"这台机器名下还有 {taskCount} 个备份任务。请先到「备份任务」页把它们删除"
+                + "（那里会一并处理它们的备份集和仓库目录），再回来删除机器记录。", 409);
+
+        // 备份集只能挂在任务下，任务为 0 时它必然也为 0——这里再确认一次，
+        // 是为了万一有历史数据留下孤儿行时，报出的是这句话而不是一条外键异常。
+        var setCount = await _db.BackupSets.CountAsync(s => s.ClientId == clientId, ct);
+        if (setCount > 0)
+            throw new BusinessException("CONFLICT",
+                $"这台机器名下还有 {setCount} 份备份集，删除机器记录会让它们失去归属。请先处理这些备份集。", 409);
+
+        var hostname = client.Hostname;
+        var displayName = client.DisplayName;
+
+        // 顺序由外键决定：告警引用客户端，投递引用告警；指令、候选、会话、
+        // 队列项、心跳都是 NO ACTION，留一条就删不掉客户端本身。
+        // clients 上挂着的证书、磁盘、指标、服务状态、会话、通知是 ON DELETE CASCADE，
+        // 由数据库自己收尾。整段包在事务里：半截状态（客户端还在、它的告警没了）
+        // 没有任何一条路径能修回去。
+        var removed = await _db.Database.CreateExecutionStrategy().ExecuteAsync(async () =>
+        {
+            await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+            // 还没发出去的投递先取消：notification_deliveries.alert_id 是「告警删除后置空」，
+            // 删完告警它们会变成孤儿 pending 记录，派发器只看投递自身的状态，
+            // 于是机器都删掉了，它的告警邮件还在继续重试。
+            var cancelledDeliveries = await _db.NotificationDeliveries
+                .Where(d => d.Alert != null && d.Alert.ClientId == clientId
+                    && d.Status == NotificationStatus.Pending)
+                .ExecuteUpdateAsync(s => s.SetProperty(d => d.Status, NotificationStatus.Cancelled), ct);
+
+            var alerts = await _db.Alerts.Where(a => a.ClientId == clientId).ExecuteDeleteAsync(ct);
+            var executionItems = await _db.ExecutionRunItems.Where(i => i.ClientId == clientId).ExecuteDeleteAsync(ct);
+            var commands = await _db.Commands.Where(c => c.ClientId == clientId).ExecuteDeleteAsync(ct);
+            var sessions = await _db.UploadSessions.Where(s => s.ClientId == clientId).ExecuteDeleteAsync(ct);
+            var candidates = await _db.CandidateBackupSets.Where(c => c.ClientId == clientId).ExecuteDeleteAsync(ct);
+            var heartbeats = await _db.ClientHeartbeats.Where(h => h.ClientId == clientId).ExecuteDeleteAsync(ct);
+
+            _db.Clients.Remove(client);
+            await _db.SaveChangesAsync(ct);
+
+            await tx.CommitAsync(ct);
+            return new { cancelledDeliveries, alerts, executionItems, commands, sessions, candidates, heartbeats };
+        });
+
+        await _audit.RecordAsync("client.delete", AuditResult.Success, "client", clientId,
+            beforeData: JsonSerializer.Serialize(new
+            {
+                clientId,
+                hostname,
+                displayName,
+                removed.alerts,
+                removed.cancelledDeliveries,
+                removed.commands,
+                removed.sessions,
+                removed.candidates,
+                removed.executionItems,
+                removed.heartbeats
+            }), ct: ct);
+
+        _logger.LogInformation("已删除客户端记录 {ClientId}({Hostname})", clientId, hostname);
     }
 
     /// <summary>下发刷新主机状态指令（设计书 15.6）</summary>

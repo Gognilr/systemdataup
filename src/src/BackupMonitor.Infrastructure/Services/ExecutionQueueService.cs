@@ -32,6 +32,12 @@ public interface IExecutionQueueService
     Task<PagedResult<ExecutionRunDto>> ListRunsAsync(Guid? planId, PagedQuery query, CancellationToken ct = default);
 
     /// <summary>
+    /// 此刻还没跑完的那些项，连同「它在等什么」。数字（queue-status）回答不了
+    /// 「什么时候轮到我」，这份名单才能——顺序与执行器放行的顺序是同一口径。
+    /// </summary>
+    Task<ExecutionQueueSnapshotDto> GetQueueAsync(CancellationToken ct = default);
+
+    /// <summary>
     /// 为一批手动「立即备份」建一次执行（D3）。并发度取系统设置 manual_run_max_concurrent，
     /// 而不是给每个任务各发一条独立指令——那样十个任务就是十个同时开传。
     /// 全部任务都不可执行时返回 null。
@@ -387,6 +393,73 @@ public class ExecutionQueueService : IExecutionQueueService
 
         return PagedResult<ExecutionRunDto>.Create(
             items.Select(r => Map(r, withItems: false)).ToList(), totalCount, query.Page, query.PageSize);
+    }
+
+    public async Task<ExecutionQueueSnapshotDto> GetQueueAsync(CancellationToken ct = default)
+    {
+        // 只看还没终结的执行里还没终结的项：跑完的那些属于「运行记录」，
+        // 混进队列名单里会把「还要等几个」这个唯一有用的数字冲淡。
+        var items = await _db.Set<ExecutionRunItem>().AsNoTracking()
+            .Include(i => i.Run)
+            .Include(i => i.Task).ThenInclude(t => t.Client)
+            .Where(i => (i.Status == ExecutionItemStatus.Pending || i.Status == ExecutionItemStatus.Running)
+                && (i.Run.Status == BatchStatus.Pending || i.Run.Status == BatchStatus.Running))
+            .ToListAsync(ct);
+
+        var activeUploads = await _db.UploadSessions
+            .CountAsync(s => UploadSessionStatuses.Active.Contains(s.Status), ct);
+        var globalLimit = Math.Clamp(
+            await _settings.GetIntAsync(SequentialExecutionWorker.GlobalUploadLimitKey, 4, ct), 1, 64);
+        var slotFull = activeUploads >= globalLimit;
+
+        var runningPerRun = items
+            .Where(i => i.Status == ExecutionItemStatus.Running)
+            .GroupBy(i => i.RunId)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var entries = items
+            // 在跑的排最前，其余按「执行产生的先后 + 执行内的顺序号」——
+            // 执行器就是这么走的（runs 按 CreatedAt、items 按 SortOrder），
+            // 名单的顺序一旦与放行顺序不一致，它就回答不了「还要等几个」。
+            .OrderByDescending(i => i.Status == ExecutionItemStatus.Running)
+            .ThenBy(i => i.Run.CreatedAt)
+            .ThenBy(i => i.SortOrder)
+            .Select(i => new ExecutionQueueEntryDto
+            {
+                ItemId = i.Id,
+                RunId = i.RunId,
+                RunName = i.Run.Name,
+                RunKind = EnumMapping.ToSnakeCase(i.Run.Kind),
+                TriggerSource = i.Run.TriggerSource,
+                RunMaxConcurrent = i.Run.MaxConcurrent,
+                SortOrder = i.SortOrder,
+                TaskId = i.TaskId,
+                TaskName = i.Task?.Name ?? "",
+                ClientId = i.ClientId,
+                ClientName = ClientLabel(i),
+                CommandType = EnumMapping.ToSnakeCase(i.CommandType),
+                Status = EnumMapping.ToSnakeCase(i.Status),
+                Wait = i.Status == ExecutionItemStatus.Running
+                    ? ExecutionQueueWaits.Running
+                    : ExecutionQueueWaits.Classify(
+                        runningPerRun.TryGetValue(i.RunId, out var n) ? n : 0,
+                        i.Run.MaxConcurrent,
+                        i.CommandType,
+                        slotFull),
+                RunCreatedAt = i.Run.CreatedAt,
+                StartedAt = i.StartedAt
+            })
+            .ToList();
+
+        return new ExecutionQueueSnapshotDto
+        {
+            ActiveUploads = activeUploads,
+            GlobalLimit = globalLimit,
+            RunningItems = entries.Count(e => e.Wait == ExecutionQueueWaits.Running),
+            WaitingForUploadSlot = entries.Count(e => e.Wait == ExecutionQueueWaits.WaitingForUploadSlot),
+            WaitingInRun = entries.Count(e => e.Wait == ExecutionQueueWaits.WaitingInRun),
+            Items = entries
+        };
     }
 
     public async Task<ExecutionRunDto> CancelRunAsync(Guid runId, CancellationToken ct = default)

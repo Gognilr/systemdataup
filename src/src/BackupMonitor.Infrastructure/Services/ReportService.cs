@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Enums;
+﻿using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Models.Admin;
@@ -204,14 +204,26 @@ public class ReportService : IReportService
             var aggregate = backupByDay.TryGetValue((backup.TaskId, reportDate), out var existing)
                 ? existing
                 : new DayAggregate();
-            aggregate.Count++;
-            aggregate.Bytes += backup.TotalBytes;
-            if (backup.Status == BackupSetStatus.Available)
-                aggregate.AvailableCount++;
-            else if (backup.Status == BackupSetStatus.Verifying)
-                aggregate.VerifyingCount++;
+            if (BackupSetStatuses.Removed.Contains(backup.Status))
+            {
+                // 「那天备份失败了」和「那天备份成功了、后来被人删掉」是两件事：
+                // 前者要立刻查，后者是人自己干的。原先 else 分支把回收站/已删除一并
+                // 算成 FailedCount，删掉几份备份之后热力图整片变红，看上去像是那几天
+                // 全都备份失败——而真正失败的那天反倒淹没在里面。
+                // 份数和容量也不算它：磁盘上早就没有的东西不该再报「有 N 个备份集」。
+                aggregate.RemovedCount++;
+            }
             else
-                aggregate.FailedCount++;
+            {
+                aggregate.Count++;
+                aggregate.Bytes += backup.TotalBytes;
+                if (backup.Status == BackupSetStatus.Available)
+                    aggregate.AvailableCount++;
+                else if (backup.Status == BackupSetStatus.Verifying)
+                    aggregate.VerifyingCount++;
+                else
+                    aggregate.FailedCount++;
+            }
             backupByDay[(backup.TaskId, reportDate)] = aggregate;
         }
 
@@ -251,6 +263,7 @@ public class ReportService : IReportService
                         backup?.AvailableCount > 0,
                         backup?.VerifyingCount > 0,
                         backup?.FailedCount > 0,
+                        backup?.RemovedCount > 0,
                         activeCount > 0);
 
                     return new TaskDailyStatusDto
@@ -458,6 +471,9 @@ public class ReportService : IReportService
         public int AvailableCount { get; set; }
         public int VerifyingCount { get; set; }
         public int FailedCount { get; set; }
+
+        /// <summary>当天入过库、但已经进回收站或被彻底删除的份数</summary>
+        public int RemovedCount { get; set; }
     }
 
 
@@ -493,6 +509,7 @@ public class ReportService : IReportService
         bool hasAvailableBackup,
         bool hasVerifyingBackup,
         bool hasFailedBackup,
+        bool hasRemovedBackup,
         bool hasActiveUpload)
     {
         if (hasAvailableBackup)
@@ -501,6 +518,11 @@ public class ReportService : IReportService
             return "in_progress";
         if (hasFailedBackup || IsFailedScan(lastScanAt, lastPrecheckStatus, date, taskTimezone))
             return "failed";
+        // 排在真失败之后、「当日无计划」之前：那天确实备出来过，只是那份备份后来被删了。
+        // 不给它单独一档的话，下面那句「计划内的日子没有备份 = failed」会把它判成失败，
+        // 于是删备份这个动作本身会在概览上伪造出一片故障。
+        if (hasRemovedBackup)
+            return "deleted";
         if (!IsScheduledOnDate(enabled, taskMode, scanSchedule, date))
             return "no_schedule";
         return date >= today ? "in_progress" : "failed";

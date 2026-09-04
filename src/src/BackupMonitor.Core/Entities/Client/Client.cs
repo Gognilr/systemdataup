@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Abstractions;
+﻿using BackupMonitor.Core.Abstractions;
 using BackupMonitor.Core.Enums;
 
 namespace BackupMonitor.Core.Entities.Client;
@@ -68,6 +68,19 @@ public class Client : IHasRowVersion
 
     /// <summary>最后心跳时间</summary>
     public DateTime? LastHeartbeatAt { get; set; }
+
+    /// <summary>
+    /// 服务端最近一次收到这个客户端**任何**已认证请求的时间。
+    ///
+    /// 与 <see cref="LastHeartbeatAt"/> 是两件事，都要留着：心跳带着系统信息、配置版本、
+    /// 网卡列表，回答的是「它在按约定汇报」；这一列只回答「它还在不在」。
+    /// 而后者的证据远不止心跳——领指令、报扫描进度、传分块，每一次都比心跳更能说明它活着。
+    ///
+    /// 存活判定（SystemWatchdogWorker）取两者的较晚者。只认心跳的那一版会把
+    /// 一台正在传 5 GB 备份、每几秒就跟服务端说一次话的机器判成离线，
+    /// 只因为它的心跳线程被大文件哈希拖住了。
+    /// </summary>
+    public DateTime? LastSeenAt { get; set; }
 
     /// <summary>最后一次配置版本号（用于增量配置下发）</summary>
     public long LastConfigVersion { get; set; }

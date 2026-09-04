@@ -1,4 +1,4 @@
-namespace BackupMonitor.Shared.Models.Admin;
+﻿namespace BackupMonitor.Shared.Models.Admin;
 
 /// <summary>
 /// 正在传输中的上传会话（管理端可见的进度）。
@@ -21,6 +21,13 @@ public class UploadProgressDto
     public Guid TaskId { get; set; }
 
     public string TaskName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 这次传的是哪个业务单元（账套）。一个上传会话只对应一个候选备份集，
+    /// 也就是一个账套——U8 一台机器 18 个账套时，只显示任务名的话这 18 条长得一模一样，
+    /// 人看不出「现在备到哪个账套了」。老数据里候选可能没有业务单元，此时为 null。
+    /// </summary>
+    public string? BusinessUnitName { get; set; }
 
     public string Status { get; set; } = string.Empty;
 

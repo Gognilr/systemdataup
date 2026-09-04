@@ -1,0 +1,52 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="a3a61779-332a-4d87-8271-c9e9bbb4a8aa" name="Administrator@DESKTOP-05MULHI 2026-09-04 11:10:03" runUser="DESKTOP-05MULHI\Administrator" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-04T11:10:03.2879827+09:00" queuing="2026-09-04T11:10:03.2879829+09:00" start="2026-09-04T11:09:58.4182202+09:00" finish="2026-09-04T11:10:03.2922548+09:00" />
+  <TestSettings name="default" id="592c8610-beb8-4d86-9137-432b8a584177">
+    <Deployment runDeploymentRoot="Administrator_DESKTOP-05MULHI_2026-09-04_11_10_03" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="77f70af7-8de8-412f-98a3-4355b63b5fce" testId="ed2ebc9d-64d0-5efc-ed15-69e586101160" testName="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests.活动指令列表随心跳一起上报" computerName="DESKTOP-05MULHI" duration="00:00:00.0441659" startTime="2026-09-04T11:10:02.5864826+09:00" endTime="2026-09-04T11:10:02.5864829+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="77f70af7-8de8-412f-98a3-4355b63b5fce" />
+    <UnitTestResult executionId="2abedc5f-ee99-48e9-88e3-7dac519c4344" testId="b485f70f-9517-01c1-7e8c-27e4ac15c246" testName="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests.升级包地址只认自己的服务端" computerName="DESKTOP-05MULHI" duration="00:00:00.0028533" startTime="2026-09-04T11:10:02.5459167+09:00" endTime="2026-09-04T11:10:02.5459290+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2abedc5f-ee99-48e9-88e3-7dac519c4344" />
+    <UnitTestResult executionId="c6b8066e-fdc0-456b-b1e6-cf455473a74b" testId="141e46ab-6d42-f84f-32ca-2b4a51400ee1" testName="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests.网卡地址随快照一起上报且不重复发送" computerName="DESKTOP-05MULHI" duration="00:00:00.0379341" startTime="2026-09-04T11:10:02.6693236+09:00" endTime="2026-09-04T11:10:02.6693238+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="c6b8066e-fdc0-456b-b1e6-cf455473a74b" />
+    <UnitTestResult executionId="faaa77d3-9860-4f54-84f7-f5a94cdb0220" testId="a958b1ae-9d0d-da33-23d4-c68ac6ba78ee" testName="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests.首次心跳带全量快照而第二次不重复上报" computerName="DESKTOP-05MULHI" duration="00:00:00.0447715" startTime="2026-09-04T11:10:02.6313243+09:00" endTime="2026-09-04T11:10:02.6313246+09:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="faaa77d3-9860-4f54-84f7-f5a94cdb0220" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests.活动指令列表随心跳一起上报" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="ed2ebc9d-64d0-5efc-ed15-69e586101160">
+      <Execution id="77f70af7-8de8-412f-98a3-4355b63b5fce" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests" name="活动指令列表随心跳一起上报" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests.网卡地址随快照一起上报且不重复发送" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="141e46ab-6d42-f84f-32ca-2b4a51400ee1">
+      <Execution id="c6b8066e-fdc0-456b-b1e6-cf455473a74b" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests" name="网卡地址随快照一起上报且不重复发送" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests.升级包地址只认自己的服务端" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="b485f70f-9517-01c1-7e8c-27e4ac15c246">
+      <Execution id="2abedc5f-ee99-48e9-88e3-7dac519c4344" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests" name="升级包地址只认自己的服务端" />
+    </UnitTest>
+    <UnitTest name="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests.首次心跳带全量快照而第二次不重复上报" storage="e:\github\systemdataup\src\tests\backupmonitor.infrastructure.tests\bin\debug\net8.0-windows\backupmonitor.infrastructure.tests.dll" id="a958b1ae-9d0d-da33-23d4-c68ac6ba78ee">
+      <Execution id="faaa77d3-9860-4f54-84f7-f5a94cdb0220" />
+      <TestMethod codeBase="E:\GitHub\systemdataup\src\tests\BackupMonitor.Infrastructure.Tests\bin\Debug\net8.0-windows\BackupMonitor.Infrastructure.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="BackupMonitor.Infrastructure.Tests.AgentHeartbeatCadenceTests" name="首次心跳带全量快照而第二次不重复上报" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="ed2ebc9d-64d0-5efc-ed15-69e586101160" executionId="77f70af7-8de8-412f-98a3-4355b63b5fce" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="b485f70f-9517-01c1-7e8c-27e4ac15c246" executionId="2abedc5f-ee99-48e9-88e3-7dac519c4344" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="141e46ab-6d42-f84f-32ca-2b4a51400ee1" executionId="c6b8066e-fdc0-456b-b1e6-cf455473a74b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a958b1ae-9d0d-da33-23d4-c68ac6ba78ee" executionId="faaa77d3-9860-4f54-84f7-f5a94cdb0220" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="一覧に存在しない結果" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="読み込まれたすべての結果" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="4" executed="4" passed="4" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v2.5.3.1+6b60a9e56a (64-bit .NET 8.0.29)&#xD;
+[xUnit.net 00:00:00.08]   Discovering: BackupMonitor.Infrastructure.Tests&#xD;
+[xUnit.net 00:00:00.16]   Discovered:  BackupMonitor.Infrastructure.Tests&#xD;
+[xUnit.net 00:00:00.17]   Starting:    BackupMonitor.Infrastructure.Tests&#xD;
+[xUnit.net 00:00:04.47]   Finished:    BackupMonitor.Infrastructure.Tests&#xD;
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

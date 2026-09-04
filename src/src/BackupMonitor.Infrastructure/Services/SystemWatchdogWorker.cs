@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Enums;
+﻿using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -110,12 +110,15 @@ public class SystemWatchdogWorker : BackgroundService
     /// <summary>
     /// A1：客户端存活判定。
     ///
+    /// 公开是为了能单测：判松了离线永远报不出来，判紧了正在干活的机器天天被误报成离线，
+    /// 而后者会让人很快学会无视这个告警——两边都要命。
+    ///
     /// 刻意不用 ExecuteUpdateAsync 批量改：批量 UPDATE 拿不到「哪些客户端刚刚转成离线」
     /// 这个集合，就发不出告警——而告警才是这件事的全部意义。客户端数量级是几十到几百，
     /// 一次全量加载没有性能问题，idx_clients_status_heartbeat (status, last_heartbeat_at)
     /// 正好覆盖这个查询。
     /// </summary>
-    private async Task RunClientLivenessAsync(IServiceScope scope, CancellationToken ct)
+    public async Task RunClientLivenessAsync(IServiceScope scope, CancellationToken ct)
     {
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var settings = scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>();
@@ -137,9 +140,15 @@ public class SystemWatchdogWorker : BackgroundService
         {
             ct.ThrowIfCancellationRequested();
 
-            // 刚审批完还没来得及发第一次心跳的，用 ApprovedAt 兜底（再兜 CreatedAt），
+            // 心跳与「最近一次任何请求」取较晚者。只认心跳的那一版判的不是「它还在不在」，
+            // 而是「它有没有按时汇报」——一台正在传 5 GB 备份、每几秒就领指令 / 报进度 /
+            // 传分块的机器，心跳被大文件哈希拖住就会被判离线并发严重告警，而它正在好好干活。
+            // 反过来也一样：真的没了的机器，这两个时间都会停住，判定不会变松。
+            //
+            // 刚审批完还没来得及说过一句话的，用 ApprovedAt 兜底（再兜 CreatedAt），
             // 不能一上来就判离线。
-            var lastSeen = client.LastHeartbeatAt ?? client.ApprovedAt ?? client.CreatedAt;
+            var lastSeen = Later(client.LastHeartbeatAt, client.LastSeenAt)
+                ?? client.ApprovedAt ?? client.CreatedAt;
             var silence = (now - lastSeen).TotalSeconds;
 
             if (silence >= offlineAfter)
@@ -171,9 +180,11 @@ public class SystemWatchdogWorker : BackgroundService
                 AlertLevel.Critical,
                 "client_offline",
                 $"客户端 {client.DisplayName} 已离线",
-                client.LastHeartbeatAt is null
-                    ? $"从未收到心跳，已静默超过 {offlineAfter} 秒"
-                    : $"最近心跳 {client.LastHeartbeatAt:yyyy-MM-dd HH:mm:ss} UTC，已静默超过 {offlineAfter} 秒",
+                // 告警正文写「最近一次通信」而不是「最近心跳」：判定用的就是这个时间，
+                // 两处写不同的数会让人拿着告警去对界面上的心跳时间，怎么对都对不上。
+                Later(client.LastHeartbeatAt, client.LastSeenAt) is not { } seen
+                    ? $"从未收到过这台机器的任何请求，已静默超过 {offlineAfter} 秒"
+                    : $"最近一次通信 {seen:yyyy-MM-dd HH:mm:ss} UTC，已静默超过 {offlineAfter} 秒",
                 clientId: client.Id,
                 ct: ct);
         }
@@ -188,6 +199,10 @@ public class SystemWatchdogWorker : BackgroundService
     /// UploadSessionService 在创建上传会话时检查暂存空间不足则抛 507，那是「拒收」不是「预警」——
     /// 第一次知道磁盘要满，是备份已经传不上来的时候。这里提前把它变成告警。
     /// </summary>
+    /// <summary>两个时间取较晚的那个；都为空则为空。</summary>
+    private static DateTime? Later(DateTime? left, DateTime? right) =>
+        left is null ? right : right is null ? left : (left > right ? left : right);
+
     private async Task RunStorageSelfCheckAsync(IServiceScope scope, CancellationToken ct)
     {
         var settings = scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>();

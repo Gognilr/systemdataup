@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Enums;
+﻿using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Models.Admin;
@@ -84,14 +84,17 @@ public class UploadProgressService : IUploadProgressService
         var waitingInRun = 0;
         foreach (var item in pending)
         {
-            var running = runningPerRun.TryGetValue(item.RunId, out var n) ? n : 0;
-            if (running >= item.MaxConcurrent)
-                waitingInRun++;
-            else if (slotFull
-                && item.CommandType is CommandType.UploadCandidate or CommandType.UploadLatest)
+            // 判据与执行器放行时、与队列名单（ExecutionQueueService.GetQueueAsync）
+            // 用的是同一个：这三处一旦分家，界面上的数字就会和实际放行对不上。
+            var wait = ExecutionQueueWaits.Classify(
+                runningPerRun.TryGetValue(item.RunId, out var n) ? n : 0,
+                item.MaxConcurrent,
+                item.CommandType,
+                slotFull);
+            if (wait == ExecutionQueueWaits.WaitingForUploadSlot)
                 waitingForSlot++;
             else
-                waitingInRun++;   // 本轮就该被放行了，归到「等这次执行」而不是「等名额」
+                waitingInRun++;
         }
 
         return new UploadQueueStatusDto
@@ -119,6 +122,11 @@ public class UploadProgressService : IUploadProgressService
                 ClientDisplayName = s.Client.DisplayName,
                 s.TaskId,
                 TaskName = s.Task.Name,
+                // 会话 → 候选备份集 → 业务单元。左连接：老数据里候选可能没挂业务单元，
+                // 那时给 null 让界面退回只显示任务名，而不是让整张表查不出来。
+                BusinessUnitName = s.CandidateBackupSet.BusinessUnit != null
+                    ? s.CandidateBackupSet.BusinessUnit.DisplayName
+                    : null,
                 s.Status,
                 s.TotalFiles,
                 s.TotalBytes,
@@ -159,6 +167,7 @@ public class UploadProgressService : IUploadProgressService
                 ClientDisplayName = r.ClientDisplayName,
                 TaskId = r.TaskId,
                 TaskName = r.TaskName,
+                BusinessUnitName = r.BusinessUnitName,
                 Status = EnumMapping.ToSnakeCase(r.Status),
                 TotalFiles = r.TotalFiles,
                 TotalBytes = r.TotalBytes,

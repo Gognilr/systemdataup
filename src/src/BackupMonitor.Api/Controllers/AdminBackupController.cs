@@ -1,4 +1,4 @@
-using BackupMonitor.Infrastructure.Services;
+﻿using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.AspNetCore.Authorization;
@@ -24,6 +24,19 @@ public class AdminBackupController : ApiBaseController
         [FromQuery] BackupQuery query, CancellationToken ct)
     {
         var result = await _backupService.GetListAsync(query, ct);
+        return OkData(result);
+    }
+
+    /// <summary>
+    /// 备份列表按「客户端 + 任务」归拢。筛选条件与 18.1 完全一致，
+    /// 展开某一组时前端再带 taskId 调 18.1 拿明细。
+    /// </summary>
+    [HttpGet("groups")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.read")]
+    public async Task<ActionResult<ApiResponse<PagedResult<BackupSetGroupDto>>>> Groups(
+        [FromQuery] BackupQuery query, CancellationToken ct)
+    {
+        var result = await _backupService.GetGroupsAsync(query, ct);
         return OkData(result);
     }
 
@@ -74,6 +87,39 @@ public class AdminBackupController : ApiBaseController
     {
         await _backupService.PurgeAsync(backupSetId, ct);
         return OkMessage("备份集已彻底删除");
+    }
+
+    /// <summary>
+    /// 批量移入回收站。逐条执行、逐条报告——选中的一批里有一份被锁定，
+    /// 不该让另外几十份也删不掉，也不该闷声跳过。
+    /// </summary>
+    [HttpPost("recycle-batch")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]
+    public async Task<ActionResult<ApiResponse<BackupSetBatchResult>>> RecycleBatch(
+        [FromBody] BackupSetBatchRequest request, CancellationToken ct)
+    {
+        var result = await _backupService.RecycleBatchAsync(request, ct);
+        return OkData(result);
+    }
+
+    /// <summary>批量从回收站还原</summary>
+    [HttpPost("restore-from-recycle-bin-batch")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]
+    public async Task<ActionResult<ApiResponse<BackupSetBatchResult>>> RestoreFromRecycleBinBatch(
+        [FromBody] BackupSetBatchRequest request, CancellationToken ct)
+    {
+        var result = await _backupService.RestoreFromRecycleBinBatchAsync(request, ct);
+        return OkData(result);
+    }
+
+    /// <summary>批量彻底删除（只对回收站里的备份集开放，物理删除仓库目录，不可撤销）</summary>
+    [HttpPost("purge-batch")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:backups.manage")]
+    public async Task<ActionResult<ApiResponse<BackupSetBatchResult>>> PurgeBatch(
+        [FromBody] BackupSetBatchRequest request, CancellationToken ct)
+    {
+        var result = await _backupService.PurgeBatchAsync(request, ct);
+        return OkData(result);
     }
 
     /// <summary>锁定备份（18.4，禁止保留清理）</summary>

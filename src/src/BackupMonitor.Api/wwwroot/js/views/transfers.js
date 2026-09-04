@@ -36,9 +36,13 @@ LOADERS.transfers = async function () {
         glyph: '⇅', title: '当前没有正在传输的备份',
         // 刚点过「立即备份」的人多半是被那句「进度在传输中页面」指过来的，
         // 而扫描阶段这里本来就是空的——不说清楚，空页面唯一能得出的结论是「没发起成功」。
+        // 备份计划到点跑起来时人第一个来的就是这里，而计划的第一步是预检
+        // （客户端把备份文件整读一遍算校验和），那个阶段一个上传会话都还没有。
+        // 只说「立即备份」的话，从计划过来的人得到的结论只能是「计划没跑起来」。
         sub: '客户端开始上传后，这里会自动出现并每 5 秒刷新一次。'
-          + '刚点过「立即备份」的话，客户端要先把备份文件整读一遍算校验和，'
-          + '几十 GB 会花上一段时间，这个阶段这里还是空的'
+          + '备份计划刚到点、或刚点过「立即备份」的话，客户端要先把备份文件整读一遍算校验和，'
+          + '几十 GB 会花上一段时间，这个阶段这里还是空的——'
+          + '想知道它扫到哪一步，到「运行记录」里打开那次执行看每一项的「说明」'
       })
     });
     // 有东西排队时也按快节奏刷：人盯着的正是「什么时候轮到我」。
@@ -110,7 +114,14 @@ const COLUMNS = [
     l: '客户端',
     render: r => `<a href="#/clients/${esc(r.clientId)}"><b>${esc(r.clientDisplayName || r.hostname)}</b></a><span class="sub mono">${esc(r.hostname)}</span>`
   },
-  { l: '任务', render: r => `${esc(r.taskName)}<span class="sub">${esc(r.totalFiles)} 个文件</span>` },
+  {
+    // 账套要跟任务名并排显示，而不是塞进副行：U8 一台机器 18 个账套时，
+    // 这一列是这 18 行之间**唯一**的区别——只写任务名的话，
+    // 「现在备到哪个账套了」在这张表上根本读不出来。
+    l: '任务 / 业务单元',
+    render: r => `${esc(r.taskName)}${r.businessUnitName ? ` · <b>${esc(r.businessUnitName)}</b>` : ''}`
+      + `<span class="sub">${esc(r.totalFiles)} 个文件</span>`
+  },
   {
     l: '进度',
     render: r => `${xferBar(r.percent, r.stalled)}<span class="sub">${Number(r.percent).toFixed(1)}% · ${fmtBytes(r.uploadedBytes)} / ${fmtBytes(r.totalBytes)}</span>`

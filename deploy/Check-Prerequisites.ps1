@@ -164,10 +164,20 @@ if ($missingVc.Count -eq 0) {
     Write-Result OK "VC++ 2015-2022 运行库：已安装"
 }
 else {
+    # 发行包里 prerequisites\vc_redist.x64.exe 就在本脚本旁边。缺这个运行库的机器
+    # 多半也没有外网，只给一个下载网址等于没给——本地有就先报本地那一份。
+    $bundledVc = Join-Path $PSScriptRoot 'prerequisites\vc_redist.x64.exe'
+    $howToInstall = if (Test-Path -LiteralPath $bundledVc) {
+        "安装：本目录下已自带，直接运行 $bundledVc`n" +
+        "      （静默安装：`"$bundledVc`" /install /passive /norestart）`n" +
+        "      服务端安装程序也会检测到缺失并提示就地安装，不需要联网。"
+    } else {
+        "安装：https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    }
     Write-Result FAIL ("缺少 VC++ 2015-2022 运行库（{0} 个文件）" -f $missingVc.Count) `
         (($missingVc -join "`n") + "`n`n" +
          "内置 PostgreSQL 依赖这些 DLL，缺失会导致数据库服务无法启动。`n" +
-         "安装：https://aka.ms/vs/17/release/vc_redist.x64.exe`n" +
+         $howToInstall + "`n" +
          "注意：在缺 UCRT 的系统上这个安装包装不上东西，`n" +
          "      要先打完 KB2999226 补丁并重启，再重新运行一次 vc_redist。")
 }

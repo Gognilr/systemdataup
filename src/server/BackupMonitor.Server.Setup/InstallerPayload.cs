@@ -1,4 +1,4 @@
-using System.IO.Compression;
+﻿using System.IO.Compression;
 using System.Reflection;
 
 namespace BackupMonitor.Server.Setup;
@@ -14,6 +14,13 @@ namespace BackupMonitor.Server.Setup;
 internal static class InstallerPayload
 {
     private const string MigrationDirectoryName = "database";
+
+    /// <summary>
+    /// payload 里那份 VC++ 运行库安装包的位置。它本来是放给客户端下载用的
+    /// （api\wwwroot\downloads），但安装器自己也需要它：内置 PostgreSQL 依赖 MSVC 运行库，
+    /// 而缺它的那台机器多半也没有外网——只给一个下载网址等于没给。
+    /// </summary>
+    private const string VcRedistEntryPath = "api/wwwroot/downloads/VC_redist.x64.exe";
 
     /// <summary>
     /// 当前安装包携带的最高迁移版本。用于判定备份包是不是「来自更新的服务端」：
@@ -51,6 +58,47 @@ internal static class InstallerPayload
         if (extracted == 0)
             throw new InvalidOperationException("安装包 payload 内没有数据库迁移脚本。");
     }
+
+    /// <summary>安装包里带没带 VC++ 运行库。开发机上单独构建的安装器可能没有。</summary>
+    public static bool HasVcRedist()
+    {
+        try
+        {
+            using var archive = OpenPayload();
+            return FindVcRedist(archive) is not null;
+        }
+        catch (Exception)
+        {
+            // 这个判断只用来决定「要不要提供一键安装」，取不到就当没带，
+            // 回落到原来那条「自己去下载」的路，不该让自检本身炸掉。
+            return false;
+        }
+    }
+
+    /// <summary>把 payload 里的 VC++ 运行库解压到指定文件路径，返回是否解出来了。</summary>
+    public static async Task<bool> TryExtractVcRedistAsync(string targetPath, CancellationToken ct)
+    {
+        using var archive = OpenPayload();
+        var entry = FindVcRedist(archive);
+        if (entry is null)
+            return false;
+
+        Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+        await using var input = entry.Open();
+        await using var output = new FileStream(
+            targetPath, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 64, useAsync: true);
+        await input.CopyToAsync(output, ct);
+        return true;
+    }
+
+    private static ZipArchiveEntry? FindVcRedist(ZipArchive archive) =>
+        archive.Entries.FirstOrDefault(entry =>
+            // 打包脚本用 Compress-Archive 生成，条目名里是反斜杠；两种分隔符都认，
+            // 与 EnumerateMigrationEntries 保持一致。
+            string.Equals(
+                entry.FullName.Replace('\\', '/'),
+                VcRedistEntryPath,
+                StringComparison.OrdinalIgnoreCase));
 
     private static IEnumerable<ZipArchiveEntry> EnumerateMigrationEntries(ZipArchive archive) =>
         archive.Entries.Where(entry =>

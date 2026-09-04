@@ -214,7 +214,7 @@ internal sealed class SetupForm : Form
 
     private async Task InstallAsync()
     {
-        if (!PrerequisiteCheck.EnsureOrPrompt(this))
+        if (!await PrerequisiteCheck.EnsureOrPromptAsync(this, CancellationToken.None))
             return;
 
         var upgrade = ServerInstaller.IsInstalled();

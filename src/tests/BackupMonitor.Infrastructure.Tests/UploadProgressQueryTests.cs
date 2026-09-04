@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Entities.Backup;
+﻿using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Entities.Upload;
 using BackupMonitor.Core.Enums;
@@ -159,6 +159,31 @@ public class UploadProgressQueryTests : IAsyncLifetime
         Assert.Equal(big, rows[1].SessionId);
     }
 
+    [Fact]
+    public async Task 返回这次传的是哪个业务单元()
+    {
+        // U8 一台机器 18 个账套时，「传输中」的 18 行只有这一个字段不一样。
+        // 少了它，界面上读不出「现在备到哪个账套了」。
+        var id = await SeedAsync(UploadStatus.Uploading, totalBytes: 1024, uploadedBytes: 512,
+            businessUnitName: "ZT201");
+
+        var row = (await QueryAsync()).Single(r => r.SessionId == id);
+
+        Assert.Equal("ZT201", row.BusinessUnitName);
+    }
+
+    [Fact]
+    public async Task 候选没有业务单元时给空而不是查不出来()
+    {
+        // 单单元任务与老数据的候选都不挂业务单元。左连接给 null，
+        // 这一条仍然要出现在列表里——它同样在传。
+        var id = await SeedAsync(UploadStatus.Uploading, totalBytes: 1024, uploadedBytes: 512);
+
+        var row = (await QueryAsync()).Single(r => r.SessionId == id);
+
+        Assert.Null(row.BusinessUnitName);
+    }
+
     // ---------- 基础设施 ----------
 
     private async Task<IReadOnlyList<UploadProgressDto>> QueryAsync()
@@ -172,7 +197,8 @@ public class UploadProgressQueryTests : IAsyncLifetime
         long totalBytes,
         long uploadedBytes,
         TimeSpan? startedAgo = null,
-        TimeSpan? idle = null)
+        TimeSpan? idle = null,
+        string? businessUnitName = null)
     {
         using var scope = _services.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
@@ -201,11 +227,21 @@ public class UploadProgressQueryTests : IAsyncLifetime
             CreatedAt = now,
             UpdatedAt = now
         };
+        var unit = businessUnitName is null ? null : new BusinessUnit
+        {
+            Id = Guid.NewGuid(),
+            TaskId = task.Id,
+            ExternalKey = $"{businessUnitName}-{suffix[..8]}",
+            DisplayName = businessUnitName,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
         var candidate = new CandidateBackupSet
         {
             Id = Guid.NewGuid(),
             ClientId = client.Id,
             TaskId = task.Id,
+            BusinessUnitId = unit?.Id,
             CandidateKey = $"prog-{suffix}",
             SourceRoot = @"D:\data\2026",
             DiscoveredAt = now,
@@ -234,6 +270,7 @@ public class UploadProgressQueryTests : IAsyncLifetime
 
         db.Clients.Add(client);
         db.BackupTasks.Add(task);
+        if (unit is not null) db.BusinessUnits.Add(unit);
         db.CandidateBackupSets.Add(candidate);
         db.UploadSessions.Add(session);
         await db.SaveChangesAsync();

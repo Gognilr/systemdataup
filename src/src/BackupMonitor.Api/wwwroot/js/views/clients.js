@@ -11,10 +11,13 @@ import { shell, loading } from '../app.js';
 import { renderClientRuntimeDetail } from './client-runtime.js';
 
 export async function vClients() {
-  App.state.clients = App.state.clients || { page: 1, pageSize: 20, status: '', keyword: '', totalCount: 0, selected: [] , sortKey: 'createdAt', sortDesc: true};
+  // includeRevoked 默认 false：注销是终点，那条记录留在列表里只有干扰作用。
+  // 要看它们走上面的「已注销」这一档。
+  App.state.clients = App.state.clients || { page: 1, pageSize: 20, status: '', keyword: '', totalCount: 0, selected: [], rows: [], includeRevoked: false, sortKey: 'createdAt', sortDesc: true};
   const st = App.state.clients;
   $('#app').innerHTML = shell('clients', '客户端管理', `
     <div class="toolbar">
+      <div id="client-scope">${scopeTabsHtml(st)}</div>
       <select id="f_status"><option value="">全部状态</option>${optsOf(L.client_status).map(o => `<option value="${o.v}" ${st.status === o.v ? 'selected' : ''}>${o.t}</option>`).join('')}</select>
       <input id="f_kw" placeholder="关键字（主机名等）" value="${esc(st.keyword)}" style="min-width:180px">
       <button class="primary" data-ui-action="loader" data-loader="clients">查询</button>
@@ -47,7 +50,13 @@ export async function vClients() {
     <div id="bb-clients">${batchBarHtml('clients')}</div>
     <div id="vwrap">${loading()}</div>`);
   loadDeploymentStatus();
-  $('#f_status').onchange = () => { st.status = $('#f_status').value; st.page = 1; LOADERS.clients(); };
+  $('#f_status').onchange = () => {
+    st.status = $('#f_status').value;
+    // 从下拉里挑「已注销」时也要真的能看见它们，否则筛出来永远是空的。
+    if (st.status === 'revoked') st.includeRevoked = true;
+    st.page = 1;
+    vClients();
+  };
   $('#f_kw').onkeydown = ev => { if (ev.key === 'Enter') { st.keyword = ev.target.value.trim(); st.page = 1; LOADERS.clients(); } };
   api('/api/v1/admin/reports/client-summary').then(summary => {
     const wrap = $('#client-summary-chips');
@@ -56,6 +65,56 @@ export async function vClients() {
   }).catch(() => {});
   await LOADERS.clients();
 }
+
+/* 「在用 / 已注销 / 全部」三档。
+   注销之后那台机器不会再有任何动静，却一直占着列表的一行——而这一页每天被打开
+   是为了看在用的机器有没有问题。默认只列在用的，注销的收进第二档，需要时才看。 */
+/* 在线 / 离线看的是「最近一次听到它说话」，不只是心跳。
+
+   领指令、报扫描进度、传分块——每一次都比心跳更能说明客户端活着，而心跳只是
+   每分钟一次的例行汇报。只认心跳的那一版会把一台正在传 5 GB 备份、
+   心跳被大文件哈希拖住的机器判成离线并发严重告警，而它正在好好干活。 */
+function laterOf(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  return new Date(a) > new Date(b) ? a : b;
+}
+
+/* 心跳明显落后于最近一次通信时，把两个时间都说出来：
+   「刚刚（心跳 6 分钟前）」——那多半是客户端正忙着算校验和，不是它出了问题。 */
+function lastSeenCell(r) {
+  const seen = laterOf(r.lastSeenAt, r.lastHeartbeatAt);
+  if (!seen) return relTime(null);
+  const lagged = r.lastHeartbeatAt && seen !== r.lastHeartbeatAt
+    && new Date(seen) - new Date(r.lastHeartbeatAt) > 120000;
+  return lagged
+    ? `${relTime(seen)} <span class="hint">（心跳 ${esc(relTime(r.lastHeartbeatAt))}）</span>`
+    : relTime(seen);
+}
+
+function scopeOf(st) {
+  if (st.status === 'revoked') return 'revoked';
+  return st.includeRevoked ? 'all' : 'active';
+}
+
+function scopeTabsHtml(st) {
+  const cur = scopeOf(st);
+  const tabs = [['active', '在用'], ['revoked', '已注销'], ['all', '全部']];
+  return `<div class="segmented" role="group" aria-label="客户端范围">${tabs.map(([v, t]) =>
+    `<button class="seg${cur === v ? ' active' : ''}" data-ui-action="method" data-method="clientScope" data-arg="${v}"${cur === v ? ' aria-current="true"' : ''}>${esc(t)}</button>`
+  ).join('')}</div>`;
+}
+
+App.clientScope = function (scope) {
+  const st = App.state.clients;
+  if (!st) return;
+  st.status = scope === 'revoked' ? 'revoked' : '';
+  st.includeRevoked = scope !== 'active';
+  st.page = 1;
+  // 选择留在上一档里没有意义：切档之后那几行多半已经不在表上了。
+  st.selected = [];
+  vClients();
+};
 
 App.toggleClientAdvanced = function () {
   const panel = $('#client-advanced');
@@ -125,9 +184,12 @@ LOADERS.clients = async function () {
     const q = new URLSearchParams({ page: st.page, pageSize: st.pageSize });
     if (st.sortKey) { q.set('sortBy', st.sortKey); q.set('sortDescending', String(st.sortDesc !== false)); }
     if (st.status) q.set('status', st.status);
+    if (st.includeRevoked) q.set('includeRevoked', 'true');
     if (st.keyword) q.set('keyword', st.keyword);
     const data = await api('/api/v1/admin/clients?' + q);
     st.totalCount = data.totalCount;
+    // 批量条要按选中行的状态决定哪些按钮能点，判据是整行而不只是 id。
+    st.rows = data.items || [];
     const filtered = hasFilter(st, ['status', 'keyword']);
     const empty = !filtered
       ? emptyState('first', { glyph: '⌗', title: '还没有客户端', sub: '从上方下载客户端安装程序并完成安装后，客户端会自动出现在这里' })
@@ -144,7 +206,10 @@ LOADERS.clients = async function () {
       // 所以两个状态并排放：连接状态 + 运行状态。
       { l: '状态', k: 'status', sort: true, render: r => status('client_status', r.status) + runtimeBadge(r) },
       { l: '证书剩余', render: r => r.certificateRemainingDays == null ? '—' : `${esc(r.certificateRemainingDays)} 天` },
-      { l: '最近心跳', k: 'lastHeartbeatAt', sort: true, render: r => relTime(r.lastHeartbeatAt) },
+      // 「最近通信」而不是「最近心跳」：在线/离线判定用的就是这个时间
+      // （服务端最近一次收到这台机器的任何请求，取它与心跳的较晚者）。
+      // 显示心跳、判定却看别的，人拿着离线告警来对这一列会怎么对都对不上。
+      { l: '最近通信', k: 'lastHeartbeatAt', sort: true, render: r => lastSeenCell(r) },
       { l: '告警', num: true, render: r => r.activeAlertCount ? `<span class="status status--err pill">${esc(r.activeAlertCount)}</span>` : '0' },
       { l: '任务数', num: true, k: 'taskCount' },
       // 按钮开关一律走 clientCaps：离线的机器下发指令只会静默排队到过期，
@@ -173,13 +238,23 @@ LOADERS.clients = async function () {
           caps.canEnable
             ? actBtn({ label: '启用', view: 'clients', action: 'enable', id: r.id, cls: 'primary', small: false })
             : actBtn({ label: '禁用', view: 'clients', action: 'disable', id: r.id, allowed: caps.canDisable, why: caps.whyDisable, small: false }),
-          actBtn({ label: '注销', view: 'clients', action: 'revoke', id: r.id, cls: 'danger', allowed: caps.canRevoke, why: caps.whyRevoke, small: false })
-        ]);
+          actBtn({ label: '注销', view: 'clients', action: 'revoke', id: r.id, cls: 'danger', allowed: caps.canRevoke, why: caps.whyRevoke, small: false }),
+          // 已注销的机器不会再有任何动静，它那一行留着只是占地方。
+          // 删除只清这条记录本身（连同心跳、指令、告警这些附属行）——名下还有备份任务时
+          // 服务端会拒绝，备份数据的去留只在「备份任务」页决定。
+          r.status === 'revoked'
+            ? actBtn({ label: '删除记录', view: 'clients', action: 'delete', id: r.id, cls: 'danger', small: false })
+            : ''
+        ].filter(Boolean));
         return `${primary} ${more}`;
       } }
     ], data.items, { empty, stateKey: 'clients' }) + pagerHtml('clients', st);
     const bb = $('#bb-clients');
     if (bb) bb.outerHTML = `<div id="bb-clients">${batchBarHtml('clients')}</div>`;
+    // 状态分布标签也会改 st.status，那条路径只重刷表格——不同步的话，
+    // 点了「已注销」标签，上面高亮的还是「在用」。
+    const scope = $('#client-scope');
+    if (scope) scope.innerHTML = scopeTabsHtml(st);
 
     // 运行状态是会自己变的：不刷新的话，界面会一直停在"上传中"，
     // 那几个因此变灰的按钮也就一直灰着，人只能猜要不要手动刷。
@@ -191,8 +266,11 @@ LOADERS.clients = async function () {
 
 /* §5.2 批量动作：选中行后工具条变形出现（逐条调用既有端点，无需后端改动）*/
 App.batchActs = App.batchActs || {};
+/* 每一项都写清「什么样的机器轮得上」。判据与单行按钮共用 clientCaps——
+   已注销的机器选中之后，这些按钮原先全是亮的，点下去服务端一律 409。 */
 App.batchActs.clients = [
   { t: '立即备份', primary: true, bulk: true,
+    allow: r => clientCaps(r).canUpload, why: '所选机器都不能下发备份（离线、已禁用/已注销，或正忙）',
     fn: async ids => {
       const d = await api('/api/v1/admin/operations/precheck-batches', { method: 'POST', body: {
         scope: { clientIds: ids }, onlyEnabled: true
@@ -200,12 +278,23 @@ App.batchActs.clients = [
       toast(`已让 ${d.dispatchedCommands} 个任务开始备份，另有 ${d.skippedTasks} 个跳过（未启用或客户端不可用）`, 'ok');
     } },
   // 这条走的是「我已经知道要传哪一份」的路子，日常不该用到——日常用上面的「立即备份」。
-  { t: '按编号补传（高级）', bulk: true, fn: ids => openClientUploadBatch(ids) },
-  { t: '刷新指标', fn: id => api(`/api/v1/admin/clients/${id}/refresh-metrics`, { method: 'POST' }) },
-  { t: '禁用', fn: id => api(`/api/v1/admin/clients/${id}/disable`, { method: 'POST', body: { reason: '批量禁用' } }) },
+  { t: '按编号补传（高级）', bulk: true,
+    allow: r => clientCaps(r).canUpload, why: '所选机器都不能接收上传指令',
+    fn: ids => openClientUploadBatch(ids) },
+  { t: '刷新指标',
+    allow: r => clientCaps(r).canDispatch, why: '所选机器都连不上，指令下发了也没人执行',
+    fn: id => api(`/api/v1/admin/clients/${id}/refresh-metrics`, { method: 'POST' }) },
+  { t: '禁用',
+    allow: r => clientCaps(r).canDisable, why: '所选机器都不能禁用（待审批、已禁用/已注销，或正忙）',
+    fn: id => api(`/api/v1/admin/clients/${id}/disable`, { method: 'POST', body: { reason: '批量禁用' } }) },
   { t: '注销', danger: true,
+    allow: r => clientCaps(r).canRevoke, why: '所选机器都不能注销（已注销、待审批，或正忙）',
     confirm: async () => await confirmModal('批量注销不可恢复，将吊销所选客户端的全部证书，确定继续？'),
-    fn: id => api(`/api/v1/admin/clients/${id}/revoke`, { method: 'POST', body: { reason: '批量注销' } }) }
+    fn: id => api(`/api/v1/admin/clients/${id}/revoke`, { method: 'POST', body: { reason: '批量注销' } }) },
+  { t: '删除记录', danger: true,
+    allow: r => r.status === 'revoked', why: '只有已注销的机器才能删除记录',
+    confirm: async ids => await confirmModal(`删除这 ${ids.length} 台已注销机器的记录？记录删掉之后在列表里就找不到它们了；名下还有备份任务的会被跳过。`),
+    fn: id => api(`/api/v1/admin/clients/${id}`, { method: 'DELETE' }) }
 ];
 
 /*
@@ -215,7 +304,7 @@ function openClientUploadBatch(clientIds) {
   return new Promise(resolve => {
     const ov = openModal('按编号补传', `
       <p class="text-muted">日常备份请用「立即备份」，不需要用到这里。这一项是给「已经检查过、但当时没传成功，现在想指定几份补传」的情况用的。</p>
-      <p class="text-muted">已选中 ${clientIds.length} 台客户端。编号可以在「运行记录」页的「这次备份」一列里找到，一行一个。</p>
+      <p class="text-muted">已选中 ${clientIds.length} 台客户端。编号可以在「运行记录」页里打开这个批次的「批次详情」，在「这次备份」一列找到，一行一个。</p>
       <div class="frow"><label>备份编号 *</label><textarea id="cb_candidate_ids" class="mono" placeholder="一行一个，形如 3f2a1c9e-…"></textarea></div>
       <div class="form-grid"><div class="frow"><label>批次名称</label><input id="cb_name" placeholder="可选"></div><div class="frow"><label>同时传几台</label><input id="cb_cc" type="number" min="1" max="50" value="2"><div class="hint">其余的排队等着，前一台传完才放下一台</div></div></div>
       <div class="frow inline"><label><input type="checkbox" id="cb_skip_busy" checked> 跳过有活动上传的客户端</label></div>`, { okText: '创建批量上传' });
@@ -238,6 +327,17 @@ function openClientUploadBatch(clientIds) {
     });
   });
 }
+
+/* 删除一条已注销的记录。服务端只接受已注销的，并且名下还有备份任务时会拒绝——
+   那句拒绝原样弹给人看，它比这里能写的任何提示都准确。 */
+ACTIONS['clients:delete'] = async id => {
+  if (!await confirmModal('删除这台已注销机器的记录？删掉之后它不再出现在列表里。它的备份集不受影响，但如果名下还有备份任务，需要先在「备份任务」页删除那些任务。')) return;
+  try {
+    await api(`/api/v1/admin/clients/${id}`, { method: 'DELETE' });
+    toast('记录已删除', 'ok');
+    LOADERS.clients();
+  } catch (e) { errToast(e); }
+};
 
 ACTIONS['clients:approve'] = async id => {
   if (!await confirmModal('审批通过该客户端并为其签发 mTLS 证书？')) return;
@@ -388,6 +488,7 @@ async function legacyClientDetail(id) {
         ${ipDetailRows(d)}
         <div class="row"><div class="k">Agent 版本</div><div class="v">${esc(d.agentVersion || '—')}</div></div>
         <div class="row"><div class="k">分组</div><div class="v">${esc(d.clientGroupName || '—')}</div></div>
+        <div class="row"><div class="k">最近通信</div><div class="v">${fmtDT(laterOf(d.lastSeenAt, d.lastHeartbeatAt))}</div></div>
         <div class="row"><div class="k">最近心跳</div><div class="v">${fmtDT(d.lastHeartbeatAt)}</div></div>
         <div class="row"><div class="k">审批信息</div><div class="v">${d.approvedAt ? fmtDT(d.approvedAt) + '（' + esc(d.approvedByName || '') + '）' : '未审批'}</div></div>
         <div class="row"><div class="k">证书指纹</div><div class="v mono">${esc(d.certificateThumbprint || '—')}</div></div>

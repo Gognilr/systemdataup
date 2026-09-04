@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Entities.Client;
+﻿using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
@@ -94,6 +94,7 @@ public class ClientConfiguration : IEntityTypeConfiguration<Client>
         builder.Property(e => e.ApprovedAt).HasColumnName("approved_at");
         builder.Property(e => e.ApprovedBy).HasColumnName("approved_by");
         builder.Property(e => e.LastHeartbeatAt).HasColumnName("last_heartbeat_at");
+        builder.Property(e => e.LastSeenAt).HasColumnName("last_seen_at");
         builder.Property(e => e.LastConfigVersion).HasColumnName("last_config_version").HasDefaultValue(0L);
         builder.Property(e => e.ConfigRevision).HasColumnName("config_revision").HasDefaultValue(0L);
         builder.Property(e => e.CertificateThumbprint).HasColumnName("certificate_thumbprint").HasMaxLength(128);

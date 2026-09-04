@@ -1,4 +1,4 @@
-using BackupMonitor.Agent;
+﻿using BackupMonitor.Agent;
 using BackupMonitor.Infrastructure.Recognition;
 using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Models.Agent;
@@ -461,6 +461,48 @@ public sealed class RecognizerWizardTests : IDisposable
 
         Assert.Null(proposal.SuggestedMinTotalBytes);
         Assert.Contains("没有意义", proposal.SizeBaselineNote ?? "", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 平铺目录里「每次丢一个文件进来，只认最新的那个」——一份备份就是一个文件。
+    ///
+    /// 这一支原先一份样本都交不出来（leaves 说的是目录单元，这里一个都没有），
+    /// 于是同一屏上先说「里堆着 14 个备份文件」，紧接着说「只观察到 0 份备份，样本太少」。
+    /// </summary>
+    [Fact]
+    public void 平铺目录取最新时按文件大小给出下限建议()
+    {
+        for (var day = 1; day <= 14; day++)
+            Write($@"seeyon_backup_2026_09_{day:00}.bak", new string('x', 4 * 1024 * 1024 + day * 1024));
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        Assert.Equal("latest_single_file", proposal.RecognizerType);
+        Assert.NotNull(proposal.SuggestedMinTotalBytes);
+        Assert.Equal(2L * 1024 * 1024, proposal.SuggestedMinTotalBytes);
+        Assert.DoesNotContain("样本太少", proposal.SizeBaselineNote ?? "", StringComparison.Ordinal);
+        Assert.Contains("14 份备份", proposal.SizeBaselineNote!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// 按组认的平铺目录（同一天的几个库凑一份备份）同样要按「一组多大」给样本，
+    /// 而不是把整个目录算成一份。
+    /// </summary>
+    [Fact]
+    public void 每天一组的平铺目录按组大小给出下限建议()
+    {
+        for (var day = 1; day <= 7; day++)
+        {
+            Write($@"beeServer_backup_2026_09_{day:00}_000004.bak", new string('x', 2 * 1024 * 1024));
+            Write($@"dzwl_backup_2026_09_{day:00}_000004.bak", new string('x', 6 * 1024 * 1024 + day * 1024));
+        }
+
+        var proposal = StructureInference.Infer(Snapshot(), DateTime.UtcNow);
+
+        Assert.Equal("multi_file_set", proposal.RecognizerType);
+        // 每组 8 MB 上下，取最小一组的一半。
+        Assert.Equal(4L * 1024 * 1024, proposal.SuggestedMinTotalBytes);
+        Assert.Contains("7 份备份", proposal.SizeBaselineNote!, StringComparison.Ordinal);
     }
 
     // ---------- B4：周期与缺口不影响置信度 ----------

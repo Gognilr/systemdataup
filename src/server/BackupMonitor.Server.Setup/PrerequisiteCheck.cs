@@ -7,7 +7,16 @@ internal enum PrerequisiteLevel
     Blocking
 }
 
-internal sealed record PrerequisiteResult(PrerequisiteLevel Level, string Title, string Detail);
+internal sealed record PrerequisiteResult(PrerequisiteLevel Level, string Title, string Detail)
+{
+    /// <summary>
+    /// 这一项能不能用安装包自带的 vc_redist.x64.exe 就地修好。
+    /// 只有「VC++ 运行库缺失」是这样——UCRT 缺失在 2012 / 2012 R2 上装 vc_redist 没有用
+    /// （它把 UCRT 当作由系统补丁提供的前置），所以那一项绝不能标成可修：
+    /// 让人白装一遍再回到同一个错误，比一开始就说清楚更糟。
+    /// </summary>
+    public bool FixableByBundledVcRedist { get; init; }
+}
 
 /// <summary>
 /// 安装前的运行环境自检。
@@ -83,11 +92,42 @@ internal static class PrerequisiteCheck
         return results;
     }
 
-    /// <summary>安装前调用。返回 false 表示存在阻断项，调用方应终止安装流程。</summary>
-    public static bool EnsureOrPrompt(IWin32Window? owner)
+    /// <summary>
+    /// 安装前调用。返回 false 表示存在阻断项，调用方应终止安装流程。
+    ///
+    /// 唯一一个能就地修好的阻断项是 VC++ 运行库：安装包里本来就带着 vc_redist.x64.exe
+    /// （它原是放给客户端下载的），而缺这个运行库的机器多半也没有外网——
+    /// 只给一个下载网址，等于让人拿着一台装不了的服务器去别处想办法。
+    /// </summary>
+    public static async Task<bool> EnsureOrPromptAsync(IWin32Window? owner, CancellationToken ct)
     {
         var results = Evaluate();
         var blocking = results.Where(r => r.Level == PrerequisiteLevel.Blocking).ToList();
+
+        // 只在「所有阻断项都是它」时才提供一键安装。同时还缺 UCRT 的机器上装 vc_redist
+        // 什么都不会发生，装完回到同一个错误——那种情况下必须让人先去打 KB2999226。
+        if (blocking.Count > 0
+            && blocking.All(r => r.FixableByBundledVcRedist)
+            && InstallerPayload.HasVcRedist())
+        {
+            var choice = MessageBox.Show(
+                owner,
+                "运行环境不满足安装条件：\r\n\r\n" + Describe(blocking)
+                + "\r\n\r\n安装包内已自带该运行库，现在就地安装吗？（约 25 MB，无需联网）",
+                "BackupMonitor 安装前自检",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button1);
+
+            if (choice == DialogResult.Yes && await TryInstallBundledVcRedistAsync(owner, ct))
+            {
+                // 装完重新体检，而不是假定装成功了就一定齐了：
+                // vc_redist 在缺 UCRT 的系统上会「安装成功」但一个 DLL 都没落盘。
+                results = Evaluate();
+                blocking = results.Where(r => r.Level == PrerequisiteLevel.Blocking).ToList();
+            }
+        }
+
         var warnings = results.Where(r => r.Level == PrerequisiteLevel.Warning).ToList();
 
         if (blocking.Count > 0)
@@ -116,6 +156,80 @@ internal static class PrerequisiteCheck
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// 把 payload 里那份 vc_redist.x64.exe 解出来就地装上。返回 false 表示没装成
+    /// （调用方随后会重新体检，仍然缺就照原样报阻断）。
+    /// </summary>
+    private static async Task<bool> TryInstallBundledVcRedistAsync(IWin32Window? owner, CancellationToken ct)
+    {
+        // 解到自己的临时子目录里，装完就删。不用系统 TEMP 根目录：
+        // 那里同名文件被别的东西占着时，覆盖会失败得莫名其妙。
+        var workDirectory = Path.Combine(Path.GetTempPath(), "BackupMonitor.Setup", Guid.NewGuid().ToString("N"));
+        var installerPath = Path.Combine(workDirectory, "vc_redist.x64.exe");
+
+        try
+        {
+            if (!await InstallerPayload.TryExtractVcRedistAsync(installerPath, ct))
+                return false;
+
+            // /passive 而不是 /quiet：这一步要跑将近一分钟，没有任何反馈的话
+            // 人会以为安装器卡死了，然后去点第二次。
+            // throwOnError:false —— 3010（要重启）和 1638（已装了更新的版本）都不是失败，
+            // 交给下面按退出码分别处理。
+            var result = await ProcessRunner.RunAsync(
+                installerPath,
+                ["/install", "/passive", "/norestart"],
+                ct,
+                throwOnError: false);
+
+            switch (result.ExitCode)
+            {
+                case 0:
+                    return true;
+
+                // 1638：机器上已经有更新版本的运行库。这不是错误，但它同时说明
+                // 「DLL 仍然缺」不是这个包能解决的——重新体检会照实报出来。
+                case 1638:
+                    return true;
+
+                case 3010:
+                    MessageBox.Show(
+                        owner,
+                        "VC++ 运行库已安装，但系统要求重启后才生效。\r\n"
+                        + "请重启这台服务器，然后重新运行本安装程序。",
+                        "需要重启",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                    return false;
+
+                default:
+                    MessageBox.Show(
+                        owner,
+                        $"VC++ 运行库安装失败（退出码 {result.ExitCode}）。\r\n\r\n"
+                        + "最常见的原因是这台机器缺 UCRT：在那种系统上 vc_redist 装不上任何东西，\r\n"
+                        + "需要先打 KB2999226 并重启。详见下一条自检提示。",
+                        "安装失败",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                owner,
+                "无法安装自带的 VC++ 运行库：" + ex.Message,
+                "安装失败",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            return false;
+        }
+        finally
+        {
+            try { Directory.Delete(workDirectory, recursive: true); } catch (Exception) { /* 临时目录，删不掉不影响安装 */ }
+        }
     }
 
     public static string Describe(IEnumerable<PrerequisiteResult> results) =>
@@ -219,9 +333,12 @@ internal static class PrerequisiteCheck
             $"缺少 VC++ 2015-2022 运行库（{missing.Count} 个文件）",
             $"未找到：{string.Join("、", missing)}\r\n"
             + "内置 PostgreSQL 依赖这些 DLL，缺失会导致数据库服务无法启动。\r\n"
-            + "安装：https://aka.ms/vs/17/release/vc_redist.x64.exe\r\n"
+            + "本安装包自带 vc_redist.x64.exe，可以就地安装，不需要联网。\r\n"
             + "注意：在缺 UCRT 的系统上这个安装包装不上东西，需先打完 KB2999226 并重启，\r\n"
-            + "再重新运行一次 vc_redist。");
+            + "再重新运行一次 vc_redist。")
+        {
+            FixableByBundledVcRedist = true
+        };
     }
 
     private static PrerequisiteResult CheckProcessArchitecture()

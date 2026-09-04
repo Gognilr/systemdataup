@@ -1,3 +1,4 @@
+﻿using System.Globalization;
 using System.Text.Json;
 using BackupMonitor.Core.Entities.System;
 using BackupMonitor.Core.Enums;
@@ -70,7 +71,10 @@ public class StorageSettingsService : IStorageSettingsService
             Repository = repository,
             Staging = staging,
             ServerHostname = Environment.MachineName,
-            BackupSetsOutsideRoot = await CountBackupSetsOutsideRootAsync(repository.EffectivePath, ct)
+            BackupSetsOutsideRoot = await CountBackupSetsOutsideRootAsync(repository.EffectivePath, ct),
+            MaxConcurrentUploadsTotal = await ReadUploadLimitAsync(ct),
+            ActiveUploads = await _db.UploadSessions
+                .CountAsync(u => UploadSessionStatuses.Active.Contains(u.Status), ct)
         };
     }
 
@@ -78,6 +82,12 @@ public class StorageSettingsService : IStorageSettingsService
     {
         var repository = Normalize(request.RepositoryPath, "备份存放目录");
         var staging = Normalize(request.StagingPath, "上传暂存目录");
+
+        // 上下限与 SequentialExecutionWorker / UploadProgressService 的 Clamp 一致。
+        // 那两处夹到范围内就算了，这里必须报错：人在界面上填了 0，静默变成 1
+        // 和静默变成"不限"是两个相反的结果，而他不会知道自己填的没生效。
+        if (request.MaxConcurrentUploadsTotal is { } limit && (limit < 1 || limit > 64))
+            throw new ValidationFailedException("同时上传的备份数上限要在 1 到 64 之间");
 
         // 两个根指向同一个目录会让暂存的半成品和正式备份混在一起：仓库目录名由主机名/任务名
         // 生成，暂存用的是 sessions\<guid>，撞不上，但保留策略扫的是整个仓库根——
@@ -88,6 +98,7 @@ public class StorageSettingsService : IStorageSettingsService
 
         var beforeRepository = await _storage.ResolveRootAsync(UploadStorage.RepositorySettingKey, ct);
         var beforeStaging = await _storage.ResolveRootAsync(UploadStorage.StagingSettingKey, ct);
+        var beforeLimit = await ReadUploadLimitAsync(ct);
 
         // 探测放在写库之前：任何一项不可用就整体拒绝，不留下"仓库改了、暂存没改"的半截状态。
         if (repository is not null)
@@ -97,6 +108,10 @@ public class StorageSettingsService : IStorageSettingsService
 
         await WriteSettingAsync(UploadStorage.RepositorySettingKey, repository, ct);
         await WriteSettingAsync(UploadStorage.StagingSettingKey, staging, ct);
+        if (request.MaxConcurrentUploadsTotal is { } newLimit)
+            await WriteRawSettingAsync(
+                SequentialExecutionWorker.GlobalUploadLimitKey,
+                newLimit.ToString(CultureInfo.InvariantCulture), ct);
         await _db.SaveChangesAsync(ct);
 
         // 60 秒缓存对刚点保存的人来说就是"改了没生效"，这里立刻作废
@@ -104,13 +119,24 @@ public class StorageSettingsService : IStorageSettingsService
 
         await _audit.RecordAsync(
             "storage.update_settings", AuditResult.Success, "system_setting", null,
-            beforeData: JsonSerializer.Serialize(new { repositoryPath = beforeRepository.Path, stagingPath = beforeStaging.Path }),
-            afterData: JsonSerializer.Serialize(new { repositoryPath = repository, stagingPath = staging }),
+            beforeData: JsonSerializer.Serialize(new
+            {
+                repositoryPath = beforeRepository.Path,
+                stagingPath = beforeStaging.Path,
+                maxConcurrentUploadsTotal = beforeLimit
+            }),
+            afterData: JsonSerializer.Serialize(new
+            {
+                repositoryPath = repository,
+                stagingPath = staging,
+                maxConcurrentUploadsTotal = request.MaxConcurrentUploadsTotal ?? beforeLimit
+            }),
             ct: ct);
 
         _logger.LogInformation(
-            "存储路径已更新 repository={Repository} staging={Staging}",
-            repository ?? "(清除)", staging ?? "(清除)");
+            "存储设置已更新 repository={Repository} staging={Staging} uploadLimit={Limit}",
+            repository ?? "(清除)", staging ?? "(清除)",
+            request.MaxConcurrentUploadsTotal?.ToString(CultureInfo.InvariantCulture) ?? "(未改)");
 
         return await GetAsync(ct);
     }
@@ -382,4 +408,33 @@ public class StorageSettingsService : IStorageSettingsService
         row.SettingValue = json;
         row.UpdatedBy = _context.UserId;
     }
+
+    /// <summary>
+    /// 写一个已经是 JSON 字面量的设置值（数字、布尔）。
+    /// 与 WriteSettingAsync 分开是因为那一个会把字符串再序列化一次——
+    /// 4 写进去会变成 "4"，而 GetIntAsync 只认 JsonValueKind.Number，读出来永远是默认值。
+    /// </summary>
+    private async Task WriteRawSettingAsync(string key, string json, CancellationToken ct)
+    {
+        var row = await _db.SystemSettings.FirstOrDefaultAsync(s => s.SettingKey == key, ct);
+
+        if (row is null)
+        {
+            _db.SystemSettings.Add(new SystemSetting
+            {
+                SettingKey = key,
+                SettingValue = json,
+                Encrypted = false,
+                UpdatedBy = _context.UserId
+            });
+            return;
+        }
+
+        row.SettingValue = json;
+        row.UpdatedBy = _context.UserId;
+    }
+
+    /// <summary>当前生效的全局上传上限。默认值与两个消费方保持一致。</summary>
+    private Task<int> ReadUploadLimitAsync(CancellationToken ct) =>
+        _settings.GetIntAsync(SequentialExecutionWorker.GlobalUploadLimitKey, 4, ct);
 }
