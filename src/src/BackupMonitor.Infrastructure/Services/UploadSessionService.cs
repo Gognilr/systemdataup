@@ -92,13 +92,35 @@ public class UploadSessionService : IUploadSessionService
                 if (existing.Status == UploadStatus.Paused)
                     throw new BusinessException(PausedErrorCode, "这次传输已被管理员暂停，恢复后会从断点继续", 409);
 
-                if (existing.Status is not (UploadStatus.Failed or UploadStatus.Cancelled or UploadStatus.Expired))
+                var reusable = existing.Status
+                    is not (UploadStatus.Failed or UploadStatus.Cancelled or UploadStatus.Expired);
+
+                // committed 会话是**永久保留**的，而它代表的那份备份可能早就被删了
+                // （移入回收站或彻底删除）。只看会话状态就把它交回去，后果是
+                // 「删掉之后这份备份再也传不上来」：每一次重传都被幂等命中这个空壳，
+                // Agent 拿到一个已经完成的会话，一个字节都不传就回 UPLOAD_ACCEPTED，
+                // 执行记录写着「备份已入库」，而仓库目录里什么都没有。
+                //
+                // 现场（2026-09-04 11:49 把全部备份集移进回收站，15:06 重新跑计划）
+                // 就是这个表现：三个任务全部「已入库」，upload_sessions 里
+                // 11:03:53 之后再没有新建过一条，仓库目录一个新文件都没有。
+                //
+                // 判据与下面那条 CANDIDATE_ALREADY_ARCHIVED 取同一个——「这个候选现在
+                // 有没有一份活着的备份」。两处分家的结果就是这次现场：下面那条判得对，
+                // 而上面这条在它之前就把请求截走了。
+                if (reusable && existing.Status == UploadStatus.Committed)
+                    reusable = await _db.BackupSets.AnyAsync(
+                        b => b.UploadSessionId == existing.Id
+                            && BackupSetStatuses.Live.Contains(b.Status), ct);
+
+                if (reusable)
                 {
                     var existingTimeout = await _settings.GetIntAsync(LifecycleExpiryWorker.SessionTimeoutKey, LifecycleExpiryWorker.DefaultSessionTimeoutSeconds, ct);
                     return BuildCreateResponse(existing, resumed: true, existingTimeout);
                 }
 
-                // 失败会话保留作审计，但释放幂等键，让同一候选可以创建全新的重试会话。
+                // 失败会话与「备份已被删掉」的 committed 会话都保留作审计，
+                // 但释放幂等键，让同一候选可以创建全新的重试会话。
                 existing.IdempotencyKey = null;
                 existing.UpdatedAt = DateTime.UtcNow;
                 await _db.SaveChangesAsync(ct);

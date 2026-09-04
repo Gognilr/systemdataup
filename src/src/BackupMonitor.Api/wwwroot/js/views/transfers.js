@@ -16,9 +16,136 @@ const POLL_IDLE_MS = 15000;
 
 export async function vTransfers() {
   $('#app').innerHTML = shell('transfers', '传输中',
-    `<div class="toolbar"><span class="tip">只显示正在传的备份；传完存好之后到「备份集」页面看。</span></div><div id="vwrap">${loading()}</div>`);
+    `<div class="toolbar"><span class="tip">只显示正在传的备份；传完存好之后到「备份集」页面看。</span></div>`
+    + `<div id="vwrap">${loading()}</div>`
+    + finishedShellHtml());
+  // 「最近结束」刻意放在 #vwrap 外面：在传的那张表 5 秒重画一次 innerHTML，
+  // 放进去的话人刚展开就会被下一轮刷新收起来。
+  wireFinished();
   await LOADERS.transfers();
 }
+
+/* ---------- 最近结束的传输 ----------
+
+   默认折叠。常态下人要看的是在传的那几条，这一块占地方没有意义。
+   但有两类信息只有这里答得上来：
+
+     一、没传成的那些（failed / cancelled / expired）。它们不入备份集（没归档），
+         也不在上面那张表（已终结），此前只能翻日志或查库；
+     二、耗时、平均速度、重试次数。判断「链路够不够快」「限速要不要调」靠的是它。
+
+   已入库的也列进来，但只作为时间线上的一行，正式档案在「备份集」页面——
+   同一批数据不做第二个入口，这里给个编号让人点过去就够了。 */
+
+const FINISHED_PAGE_SIZE = 50;
+const finishedState = { page: 0, rows: [], total: 0, loading: false };
+
+function finishedShellHtml() {
+  return `<details id="vfinished" class="fold-section">
+    <summary>最近结束的传输<span class="sub">传成功的去了「备份集」，失败、取消、过期的只有这里看得到</span></summary>
+    <div id="vfinished-body"></div>
+  </details>`;
+}
+
+function wireFinished() {
+  const box = $('#vfinished');
+  if (!box) return;
+  box.addEventListener('toggle', () => {
+    // 只在第一次展开时拉，之后靠「加载更多」翻页；收起再展开不重拉，
+    // 免得人只是想收起来腾地方却触发一次请求。
+    if (box.open && finishedState.page === 0 && !finishedState.loading) loadFinished();
+  });
+}
+
+async function loadFinished() {
+  const body = $('#vfinished-body');
+  if (!body || finishedState.loading) return;
+  finishedState.loading = true;
+  if (finishedState.page === 0) body.innerHTML = loading();
+
+  try {
+    const next = finishedState.page + 1;
+    const data = await api(`/api/v1/admin/upload-sessions/finished?page=${next}&pageSize=${FINISHED_PAGE_SIZE}`);
+    finishedState.page = next;
+    finishedState.total = data.totalCount || 0;
+    finishedState.rows = finishedState.rows.concat(data.items || []);
+    renderFinished();
+  } catch (e) {
+    // 这一块是补充信息，失败不该影响上面那张表；就地把原因说出来即可。
+    body.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  } finally {
+    finishedState.loading = false;
+  }
+}
+
+function renderFinished() {
+  const body = $('#vfinished-body');
+  if (!body) return;
+
+  const more = finishedState.rows.length < finishedState.total
+    ? `<div class="toolbar"><button class="small" data-ui-action="act" data-view="transfers" data-action="more">加载更多</button>`
+      + `<span class="tip">已显示 ${finishedState.rows.length} / ${finishedState.total} 条</span></div>`
+    : `<div class="toolbar"><span class="tip">共 ${finishedState.total} 条，已全部显示</span></div>`;
+
+  // 折叠标题上只放得下一句话，而这一块「为什么存在、该怎么用」需要三句才说得清；
+  // 展开之后再把话补全，不占常态下的版面。
+  const intro = `<div class="toolbar"><span class="tip">`
+    + `按结束时间倒序，成功和没成功的都在里面。`
+    + `传成功的正式档案在「备份集」页面，这里只留一行时间线，点「归档」列的编号就能过去；`
+    + `失败、取消、过期的不入备份集，也不会留在上面那张表里，只有这里看得到，`
+    + `断在哪儿看「传输量」，为什么断看「原因」。`
+    + `另外耗时、平均速度、重试次数只有传输会话上才有——判断链路够不够快、限速要不要调，看的就是这几列。`
+    + `</span></div>`;
+
+  body.innerHTML = intro + tableHtml(FINISHED_COLUMNS, finishedState.rows, {
+    empty: emptyState('ok', { glyph: '✓', title: '还没有结束过的传输' })
+  }) + (finishedState.total ? more : '');
+}
+
+const FINISHED_COLUMNS = [
+  {
+    l: '客户端',
+    render: r => `<a href="#/clients/${esc(r.clientId)}">${esc(r.clientDisplayName)}</a>`
+  },
+  {
+    l: '任务 / 业务单元',
+    render: r => `${esc(r.taskName)}${r.businessUnitName ? ` · <b>${esc(r.businessUnitName)}</b>` : ''}`
+  },
+  { l: '状态', render: r => status('upload_status', r.status) },
+  {
+    // 失败的那些靠「传了多少 / 一共多少」看出是传到哪儿断的；
+    // 只写总量的话，断在开头和断在 99% 长得一模一样。
+    l: '传输量',
+    num: true,
+    render: r => (r.uploadedBytes === r.totalBytes
+      ? esc(fmtBytes(r.totalBytes))
+      : `${esc(fmtBytes(r.uploadedBytes))} / ${esc(fmtBytes(r.totalBytes))}`)
+  },
+  { l: '耗时', num: true, render: r => (r.durationSeconds == null ? '<span class="sub">—</span>' : esc(fmtDuration(r.durationSeconds))) },
+  { l: '平均速度', num: true, render: r => fmtRate(r.averageBytesPerSecond) },
+  {
+    l: '重试',
+    num: true,
+    render: r => (r.retryCount ? `<span class="cell-warn">${esc(r.retryCount)}</span>` : '<span class="sub">0</span>')
+  },
+  { l: '结束于', render: r => relTime(r.completedAt) },
+  {
+    // committed 却没有编号，说明那份备份已经被删了。这一格空着本身就是信息，
+    // 而不是「数据没取到」——所以要把话写出来，不能留一个横杠。
+    l: '归档',
+    render: r => {
+      if (r.backupSetCode) return `<a href="#/backups">${esc(r.backupSetCode)}</a>`;
+      if (r.status === 'committed') return '<span class="cell-warn">备份已删除</span>';
+      return `<span class="sub">${esc(r.errorCode || '未入库')}</span>`;
+    }
+  },
+  {
+    l: '原因',
+    render: r => (r.errorMessage ? `<span class="sub">${esc(r.errorMessage)}</span>` : '')
+  }
+];
+
+ACTIONS['transfers:more'] = () => loadFinished();
 
 LOADERS.transfers = async function () {
   clearTimeout(App.timer);

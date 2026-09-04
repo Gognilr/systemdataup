@@ -74,7 +74,8 @@ public class StorageSettingsService : IStorageSettingsService
             BackupSetsOutsideRoot = await CountBackupSetsOutsideRootAsync(repository.EffectivePath, ct),
             MaxConcurrentUploadsTotal = await ReadUploadLimitAsync(ct),
             ActiveUploads = await _db.UploadSessions
-                .CountAsync(u => UploadSessionStatuses.Active.Contains(u.Status), ct)
+                .CountAsync(u => UploadSessionStatuses.Active.Contains(u.Status), ct),
+            InFlightUploads = await CountInFlightUploadsAsync(ct)
         };
     }
 
@@ -99,6 +100,25 @@ public class StorageSettingsService : IStorageSettingsService
         var beforeRepository = await _storage.ResolveRootAsync(UploadStorage.RepositorySettingKey, ct);
         var beforeStaging = await _storage.ResolveRootAsync(UploadStorage.StagingSettingKey, ct);
         var beforeLimit = await ReadUploadLimitAsync(ct);
+
+        // 有传输没结束时不许换根。
+        //
+        // 在传的会话把已经收到的分块留在旧暂存根下，断点续传是拿「暂存根 + 会话 ID」找回去的；
+        // verifying 的那几条正被提交工作器从暂存往旧仓库根里搬。这时候换根，客户端会带着一个
+        // 服务端再也找不到的断点继续传，搬到一半的备份则分在两个目录里——都属于"界面上写着成功、
+        // 文件却不在该在的地方"，而这正是备份工具最不能出的一类事。
+        //
+        // 只拦真的换根：原样再保存一次不该被挡在门外。并发上限也不在此列，
+        // 它只作用于下一次取名额，对已经在传的没有任何影响。
+        if (ChangesRoot(repository, beforeRepository) || ChangesRoot(staging, beforeStaging))
+        {
+            var inFlight = await CountInFlightUploadsAsync(ct);
+            if (inFlight > 0)
+                throw new BusinessException("UPLOAD_IN_PROGRESS",
+                    $"当前有 {inFlight} 个传输还没结束，这时候改目录会让它们找不到已经传上来的分块。"
+                    + "请等这几条传完，或到「传输中」页面把它们取消掉，再改目录。"
+                    + "（同时上传的备份数上限不受影响，可以单独保存。）", 409);
+        }
 
         // 探测放在写库之前：任何一项不可用就整体拒绝，不留下"仓库改了、暂存没改"的半截状态。
         if (repository is not null)
@@ -304,6 +324,40 @@ public class StorageSettingsService : IStorageSettingsService
             _logger.LogWarning(ex, "统计仓库根之外的备份集失败，按 0 显示");
             return 0;
         }
+    }
+
+    /// <summary>
+    /// 还没走完的上传会话数。口径与「传输中」页面的那张表一致（InFlight），
+    /// 人才能照着那张表把它们一条条清干净——换成别的口径，界面上会出现
+    /// "这里说还有 2 个没结束，那边一条都没有"。
+    /// </summary>
+    private Task<int> CountInFlightUploadsAsync(CancellationToken ct) =>
+        _db.UploadSessions.CountAsync(u => UploadSessionStatuses.InFlight.Contains(u.Status), ct);
+
+    /// <summary>
+    /// 这次提交会不会真的换掉一个存储根。
+    /// 换根才需要在有传输时拦下来；原样再保存一次（比如只想改并发上限）不该被挡在门外。
+    /// </summary>
+    private static bool ChangesRoot(string? requested, StorageRootResolution before)
+    {
+        // 留空 = 清除配置。库里本来就没配的话什么都没变；配过的话生效路径会回落到
+        // appsettings 或程序目录，那是一次实实在在的换根。
+        if (requested is null)
+            return before.Source == StorageRootSource.Database;
+
+        try
+        {
+            return !string.Equals(Canonical(requested), Canonical(before.Path), StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            // 旧值可能本身就是个非法路径（盘符不存在、库里被改坏），GetFullPath 会抛。
+            // 比不出来就按"换了"处理：宁可多拦一次，也不要在有传输在跑时放行。
+            return true;
+        }
+
+        static string Canonical(string path) =>
+            Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
     }
 
     /// <summary>规范化输入：留空 → null（表示清除配置），否则校验为可用的绝对路径</summary>

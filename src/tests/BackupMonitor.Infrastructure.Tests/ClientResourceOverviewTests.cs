@@ -171,6 +171,47 @@ public class ClientResourceOverviewTests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// 概览行要带上 IP，而且口径必须和客户端列表页一致：看出「哪台吃紧」之后，
+    /// 下一步就是照着 IP 连过去看一眼。
+    ///
+    /// 对端地址是 IPv6（Windows 的名称解析很容易把 Agent 领到 fe80:: 上去）时要回落到
+    /// 自报网卡里的第一个可用 IPv4，并且跳过回环——同一台机器在两个页面上显示两个不同的地址，
+    /// 比不显示更糟。
+    /// </summary>
+    [Fact]
+    public async Task 概览行带上IP_口径与列表页一致()
+    {
+        var clientId = Guid.NewGuid();
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.Clients.Add(new Client
+            {
+                Id = clientId,
+                MachineId = Guid.NewGuid().ToString("N"),
+                Hostname = "IP-" + Guid.NewGuid().ToString("N")[..8],
+                DisplayName = "IP 展示测试客户端",
+                Status = ClientStatus.Online,
+                LastRemoteIp = "fe80::1",
+                IpAddresses = """["127.0.0.1","192.168.1.50"]"""
+            });
+            await db.SaveChangesAsync();
+        }
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var rows = await scope.ServiceProvider
+                .GetRequiredService<IClientAdminService>()
+                .GetResourceOverviewAsync(limit: 200);
+
+            var row = Assert.Single(rows, r => r.Id == clientId);
+            Assert.Equal("fe80::1", row.LastRemoteIp);
+            Assert.Equal("192.168.1.50", row.Ipv4Address);
+        }
+    }
+
     private static ClientHeartbeat NewHeartbeat(Guid clientId, DateTime receivedAt, decimal cpu, decimal memory) =>
         new()
         {

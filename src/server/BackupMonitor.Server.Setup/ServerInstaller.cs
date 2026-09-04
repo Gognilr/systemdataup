@@ -146,8 +146,22 @@ internal sealed class ServerInstaller
                 new Progress<string>(message => progress.Report(new ServerInstallProgress(message, 55))),
                 ct);
 
-            progress.Report(new ServerInstallProgress("正在设置仓库与暂存目录…", 65));
-            await ConfigureStoragePathsAsync(applicationConnection, request.DataDirectory, ct);
+            // 只在首次安装时给存储路径写初值。
+            //
+            // 这一步写的是 system_settings 的 repository_path / staging_path，而它在路径解析链
+            // 里优先级最高——高于 appsettings 的 Storage:*（见 UploadStorage.ResolveRootAsync）。
+            // 升级时再跑一遍，只要数据库里那两个键还是空的（管理员没在管理端改过路径，
+            // 路径一直由 appsettings 提供），就会被填上数据目录下的 repository / staging，
+            // 从此把 appsettings 里那个自定义路径永久盖住。界面上看到的现象正是
+            // 「升级后暂存目录变回默认值，取值来源同时从『appsettings 配置文件』变成『管理端配置』」。
+            //
+            // 升级本来也不需要这一步：路径要么已经在数据库里（管理员显式配过，更不该动），
+            // 要么在 appsettings 里（WriteTurnkeyConfiguration 已经把上一次的值原样保留下来）。
+            if (firstInstall)
+            {
+                progress.Report(new ServerInstallProgress("正在设置仓库与暂存目录…", 65));
+                await ConfigureStoragePathsAsync(applicationConnection, request.DataDirectory, ct);
+            }
 
             progress.Report(new ServerInstallProgress("正在注册 Windows 服务和防火墙规则…", 70));
             await RegisterApiServiceAsync(request.InstallDirectory, ct);

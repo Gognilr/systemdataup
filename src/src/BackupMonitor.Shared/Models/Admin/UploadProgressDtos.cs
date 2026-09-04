@@ -98,3 +98,70 @@ public class UploadQueueStatusDto
     /// <summary>系统设置 max_concurrent_uploads_total</summary>
     public int GlobalLimit { get; set; }
 }
+
+/// <summary>
+/// 一条已经结束的传输。
+///
+/// 「传输中」页面只显示在途的会话，传完就消失。于是有两类信息在界面上无处可查：
+///
+///   一、**没传成的那些**（failed / cancelled / expired）。它们不入备份集（没归档），
+///       也不在传输中（已终结）。要回答「昨晚那条为什么没传上去」只能翻日志或查库。
+///   二、**只有会话上才有的数字**——这次传了多久、平均速度、重试了几次。
+///       判断「链路够不够快」「限速要不要调」靠的是它，备份集上没有这些。
+///
+/// 已入库的那些也列进来，但只作为时间线上的一行：正式档案在「备份集」页面，
+/// 这里给出 <see cref="BackupSetCode"/> 让人点过去，而不是把那一页复制一遍。
+/// </summary>
+public class FinishedTransferDto
+{
+    public Guid SessionId { get; set; }
+
+    public Guid ClientId { get; set; }
+
+    public string ClientDisplayName { get; set; } = string.Empty;
+
+    public Guid TaskId { get; set; }
+
+    public string TaskName { get; set; } = string.Empty;
+
+    /// <summary>业务单元（账套）名。老数据里候选可能没挂业务单元，此时为 null。</summary>
+    public string? BusinessUnitName { get; set; }
+
+    /// <summary>终态：committed / failed / cancelled / expired</summary>
+    public string Status { get; set; } = string.Empty;
+
+    public int TotalFiles { get; set; }
+
+    public long TotalBytes { get; set; }
+
+    /// <summary>实际传完的字节。失败的那些靠它与 TotalBytes 的差看出「传到哪儿断的」。</summary>
+    public long UploadedBytes { get; set; }
+
+    public DateTime? StartedAt { get; set; }
+
+    public DateTime? CompletedAt { get; set; }
+
+    /// <summary>整段传输耗时（秒）。起止有一个取不到时为 null，不猜。</summary>
+    public long? DurationSeconds { get; set; }
+
+    /// <summary>
+    /// 全程平均速度（字节/秒）。这里用平均值是对的——传输已经结束，
+    /// 要回答的是「这条链路整体多快」，不是「此刻快不快」。
+    /// 耗时为 0 或算不出来时为 null。
+    /// </summary>
+    public long? AverageBytesPerSecond { get; set; }
+
+    /// <summary>服务端记下的重试次数。链路不稳时它比平均速度更早露出来。</summary>
+    public int RetryCount { get; set; }
+
+    public string? ErrorCode { get; set; }
+
+    public string? ErrorMessage { get; set; }
+
+    /// <summary>
+    /// 入库之后的正式备份集编号；没入库、或那份备份已经被删掉时为 null。
+    /// null 且状态是 committed，说明这次传输的成果已经不在了——
+    /// 这一栏空着本身就是要给人看见的信息。
+    /// </summary>
+    public string? BackupSetCode { get; set; }
+}

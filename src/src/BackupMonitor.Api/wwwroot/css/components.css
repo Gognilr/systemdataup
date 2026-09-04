@@ -539,3 +539,11 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 @media (max-width:760px){
   .bsgroup .bsg-meta{margin-left:0;flex-basis:100%}
 }
+
+/* 「最近结束的传输」这类默认折叠的整段内容。与 .fadv（表单里的「高级选项」）
+   分开是因为分量不同：它是页面上的另一件事，不是上面那张表的续行，
+   所以要有一条明确的分界线，标题也用正文色而不是弱化色。 */
+.fold-section{margin-top:var(--s-4);padding-top:var(--s-3);border-top:1px solid var(--border)}
+.fold-section>summary{cursor:pointer;user-select:none;font:var(--t-body);color:var(--text)}
+.fold-section>summary:hover{color:var(--accent)}
+.fold-section>summary .sub{margin-left:var(--s-2);color:var(--text-muted);font:var(--t-sm)}

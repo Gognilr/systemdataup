@@ -402,12 +402,33 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
             var entries = PrecheckResultPayload.Entries(command.ResultPayload);
             if (entries.Count > 0)
             {
+                // 「这次没有新备份」不是故障，它是每天最常见的那个结果。
+                // 判据原先是 passed > 0，于是一个任务的单元全都没有新备份时整条指令判 failed，
+                // 执行记录里那一项跟着写成「指令failed：扫描完成：1 个业务单元，0 个有新备份」——
+                // 一句自相矛盾的话：扫描完成了，也没有任何东西出错。
+                //
+                // 更实际的代价是它把 SequentialExecutionWorker.ClassifyPrecheckAsync 里
+                // 那条「全部单元都没有新备份 → 成功，写『这次没有新备份』」整个绕开了：
+                // 指令一旦是终态失败，那边的判定在看清单之前就结束了。于是每天例行的
+                // 「今天没有新备份」在界面上一律显示成失败，人分不出哪次是真出了事。
+                //
+                // 分界线与 AgentPrecheckService 的告警分界线取同一条：
+                // passed / no_new_backup 之外才算没通过。两处对「这算不算故障」的定义
+                // 一旦分家，就会出现告警中心不报警、执行记录却写着失败这种没法排查的现象。
+                var noNewBackup = EnumMapping.ToSnakeCase(PrecheckStatus.NoNewBackup);
                 var passed = entries.Count(e => e.Status == PrecheckResultPayload.StatePassed);
-                command.Status = passed > 0 ? CommandStatus.Succeeded : CommandStatus.Failed;
+                var healthy = entries.Count(e =>
+                    e.Status == PrecheckResultPayload.StatePassed || e.Status == noNewBackup);
+
+                command.Status = healthy > 0 ? CommandStatus.Succeeded : CommandStatus.Failed;
                 command.ResultCode = Truncate(
                     passed > 0 ? PrecheckResultPayload.StatePassed : entries[0].Status, MaxResultCodeLength);
                 command.ResultMessage = Truncate(
-                    $"扫描完成：{entries.Count} 个业务单元，{passed} 个有新备份", MaxResultMessageLength);
+                    healthy == entries.Count
+                        ? $"扫描完成：{entries.Count} 个业务单元，{passed} 个有新备份"
+                        : $"扫描完成：{entries.Count} 个业务单元，{passed} 个有新备份，"
+                          + $"{entries.Count - healthy} 个没通过预检",
+                    MaxResultMessageLength);
             }
         }
 

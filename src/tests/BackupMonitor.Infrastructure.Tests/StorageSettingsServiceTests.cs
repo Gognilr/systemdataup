@@ -1,3 +1,7 @@
+using BackupMonitor.Core.Entities.Backup;
+using BackupMonitor.Core.Entities.Client;
+using BackupMonitor.Core.Entities.Upload;
+using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Exceptions;
@@ -47,9 +51,21 @@ public class StorageSettingsServiceTests : IDisposable
         using var connection = new NpgsqlConnection(_fixture.ConnectionString);
         connection.Open();
         using var command = new NpgsqlCommand(
-            "UPDATE system_settings SET setting_value = 'null'::jsonb WHERE setting_key IN ('repository_path', 'staging_path')",
+            "UPDATE system_settings SET setting_value = 'null'::jsonb WHERE setting_key IN ('repository_path', 'staging_path');"
+            // 并发上限的用例会把它改掉，收尾时放回 V030 的出厂值。
+            + "UPDATE system_settings SET setting_value = '4'::jsonb WHERE setting_key = 'max_concurrent_uploads_total'",
             connection);
         command.ExecuteNonQuery();
+
+        // 换根的守卫数的是全库还没结束的上传会话，而 postgres 集合里的各个测试类共用一个库，
+        // 前面的类留下的在传会话会让这里所有改路径的用例撞上 409。终结掉即可——
+        // 同集合内各类是顺序跑的，跑完的类不会再回头看这些行。不能 DELETE：
+        // 别人留下的会话下面可能还挂着分块，删父行会直接撞外键。
+        using var terminate = new NpgsqlCommand(
+            "UPDATE upload_sessions SET status = 'expired' WHERE status IN "
+            + "('created', 'waiting_permission', 'uploading', 'paused', 'retry_wait', 'received', 'verifying')",
+            connection);
+        terminate.ExecuteNonQuery();
     }
 
     /// <summary>
@@ -320,5 +336,157 @@ public class StorageSettingsServiceTests : IDisposable
         var same = Path.Combine(_tempRoot, "shared");
         await Assert.ThrowsAsync<ValidationFailedException>(() => service.UpdateAsync(
             new UpdateStorageSettingsRequest { RepositoryPath = same, StagingPath = same }));
+    }
+
+    /// <summary>
+    /// 有传输没结束时不许换根。
+    ///
+    /// 在传的会话把已收到的分块留在旧暂存根下，续传是按「暂存根 + 会话 ID」找回去的；
+    /// verifying 的那几条正被提交工作器从暂存往旧仓库根里搬。换根之后前者的断点在服务端
+    /// 已经不存在，后者的备份分在两个目录里——两种都是"界面写着成功、文件不在该在的地方"。
+    /// </summary>
+    [Fact]
+    public async Task 有传输没结束时_拒绝更换存储根()
+    {
+        ResetSettings();
+        await using var provider = BuildServices();
+        await SeedInFlightUploadAsync(provider, UploadStatus.Uploading);
+
+        using var scope = provider.CreateScope();
+        var service = scope.ServiceProvider.GetRequiredService<IStorageSettingsService>();
+
+        var ex = await Assert.ThrowsAsync<BusinessException>(() => service.UpdateAsync(
+            new UpdateStorageSettingsRequest { RepositoryPath = Path.Combine(_tempRoot, "repository") }));
+
+        Assert.Equal(409, ex.StatusCode);
+        Assert.Contains("传输", ex.Message);
+
+        // 拦下来就必须什么都没写：留下"仓库改了、暂存没改"才是最糟的结果。
+        var settings = await service.GetAsync();
+        Assert.Equal("default", settings.Repository.Source);
+        Assert.Equal(1, settings.InFlightUploads);
+    }
+
+    /// <summary>
+    /// verifying 同样要拦。它不占暂存写入（Active 口径里没有它），但提交工作器正拿着
+    /// 旧仓库根往里搬文件——只按"在传"判定的话，最危险的那一刻恰好是放行的。
+    /// </summary>
+    [Fact]
+    public async Task 正在入库的会话_同样拦住换根()
+    {
+        ResetSettings();
+        await using var provider = BuildServices();
+        await SeedInFlightUploadAsync(provider, UploadStatus.Verifying);
+
+        using var scope = provider.CreateScope();
+        var service = scope.ServiceProvider.GetRequiredService<IStorageSettingsService>();
+
+        var ex = await Assert.ThrowsAsync<BusinessException>(() => service.UpdateAsync(
+            new UpdateStorageSettingsRequest { StagingPath = Path.Combine(_tempRoot, "staging") }));
+
+        Assert.Equal(409, ex.StatusCode);
+    }
+
+    /// <summary>
+    /// 路径原样提交不算换根，必须放行——否则"只想把并发上限从 4 改成 2"这件事，
+    /// 在有传输的时候永远做不成，而那正是最想调它的时候。
+    /// </summary>
+    [Fact]
+    public async Task 有传输没结束时_路径不动仍可改并发上限()
+    {
+        ResetSettings();
+        await using var provider = BuildServices();
+
+        var repository = Path.Combine(_tempRoot, "repository");
+        var staging = Path.Combine(_tempRoot, "staging");
+        using (var setup = provider.CreateScope())
+        {
+            await setup.ServiceProvider.GetRequiredService<IStorageSettingsService>().UpdateAsync(
+                new UpdateStorageSettingsRequest { RepositoryPath = repository, StagingPath = staging });
+        }
+
+        await SeedInFlightUploadAsync(provider, UploadStatus.Uploading);
+
+        using var scope = provider.CreateScope();
+        var service = scope.ServiceProvider.GetRequiredService<IStorageSettingsService>();
+        var updated = await service.UpdateAsync(new UpdateStorageSettingsRequest
+        {
+            RepositoryPath = repository,
+            StagingPath = staging,
+            MaxConcurrentUploadsTotal = 2
+        });
+
+        Assert.Equal(2, updated.MaxConcurrentUploadsTotal);
+        Assert.Equal(repository, updated.Repository.EffectivePath);
+    }
+
+    /// <summary>
+    /// 一个还没结束的上传会话。会话行有外键，客户端/任务/候选备份集都得跟着建出来。
+    /// </summary>
+    private static async Task SeedInFlightUploadAsync(ServiceProvider provider, UploadStatus status)
+    {
+        using var scope = provider.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var now = DateTime.UtcNow;
+        var suffix = Guid.NewGuid().ToString("N");
+
+        var client = new Client
+        {
+            Id = Guid.NewGuid(),
+            MachineId = $"storage-{suffix}",
+            Hostname = $"storage-host-{suffix[..8]}",
+            DisplayName = $"存储设置测试客户端-{suffix[..8]}",
+            Status = ClientStatus.Online,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+        var task = new BackupTask
+        {
+            Id = Guid.NewGuid(),
+            ClientId = client.Id,
+            Name = $"storage-task-{suffix[..8]}",
+            ApplicationName = "StorageSettingsTest",
+            SourcePath = @"D:\data",
+            RecognizerType = RecognizerType.MultiFileSet,
+            TaskMode = TaskMode.Automatic,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+        var candidate = new CandidateBackupSet
+        {
+            Id = Guid.NewGuid(),
+            ClientId = client.Id,
+            TaskId = task.Id,
+            CandidateKey = $"storage-{suffix}",
+            SourceRoot = @"D:\data\2026",
+            DiscoveredAt = now,
+            PrecheckStatus = PrecheckStatus.Passed,
+            TotalFiles = 1,
+            TotalBytes = 1024,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+        var session = new UploadSession
+        {
+            Id = Guid.NewGuid(),
+            ClientId = client.Id,
+            TaskId = task.Id,
+            CandidateBackupSetId = candidate.Id,
+            Status = status,
+            TotalFiles = 1,
+            TotalBytes = 1024,
+            UploadedBytes = 512,
+            ChunkSizeBytes = 8 * 1024 * 1024,
+            StartedAt = now,
+            LastActivityAt = now,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+
+        db.Clients.Add(client);
+        db.BackupTasks.Add(task);
+        db.CandidateBackupSets.Add(candidate);
+        db.UploadSessions.Add(session);
+        await db.SaveChangesAsync();
     }
 }

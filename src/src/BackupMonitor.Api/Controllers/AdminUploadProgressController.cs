@@ -1,4 +1,4 @@
-using BackupMonitor.Infrastructure.Services;
+﻿using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.AspNetCore.Authorization;
@@ -30,6 +30,19 @@ public class AdminUploadProgressController : ApiBaseController
     public async Task<ActionResult<ApiResponse<IReadOnlyList<UploadProgressDto>>>> Active(CancellationToken ct)
     {
         var result = await _progress.GetActiveAsync(ct);
+        return OkData(result);
+    }
+
+    /// <summary>
+    /// 最近结束的传输。默认不在界面上展开——常态下人要看的是在传的那几条；
+    /// 但「昨晚那条为什么没传上去」只有这里答得上来。
+    /// </summary>
+    [HttpGet("finished")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.read")]
+    public async Task<ActionResult<ApiResponse<PagedResult<FinishedTransferDto>>>> Finished(
+        [FromQuery] PagedQuery query, CancellationToken ct)
+    {
+        var result = await _progress.GetRecentFinishedAsync(query, ct);
         return OkData(result);
     }
 

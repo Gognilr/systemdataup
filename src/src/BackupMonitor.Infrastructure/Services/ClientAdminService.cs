@@ -572,7 +572,10 @@ public class ClientAdminService : IClientAdminService
                 c.Hostname,
                 c.DisplayName,
                 c.Status,
-                c.LastHeartbeatAt
+                c.LastHeartbeatAt,
+                c.LastRemoteIp,
+                // 与列表页同一个用途：对端地址不是 IPv4 时，从自报网卡里挑一个能用的。
+                c.IpAddresses
             })
             .ToListAsync(ct);
 
@@ -623,6 +626,8 @@ public class ClientAdminService : IClientAdminService
                     DisplayName = c.DisplayName,
                     Status = EnumMapping.ToSnakeCase(c.Status),
                     LastHeartbeatAt = c.LastHeartbeatAt,
+                    LastRemoteIp = c.LastRemoteIp,
+                    Ipv4Address = ResolveIpv4(c.LastRemoteIp, c.IpAddresses),
                     CpuPercent = heartbeat?.CpuPercent,
                     MemoryPercent = heartbeat?.MemoryPercent,
                     MemoryTotalBytes = heartbeat?.MemoryTotalBytes,

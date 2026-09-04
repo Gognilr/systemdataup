@@ -1,5 +1,5 @@
 import { api } from '../api.js';
-import { $, esc, emptyState, fmtBytes, fmtDT, fmtRate, fmtDuration, relTime, status, tableHtml, clientName, xferBar } from '../ui.js';
+import { $, esc, emptyState, fmtBytes, fmtDT, fmtRate, fmtDuration, relTime, status, tableHtml, clientName, xferBar, ipCell } from '../ui.js';
 import { shell, loading } from '../app.js';
 
 const byValue = (items, value) => (items || []).find(item => item.value === value)?.count || 0;
@@ -141,6 +141,10 @@ function renderClientResources(rows) {
   return tableHtml(
     [
       { l: '客户端', render: r => `<a href="#/clients/${esc(r.id)}"><b>${esc(clientName(r))}</b></a><span class="sub mono">${esc(r.hostname)}</span>` },
+      // 看出「哪台吃紧」之后，下一步就是照着 IP 连过去看一眼。
+      // 复用客户端列表页那个单元格：同一台机器在两页上必须显示同一个地址，
+      // 连 title 里"这是对端地址还是自报网卡地址"的说明也一并沿用。
+      { l: 'IP', render: r => ipCell(r) },
       { l: '状态', render: r => status('client_status', r.status) },
       { l: 'CPU', render: r => `<span${warn(r.cpuPercent, 85)}>${pct(r.cpuPercent)}</span>` },
       { l: '内存', render: r => `<span${warn(r.memoryPercent, 90)}>${pct(r.memoryPercent)}</span>`

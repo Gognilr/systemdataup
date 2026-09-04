@@ -311,6 +311,20 @@ public class ClientResourceRowDto
     public string Status { get; set; } = null!;
     public DateTime? LastHeartbeatAt { get; set; }
 
+    /// <summary>
+    /// 服务端最近一次心跳观测到的对端 IP。与客户端列表页同源同口径——
+    /// 概览上看出"哪台吃紧"之后，下一步就是照着 IP 连过去看，
+    /// 为一个地址再跳一次客户端列表是没有道理的。
+    /// </summary>
+    public string? LastRemoteIp { get; set; }
+
+    /// <summary>
+    /// 这台机器"应该按哪个地址去找"的 IPv4（对端地址是 IPv4 就用它，否则回落到自报网卡里的第一个）。
+    /// 口径与 <see cref="ClientListItemDto.Ipv4Address"/> 完全一致：同一台机器在概览和客户端列表上
+    /// 显示两个不同的地址，比不显示更糟。
+    /// </summary>
+    public string? Ipv4Address { get; set; }
+
     public decimal? CpuPercent { get; set; }
     public decimal? MemoryPercent { get; set; }
     public long? MemoryTotalBytes { get; set; }

@@ -1,6 +1,7 @@
 ﻿using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
+using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.EntityFrameworkCore;
 
@@ -17,6 +18,16 @@ public interface IUploadProgressService
     /// 不显示的话，限流的表现就是「点了没反应」——那比不限流更糟。
     /// </summary>
     Task<UploadQueueStatusDto> GetQueueStatusAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// 最近结束的传输，最新的在前。
+    ///
+    /// 「传输中」只显示在途会话，传完就消失，于是没传成的那些（failed / cancelled /
+    /// expired）在界面上无处可查——它们不入备份集，也不在传输中。耗时、平均速度、
+    /// 重试次数同理：只有会话上才有，而它们正是判断链路好坏的依据。
+    /// </summary>
+    Task<PagedResult<FinishedTransferDto>> GetRecentFinishedAsync(
+        PagedQuery query, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -105,6 +116,87 @@ public class UploadProgressService : IUploadProgressService
             WaitingInRun = waitingInRun,
             GlobalLimit = globalLimit
         };
+    }
+
+    public async Task<PagedResult<FinishedTransferDto>> GetRecentFinishedAsync(
+        PagedQuery query, CancellationToken ct = default)
+    {
+        var sessions = _db.UploadSessions.AsNoTracking()
+            .Where(s => UploadSessionStatuses.Terminal.Contains(s.Status));
+
+        var total = await sessions.LongCountAsync(ct);
+
+        var rows = await sessions
+            // 按结束时刻排，不是创建时刻：人要看的是「最近发生了什么」。
+            // 终态会话理应都有 CompletedAt，早期数据里可能为空，用 CreatedAt 兜底，
+            // 否则那几条会永远沉在最后一页。
+            .OrderByDescending(s => s.CompletedAt ?? s.CreatedAt)
+            .Skip((query.Page - 1) * query.PageSize)
+            .Take(query.PageSize)
+            .Select(s => new
+            {
+                s.Id,
+                s.ClientId,
+                ClientDisplayName = s.Client.DisplayName,
+                s.TaskId,
+                TaskName = s.Task.Name,
+                BusinessUnitName = s.CandidateBackupSet.BusinessUnit != null
+                    ? s.CandidateBackupSet.BusinessUnit.DisplayName
+                    : null,
+                s.Status,
+                s.TotalFiles,
+                s.TotalBytes,
+                s.UploadedBytes,
+                s.RetryCount,
+                s.ErrorCode,
+                s.ErrorMessage,
+                s.StartedAt,
+                s.CompletedAt,
+                s.CreatedAt,
+                // 只认还活着的备份集。软删的行还在，把它算进来等于告诉人
+                // 「这次传输的成果还在」，而那份备份恰恰是刚被删掉的那一份。
+                BackupSetCode = _db.BackupSets
+                    .Where(b => b.UploadSessionId == s.Id && BackupSetStatuses.Live.Contains(b.Status))
+                    .Select(b => b.BackupSetCode)
+                    .FirstOrDefault()
+            })
+            .ToListAsync(ct);
+
+        var items = rows.Select(r =>
+        {
+            var since = r.StartedAt ?? r.CreatedAt;
+            var duration = r.CompletedAt is null ? (TimeSpan?)null : r.CompletedAt.Value - since;
+
+            // 耗时不足 1 秒时不给速度：几十毫秒的除数会算出一个荒唐的数，
+            // 而那种会话（比如幂等复用的）本来就没有「速度」可言。
+            long? average = duration is { TotalSeconds: >= 1 } && r.UploadedBytes > 0
+                ? (long)(r.UploadedBytes / duration.Value.TotalSeconds)
+                : null;
+
+            return new FinishedTransferDto
+            {
+                SessionId = r.Id,
+                ClientId = r.ClientId,
+                ClientDisplayName = r.ClientDisplayName,
+                TaskId = r.TaskId,
+                TaskName = r.TaskName,
+                BusinessUnitName = r.BusinessUnitName,
+                Status = EnumMapping.ToSnakeCase(r.Status),
+                TotalFiles = r.TotalFiles,
+                TotalBytes = r.TotalBytes,
+                UploadedBytes = r.UploadedBytes,
+                StartedAt = r.StartedAt,
+                CompletedAt = r.CompletedAt,
+                DurationSeconds = duration is null ? null : (long)Math.Max(0, duration.Value.TotalSeconds),
+                AverageBytesPerSecond = average,
+                RetryCount = r.RetryCount,
+                ErrorCode = r.ErrorCode,
+                ErrorMessage = r.ErrorMessage,
+                BackupSetCode = r.BackupSetCode
+            };
+        }).ToList();
+
+        return PagedResult<FinishedTransferDto>.Create(items, total, query.Page, query.PageSize);
     }
 
     public async Task<IReadOnlyList<UploadProgressDto>> GetActiveAsync(CancellationToken ct = default)

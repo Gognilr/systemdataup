@@ -27,12 +27,19 @@ async function render() {
   try {
     const s = await api('/api/v1/admin/storage-settings');
     serverHostname = s.serverHostname || '';
+    // 有传输没结束时两个目录不能改（服务端同样会拒绝）。锁在输入框上而不是等点保存再报错：
+    // 目录是要一层层浏览着挑出来的，挑完一整轮再被告知"现在不能改"，那一轮就白做了。
+    const locked = (s.inFlightUploads || 0) > 0;
     body.innerHTML = `<div class="card">
       <p class="text-muted">备份文件最终存放在「备份存放目录」下，按 <code>主机名\\任务名\\备份时间</code> 分层，每份备份带一个 <code>manifest.json</code> 文件清单。上传过程中的分块先落在「上传暂存目录」，校验通过后才搬进正式目录，因此两个目录建议放在不同磁盘。</p>
       <div class="notice">这里的路径都是<strong>服务端 ${esc(serverHostname || '本机')}</strong> 上的目录，不是你当前这台电脑的。从别的电脑打开管理页面时，「浏览…」列出的同样是服务器上的磁盘。</div>
 
-      ${pathBlock('repo', '备份存放目录', s.repository, 'D:\\BackupRepository', '备份最终存这里。改完之后，新备份写入新目录，已经入库的备份仍留在原来的位置，不会被移动，也不会丢。')}
-      ${pathBlock('stage', '上传暂存目录', s.staging, 'D:\\BackupStaging', '只放上传过程中的临时分块，提交后自动清理。要留出足够空间容纳单份最大的备份。')}
+      ${locked
+        ? `<div class="notice warning">当前有 ${esc(s.inFlightUploads)} 个传输还没结束，两个目录暂时不能改：正在传的备份是按现在的暂存目录找断点续传的，已经传完、正在入库的那几份也正往现在的备份目录里搬——这时候换目录，它们会找不到已经传上来的数据。到<a href="#/transfers">「传输中」</a>页面等它们跑完，或者在那里把它们取消掉，再回来改。下面的「同时上传的备份数上限」不受影响，随时可以改。</div>`
+        : ''}
+
+      ${pathBlock('repo', '备份存放目录', s.repository, 'D:\\BackupRepository', '备份最终存这里。改完之后，新备份写入新目录，已经入库的备份仍留在原来的位置，不会被移动，也不会丢。', locked)}
+      ${pathBlock('stage', '上传暂存目录', s.staging, 'D:\\BackupStaging', '只放上传过程中的临时分块，提交后自动清理。要留出足够空间容纳单份最大的备份。', locked)}
 
       ${uploadLimitBlock(s)}
 
@@ -79,7 +86,7 @@ function uploadLimitBlock(s) {
 /* 一个存储根的展示块：当前生效值 + 磁盘余量 + 可写性 + 输入框 + 浏览按钮。
    输入框故意不回填"生效路径"，只回填管理员显式配过的值——
    否则清空配置（回落到默认）这件事就没法在界面上表达了。 */
-function pathBlock(id, title, p, placeholder, note) {
+function pathBlock(id, title, p, placeholder, note, locked) {
   const disk = p.freeBytes != null && p.totalBytes != null
     ? `剩余 ${fmtBytes(p.freeBytes)} / 共 ${fmtBytes(p.totalBytes)}`
     : '容量未知';
@@ -95,10 +102,10 @@ function pathBlock(id, title, p, placeholder, note) {
     </dl>
     <div class="frow"><label>${esc(title)}</label>
       <div class="storage-path-input">
-        <input id="st_${id}" class="mono" value="${esc(p.configuredPath || '')}" placeholder="${esc(placeholder)}">
-        <button class="small" data-pick="st_${id}" data-title="${esc(title)}">浏览…</button>
+        <input id="st_${id}" class="mono" value="${esc(p.configuredPath || '')}" placeholder="${esc(placeholder)}"${locked ? ' disabled' : ''}>
+        <button class="small" data-pick="st_${id}" data-title="${esc(title)}"${locked ? ' disabled' : ''}>浏览…</button>
       </div>
-      <div class="hint">${esc(note)}</div>
+      <div class="hint">${esc(note)}${locked ? '<strong>有传输没结束，暂时不能改。</strong>' : ''}</div>
     </div>`;
 }
 

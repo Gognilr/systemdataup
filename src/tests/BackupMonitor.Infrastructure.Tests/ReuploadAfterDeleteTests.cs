@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -33,6 +33,16 @@ public class ReuploadAfterDeleteTests : IDisposable
     private const int ChunkSize = 16;
 
     private readonly PostgresDatabaseFixture _fixture;
+
+    /// <summary>
+    /// 同一个候选键 = 同一份备份被反复扫到；Agent 也拿它当建会话的幂等键。
+    ///
+    /// 每个测试实例各取一个，不能写成常量：upload_sessions 的幂等键是**全库唯一**的
+    /// （uq_upload_sessions_idempotency，不按客户端分），同一个 fixture 里的用例
+    /// 用同一个键就会互相撞成 23505，而那与被测的缺陷毫无关系。
+    /// </summary>
+    private readonly string _candidateKey = $"ru-candidate-{Guid.NewGuid():N}";
+
     private readonly string _stagingRoot;
     private readonly string _repositoryRoot;
 
@@ -168,7 +178,7 @@ public class ReuploadAfterDeleteTests : IDisposable
 
     // ---------- 链条的三步 ----------
 
-    private static async Task<Guid> PrecheckAsync(
+    private async Task<Guid> PrecheckAsync(
         ServiceProvider sp, Guid clientId, Guid taskId, List<PrecheckFileDto> files)
     {
         await using var scope = sp.CreateAsyncScope();
@@ -178,7 +188,17 @@ public class ReuploadAfterDeleteTests : IDisposable
         return response.CandidateBackupSetId!.Value;
     }
 
-    private static async Task<Guid> CreateSessionAsync(
+    /// <summary>
+    /// 幂等键必须带上，而且两次用的是同一个——真实 Agent 就是这么发的
+    /// （AgentWorker.CreateUploadSessionAsync：IdempotencyKey = candidate.CandidateKey，
+    /// 候选键由源文件内容决定，源文件不变它就不变）。
+    ///
+    /// 这一条原先不带键，于是这整条「删了就再也备不回来」的链漏掉了第五道闸：
+    /// 幂等分支只看会话状态，把那个 committed 的空壳原样交回，Agent 一个字节都不传
+    /// 就回 UPLOAD_ACCEPTED。现场（2026-09-04 删光备份集后重跑计划）三个任务
+    /// 全部显示「备份已入库」，而仓库目录里什么都没有——测试全绿，故障照发。
+    /// </summary>
+    private async Task<Guid> CreateSessionAsync(
         ServiceProvider sp, Guid clientId, Guid candidateId, List<PrecheckFileDto> files)
     {
         await using var scope = sp.CreateAsyncScope();
@@ -188,7 +208,8 @@ public class ReuploadAfterDeleteTests : IDisposable
             CandidateBackupSetId = candidateId,
             TotalFiles = files.Count,
             TotalBytes = files.Sum(f => f.SizeBytes),
-            ChunkSizeBytes = ChunkSize
+            ChunkSizeBytes = ChunkSize,
+            IdempotencyKey = _candidateKey
         });
         return created.UploadSessionId;
     }
@@ -320,9 +341,10 @@ public class ReuploadAfterDeleteTests : IDisposable
             Sha256 = Hex(SHA256.HashData(Encoding.UTF8.GetBytes($"{f.Path}:{f.Size}")))
         }).ToList();
 
-    private static SubmitPrecheckResultRequest PassedRequest(List<PrecheckFileDto> files) => new()
+
+    private SubmitPrecheckResultRequest PassedRequest(List<PrecheckFileDto> files) => new()
     {
-        CandidateKey = "ru-candidate",   // 同一个候选键 = 同一份备份被反复扫到
+        CandidateKey = _candidateKey,
         SourceRoot = @"D:\Seeyon\A6\Backup\2026",
         PrecheckStatus = "passed",
         TotalFiles = files.Count,

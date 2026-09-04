@@ -38,6 +38,13 @@ public class StorageSettingsDto
     /// 要跟当前实际并发摆在一起，才知道是「一直顶着上限」还是「从来没到过」。
     /// </summary>
     public int ActiveUploads { get; set; }
+
+    /// <summary>
+    /// 还没结束的上传会话数（口径同「传输中」页面）。大于 0 时服务端拒绝更换存储根：
+    /// 在传的会话按旧暂存根找断点，正在提交的那几条正往旧仓库根里搬。
+    /// 界面据此把两个路径输入框锁上，而不是等人填完点了保存再报错。
+    /// </summary>
+    public int InFlightUploads { get; set; }
 }
 
 /// <summary>单个存储根的当前状态</summary>

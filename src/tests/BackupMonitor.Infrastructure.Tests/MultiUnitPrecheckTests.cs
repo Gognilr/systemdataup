@@ -184,8 +184,21 @@ public class MultiUnitPrecheckTests : IAsyncLifetime
         Assert.Equal(2, ParseCandidates(command.ResultPayload).Count);   // 清单不能被完成上报抹掉
     }
 
+    /// <summary>
+    /// 全部单元都没有新备份 = 正常结束，不是失败。
+    ///
+    /// 这一条原先断言的是 Failed——名字说「不当成故障」，断言却把指令判成失败，
+    /// 自相矛盾的地方就是缺陷本身。现场（2026-09-04 15:06 瑞来_大宗物料）的表现是
+    /// 执行记录里写着「指令failed：扫描完成：1 个业务单元，0 个有新备份」：
+    /// 扫描完成了，也没有任何东西出错，而每天例行的这个结果一律显示成失败，
+    /// 人于是分不出哪一次是真出了事。
+    ///
+    /// 附带的代价更隐蔽：指令一旦是终态失败，SequentialExecutionWorker 的判定
+    /// 在看清单之前就走了「指令死了」那条分支，ClassifyPrecheckAsync 里
+    /// 「全部单元都没有新备份 → 成功，写『这次没有新备份』」那条路永远到不了。
+    /// </summary>
     [Fact]
-    public async Task 全部单元都没有新备份时不当成故障报警()
+    public async Task 全部单元都没有新备份时算正常结束而不是失败()
     {
         var (clientId, taskId) = await SeedClientTaskAsync();
         var commandId = await SeedPrecheckCommandAsync(clientId, taskId);
@@ -198,8 +211,10 @@ public class MultiUnitPrecheckTests : IAsyncLifetime
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
         var command = await db.Commands.AsNoTracking().FirstAsync(c => c.Id == commandId);
-        Assert.Equal(CommandStatus.Failed, command.Status);
+        Assert.Equal(CommandStatus.Succeeded, command.Status);
+        // 结论仍然如实写着「这次什么都没有」，成功指的是这次扫描本身没出事
         Assert.Equal("no_new_backup", command.ResultCode);
+        Assert.Equal("扫描完成：2 个业务单元，0 个有新备份", command.ResultMessage);
 
         // 「今天还没产生新备份」是最常见的正常结局，报成故障等于每天造一批假告警
         var raised = await db.Alerts.AsNoTracking()
@@ -207,10 +222,58 @@ public class MultiUnitPrecheckTests : IAsyncLifetime
         Assert.Equal(0, raised);
     }
 
+    /// <summary>
+    /// 真的没通过预检（大小异常之类）才判指令失败——把这条一起钉住，
+    /// 否则上面那条修完之后很容易滑向「预检永远成功」，那是更糟的谎话。
+    /// </summary>
+    [Fact]
+    public async Task 全部单元都没通过预检时仍然判指令失败()
+    {
+        var (clientId, taskId) = await SeedClientTaskAsync();
+        var commandId = await SeedPrecheckCommandAsync(clientId, taskId);
+
+        await SubmitAsync(clientId, taskId, commandId, "ZT001", passed: false, status: "size_abnormal");
+        await SubmitAsync(clientId, taskId, commandId, "ZT201-ZT216", passed: false, status: "size_abnormal");
+        await CompleteAsync(clientId, commandId);
+
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var command = await db.Commands.AsNoTracking().FirstAsync(c => c.Id == commandId);
+
+        Assert.Equal(CommandStatus.Failed, command.Status);
+        Assert.Equal("size_abnormal", command.ResultCode);
+        Assert.Contains("2 个没通过预检", command.ResultMessage);
+    }
+
+    /// <summary>
+    /// 一部分单元没通过、另一部分正常时，整条指令不算失败：
+    /// 判失败会让执行记录走「指令死了」那条分支，把另外那些单元的上传结论一并埋掉。
+    /// 没通过的那几个由 size_abnormal / precheck_failed 告警各自报出去。
+    /// </summary>
+    [Fact]
+    public async Task 部分单元没通过时指令不判失败()
+    {
+        var (clientId, taskId) = await SeedClientTaskAsync();
+        var commandId = await SeedPrecheckCommandAsync(clientId, taskId);
+
+        await SubmitAsync(clientId, taskId, commandId, "ZT001", passed: false, status: "size_abnormal");
+        await SubmitAsync(clientId, taskId, commandId, "ZT201-ZT216", passed: true);
+        await CompleteAsync(clientId, commandId);
+
+        await using var scope = _services.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var command = await db.Commands.AsNoTracking().FirstAsync(c => c.Id == commandId);
+
+        Assert.Equal(CommandStatus.Succeeded, command.Status);
+        Assert.Equal("passed", command.ResultCode);
+        Assert.Contains("1 个没通过预检", command.ResultMessage);
+    }
+
     // ---------- 基础设施 ----------
 
+    /// <summary><paramref name="status"/> 只在 <paramref name="passed"/> 为 false 时生效，默认 no_new_backup。</summary>
     private async Task<SubmitPrecheckResultResponse> SubmitAsync(
-        Guid clientId, Guid taskId, Guid commandId, string unit, bool passed)
+        Guid clientId, Guid taskId, Guid commandId, string unit, bool passed, string status = "no_new_backup")
     {
         await using var scope = _services.CreateAsyncScope();
         var precheck = scope.ServiceProvider.GetRequiredService<IAgentPrecheckService>();
@@ -221,11 +284,13 @@ public class MultiUnitPrecheckTests : IAsyncLifetime
             return await precheck.SubmitResultAsync(clientId, taskId, new SubmitPrecheckResultRequest
             {
                 CommandId = commandId,
-                CandidateKey = $"{taskId:N}:{unit}:no_new_backup:{root}",
+                CandidateKey = $"{taskId:N}:{unit}:{status}:{root}",
                 SourceRoot = root,
-                PrecheckStatus = "no_new_backup",
-                FailureCode = "NO_NEW_BACKUP",
-                FailureMessage = "快速指纹与上一次候选一致，未发现新的备份",
+                PrecheckStatus = status,
+                FailureCode = status.ToUpperInvariant(),
+                FailureMessage = status == "no_new_backup"
+                    ? "快速指纹与上一次候选一致，未发现新的备份"
+                    : "备份大小超出设定范围",
                 BusinessUnit = new PrecheckBusinessUnitDto { ExternalKey = unit, DisplayName = unit }
             });
         }
