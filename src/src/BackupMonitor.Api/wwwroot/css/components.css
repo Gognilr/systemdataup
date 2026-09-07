@@ -20,6 +20,9 @@ td .sub{display:block;color:var(--text-muted);font:var(--t-sm)}
 td,.stat .n,.pager{font-variant-numeric:tabular-nums}
 .mono,pre.json{font-family:var(--font-mono)}
 .mono{font-size:12px}
+/* 数字后面的单位（实施方案 U3）：降一号字、次要色、常规字重。
+   量级是要一眼读到的那个信息，单位只是把它说完整。 */
+.unit{margin-left:.25em;font-size:.82em;font-weight:400;color:var(--text-muted)}
 th.sortable{cursor:pointer;user-select:none}
 th.sortable:hover{color:var(--text)}
 th .sarrow{font-size:10px;margin-left:var(--s-1)}
@@ -207,6 +210,10 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
 .dashboard-statusbar .status-meta{display:flex;gap:var(--s-3);flex-wrap:wrap;color:var(--text-muted);font:var(--t-sm)}
 .dashboard-statusbar .status-mark{font-size:18px;color:var(--ok-fg)}
 .dashboard-statusbar.has-work .status-mark{color:var(--err-fg)}
+/* 数据新鲜度（实施方案 W5）：常态是最不起眼的一项，推到最右；
+   过期时才变告警色——「数据有多旧」平时不该抢注意力，出问题时必须抢。 */
+.dashboard-statusbar .freshness{margin-left:auto;white-space:nowrap;font-variant-numeric:tabular-nums}
+.dashboard-statusbar .freshness.is-stale{color:var(--warn-fg);font-weight:600}
 .dashboard-columns{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr);gap:var(--s-4)}
 .dashboard-section-head{display:flex;align-items:baseline;justify-content:space-between;gap:var(--s-3);margin-bottom:var(--s-3)}
 .dashboard-section-head h2{margin:0;font:600 var(--t-md)}
@@ -481,7 +488,17 @@ tr.kbd-focus td:first-child{box-shadow:inset 2px 0 0 var(--accent)}
    与 .capacity-meter 同一套视觉，但要窄一格：它在表格行里，不能把行高撑起来。
    卡住的那条换成警告色而不是加动画——动画会让"没在动"看起来像"在动"。 */
 .xfer-bar{height:6px;border-radius:99px;background:var(--surface-sunk);overflow:hidden;min-width:120px;margin-bottom:2px}
-.xfer-bar span{display:block;height:100%;background:var(--accent);border-radius:inherit;transition:width .4s ease}
+/* 过渡时长按轮询节奏给（实施方案 W3）：轮询是 5 秒一次，
+   0.4 秒的缓动会让进度条「跳完再等 4.6 秒」，观感上仍然是一顿一顿的。
+   1.2 秒接近连续。不做速率插值——那是在界面上编造没有采样到的数据。 */
+.xfer-bar span{display:block;height:100%;background:var(--accent);border-radius:inherit;transition:width 1.2s cubic-bezier(.4,0,.2,1)}
+
+/* 速率走势线（实施方案 U1）：跟在速度数字下面，右对齐到数字列。 */
+.spark{display:block;margin-left:auto;overflow:visible}
+.spark polyline{fill:none;stroke:var(--accent);stroke-width:1.25;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke}
+/* 卡住的那一行整行变告警色，走势线跟着变——同一个事实不该由两种颜色说。 */
+tr:has(.cell-warn) .spark polyline{stroke:var(--warn-fg)}
+.spark-empty{display:block;color:var(--text-faint);font:var(--t-micro)}
 .xfer-bar.is-stalled span{background:var(--warn)}
 
 /* ── 备份计划的任务编组器 ──

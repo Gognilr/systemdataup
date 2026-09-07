@@ -1,6 +1,15 @@
 import { api } from '../api.js';
-import { $, esc, emptyState, fmtBytes, fmtDT, fmtRate, fmtDuration, relTime, status, tableHtml, clientName, xferBar, ipCell } from '../ui.js';
-import { shell, loading } from '../app.js';
+import { App, LOADERS } from '../state.js';
+import { $, esc, emptyState, fmtBytes, fmtBytesHtml, fmtDT, fmtRate, fmtDuration, relTime, status, tableHtml, clientName, xferBar, ipCell } from '../ui.js';
+import { shell, loading, schedulePoll } from '../app.js';
+
+/* 概览是「值守」组的落地页，上面还挂着「正在传输」，此前却一个定时器都没有——
+   打开那一刻的快照会一直挂到手动刷新，而界面上没有任何地方说明数据截止到什么时候。
+   一个挂在墙上显示器的概览页，和一个刚打开的，长得一模一样（实施方案 W5）。
+
+   20 秒：概览上唯一会快速变的是「正在传输」，而真要盯传输的人会去传输页；
+   20 秒足够让待办数、在线数、最近入库时间保持有意义。 */
+const POLL_MS = 20000;
 
 const byValue = (items, value) => (items || []).find(item => item.value === value)?.count || 0;
 
@@ -118,7 +127,7 @@ function renderCapacity(capacity, totalBytes, dailyUploads) {
   const diskText = total ? `磁盘可用 ${fmtBytes(free)} / ${fmtBytes(total)}` : '磁盘容量暂不可用';
   const fullText = cap.estimatedFullAt ? `按近 14 天写入速度预计 ${fmtDT(cap.estimatedFullAt)} 写满` : '写满时间需要更多历史写入数据';
   return `<div class="capacity-card">
-    <div class="capacity-stat"><strong>${fmtBytes(repository)}</strong><span>已入库仓库数据<br>${esc(diskText)}</span></div>
+    <div class="capacity-stat"><strong>${fmtBytesHtml(repository)}</strong><span>已入库仓库数据<br>${esc(diskText)}</span></div>
     <div class="capacity-meter" aria-label="仓库数据占磁盘容量 ${usedPercent.toFixed(1)}%"><span style="width:${usedPercent.toFixed(1)}%"></span></div>
     <div class="text-muted">${esc(fullText)}</div>
     <div class="dashboard-section-head"><h2>入库趋势</h2><small>最近 14 天</small></div>
@@ -187,18 +196,28 @@ function renderTransfers(rows) {
 
 export async function vDashboard() {
   $('#app').innerHTML = shell('overview', '概览', loading());
+  await LOADERS.overview();
+}
+
+LOADERS.overview = async function () {
   try {
     // alert-summary 与 restore-requests?status=ready 此前只是为了在浏览器里凑待办计数，
     // 待办改读服务端聚合后这两次往返都不再需要，首屏少两次请求。
-    const [clientSummary, backupSummary, taskSummary, todoSummary] = await Promise.all([
-      api('/api/v1/admin/reports/client-summary'),
-      api('/api/v1/admin/reports/backup-summary'),
-      api('/api/v1/admin/reports/task-summary'),
-      api('/api/v1/admin/reports/todo-summary')
-    ]);
-    // 资源列表失败不该把整个概览拖垮——它是附加视图，不是概览的前提。
-    const clientResources = await api('/api/v1/admin/clients/resource-overview?limit=50').catch(() => []);
-    const transfers = (await api('/api/v1/admin/upload-sessions/active').catch(() => [])) || [];
+    //
+    // 六个一起发（实施方案 W2）。后两个原先串在 Promise.all 之后 await，
+    // 首屏因此是三波串行往返；而它们各自带着 .catch —— 那正说明它们是
+    // 「失败不阻断」的附加信息，本来就不该排在关键路径后面等。
+    const [clientSummary, backupSummary, taskSummary, todoSummary, clientResources, rawTransfers] =
+      await Promise.all([
+        api('/api/v1/admin/reports/client-summary'),
+        api('/api/v1/admin/reports/backup-summary'),
+        api('/api/v1/admin/reports/task-summary'),
+        api('/api/v1/admin/reports/todo-summary'),
+        // 资源列表失败不该把整个概览拖垮——它是附加视图，不是概览的前提。
+        api('/api/v1/admin/clients/resource-overview?limit=50').catch(() => []),
+        api('/api/v1/admin/upload-sessions/active').catch(() => [])
+      ]);
+    const transfers = rawTransfers || [];
     // 横幅上的「N 项需要关注」与待办页横幅同源，两边不会再各报各的数。
     const todoCount = todoTotal(todoSummary);
     const online = byValue(clientSummary.byStatus, 'online');
@@ -207,7 +226,7 @@ export async function vDashboard() {
 
     $('#view').innerHTML = `<div class="dashboard-statusbar${todoCount ? ' has-work' : ''}" role="status">
       <span class="status-mark" aria-hidden="true">${todoCount ? '!' : '✓'}</span><strong class="status-title">${todoCount ? `${todoCount} 项需要关注` : '一切正常'}</strong>
-      <span class="status-meta"><span>${esc(online)} 台在线${offline ? ` · ${esc(offline)} 台离线或疑似离线` : ''}</span><span>${esc(lastUpload)}</span><span>${esc(taskSummary.totalTasks || 0)} 个备份任务</span></span>
+      <span class="status-meta"><span>${esc(online)} 台在线${offline ? ` · ${esc(offline)} 台离线或疑似离线` : ''}</span><span>${esc(lastUpload)}</span><span>${esc(taskSummary.totalTasks || 0)} 个备份任务</span>${freshnessHtml()}</span>
     </div>
     ${renderTransfers(transfers)}
     <div class="dashboard-columns">
@@ -216,7 +235,58 @@ export async function vDashboard() {
     </div>
     <section class="card"><div class="dashboard-section-head"><h2>客户端资源</h2><small>最近一次心跳 · 告警与内存吃紧的排前</small></div>${renderClientResources(clientResources)}</section>
     <section class="card"><div class="dashboard-section-head"><h2>备份时序</h2><small>最近 14 天 · 任务按异常优先</small></div>${renderMatrix(taskSummary)}</section>`;
+
+    startFreshnessTicker();
+    schedulePoll('overview', LOADERS.overview, POLL_MS);
   } catch (e) {
+    // 刷新失败**不清空已有内容**：上一次的数字仍然比一屏错误信息有用。
+    // 只把新鲜度标成告警色——数据变旧本身就是需要被看见的状态。
+    // 首屏就失败时没有「已有内容」可留，那时才整屏报错。
+    if ($('#view') && $('#view').querySelector('.dashboard-statusbar')) {
+      markStale();
+      schedulePoll('overview', LOADERS.overview, POLL_MS);
+      return;
+    }
     $('#view').innerHTML = `<div class="empty"><span class="e-glyph" aria-hidden="true">!</span><div class="e-title">概览加载失败</div><div class="e-sub">${esc(e.message)}</div></div>`;
   }
+};
+
+/* ── 数据新鲜度（实施方案 W5）───────────────────────────────────────────────
+
+   仪表要自己声明数据有多旧。挂在墙上显示器的概览页和刚打开的那个，
+   在此之前长得一模一样——而「这个数字是十分钟前的」恰恰是判断要不要相信它的前提。
+
+   秒数由一个 1 秒的计时器只更新那一个文本节点，不触发任何重排。 */
+function freshnessHtml() {
+  App.overviewFetchedAt = Date.now();
+  const t = new Date(App.overviewFetchedAt);
+  const p = x => String(x).padStart(2, '0');
+  return `<span class="freshness" id="freshness">`
+    + `<time datetime="${t.toISOString()}">更新于 ${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}</time>`
+    + ` · <span id="freshAge">刚刚</span></span>`;
+}
+
+function ageText(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 5) return '刚刚';
+  if (s < 60) return `${s} 秒前`;
+  const m = Math.round(s / 60);
+  return m < 60 ? `${m} 分钟前` : `${Math.round(m / 60)} 小时前`;
+}
+
+function markStale() {
+  document.getElementById('freshness')?.classList.add('is-stale');
+}
+
+function startFreshnessTicker() {
+  clearInterval(App.freshnessTimer);
+  App.freshnessTimer = setInterval(() => {
+    const el = document.getElementById('freshAge');
+    // 概览已经不在屏幕上了（切页/重渲染），计时器自己收摊。
+    if (!el) { clearInterval(App.freshnessTimer); App.freshnessTimer = null; return; }
+    const age = Date.now() - (App.overviewFetchedAt || Date.now());
+    el.textContent = ageText(age);
+    // 超过三倍轮询间隔还没刷新成功，说明确实出问题了，不能再让它看起来是新鲜的。
+    if (age > POLL_MS * 3) markStale();
+  }, 1000);
 }

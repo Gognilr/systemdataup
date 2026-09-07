@@ -65,6 +65,9 @@ public class BackupTaskConfiguration : IEntityTypeConfiguration<BackupTask>
         builder.Property(e => e.MinFileCount).HasColumnName("min_file_count");
         builder.Property(e => e.BandwidthLimitKbps).HasColumnName("bandwidth_limit_kbps");
         builder.Property(e => e.ChunkSizeBytes).HasColumnName("chunk_size_bytes").HasDefaultValue(8388608);
+        builder.Property(e => e.MaxParallelChunks).HasColumnName("max_parallel_chunks").HasDefaultValue(4);
+        builder.Property(e => e.MaxParallelFiles).HasColumnName("max_parallel_files").HasDefaultValue(3);
+        builder.Property(e => e.MaxParallelHashes).HasColumnName("max_parallel_hashes").HasDefaultValue(3);
         builder.Property(e => e.RetryCount).HasColumnName("retry_count").HasDefaultValue(3);
         builder.Property(e => e.RetryIntervalSeconds).HasColumnName("retry_interval_seconds").HasDefaultValue(1800);
         builder.Property(e => e.RetentionPolicyId).HasColumnName("retention_policy_id");

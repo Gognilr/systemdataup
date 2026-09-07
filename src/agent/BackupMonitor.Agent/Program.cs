@@ -17,7 +17,13 @@ builder.Services.AddSingleton<BackupMonitor.Agent.AgentCandidateFileStore>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentApiClient>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentSignatureVerifier>();
 builder.Services.AddSingleton<BackupMonitor.Agent.SystemProbe>();
-builder.Services.AddSingleton<BackupMonitor.Agent.BackupScanner>();
+builder.Services.AddSingleton<BackupMonitor.Agent.AgentFileHashCache>();
+// BackupScanner 的哈希缓存与并发度是可选构造参数（默认值即「关掉缓存、3 路并发」），
+// 这里显式装配，好让配置里的 MaxParallelHashes 真的生效。
+builder.Services.AddSingleton(sp => new BackupMonitor.Agent.BackupScanner(
+    sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<BackupMonitor.Agent.BackupScanner>>(),
+    sp.GetRequiredService<BackupMonitor.Agent.AgentFileHashCache>(),
+    sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<BackupMonitor.Agent.AgentOptions>>().Value.MaxParallelHashes));
 builder.Services.AddSingleton<BackupMonitor.Agent.DirectoryBrowser>();
 builder.Services.AddSingleton<BackupMonitor.Agent.BackupDirectoryProber>();
 builder.Services.AddSingleton<BackupMonitor.Agent.InstalledServiceProbe>();

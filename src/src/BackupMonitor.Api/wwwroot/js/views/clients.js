@@ -7,7 +7,7 @@ import {
   toast, errToast, confirmModal, formModal, openModal, closeModal, clientName,
   clientCaps, actBtn, actMenu, runtimeBadge, ipCell, ipDetailRows
 } from '../ui.js';
-import { shell, loading } from '../app.js';
+import { shell, loading, schedulePoll } from '../app.js';
 import { renderClientRuntimeDetail } from './client-runtime.js';
 
 export async function vClients() {
@@ -260,7 +260,7 @@ LOADERS.clients = async function () {
     // 那几个因此变灰的按钮也就一直灰着，人只能猜要不要手动刷。
     // 只在真有机器在干活时才轮询；route() 切页时会 clearTimeout(App.timer)。
     if (data.items.some(r => r.runtimeState && r.runtimeState !== 'idle'))
-      App.timer = setTimeout(() => { if (location.hash === '#/clients') LOADERS.clients(); }, 8000);
+      schedulePoll('clients', LOADERS.clients, 8000);
   } catch (e) { wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 };
 
@@ -526,7 +526,9 @@ export async function vClientDetail(id) {
     $('#view').innerHTML = renderClientRuntimeDetail(detail, history);
     // 同列表：正在干活时才轮询，让"上传中"和跟着它变灰的按钮自己走完。
     if (detail.runtimeState && detail.runtimeState !== 'idle')
-      App.timer = setTimeout(() => {
+      schedulePoll('clients', () => {
+        // 详情页的路由是 #/clients/<id>，schedulePoll 只比对第一段，
+        // 这里再确认一次是不是还停在同一台机器上。
         if (location.hash === '#/clients/' + id) vClientDetail(id);
       }, 10000);
   } catch (e) {

@@ -67,6 +67,19 @@ public class BackupTaskService : IBackupTaskService
 
     private static readonly Func<IQueryable<BackupTask>, bool, IQueryable<BackupTask>> TaskSortFallback =
         SortWhitelist.By<BackupTask, DateTime>(t => t.CreatedAt);
+    /// <summary>
+    /// 三个传输并发度打成一个参数，而不是往 ApplyEditableFields 那条已经很长的参数表里
+    /// 再塞三个 int——相邻的同类型参数越多，调用点写错顺序的概率越大，
+    /// 而写错的表现是「传得莫名其妙地慢」，没有任何报错。
+    /// </summary>
+    private readonly record struct TaskParallelism(int Chunks, int Files, int Hashes);
+
+    /// <summary>并发度取值范围（实施方案 T7）。与 V035 的 CHECK 约束、客户端的 Math.Clamp 三处保持一致。</summary>
+    private const int MinParallelChunks = 1;
+    private const int MaxParallelChunks = 16;
+    private const int MinParallelFiles = 1;
+    private const int MaxParallelFiles = 8;
+
     private const int MinChunkSize = 4 * 1024 * 1024;   // 4MB（设计书 7.2）
     private const int MaxChunkSize = 32 * 1024 * 1024;  // 32MB
 
@@ -141,6 +154,7 @@ public class BackupTaskService : IBackupTaskService
             request.ScheduleTimezone, request.RandomDelayMinutes, request.StabilityIntervalSeconds,
             request.MaxStabilityWaitSeconds, request.MinTotalBytes, request.MaxTotalBytes,
             request.MinFileCount, request.BandwidthLimitKbps, request.ChunkSizeBytes,
+            new TaskParallelism(request.MaxParallelChunks, request.MaxParallelFiles, request.MaxParallelHashes),
             request.RetryCount, request.RetryIntervalSeconds, request.RetentionPolicyId,
             request.RecognizerConfig, request.AlertConfig);
 
@@ -183,6 +197,7 @@ public class BackupTaskService : IBackupTaskService
             request.ScheduleTimezone, request.RandomDelayMinutes, request.StabilityIntervalSeconds,
             request.MaxStabilityWaitSeconds, request.MinTotalBytes, request.MaxTotalBytes,
             request.MinFileCount, request.BandwidthLimitKbps, request.ChunkSizeBytes,
+            new TaskParallelism(request.MaxParallelChunks, request.MaxParallelFiles, request.MaxParallelHashes),
             request.RetryCount, request.RetryIntervalSeconds, request.RetentionPolicyId,
             request.RecognizerConfig, request.AlertConfig);
 
@@ -630,6 +645,9 @@ public class BackupTaskService : IBackupTaskService
             MinFileCount = task.MinFileCount,
             BandwidthLimitKbps = task.BandwidthLimitKbps,
             ChunkSizeBytes = task.ChunkSizeBytes,
+            MaxParallelChunks = task.MaxParallelChunks,
+            MaxParallelFiles = task.MaxParallelFiles,
+            MaxParallelHashes = task.MaxParallelHashes,
             RetryCount = task.RetryCount,
             RetryIntervalSeconds = task.RetryIntervalSeconds,
             RetentionPolicyId = task.RetentionPolicyId,
@@ -1004,6 +1022,7 @@ public class BackupTaskService : IBackupTaskService
         string scheduleTimezone, int randomDelayMinutes, int stabilityIntervalSeconds,
         int maxStabilityWaitSeconds, long? minTotalBytes, long? maxTotalBytes,
         int? minFileCount, int? bandwidthLimitKbps, int chunkSizeBytes,
+        TaskParallelism parallelism,
         int retryCount, int retryIntervalSeconds, Guid? retentionPolicyId,
         string recognizerConfig, string? alertConfig)
     {
@@ -1024,6 +1043,20 @@ public class BackupTaskService : IBackupTaskService
         if (chunkSizeBytes is < MinChunkSize or > MaxChunkSize)
             throw new BusinessException("INVALID_REQUEST",
                 $"分块大小必须在 {MinChunkSize / 1024 / 1024}MB - {MaxChunkSize / 1024 / 1024}MB 之间", 400);
+
+        // 三个并发度在服务端**拒绝**越界，而不是悄悄夹回来（实施方案 T7）。
+        // 客户端拿到之后还会再夹一次——两端各夹一次，任何一端漏了都不至于出事；
+        // 但服务端这一道必须是「拒绝」：填了 999 却被静默改成 16 的话，
+        // 界面回显的和填进去的不一样，而没有任何地方说过它被改过。
+        if (parallelism.Chunks is < MinParallelChunks or > MaxParallelChunks)
+            throw new BusinessException("INVALID_REQUEST",
+                $"单文件并发分块数必须在 {MinParallelChunks} - {MaxParallelChunks} 之间", 400);
+        if (parallelism.Files is < MinParallelFiles or > MaxParallelFiles)
+            throw new BusinessException("INVALID_REQUEST",
+                $"并发文件数必须在 {MinParallelFiles} - {MaxParallelFiles} 之间", 400);
+        if (parallelism.Hashes is < MinParallelFiles or > MaxParallelFiles)
+            throw new BusinessException("INVALID_REQUEST",
+                $"预检并发哈希数必须在 {MinParallelFiles} - {MaxParallelFiles} 之间", 400);
 
         if (minTotalBytes is not null && maxTotalBytes is not null && minTotalBytes > maxTotalBytes)
             throw new ValidationFailedException("总大小下限不能大于上限");
@@ -1093,6 +1126,9 @@ public class BackupTaskService : IBackupTaskService
         task.MinFileCount = minFileCount;
         task.BandwidthLimitKbps = bandwidthLimitKbps;
         task.ChunkSizeBytes = chunkSizeBytes;
+        task.MaxParallelChunks = parallelism.Chunks;
+        task.MaxParallelFiles = parallelism.Files;
+        task.MaxParallelHashes = parallelism.Hashes;
         task.RetryCount = Math.Clamp(retryCount, 0, 10);
         task.RetryIntervalSeconds = Math.Max(retryIntervalSeconds, 60);
         task.RetentionPolicyId = retentionPolicyId;

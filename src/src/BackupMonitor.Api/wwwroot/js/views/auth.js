@@ -3,15 +3,57 @@ import { store, api, setAccessToken, clearAuth } from '../api.js';
 import { App } from '../state.js';
 import { $, esc, toast, errToast } from '../ui.js';
 
+/* 指纹按 4 位分组（实施方案 U4）。一串 64 位十六进制、比例字体、不分组，
+   要拿它和部署记录逐字核对基本保证会看错。复制时给的仍是不带空格的原值。 */
+function groupHex(hex, size = 4) {
+  const clean = String(hex).replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+  return clean.replace(new RegExp(`(.{${size}})`, 'g'), '$1 ').trim();
+}
+
+/* 身份区的内容异步补进来：取不到就整块留空，绝不能因为一个附加信息让人登不上去。
+   显示指纹不是装饰——LAN Turnkey 形态下「我连的是不是那台服务器」本来就要人工核对，
+   而此前管理网页上没有任何地方看得到它。 */
+async function fillServerIdentity() {
+  let identity;
+  try {
+    identity = await api('/api/v1/public/server-identity', { noAuth: true });
+  } catch (e) {
+    return;
+  }
+  const box = $('#lg_facts');
+  if (!box || !identity) return;
+
+  const rows = [];
+  // Secure 形态下 TLS 由 nginx 终结，服务端手里没有证书、指纹为 null。
+  // 那时整行不显示——一个空着的指纹栏比没有这一栏更容易被误读成「核对过了」。
+  if (identity.fingerprint)
+    rows.push(`<dt>服务端指纹</dt><dd class="mono">${esc(groupHex(identity.fingerprint))}</dd>`);
+  if (identity.version)
+    rows.push(`<dt>版本</dt><dd class="mono">${esc(identity.version)}</dd>`);
+  if (!rows.length) return;
+
+  box.innerHTML = rows.join('');
+  if (identity.fingerprint)
+    $('#lg_hint').textContent = '登录前请核对指纹与部署记录一致。';
+}
+
 export function vLogin() {
-  $('#app').innerHTML = `<div class="login-wrap"><div class="login-box">
-    <h1>BackupMonitor</h1>
-    <div class="sub">轻量级集中备份采集与监控系统 · 管理控制台</div>
+  $('#app').innerHTML = `<div class="login-wrap"><div class="login-shell">
+    <aside class="login-brand">
+      <div class="brand-name">BackupMonitor</div>
+      <div class="brand-sub">轻量级集中备份采集与监控</div>
+      <dl class="brand-facts" id="lg_facts"></dl>
+      <p class="brand-hint" id="lg_hint"></p>
+    </aside>
+    <div class="login-box">
+    <h1>登 录</h1>
+    <div class="sub">管理控制台</div>
     <div id="lg_err"></div>
     <div class="frow"><label>用户名</label><input id="lg_user" autocomplete="username" value=""></div>
     <div class="frow"><label>密码</label><input id="lg_pass" type="password" autocomplete="current-password"></div>
     <button class="primary" style="width:100%;margin-top:8px" id="lg_btn">登 录</button>
-  </div></div>`;
+  </div></div></div>`;
+  fillServerIdentity();
   const doLogin = async () => {
     const btn = $('#lg_btn'); btn.disabled = true;
     $('#lg_err').innerHTML = '';

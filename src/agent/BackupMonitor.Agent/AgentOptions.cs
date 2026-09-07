@@ -35,6 +35,26 @@ public sealed class AgentOptions
     /// </summary>
     public int MaxParallelChunks { get; set; } = 4;
 
+    /// <summary>
+    /// 同时在传的文件数（1–8，超出范围会被夹回）。
+    ///
+    /// 为什么需要它：块内并发解决的是「等一块被处理完才敢发下一块」，而文件之间还停在
+    /// 同一个问题上——每个文件固定三次串行往返（missing-chunks → PUT → complete）。
+    /// 大文件无所谓，往返被摊薄进几百兆数据里；U8 附件库那种「几千个几十 KB 的文件」
+    /// 则完全相反，速率由往返次数而不是带宽决定，网卡基本是空的。
+    ///
+    /// 它**不会**放大在途分块数：所有文件的分块 PUT 共用一个 MaxParallelChunks 大小的
+    /// 信号量，文件级并发带来的只是控制类往返的重叠。
+    /// </summary>
+    public int MaxParallelFiles { get; set; } = 3;
+
+    /// <summary>
+    /// 预检阶段同时读盘算 SHA-256 的文件数（1–8，超出范围会被夹回）。
+    ///
+    /// 默认 3：单流顺序读通常吃不满盘，而并发太多会让机械盘退化成随机读、比串行还慢。
+    /// </summary>
+    public int MaxParallelHashes { get; set; } = 3;
+
     /// <summary>本地文件日志保留天数。出问题的机器常在客户现场，日志得留得住又不能撑爆磁盘。</summary>
     public int LogRetentionDays { get; set; } = 14;
 

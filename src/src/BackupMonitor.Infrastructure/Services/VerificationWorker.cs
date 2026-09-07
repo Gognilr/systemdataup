@@ -1,5 +1,6 @@
 using System.Threading.Channels;
 using BackupMonitor.Core.Enums;
+using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -138,7 +139,9 @@ public class VerificationWorker : BackgroundService
                 }
 
                 string hash;
-                await using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true))
+                // 复查是把整份备份从头读到尾算 SHA-256，参数与上传侧对齐（实施方案 T6）：
+                // 80KB 默认缓冲对 GB 级文件意味着几万次往返，且没有 SequentialScan 时预读也起不来。
+                await using (var stream = StreamIo.OpenSequentialRead(path))
                 {
                     hash = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(stream, ct)).ToLowerInvariant();
                 }
@@ -217,7 +220,9 @@ public class VerificationWorker : BackgroundService
                 }
 
                 string hash;
-                await using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true))
+                // 复查是把整份备份从头读到尾算 SHA-256，参数与上传侧对齐（实施方案 T6）：
+                // 80KB 默认缓冲对 GB 级文件意味着几万次往返，且没有 SequentialScan 时预读也起不来。
+                await using (var stream = StreamIo.OpenSequentialRead(path))
                 {
                     hash = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(stream, ct)).ToLowerInvariant();
                 }

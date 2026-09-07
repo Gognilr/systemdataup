@@ -496,40 +496,37 @@ public class UploadSessionService : IUploadSessionService
         if (!exists)
             throw new BusinessException("CHUNK_INVALID", "暂存文件缺失", 409);
 
-        var serverSha = await _storage.ComputeFileHashAsync(sessionId, file.Id, ct);
         var now = DateTime.UtcNow;
 
-        // 审查 P1-1：完整性判定以预检清单的 expected_sha256 为准（权威基准，服务端持有）。
-        // 客户端在完成时声明的 request.Sha256 只作附加交叉验证——它由上传方单方面给出，
-        // 原先「不传就整段跳过」等于把完整性开关交到了被验证方手里。
-        var mismatchReason =
-            !string.Equals(serverSha, file.ExpectedSha256, StringComparison.OrdinalIgnoreCase)
-                ? $"实测哈希与预检期望值不一致（期望 {file.ExpectedSha256}，实测 {serverSha}）"
-            : !string.IsNullOrWhiteSpace(request.Sha256)
-              && !string.Equals(serverSha, request.Sha256, StringComparison.OrdinalIgnoreCase)
-                ? $"客户端声明哈希与实测不一致（声明 {request.Sha256}，实测 {serverSha}）"
-            : null;
-
-        if (mismatchReason is not null)
+        // 实施方案 T2：整文件 SHA-256 复核挪到入库阶段（UploadCommitWorker），这里不再做。
+        //
+        // 为什么可以挪：每一块写入时已经做过块哈希双端比对**和**块长度校验（见 UploadChunkAsync
+        // 里 P1-1 那段），加上分块覆盖全文件、偏移严格划分——整文件哈希新增的覆盖面只剩
+        // 「上传过程中源文件被改」这一种。这一种确实要防，但它不需要客户端在线上等着。
+        //
+        // 为什么必须挪：这一步是整份顺序读。6GB 的备份在慢盘上是分钟级，而客户端的
+        // HTTP 超时是 10 分钟——足够大的文件加上足够慢的盘，正常上传会以超时告终，
+        // 而报出来的错跟哈希毫无关系，根本没法往这个方向查。
+        //
+        // 长度这一条留在这里：它是常数时间的，而且能在最早的时点拦住「块都收齐了但
+        // 暂存文件长度不对」这种自相矛盾的状态。
+        if (length != file.SizeBytes)
         {
             file.Status = UploadFileStatus.Failed;
-            file.ErrorCode = "FILE_HASH_MISMATCH";
-            file.ServerSha256 = serverSha;
+            file.ErrorCode = "CHUNK_INVALID";
             session.UpdatedAt = now;
             await _db.SaveChangesAsync(ct);
-            await _audit.RecordAsync("upload.file.complete", AuditResult.Failure, "upload_session", session.Id,
-                errorCode: "FILE_HASH_MISMATCH",
-                errorMessage: $"文件哈希错误 {file.RelativePath}：{mismatchReason}", ct: ct);
             throw new BusinessException(
-                "FILE_HASH_MISMATCH", $"文件哈希错误（{file.RelativePath}）：{mismatchReason}", 409);
+                "CHUNK_INVALID",
+                $"暂存文件长度与预检不符（{file.RelativePath}：期望 {file.SizeBytes} 字节，实际 {length} 字节）", 409);
         }
 
-        file.Status = UploadFileStatus.Verified;
-        file.ServerSha256 = serverSha;
-        file.SizeBytes = length;
-        session.VerifiedBytes = await _db.UploadFiles
-            .Where(f => f.UploadSessionId == session.Id && f.Status == UploadFileStatus.Verified)
-            .SumAsync(f => f.SizeBytes, ct) + length;
+        // Received 而不是 Verified：这个文件收齐了，但还没复核过整文件哈希。
+        // 两个状态的区别在入库时才被消化，CompleteSessionAsync 本来就把两者一起放行。
+        file.Status = UploadFileStatus.Received;
+        // 客户端自报的哈希此刻没有地方比，存下来，入库复核时一并交叉验证——
+        // 原有的「双向验证」语义一个字都不能少，只是比对的时点后移了。
+        file.ClientDeclaredSha256 = string.IsNullOrWhiteSpace(request.Sha256) ? null : request.Sha256;
         session.UpdatedAt = now;
         await _db.SaveChangesAsync(ct);
 
@@ -537,7 +534,7 @@ public class UploadSessionService : IUploadSessionService
         {
             UploadFileId = file.Id,
             Status = EnumMapping.ToSnakeCase(file.Status),
-            ServerSha256 = serverSha
+            ServerSha256 = null
         };
     }
 

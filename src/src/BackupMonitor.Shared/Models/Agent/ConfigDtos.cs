@@ -54,6 +54,24 @@ public class AgentTaskConfigDto
     public long ConfigVersion { get; set; }
 
     /// <summary>
+    /// 单文件在途分块数（1-16）。**性能参数，不是限速手段**——
+    /// 限速的唯一口径是 <see cref="BandwidthLimitKbps"/>，那是管理员可见可调的那个。
+    ///
+    /// 下发它是因为它会随现场变（万兆网 4 路填不满、老机器或机械盘想降到 2），
+    /// 而此前它只存在于客户端本地的 appsettings，改一次要逐台改文件、逐台重启服务。
+    ///
+    /// 字段位置追加在任务块末尾（见 AgentSignatureCanonicalizer 的同名说明）：
+    /// 前面的顺序一个都不能动，否则配置签名不兼容。
+    /// </summary>
+    public int MaxParallelChunks { get; set; } = 4;
+
+    /// <summary>同时在传的文件数（1-8）。不会放大在途分块总数，两者共用同一个信号量。</summary>
+    public int MaxParallelFiles { get; set; } = 3;
+
+    /// <summary>预检阶段并发读盘算 SHA-256 的文件数（1-8）。</summary>
+    public int MaxParallelHashes { get; set; } = 3;
+
+    /// <summary>
     /// 上一次候选备份集的 QuickFingerprint，按业务单元 externalKey 索引（无业务单元时为 root）。
     ///
     /// 给 Agent 的两段式扫描当基线用：先只算头尾采样的 QuickHash 拼出指纹，

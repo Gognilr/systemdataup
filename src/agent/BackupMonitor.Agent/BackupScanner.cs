@@ -58,10 +58,25 @@ public readonly record struct ScanProgress(
 public sealed class BackupScanner
 {
     private readonly ILogger<BackupScanner> _logger;
+    private readonly AgentFileHashCache? _hashCache;
+    private readonly int _maxParallelHashes;
 
-    public BackupScanner(ILogger<BackupScanner> logger)
+    /// <param name="hashCache">
+    /// 文件级哈希缓存（实施方案 T5）。可以为 null——那时行为与引入缓存之前逐字节相同，
+    /// 单元测试就是这么用的：它要验的是「扫描挑中哪些文件」，跟缓存没关系。
+    /// </param>
+    /// <param name="maxParallelHashes">
+    /// 同时读盘算哈希的文件数。默认 3：单流顺序读通常吃不满盘，
+    /// 而并发太多会让机械盘退化成随机读，反而更慢。
+    /// </param>
+    public BackupScanner(
+        ILogger<BackupScanner> logger,
+        AgentFileHashCache? hashCache = null,
+        int maxParallelHashes = 3)
     {
         _logger = logger;
+        _hashCache = hashCache;
+        _maxParallelHashes = Math.Clamp(maxParallelHashes, 1, 8);
     }
 
     /// <summary>
@@ -159,6 +174,12 @@ public sealed class BackupScanner
         if (unitNames.Count > 1)
             await Report(progress, new ScanProgress(0, roots.Count, null, "enumerated", null, 0, 0, unitNames), ct);
 
+        // 文件级哈希缓存（实施方案 T5）。整个任务共用一个会话：读盘一次，之后都在内存里，
+        // 每个单元算完哈希落一次盘——中途被取消时已经算过的那些不至于白算。
+        //
+        // 试扫不开：它连 QuickHash 都不算，更没有全量哈希可缓存，开了只会白建一个文件。
+        var hashCache = testOnly ? null : _hashCache?.Open(task.TaskId);
+
         for (var unitIndex = 0; unitIndex < roots.Count; unitIndex++)
         {
             var selected = roots[unitIndex];
@@ -218,6 +239,11 @@ public sealed class BackupScanner
                     // 界面却不给它标 [必需]——同一个事实在两处显示不一致。
                     IsRequired = rules.IsRequiredFile(relative)
                 });
+
+                // 这次扫描见过这个文件，哪怕下面因为快速指纹命中而根本不算哈希。
+                // 少了这一句，被跳过的那批文件会在 30 天后被缓存当成「已删除」淘汰掉，
+                // 下一次真要重算时白白多读一遍全盘。
+                hashCache?.Touch(file.FullName);
             }
 
             var missingRequired = rules.HasMissingRequired(fileDtos.Select(f => f.RelativePath));
@@ -264,13 +290,53 @@ public sealed class BackupScanner
                 // ── 第二段：真有新东西，该读的还是要读 ──
                 // 这一段是整次扫描里最慢的部分（一个账套就是好几个 GB），进度也只有在这里
                 // 报才有意义——报的是「第几个单元、正在读哪个文件」，不是一个空转的百分比。
-                for (var i = 0; i < files.Count; i++)
+                // 并发读盘算哈希（实施方案 T5）。串行时单流顺序读吃不满盘，
+                // 而这一段是整次扫描里最慢的部分。并发度上限刻意留得小（默认 3）：
+                // 机械盘上并发太多会退化成随机读，比串行还慢。
+                //
+                // 进度改按「已完成第几个」报而不是「正在处理第 i 个」——并发之后
+                // 后者没有意义，同一时刻有好几个 i 在跑。
+                var hashedCount = 0;
+                var hashQueue = new System.Collections.Concurrent.ConcurrentQueue<int>(Enumerable.Range(0, files.Count));
+                // 并发度优先取服务端随任务下发的值（实施方案 T7），下发缺失或非法时回退到本地配置。
+                var configuredHashParallel = task.MaxParallelHashes > 0 ? task.MaxParallelHashes : _maxParallelHashes;
+                var hashParallel = Math.Min(Math.Clamp(configuredHashParallel, 1, 8), Math.Max(1, files.Count));
+
+                async Task RunHashWorkerAsync()
                 {
-                    ct.ThrowIfCancellationRequested();
-                    await Report(progress, new ScanProgress(
-                        unitIndex, roots.Count, unitName, "hashing", files[i].Name, i, files.Count), ct);
-                    fileDtos[i].Sha256 = await ComputeSha256Async(files[i].FullName, ct);
+                    while (hashQueue.TryDequeue(out var i))
+                    {
+                        ct.ThrowIfCancellationRequested();
+
+                        // forceFullHash（界面上的「强制完整校验」）必须绕过缓存：
+                        // 它存在的全部意义就是「这一次我不信任何增量判据，全部重读」。
+                        var cached = forceFullHash
+                            ? null
+                            : hashCache?.TryGet(
+                                files[i].FullName, files[i].Length, files[i].LastWriteTimeUtc, fileDtos[i].QuickHash);
+
+                        if (cached is not null)
+                        {
+                            fileDtos[i].Sha256 = cached;
+                        }
+                        else
+                        {
+                            var sha = await ComputeSha256Async(files[i].FullName, ct);
+                            fileDtos[i].Sha256 = sha;
+                            hashCache?.Put(
+                                files[i].FullName, files[i].Length, files[i].LastWriteTimeUtc, fileDtos[i].QuickHash, sha);
+                        }
+
+                        var done = Interlocked.Increment(ref hashedCount);
+                        await Report(progress, new ScanProgress(
+                            unitIndex, roots.Count, unitName, "hashing", files[i].Name, done, files.Count), ct);
+                    }
                 }
+
+                await Task.WhenAll(Enumerable.Range(0, hashParallel).Select(_ => RunHashWorkerAsync()));
+
+                // 每个单元算完就落一次盘：中途被取消时，已经算过的那些不至于白算。
+                hashCache?.Save();
 
                 manifestHash = FingerprintOf(fileDtos, f => f.Sha256);
                 candidateKey = $"{task.TaskId:N}:{unitKey}:{manifestHash}";
@@ -567,7 +633,12 @@ public sealed class BackupScanner
 
     private static async Task<string> ComputeSha256Async(string path, CancellationToken ct)
     {
-        await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1024 * 1024, useAsync: true);
+        // SequentialScan 让操作系统的预读真正成批下发。参数与服务端侧的
+        // UploadStorage.ComputeFileHashAsync / UploadCommitWorker 对齐——
+        // 同样是「把一个几 GB 的文件从头读到尾」，两边没有理由用不同的读法。
+        await using var stream = new FileStream(
+            path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite,
+            bufferSize: 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
         var hash = await SHA256.HashDataAsync(stream, ct);
         return Convert.ToHexString(hash).ToLowerInvariant();
     }

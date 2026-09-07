@@ -78,10 +78,14 @@ public class DownloadsController : ApiBaseController
                 {
                     var fullPath = ResolveFile(context.RepositoryPath, file);
                     // ZIP 条目名统一正斜杠（跨平台解压兼容）
-                    var entry = zip.CreateEntry(file.RelativePath.Replace('\\', '/'), CompressionLevel.Fastest);
+                    // store 而不是 Deflate（实施方案 T6）。备份文件（.bak、已压缩的附件包）
+                    // 压缩比很低，而单线程 Deflate 大约 100-200MB/s 封顶——这是拿确定的 CPU
+                    // 和确定的延迟去换不确定的一点空间。ZIP 在这里的作用是**容器**
+                    //（把多文件打成一个可下载的东西），不是压缩。
+                    var entry = zip.CreateEntry(file.RelativePath.Replace('\\', '/'), CompressionLevel.NoCompression);
                     await using var entryStream = entry.Open();
-                    await using var fileStream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
-                    await fileStream.CopyToAsync(entryStream, ct);
+                    await using var fileStream = StreamIo.OpenSequentialRead(fullPath);
+                    await fileStream.CopyToAsync(entryStream, StreamIo.LargeFileBufferBytes, ct);
                 }
             } // using 结束时写入中央目录
 
@@ -172,19 +176,34 @@ public class DownloadsController : ApiBaseController
         var fileFullyDelivered = false;
         try
         {
-            await using var fileStream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
+            // 实施方案 T6：1MB 缓冲 + SequentialScan + ArrayPool。
+            //
+            // 刻意**不**用 Response.Body.SendFileAsync（Windows 上会走 TransmitFile 零拷贝）：
+            // 它在客户端中断时拿不到「已经传了多少字节」，而下面的 FinishDownloadAsync
+            // 要靠这个数记账——「断在哪儿」在恢复场景里是有用的信息，
+            // 6GB 断在开头和断在 99% 是完全不同的两件事。
+            await using var fileStream = StreamIo.OpenSequentialRead(fullPath);
             fileStream.Seek(start, SeekOrigin.Begin);
 
-            var buffer = new byte[81920];
-            var remaining = length;
-            while (remaining > 0)
+            var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(StreamIo.LargeFileBufferBytes);
+            try
             {
-                var read = await fileStream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), ct);
-                if (read == 0)
-                    break;
-                await Response.Body.WriteAsync(buffer.AsMemory(0, read), ct);
-                copied += read;
-                remaining -= read;
+                var remaining = length;
+                while (remaining > 0)
+                {
+                    // Rent 可能给回更大的数组，只用申请的那一段。
+                    var want = (int)Math.Min(StreamIo.LargeFileBufferBytes, remaining);
+                    var read = await fileStream.ReadAsync(buffer.AsMemory(0, want), ct);
+                    if (read == 0)
+                        break;
+                    await Response.Body.WriteAsync(buffer.AsMemory(0, read), ct);
+                    copied += read;
+                    remaining -= read;
+                }
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
             }
 
             // 审查 P1-7：这里只能断言「本文件是否完整交付」（含从 0 开始的 Range 全量请求）。

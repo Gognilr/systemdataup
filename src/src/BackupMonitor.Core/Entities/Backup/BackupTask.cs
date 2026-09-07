@@ -77,6 +77,22 @@ public class BackupTask : IHasRowVersion
     /// <summary>分块大小（字节，4MB-32MB，默认 8MB）</summary>
     public int ChunkSizeBytes { get; set; } = 8388608;
 
+    /// <summary>
+    /// 单文件内同时在途的分块数（1-16，默认 4）。
+    /// 性能参数，不是限速手段——限速的唯一口径是 <see cref="BandwidthLimitKbps"/>。
+    /// </summary>
+    public int MaxParallelChunks { get; set; } = 4;
+
+    /// <summary>
+    /// 同时在传的文件数（1-8，默认 3）。解决的是「每个文件三次串行往返」，
+    /// 对几千个小文件的形态收益最大；它与 <see cref="MaxParallelChunks"/> 共用同一个
+    /// 在途分块信号量，因此不会把在途分块数乘上去。
+    /// </summary>
+    public int MaxParallelFiles { get; set; } = 3;
+
+    /// <summary>预检阶段同时读盘算 SHA-256 的文件数（1-8，默认 3）。</summary>
+    public int MaxParallelHashes { get; set; } = 3;
+
     /// <summary>失败重试次数</summary>
     public int RetryCount { get; set; } = 3;
 

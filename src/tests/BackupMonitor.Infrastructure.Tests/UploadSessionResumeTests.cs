@@ -108,11 +108,19 @@ public class UploadSessionResumeTests : IDisposable
                 expectedHash: "00", data: new MemoryStream()));
         Assert.Equal("CHUNK_INVALID", ex2.ErrorCode);
 
-        // 整文件哈希一致 → verified
+        // 分块收齐 → received。
+        // 实施方案 T2：整文件哈希复核挪到入库阶段（UploadCommitWorker），
+        // complete-file 只做常数时间的检查，因此这里不再是 verified、
+        // 也不再回 ServerSha256——那两样都要等入库复核之后才有。
         var complete = await svc.CompleteFileAsync(clientId, sessionId, fileId,
             new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = FullHash() });
-        Assert.Equal("verified", complete.Status);
-        Assert.Equal(FullHash(), complete.ServerSha256);
+        Assert.Equal("received", complete.Status);
+        Assert.Null(complete.ServerSha256);
+
+        // 客户端声明的哈希被存下来，留给入库复核做交叉验证——
+        // 原有的「双向验证」语义一个字都不能少，只是比对的时点后移了。
+        var stored = await db.UploadFiles.AsNoTracking().SingleAsync(f => f.Id == fileId);
+        Assert.Equal(FullHash(), stored.ClientDeclaredSha256);
     }
 
     [Fact]
@@ -173,8 +181,7 @@ public class UploadSessionResumeTests : IDisposable
         // 各块写入区间由 offset 严格划分、互不重叠，这是允许并发写的前提。
         var complete = await svc.CompleteFileAsync(clientId, sessionId, fileId,
             new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = FullHash() });
-        Assert.Equal("verified", complete.Status);
-        Assert.Equal(FullHash(), complete.ServerSha256);
+        Assert.Equal("received", complete.Status);
     }
 
     [Fact]
@@ -203,8 +210,16 @@ public class UploadSessionResumeTests : IDisposable
         Assert.Contains(0, missing.Missing!);
     }
 
+    /// <summary>
+    /// complete-file 的判定范围（实施方案 T2 之后）。
+    ///
+    /// 整文件哈希复核挪去了入库阶段，这里只保留常数时间的检查。
+    /// 这条测试因此改成验「哈希对不对**不再**在这一步决定，但长度对不对仍然在」——
+    /// 后者是能在最早时点拦住「块都收齐了、暂存文件长度却不对」这种自相矛盾状态的那一道。
+    /// 哈希复核本身由 UploadCommitHashVerificationTests 验。
+    /// </summary>
     [Fact]
-    public async Task 整文件哈希比对()
+    public async Task 完成文件只做常数时间检查()
     {
         await using var sp = BuildServices();
         await using var scope = sp.CreateAsyncScope();
@@ -216,26 +231,21 @@ public class UploadSessionResumeTests : IDisposable
         for (var i = 0; i < ChunkCount; i++)
             await UploadChunkAsync(svc, clientId, sessionId, fileId, i);
 
-        // 错误整文件哈希 → FILE_HASH_MISMATCH
-        var ex = await Assert.ThrowsAsync<BusinessException>(() =>
-            svc.CompleteFileAsync(clientId, sessionId, fileId,
-                new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = new string('f', 64) }));
-        Assert.Equal("FILE_HASH_MISMATCH", ex.ErrorCode);
+        // 客户端声明一个错的哈希，complete-file 不再据此判定——它被存下来，
+        // 等入库复核时和服务端实测值一起比。这一步不再整读文件，因此也不可能在这里发现它错。
+        var wrong = await svc.CompleteFileAsync(clientId, sessionId, fileId,
+            new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = new string('f', 64) });
+        Assert.Equal("received", wrong.Status);
 
-        var failed = await db.UploadFiles.AsNoTracking().SingleAsync(f => f.Id == fileId);
-        Assert.Equal(UploadFileStatus.Failed, failed.Status);
-        Assert.Equal("FILE_HASH_MISMATCH", failed.ErrorCode);
-        Assert.Equal(FullHash(), failed.ServerSha256);   // 服务端真实哈希仍被记录
-
-        // 分块未收齐时不得完成（另一文件语义：这里删除无必要，直接验证收齐后的成功路径）
-        var ok = await svc.CompleteFileAsync(clientId, sessionId, fileId,
-            new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = FullHash() });
-        Assert.Equal("verified", ok.Status);
+        var stored = await db.UploadFiles.AsNoTracking().SingleAsync(f => f.Id == fileId);
+        Assert.Equal(UploadFileStatus.Received, stored.Status);
+        Assert.Equal(new string('f', 64), stored.ClientDeclaredSha256);
+        Assert.Null(stored.ServerSha256);   // 服务端实测值要等入库复核才有
 
         // 已完成文件重复调用幂等返回
         var again = await svc.CompleteFileAsync(clientId, sessionId, fileId,
             new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = FullHash() });
-        Assert.Equal("verified", again.Status);
+        Assert.Equal("received", again.Status);
     }
 
     /// <summary>
@@ -284,7 +294,7 @@ public class UploadSessionResumeTests : IDisposable
         await UploadChunkAsync(svc2, clientId, sessionId, fileId, 2);
         var complete = await svc2.CompleteFileAsync(clientId, sessionId, fileId,
             new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = FullHash() });
-        Assert.Equal("verified", complete.Status);
+        Assert.Equal("received", complete.Status);
     }
 
     /// <summary>
@@ -500,7 +510,7 @@ public class UploadSessionResumeTests : IDisposable
         await UploadChunkAsync(svc, clientId, sessionId, fileId, 2);
         var complete = await svc.CompleteFileAsync(clientId, sessionId, fileId,
             new CompleteUploadFileRequest { SizeBytes = Payload.Length, Sha256 = FullHash() });
-        Assert.Equal("verified", complete.Status);
+        Assert.Equal("received", complete.Status);
     }
 
     [Fact]

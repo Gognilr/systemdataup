@@ -6,7 +6,7 @@ import {
   tableHtml, pagerHtml, skeleton, emptyState, hasFilter,
   toast, errToast, confirmModal, openModal, openDrawer
 } from '../ui.js';
-import { shell, loading } from '../app.js';
+import { shell, loading, schedulePoll } from '../app.js';
 
 export async function vRestores() {
   App.state.restores = App.state.restores || { page: 1, pageSize: 20, status: '', totalCount: 0 };
@@ -53,7 +53,7 @@ LOADERS.restores = async function () {
       } }
     ], data.items, { empty }) + pagerHtml('restores', st);
     if (data.items.some(r => ['requested', 'verifying', 'downloading'].includes(r.status))) {
-      App.timer = setTimeout(() => { if (location.hash === '#/restores') LOADERS.restores(); }, 5000);
+      schedulePoll('restores', LOADERS.restores, 5000);
     }
   } catch (e) { wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 };

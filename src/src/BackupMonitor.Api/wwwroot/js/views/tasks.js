@@ -473,6 +473,14 @@ async function taskFormFields(initial, template, prefill, client) {
     // B3：随机延迟此前是个死字段——实体有、表单没有输入项——用来错开多台机器同一时刻扫描/上传。
     { name: 'randomDelayMinutes', label: '随机延迟（分钟）', type: 'number', value: v.randomDelayMinutes ?? 0, advanced: true,
       hint: '0~1440 分钟，用来错开多台机器同时扫描，避免 cron 都写 0 2 * * * 时集中打满带宽' },
+    // T7：三个传输并发度此前只存在于客户端本地的 appsettings，改一次要逐台改文件、逐台重启服务。
+    // 它们是**性能参数**，不是限速手段——限速请用「带宽限速」，那才是管理员该调的那个。
+    { name: 'maxParallelChunks', label: '并发分块数', type: 'number', value: v.maxParallelChunks ?? 4, advanced: true,
+      hint: '1~16，默认 4。一个文件同时在传几块；千兆网 4 路基本能填满，再往上收益递减而客户端内存线性涨' },
+    { name: 'maxParallelFiles', label: '并发文件数', type: 'number', value: v.maxParallelFiles ?? 3, advanced: true,
+      hint: '1~8，默认 3。几千个小文件的账套（如 U8 附件库）主要靠它提速；它不会增加同时在传的分块总数' },
+    { name: 'maxParallelHashes', label: '并发校验数', type: 'number', value: v.maxParallelHashes ?? 3, advanced: true,
+      hint: '1~8，默认 3。预检时同时读几个文件算校验和；机械盘上调大反而会因为随机读变慢' },
     { name: 'cfgInclude', label: '只看哪些文件', type: 'textarea', rows: 2, value: cfg.include.join('\n'), advanced: true,
       placeholder: '*.bak', hint: '一行一个。留空表示目录里的文件都算' },
     { name: 'cfgExclude', label: '忽略哪些文件', type: 'textarea', rows: 2, value: cfg.exclude.join('\n'), advanced: true,
@@ -557,11 +565,25 @@ function taskFormValues(vals, base, baseConfig) {
     minTotalBytes: numOrNull(vals.minTotalBytes), maxTotalBytes: numOrNull(vals.maxTotalBytes),
     minFileCount: numOrNull(vals.minFileCount),
     randomDelayMinutes: vals.randomDelayMinutes === '' || vals.randomDelayMinutes == null ? 0 : Number(vals.randomDelayMinutes),
+    // 服务端会**拒绝**越界值而不是悄悄夹回来，这里先夹一道只是为了让人不至于
+    // 因为手滑多打一个 0 就吃一个 400。三处（这里 / BackupTaskService / V035 的 CHECK）范围一致。
+    maxParallelChunks: clampNum(vals.maxParallelChunks, 1, 16, 4),
+    maxParallelFiles: clampNum(vals.maxParallelFiles, 1, 8, 3),
+    maxParallelHashes: clampNum(vals.maxParallelHashes, 1, 8, 3),
     recognizerConfig: composeRecognizerConfig(vals, baseConfig !== undefined ? baseConfig : base && base.recognizerConfig)
   });
 }
 
 /* 表单数字输入统一转换：空字符串/undefined → null（表示"不检查"），其余转 Number */
+/* 夹取到 [min,max]，空值/非数字回落到 def。
+   与 numOrNull 分开：那个允许 null（「不检查」），这个不允许——
+   并发度没有「不设置」这个语义，缺了就得有个默认值顶上。 */
+function clampNum(v, min, max, def) {
+  const n = Number(v);
+  if (v === '' || v == null || Number.isNaN(n)) return def;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
 function numOrNull(v) {
   return v === '' || v == null ? null : Number(v);
 }
@@ -600,6 +622,7 @@ export async function openTaskDrawer(id, viaNav = false) {
       <div class="row"><div class="k">稳定判定</div><div class="v">${esc(d.stabilityIntervalSeconds)}s / 最长 ${esc(d.maxStabilityWaitSeconds)}s</div></div>
       <div class="row"><div class="k">大小限制</div><div class="v">${fmtBytes(d.minTotalBytes)} ~ ${fmtBytes(d.maxTotalBytes)}，文件数 ≥ ${esc(d.minFileCount ?? '—')}</div></div>
       <div class="row"><div class="k">限速 / 分块</div><div class="v">${d.bandwidthLimitKbps ? esc(d.bandwidthLimitKbps) + ' KB/s' : '不限'} / ${fmtBytes(d.chunkSizeBytes)}</div></div>
+      <div class="row"><div class="k">并发（块/文件/校验）</div><div class="v">${esc(d.maxParallelChunks)} / ${esc(d.maxParallelFiles)} / ${esc(d.maxParallelHashes)}</div></div>
       <div class="row"><div class="k">重试</div><div class="v">${esc(d.retryCount)} 次，间隔 ${esc(d.retryIntervalSeconds)}s</div></div>
       <div class="row"><div class="k">保留策略</div><div class="v">${d.retentionPolicyName
         ? esc(d.retentionPolicyName)
@@ -1040,6 +1063,11 @@ async function applyRequiredFiles(taskId, patterns) {
       minTotalBytes: detail.minTotalBytes, maxTotalBytes: detail.maxTotalBytes,
       minFileCount: detail.minFileCount, bandwidthLimitKbps: detail.bandwidthLimitKbps,
       chunkSizeBytes: detail.chunkSizeBytes, retryCount: detail.retryCount,
+      // 表单不管的字段一律回填原值：PUT 的请求模型对未提供的字段取默认值，
+      // 漏一个就是「只改了识别规则，并发度被悄悄打回 4/3/3」，而且没有任何提示。
+      maxParallelChunks: detail.maxParallelChunks,
+      maxParallelFiles: detail.maxParallelFiles,
+      maxParallelHashes: detail.maxParallelHashes,
       retryIntervalSeconds: detail.retryIntervalSeconds, retentionPolicyId: detail.retentionPolicyId,
       alertConfig: detail.alertConfig,
       recognizerConfig: sent,

@@ -69,7 +69,10 @@ button.small,.button.small{padding:var(--s-1) var(--s-2);font:var(--t-sm)}
 .sidebar.is-collapsed .nav-group-label{visibility:hidden}
 .sidebar nav a{display:flex;align-items:center;gap:var(--s-3);height:36px;padding:var(--s-1) var(--s-4);color:var(--ink-200);font:var(--t-body);transition:background var(--dur-fast) var(--ease);white-space:nowrap}
 .sidebar.is-collapsed nav a{justify-content:center;padding-left:var(--s-1);padding-right:var(--s-1)}
-.nav-icon{width:20px;display:inline-flex;justify-content:center;flex-shrink:0;font:var(--t-md)}
+/* 图标是内联 SVG（实施方案 U2）：跟随 currentColor，因此选中态自动变色，
+   不需要为 .active 单独定义一套颜色。 */
+.nav-icon{width:20px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.nav-icon svg{display:block}
 .sidebar nav a:hover{background:var(--sidebar-hover);color:var(--ink-0)}
 .sidebar nav a.active{background:var(--accent);color:var(--accent-fg)}
 .sidebar .sidebar-toggle{margin:var(--s-2);width:calc(100% - var(--s-4));height:28px;padding:0;background:transparent;border-color:var(--sidebar-bd);color:var(--ink-300);font-size:18px}
@@ -101,9 +104,31 @@ button.small,.button.small{padding:var(--s-1) var(--s-2);font:var(--t-sm)}
   .topbar{padding-left:var(--s-3);padding-right:var(--s-3)}
 }
 
-/* ── 登录页：纯净背景（UI-REDESIGN §7.5，无装饰渐变） ── */
+/* ── 登录页：纯净背景（UI-REDESIGN §7.5，无装饰渐变） ──
+
+   左右分栏（实施方案 U4）：左侧深色区放产品标识与服务端身份，右侧是表单。
+   左边那块不是装饰——指纹是**真信息**，LAN Turnkey 形态下管理员本来就要核对它。
+   仍然没有渐变、没有发光、没有背景图：专业感来自那串等宽的十六进制，不来自视觉效果。 */
 .login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg)}
+.login-shell{display:flex;border-radius:var(--r-lg);overflow:hidden;box-shadow:var(--e-2);max-width:96vw}
+.login-brand{width:300px;flex-shrink:0;background:var(--ink-950);color:var(--ink-200);padding:var(--s-8);display:flex;flex-direction:column;gap:var(--s-2)}
+.login-brand .brand-name{font:600 var(--t-xl);color:var(--ink-0)}
+.login-brand .brand-sub{font:var(--t-sm);color:var(--ink-400);margin-bottom:var(--s-6)}
+.login-brand .brand-facts{margin-top:auto;display:flex;flex-direction:column;gap:var(--s-1)}
+.login-brand .brand-facts dt{font:var(--t-micro);color:var(--ink-400);letter-spacing:.04em}
+.login-brand .brand-facts dd{font-size:11px;line-height:16px;color:var(--ink-100);word-break:break-all;margin-bottom:var(--s-2)}
+.login-brand .brand-hint{font:var(--t-micro);color:var(--ink-400);line-height:1.5}
+/* 独立使用时（强制改密页）保留圆角与阴影；嵌进 login-shell 时由外壳统一承担，
+   自己再来一层圆角会在拼缝处露出一道白边。 */
 .login-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--s-8);width:380px;max-width:92vw;box-shadow:var(--e-2)}
+.login-shell .login-box{border-radius:0;box-shadow:none;border-left:0}
+/* 窄屏收成单栏：左栏移到表单上方，只留标识与指纹，不再占半屏。 */
+@media (max-width:720px){
+  .login-shell{flex-direction:column;border-radius:var(--r-lg)}
+  .login-brand{width:auto;padding:var(--s-6) var(--s-8)}
+  .login-brand .brand-sub{margin-bottom:var(--s-3)}
+  .login-brand .brand-facts{margin-top:0}
+}
 .login-box h1{margin-bottom:var(--s-1)}
 .login-box .sub{color:var(--text-muted);font:var(--t-body);margin-bottom:var(--s-6)}
 .login-box .frow label{font-weight:600;color:var(--text)}

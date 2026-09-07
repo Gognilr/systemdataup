@@ -29,6 +29,15 @@ public class UploadFileEntity
     /// <summary>服务端接收后计算的 SHA-256（双端校验）</summary>
     public string? ServerSha256 { get; set; }
 
+    /// <summary>
+    /// 客户端在 complete 时自报的整文件 SHA-256（T2）。
+    ///
+    /// 只作附加交叉验证：它由上传方单方面给出，权威基准永远是 ExpectedSha256——
+    /// 那是预检清单里的值，服务端持有。整文件复核挪到入库阶段之后，
+    /// complete 那一刻已经没有地方比这个值了，所以先存下来。
+    /// </summary>
+    public string? ClientDeclaredSha256 { get; set; }
+
     public long UploadedBytes { get; set; }
 
     public int TotalChunks { get; set; }

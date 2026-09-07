@@ -132,6 +132,17 @@ public static class AgentSignatureCanonicalizer
             // 快速指纹基线：字段追加在任务块末尾，前面的顺序一个都不动。
             // 它决定 Agent 会不会跳过全量哈希，不签名就等于把「让备份静默停摆」
             // 这个开关暴露给任何能改写响应体的人。
+            // 三个并发度同样要签名，理由和快速指纹一样：能改写响应体的人若能把
+            // MaxParallelChunks 压成 1，备份不会失败、只会变得极慢——
+            // 而「传得莫名其妙地慢」是最不容易被发现的那种故障。
+            // 追加在任务块末尾、快速指纹之前，前面的顺序一个都不动。
+            fields.AddRange(
+            [
+                task.MaxParallelChunks.ToString(CultureInfo.InvariantCulture),
+                task.MaxParallelFiles.ToString(CultureInfo.InvariantCulture),
+                task.MaxParallelHashes.ToString(CultureInfo.InvariantCulture)
+            ]);
+
             var fingerprints = task.LastQuickFingerprints ?? [];
             fields.Add(fingerprints.Count.ToString(CultureInfo.InvariantCulture));
             foreach (var fingerprint in fingerprints.OrderBy(f => f.ExternalKey, StringComparer.Ordinal))

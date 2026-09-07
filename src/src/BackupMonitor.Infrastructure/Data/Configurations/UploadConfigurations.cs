@@ -109,6 +109,7 @@ public class UploadFileConfiguration : IEntityTypeConfiguration<UploadFileEntity
         builder.Property(e => e.SizeBytes).HasColumnName("size_bytes");
         builder.Property(e => e.ExpectedSha256).HasColumnName("expected_sha256").HasMaxLength(64).IsRequired();
         builder.Property(e => e.ServerSha256).HasColumnName("server_sha256").HasMaxLength(64);
+        builder.Property(e => e.ClientDeclaredSha256).HasColumnName("client_declared_sha256").HasMaxLength(64);
         builder.Property(e => e.UploadedBytes).HasColumnName("uploaded_bytes").HasDefaultValue(0L);
         builder.Property(e => e.TotalChunks).HasColumnName("total_chunks");
         builder.Property(e => e.UploadedChunks).HasColumnName("uploaded_chunks").HasDefaultValue(0);

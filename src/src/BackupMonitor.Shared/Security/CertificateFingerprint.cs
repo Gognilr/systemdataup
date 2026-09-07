@@ -49,6 +49,22 @@ public static class CertificateFingerprint
         return string.Join(Environment.NewLine, lines);
     }
 
+    /// <summary>
+    /// 单行展示格式：4 位一组，空格分隔。给状态行、日志行这类只有一行位置的地方用；
+    /// 需要多行分块的用 <see cref="ToDisplayBlock"/>。同样仅用于显示，不要拿它去比较。
+    /// </summary>
+    public static string ToGroupedHex(string? value)
+    {
+        var normalized = Normalize(value);
+        if (normalized.Length == 0)
+            return string.Empty;
+
+        var groups = new List<string>();
+        for (var offset = 0; offset < normalized.Length; offset += GroupSize)
+            groups.Add(normalized.Substring(offset, Math.Min(GroupSize, normalized.Length - offset)));
+        return string.Join(' ', groups);
+    }
+
     /// <summary>两个指纹是否为同一张证书。始终经规范化后比较。</summary>
     public static bool Matches(string? left, string? right)
     {

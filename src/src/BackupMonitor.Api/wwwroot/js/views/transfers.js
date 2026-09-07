@@ -5,9 +5,9 @@ import { api } from '../api.js';
 import { App, ACTIONS, LOADERS } from '../state.js';
 import {
   $, esc, status, fmtBytes, fmtRate, fmtDuration, relTime,
-  tableHtml, emptyState, xferBar, toast, errToast, confirmModal
+  tableHtml, patchRows, emptyState, xferBar, sparkline, toast, errToast, confirmModal
 } from '../ui.js';
-import { shell, loading } from '../app.js';
+import { shell, loading, schedulePoll } from '../app.js';
 
 /* 有东西在传时 5 秒一刷：慢传输里数字动不动，本身就是最重要的那条信息。
    一条都没有时放慢到 15 秒——没人守着一个空页面，但新的传输开始时要能自己冒出来。 */
@@ -158,7 +158,21 @@ LOADERS.transfers = async function () {
       // 排队状态取不到不该让整页失败：它是补充信息，正在传的那几条才是主角。
       api('/api/v1/admin/upload-sessions/queue-status').catch(() => null)
     ]);
+
+    // 稳态刷新走行级增量（实施方案 W3）：结构没变时只改内容变了的单元格。
+    // 整块 innerHTML 重建会把 DOM 全换掉，于是 .xfer-bar 的 transition 拿不到
+    // 上一个宽度、进度条一直是瞬移的，选中的文本也会被清空。
+    // 只有「从空变有 / 从有变空 / 表还不存在」这三种结构变化才整块重建。
+    const tbody = wrap.querySelector('table tbody');
+    if (tbody && rows.length) {
+      patchStatusbars(wrap, queue, rows);
+      patchRows(tbody, rows, r => r.sessionId, r => COLUMNS.map(c => c.render(r)), COLUMNS);
+      schedule(rows, queue);
+      return;
+    }
+
     wrap.innerHTML = queueHtml(queue) + summaryHtml(rows) + tableHtml(COLUMNS, rows, {
+      rowKey: r => r.sessionId,
       empty: emptyState('ok', {
         glyph: '⇅', title: '当前没有正在传输的备份',
         // 刚点过「立即备份」的人多半是被那句「进度在传输中页面」指过来的，
@@ -172,17 +186,42 @@ LOADERS.transfers = async function () {
           + '想知道它扫到哪一步，到「运行记录」里打开那次执行看每一项的「说明」'
       })
     });
-    // 有东西排队时也按快节奏刷：人盯着的正是「什么时候轮到我」。
-    const busy = rows.length || (queue && queue.queuedItems);
-    App.timer = setTimeout(() => {
-      if (location.hash === '#/transfers') LOADERS.transfers();
-    }, busy ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+    schedule(rows, queue);
   } catch (e) {
     // 刷新失败不清空已有内容也不再排下一次：一直重试会把错误刷成滚动条，
     // 而上一次的数字仍然比空白有用。
     wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
   }
 };
+
+/* 有东西排队时也按快节奏刷：人盯着的正是「什么时候轮到我」。
+   走 schedulePoll 而不是裸 setTimeout：页面切到后台时停掉，回到前台立刻补一次（W4）。 */
+function schedule(rows, queue) {
+  const busy = rows.length || (queue && queue.queuedItems);
+  schedulePoll('transfers', LOADERS.transfers, busy ? POLL_ACTIVE_MS : POLL_IDLE_MS);
+}
+
+/* 两条状态条在增量刷新时也要跟着动，否则「3 条正在传」会停在打开那一刻的数字。
+   它们不是表格，没有行 key 可言，但各自只有一个容器——整块换掉这一个容器的代价
+   可以忽略，而且里面没有任何需要保持连续性的东西（没有过渡、不可选中）。 */
+function patchStatusbars(wrap, queue, rows) {
+  const bars = wrap.querySelectorAll(':scope > .dashboard-statusbar');
+  const html = queueHtml(queue) + summaryHtml(rows);
+  const holder = document.createElement('div');
+  holder.innerHTML = html;
+  const next = [...holder.children];
+
+  // 条数会变（排队条在没人排队时整条消失），数量对不上就退回整块重建，
+  // 免得写出「排队条还在、内容却是汇总」这种错位。
+  if (next.length !== bars.length) {
+    bars.forEach(b => b.remove());
+    wrap.prepend(...next);
+    return;
+  }
+  bars.forEach((bar, i) => {
+    if (bar.outerHTML !== next[i].outerHTML) bar.replaceWith(next[i]);
+  });
+}
 
 /* 全局上传闸的状态。限流如果看不见，它的表现就是「点了备份没反应」——
    人会以为系统坏了，然后去点更多次。排队数为 0 且没到上限时不显示，
@@ -253,7 +292,14 @@ const COLUMNS = [
     l: '进度',
     render: r => `${xferBar(r.percent, r.stalled)}<span class="sub">${Number(r.percent).toFixed(1)}% · ${fmtBytes(r.uploadedBytes)} / ${fmtBytes(r.totalBytes)}</span>`
   },
-  { l: '速度', num: true, render: r => fmtRate(r.bytesPerSecond) },
+  {
+    // 数字答「现在多快」，下面那条线答「在变快还是在变慢」。
+    // 只有一个瞬时数字时，「链路慢」和「链路正在退化」长得一模一样，
+    // 而这两者的处置完全不同——前者等着就好，后者要去查网络。
+    l: '速度',
+    num: true,
+    render: r => `${fmtRate(r.bytesPerSecond)}${sparkline(r.recentRates)}`
+  },
   {
     l: '预计剩余',
     num: true,

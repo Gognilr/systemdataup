@@ -49,6 +49,15 @@ public class CreateBackupTaskRequest
     public int? MinFileCount { get; set; }
     public int? BandwidthLimitKbps { get; set; }
     public int ChunkSizeBytes { get; set; } = 8388608;
+
+    /// <summary>单文件在途分块数（1-16）。性能参数，限速请用 BandwidthLimitKbps。</summary>
+    public int MaxParallelChunks { get; set; } = 4;
+
+    /// <summary>同时在传的文件数（1-8）。不放大在途分块总数。</summary>
+    public int MaxParallelFiles { get; set; } = 3;
+
+    /// <summary>预检并发哈希的文件数（1-8）。</summary>
+    public int MaxParallelHashes { get; set; } = 3;
     public int RetryCount { get; set; } = 3;
     public int RetryIntervalSeconds { get; set; } = 1800;
     public Guid? RetentionPolicyId { get; set; }
@@ -90,6 +99,15 @@ public class UpdateBackupTaskRequest
     public int? MinFileCount { get; set; }
     public int? BandwidthLimitKbps { get; set; }
     public int ChunkSizeBytes { get; set; } = 8388608;
+
+    /// <summary>单文件在途分块数（1-16）。性能参数，限速请用 BandwidthLimitKbps。</summary>
+    public int MaxParallelChunks { get; set; } = 4;
+
+    /// <summary>同时在传的文件数（1-8）。不放大在途分块总数。</summary>
+    public int MaxParallelFiles { get; set; } = 3;
+
+    /// <summary>预检并发哈希的文件数（1-8）。</summary>
+    public int MaxParallelHashes { get; set; } = 3;
     public int RetryCount { get; set; } = 3;
     public int RetryIntervalSeconds { get; set; } = 1800;
     public Guid? RetentionPolicyId { get; set; }
@@ -172,6 +190,9 @@ public class BackupTaskDetailDto : BackupTaskListItemDto
     public int? MinFileCount { get; set; }
     public int? BandwidthLimitKbps { get; set; }
     public int ChunkSizeBytes { get; set; }
+    public int MaxParallelChunks { get; set; }
+    public int MaxParallelFiles { get; set; }
+    public int MaxParallelHashes { get; set; }
     public int RetryCount { get; set; }
     public int RetryIntervalSeconds { get; set; }
     public Guid? RetentionPolicyId { get; set; }

@@ -1716,7 +1716,27 @@ public sealed class AgentWorker : BackgroundService
 
         try
         {
-            foreach (var remoteFile in session.Files)
+            // 文件级工作池（实施方案 T1）。原先这里是 `foreach (var remoteFile in session.Files)`：
+            // 块内 4 路并发已经有了，文件之间却一路都没有，而每个文件固定三次串行往返
+            // （missing-chunks → PUT → complete）。大文件无所谓，往返被摊薄进几百兆数据里；
+            // U8 附件库那种几千个几十 KB 的文件则完全相反——速率由往返次数而不是带宽决定。
+            //
+            // 关键约束：文件级并发**不得放大在途分块数**。所有文件的分块 PUT 共用下面这一个
+            // 信号量，因此无论多少文件在并行，在途分块总数仍然 ≤ MaxParallelChunks——
+            // 内存占用（每路一个分块缓冲）与服务端并发压力都和改造前持平，
+            // 多出来的只是控制类往返的重叠。
+            // 并发度优先取服务端随任务下发的值（实施方案 T7），下发缺失时才回退到本地配置。
+            // 客户端仍然自己夹一次：服务端已经拒绝过越界值，但直接改库塞进去的、
+            // 或者更旧的服务端下发的 0，都不该让这里 new 出一个非法的信号量。
+            var parallelChunks = Math.Clamp(task?.MaxParallelChunks ?? _options.MaxParallelChunks, 1, 16);
+            var parallelFiles = Math.Clamp(task?.MaxParallelFiles ?? _options.MaxParallelFiles, 1, 8);
+
+            using var chunkGate = new SemaphoreSlim(parallelChunks);
+            var fileQueue = new System.Collections.Concurrent.ConcurrentQueue<UploadSessionFileDto>(session.Files);
+            using var fileFailFast = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            Exception? firstFileFailure = null;
+
+            async Task UploadOneFileAsync(UploadSessionFileDto remoteFile, CancellationToken fileCt)
             {
                 var local = candidateFiles.FirstOrDefault(f => string.Equals(f.RelativePath, remoteFile.RelativePath, StringComparison.OrdinalIgnoreCase));
                 if (local is null || !File.Exists(local.FullPath))
@@ -1727,7 +1747,7 @@ public sealed class AgentWorker : BackgroundService
                     throw new UploadAbortedException("LOCAL_FILE_MISSING", $"本地文件不存在：{remoteFile.RelativePath}");
                 }
 
-                var missing = await _api.GetMissingChunksAsync(session.UploadSessionId, remoteFile.UploadFileId, ct);
+                var missing = await _api.GetMissingChunksAsync(session.UploadSessionId, remoteFile.UploadFileId, fileCt);
                 var indexes = ExpandMissing(missing, local.SizeBytes, session.ChunkSizeBytes);
 
                 // 分块并行发送（原先是严格串行的 foreach）。
@@ -1742,8 +1762,8 @@ public sealed class AgentWorker : BackgroundService
                 // 同一文件多块并发写、各块偏移互不重叠（见 UploadStorage.WriteChunkAsync），
                 // 分块记录按 (file, index) upsert、计数在数据库侧增量累加，并发落库都是安全的。
                 var queue = new System.Collections.Concurrent.ConcurrentQueue<int>(indexes);
-                var parallel = Math.Clamp(_options.MaxParallelChunks, 1, 16);
-                using var failFast = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var parallel = parallelChunks;
+                using var failFast = CancellationTokenSource.CreateLinkedTokenSource(fileCt);
                 Exception? firstFailure = null;
 
                 async Task RunSenderAsync()
@@ -1755,7 +1775,7 @@ public sealed class AgentWorker : BackgroundService
                             failFast.Token.ThrowIfCancellationRequested();
                             await UploadChunkWithRetryAsync(
                                 session.UploadSessionId, remoteFile.UploadFileId, local.FullPath,
-                                index, session.ChunkSizeBytes, throttle, failFast.Token);
+                                index, session.ChunkSizeBytes, throttle, chunkGate, failFast.Token);
 
                             // 只累加本次真正传的块。续传时已在服务端的块不在 indexes 里，
                             // 因此百分比反映的是「这一次要传多少」，不是文件总量——
@@ -1766,7 +1786,7 @@ public sealed class AgentWorker : BackgroundService
                             var total = Interlocked.Add(ref sentBytes, chunkLength);
                             await progress.ReportAsync(total, local.RelativePath, failFast.Token);
                         }
-                        catch (OperationCanceledException) when (failFast.IsCancellationRequested && !ct.IsCancellationRequested)
+                        catch (OperationCanceledException) when (failFast.IsCancellationRequested && !fileCt.IsCancellationRequested)
                         {
                             // 另一路已经失败、把大家一起叫停了，本路不是自己出错。
                             // 不记录，好让真正的失败原因原样冒出去——否则最终抛出的
@@ -1789,7 +1809,7 @@ public sealed class AgentWorker : BackgroundService
 
                 // 外层取消优先：那意味着整个 Agent 正在停机，
                 // 不该被包装成「这次上传失败了」。
-                ct.ThrowIfCancellationRequested();
+                fileCt.ThrowIfCancellationRequested();
                 if (firstFailure is not null)
                     System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(firstFailure).Throw();
 
@@ -1797,8 +1817,42 @@ public sealed class AgentWorker : BackgroundService
                 {
                     SizeBytes = local.SizeBytes,
                     Sha256 = local.Sha256
-                }, ct);
+                }, fileCt);
             }
+
+            async Task RunFileWorkerAsync()
+            {
+                while (fileQueue.TryDequeue(out var remoteFile))
+                {
+                    try
+                    {
+                        fileFailFast.Token.ThrowIfCancellationRequested();
+                        await UploadOneFileAsync(remoteFile, fileFailFast.Token);
+                    }
+                    catch (OperationCanceledException) when (fileFailFast.IsCancellationRequested && !ct.IsCancellationRequested)
+                    {
+                        // 同分块级的理由：别人失败叫停了全体，本路不是自己出错，
+                        // 不能用一个「已取消」把真正的失败原因盖掉。
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.CompareExchange(ref firstFileFailure, ex, null);
+                        fileFailFast.Cancel();
+                        return;
+                    }
+                }
+            }
+
+            var fileParallel = parallelFiles;
+            await Task.WhenAll(Enumerable.Range(0, fileParallel).Select(_ => RunFileWorkerAsync()));
+
+            ct.ThrowIfCancellationRequested();
+            // 这一步不能省：文件级并发之后，「全部文件都完成了」不再由 foreach 的顺序隐式保证。
+            // 漏掉它就会带着一个失败的文件去调 complete-session，
+            // 服务端那边看到的是「客户端说传完了」，而实际少一个文件。
+            if (firstFileFailure is not null)
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(firstFileFailure).Throw();
 
             var completed = await _api.CompleteUploadSessionAsync(session.UploadSessionId, new CompleteUploadSessionRequest
             {
@@ -2070,13 +2124,24 @@ public sealed class AgentWorker : BackgroundService
         }
     }
 
-    private async Task UploadChunkWithRetryAsync(Guid sessionId, Guid fileId, string path, int chunkIndex, int chunkSize, ChunkThrottle throttle, CancellationToken ct)
+    /// <param name="chunkGate">
+    /// 在途分块的全局闸门（实施方案 T1）。整个会话共用一个，容量是 MaxParallelChunks，
+    /// 所以文件级并发不会把在途分块数乘上去——那既是内存占用（每路一个分块缓冲）
+    /// 也是服务端的并发写压力，两者都不该被一个「文件级」的参数悄悄放大。
+    ///
+    /// 闸门要在**读盘之前**就拿：缓冲区是在这里面申请的，等到发送时才拿等于没限住内存。
+    /// </param>
+    private async Task UploadChunkWithRetryAsync(Guid sessionId, Guid fileId, string path, int chunkIndex, int chunkSize, ChunkThrottle throttle, SemaphoreSlim chunkGate, CancellationToken ct)
     {
         var info = new FileInfo(path);
         var offset = (long)chunkIndex * chunkSize;
         var length = (int)Math.Min(chunkSize, info.Length - offset);
         if (length <= 0)
             return;
+
+        await chunkGate.WaitAsync(ct);
+        try
+        {
 
         // 分块默认 8MB，逐块裸分配全部落 LOH；改用 ArrayPool 复用。
         // 风险点：Rent 返回的数组可能比请求的大，下游一律按 length 切片，
@@ -2123,6 +2188,12 @@ public sealed class AgentWorker : BackgroundService
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
+        }
+
+        }
+        finally
+        {
+            chunkGate.Release();
         }
     }
 

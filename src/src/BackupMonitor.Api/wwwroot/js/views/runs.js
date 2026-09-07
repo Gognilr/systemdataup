@@ -12,7 +12,7 @@ import {
   $, esc, status, shortId, fmtDT, relTime, tableHtml, pagerHtml,
   emptyState, openModal, errToast
 } from '../ui.js';
-import { shell, loading } from '../app.js';
+import { shell, loading, schedulePoll } from '../app.js';
 import {
   openRunModal, RUN_STATUS, TRIGGER_TEXT, statusPill, runKindText, runTitle
 } from './run-detail.js';
@@ -82,9 +82,7 @@ LOADERS.runs = async function () {
     wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
   }
 
-  App.timer = setTimeout(() => {
-    if (location.hash === '#/runs') LOADERS.runs();
-  }, busy ? POLL_BUSY_MS : POLL_IDLE_MS);
+  schedulePoll('runs', LOADERS.runs, busy ? POLL_BUSY_MS : POLL_IDLE_MS);
 };
 
 /* ── 队列 ── */

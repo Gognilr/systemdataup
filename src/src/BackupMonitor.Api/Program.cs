@@ -153,6 +153,29 @@ builder.Services.Configure<ForwardedHeadersOptions>(options =>
     }
 });
 
+// 响应压缩（实施方案 W1）。
+//
+// 两种部署形态都得在这里兜住：Secure 形态下 nginx 那一层可以另开 gzip，
+// 但 Turnkey 形态是 Kestrel 直接对外，没有任何代理能补上。此前两边都没开，
+// 于是 8900 行 JS/CSS 与所有 JSON 列表响应全部按原文传输——
+// 一页 50 条的审计日志压缩比通常在 8 倍以上。
+//
+// EnableForHttps 显式打开：本系统的响应体是 JSON 与静态资源，
+// 不含「攻击者可注入的反射内容 + 同一响应里的机密字段」这一组合，
+// 不具备 BREACH 的利用前提。不要凭「HTTPS 上不该压缩」的笼统印象把这条改回去。
+builder.Services.AddResponseCompression(options =>
+{
+    options.EnableForHttps = true;
+    options.Providers.Add<Microsoft.AspNetCore.ResponseCompression.BrotliCompressionProvider>();
+    options.Providers.Add<Microsoft.AspNetCore.ResponseCompression.GzipCompressionProvider>();
+
+    // 恢复下载走 application/octet-stream 与 application/zip，两者都**不在**这个名单里：
+    // 备份文件要么本就压不动、要么已经压过，压第二遍只会在传几十 GB 时白烧一个核。
+    options.MimeTypes =
+        Microsoft.AspNetCore.ResponseCompression.ResponseCompressionDefaults.MimeTypes
+            .Concat(["application/json", "image/svg+xml"]);
+});
+
 // Controllers + 统一 JSON + 模型校验失败也走统一错误形状
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
@@ -409,6 +432,10 @@ if (app.Environment.IsDevelopment())
 // Secure 形态的 TLS 由 nginx 终结；Turnkey 形态的 Kestrel 端点本身就是 HTTPS，
 // 因此这里不做重定向，避免反向代理和本地 HTTPS 之间形成循环。
 app.UseCors("Management");
+
+// 压缩必须排在静态文件之前，否则 wwwroot 里的 JS/CSS 直接被 StaticFileMiddleware
+// 写出去，永远走不到压缩中间件（实施方案 W1）。
+app.UseResponseCompression();
 
 // 内置单页管理控制台（wwwroot）：静态文件匿名可访问，业务接口仍走认证授权
 app.UseDefaultFiles();

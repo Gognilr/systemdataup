@@ -25,19 +25,43 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 });
 
 /* ── 信息架构（UI-REDESIGN §5）：按运维工作分组，而不是按 REST 端点排列 ── */
+/* 侧栏图标（实施方案 U2）。
+   原先是 Unicode 几何符号（⌂ ⇅ ○ ▲ …）。它们在 Windows 上多半落到 Segoe UI Symbol，
+   字重、基线、视觉大小与正文字体对不齐，个别（▲ ✉ ↺）在某些环境还会走 emoji 呈现变成彩色。
+   换成 16×16 / 1.5px 描边 / currentColor 的内联 SVG：跟随主题、跟随选中态，
+   十七个 path 加起来不到 3KB，比引一个图标库或多一次 HTTP 请求都划算。 */
+const ICON = {
+  overview: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 7.2 8 2.5l6 4.7V13a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/></svg>',
+  transfers: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 2.5v11m0 0L2 11m2.5 2.5L7 11M11.5 13.5v-11m0 0L9 5m2.5-2.5L14 5"/></svg>',
+  todo: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 4.5h8.5M5.5 8h8.5M5.5 11.5h8.5M2 4.5h.01M2 8h.01M2 11.5h.01"/></svg>',
+  alerts: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.2 14.5 13.5h-13zM8 6.6v3M8 11.6h.01"/></svg>',
+  clients: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 3.5h11v7h-11zM5.5 13.5h5M8 10.5v3"/></svg>',
+  tasks: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 2.5h11v11h-11zM5.2 8l2 2 3.6-4"/></svg>',
+  plans: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 3.5h11v10h-11zM2.5 6.5h11M5.5 2v2.5M10.5 2v2.5"/></svg>',
+  backups: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.5c3 0 5.5.9 5.5 2s-2.5 2-5.5 2-5.5-.9-5.5-2 2.5-2 5.5-2M2.5 4.5v7c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2v-7"/></svg>',
+  restores: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.6 8a5.4 5.4 0 1 0 1.7-3.9M2.2 2.6v3.2h3.2"/></svg>',
+  settings: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 5.6a2.4 2.4 0 1 0 0 4.8 2.4 2.4 0 0 0 0-4.8M13 8c0-.4 0-.7-.1-1l1.4-1-1.4-2.4-1.6.6a5 5 0 0 0-1.7-1L9.3 1.4H6.7l-.3 1.8a5 5 0 0 0-1.7 1l-1.6-.6L1.7 6l1.4 1a5 5 0 0 0 0 2l-1.4 1 1.4 2.4 1.6-.6a5 5 0 0 0 1.7 1l.3 1.8h2.6l.3-1.8a5 5 0 0 0 1.7-1l1.6.6 1.4-2.4-1.4-1c.1-.3.1-.6.1-1"/></svg>',
+  retention: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 4.5h9v8a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1zM2 4.5h12M6.2 2.5h3.6M6.5 7v4M9.5 7v4"/></svg>',
+  notifications: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 4.2h12v7.6H2zM2.3 4.6 8 8.8l5.7-4.2"/></svg>',
+  upgrades: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 13V3m0 0L4.4 6.6M8 3l3.6 3.6"/></svg>',
+  runs: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2.6a5.4 5.4 0 1 1 0 10.8A5.4 5.4 0 0 1 8 2.6M8 5.2V8l2 1.4"/></svg>',
+  audit: '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 3.5h11M2.5 6.5h11M2.5 9.5h7M2.5 12.5h7"/></svg>',
+  'registration-tokens': '<svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.4 6.6a3 3 0 1 1 0 2.8L6 9.4v1.7H4.4v1.7H2V10.9L6 6.6z"/></svg>',
+};
+
 export const NAV_GROUPS = [
   { key: 'watch', label: '值守', items: [
-    ['overview', '概览', '⌂'], ['transfers', '传输中', '⇅'], ['todo', '待办', '○'], ['alerts', '告警', '▲']
+    ['overview', '概览', ICON.overview], ['transfers', '传输中', ICON.transfers], ['todo', '待办', ICON.todo], ['alerts', '告警', ICON.alerts]
   ] },
   { key: 'fleet', label: '机群', items: [
-    ['clients', '客户端', '◉'], ['tasks', '备份任务', '▣'], ['plans', '备份计划', '≣']
+    ['clients', '客户端', ICON.clients], ['tasks', '备份任务', ICON.tasks], ['plans', '备份计划', ICON.plans]
   ] },
   { key: 'data', label: '数据', items: [
-    ['backups', '备份集', '▤'], ['restores', '恢复', '↺']
+    ['backups', '备份集', ICON.backups], ['restores', '恢复', ICON.restores]
   ] },
   { key: 'manage', label: '管理', items: [
-    ['settings', '存储设置', '⚙'], ['retention', '保留策略', '◫'], ['notifications', '通知', '✉'],
-    ['upgrades', '客户端升级', '↑'], ['runs', '运行记录', '◷'], ['audit', '审计日志', '≡']
+    ['settings', '存储设置', ICON.settings], ['retention', '保留策略', ICON.retention], ['notifications', '通知', ICON.notifications],
+    ['upgrades', '客户端升级', ICON.upgrades], ['runs', '运行记录', ICON.runs], ['audit', '审计日志', ICON.audit]
   ] }
 ];
 const NAV_ITEMS = NAV_GROUPS.flatMap(g => g.items.map(([key, label, icon]) => ({ key, label, icon, group: g.label })));
@@ -78,6 +102,36 @@ export function shell(active, title, body) {
   </div></div>`;
 }
 export const loading = () => skeleton(5);
+
+/* ── 轮询编排（实施方案 W4）────────────────────────────────────────────────
+
+   页面不可见时不排下一轮，回到前台**立刻刷一次**再恢复节奏。
+
+   「立刻刷」这一步不能省：少了它，人切回来看到的是切走那一刻的旧数字，
+   而这正是最容易被当成「系统卡住了」的场景——传输页尤其如此，
+   一屏不动的进度条和一个真的卡死的传输长得一模一样。
+
+   浏览器本来就会把后台标签页的 setTimeout 节流到约一分钟一次，所以这不是失控问题；
+   省下的是「几个管理员各挂一个页面，服务端为没人看的界面持续跑聚合查询」。 */
+export function schedulePoll(routeKey, fn, delayMs) {
+  clearTimeout(App.timer);
+  App.pendingPoll = null;
+  if (document.visibilityState === 'hidden') {
+    App.pendingPoll = { routeKey, fn };
+    return;
+  }
+  App.timer = setTimeout(() => {
+    if (location.hash.replace(/^#\/?/, '').split('/')[0] === routeKey) fn();
+  }, delayMs);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  const pending = App.pendingPoll;
+  App.pendingPoll = null;
+  if (!pending) return;
+  if (location.hash.replace(/^#\/?/, '').split('/')[0] === pending.routeKey) pending.fn();
+});
 
 /* ── 动作分发 / 分页 / 排序 / 批量 ── */
 App.act = async function (view, action, id) {
@@ -547,6 +601,8 @@ const VIEW_EXPORTS = {
 const DRAWER_EXPORTS = { tasks: 'openTaskDrawer', restores: 'openRestoreDrawer', alerts: 'openAlertDrawer', audit: 'openAuditDrawer' };
 async function route() {
   clearTimeout(App.timer);
+  // 切页时把「等回到前台再刷」的那一笔也丢掉，否则旧页的轮询会在切回来时复活。
+  App.pendingPoll = null;
   const hash = location.hash || '#/login';
   const parts = hash.replace(/^#\/?/, '').split('/');
   const page = parts[0] || 'login';

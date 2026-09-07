@@ -75,12 +75,35 @@ export function status(group, val) {
 }
 
 /* ── 格式化 ── */
+/* 有效位数随量级走（实施方案 U3）：998 MB / 12.4 GB / 1.24 TB。
+
+   原先一律两位小数。「6.24 TB」里最后那一位既没有决策价值，又把数字拉长、
+   把量级本身冲淡了——而在一屏全是数字的运维界面上，量级才是要一眼读到的东西。 */
+function scaleBytes(n) {
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = Number(n);
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  const digits = i === 0 ? 0 : v >= 100 ? 0 : v >= 10 ? 1 : 2;
+  return { value: v.toFixed(digits), unit: u[i] };
+}
+
+/* 纯文本版本，语义与从前一致（可以安全地进 esc()、textContent、title 属性）。
+   全站 40 多处调用都走这里，不改契约。 */
 export function fmtBytes(n) {
   if (n == null) return '—';
-  n = Number(n);
-  const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  return (i === 0 ? n : n.toFixed(2)) + ' ' + u[i];
+  const { value, unit } = scaleBytes(n);
+  return `${value} ${unit}`;
+}
+
+/* HTML 版本：单位降一号字、用次要色。只用在确认是 innerHTML 的展示点——
+   关键指标（--t-num 28px）用上之后，「**6.2** TB」和「6.24 TB」差的
+   正好是那一点「贵」的感觉。刻意不去动 fmtBytes 本身：
+   它有 40 多个调用点，其中有进 esc() 的、有进属性的，改契约必然漏掉一个，
+   而漏掉的表现是界面上直接显示出 <span> 源码。 */
+export function fmtBytesHtml(n) {
+  if (n == null) return '—';
+  const { value, unit } = scaleBytes(n);
+  return `${value}<span class="unit">${unit}</span>`;
 }
 /* 速度和剩余时间：算不出来的时候一律给 —— 而不是 0。
    「0 B/s」和「剩余 0 秒」看起来都像是个结论，实际是「不知道」，
@@ -111,6 +134,38 @@ export function fmtDuration(sec) {
 export function xferBar(percent, stalled) {
   const p = Math.max(0, Math.min(100, Number(percent) || 0));
   return `<div class="xfer-bar${stalled ? ' is-stalled' : ''}" role="progressbar" aria-valuenow="${p.toFixed(1)}" aria-valuemin="0" aria-valuemax="100"><span style="width:${p.toFixed(2)}%"></span></div>`;
+}
+
+/* 速率走势线（实施方案 U1）。48×14 的内联 SVG，一条 polyline。
+
+   刻意不引图表库：任何一个库为了这条线带进来的都是几十 KB 加一套自己的主题系统，
+   而这里要画的只有「一行数据的一分钟趋势」。
+
+   纵轴按本行自身的最大值归一化，不做跨行统一刻度：这条线要回答的是
+   「这一条传输自己在变快还是变慢」，不是「哪一条最快」——后者是「速度」列的事。
+
+   少于两点时给一个横杠。补零画出的曲线会让刚开始的传输看起来像刚刚提速，
+   那是在界面上编造没有采样到的数据。 */
+export function sparkline(values, { width = 48, height = 14 } = {}) {
+  if (!Array.isArray(values) || values.length < 2)
+    return '<span class="spark-empty" aria-hidden="true">—</span>';
+
+  const max = Math.max(...values, 1);
+  const step = width / (values.length - 1);
+  const points = values
+    .map((v, i) => `${(i * step).toFixed(1)},${(height - (Number(v) / max) * height).toFixed(1)}`)
+    .join(' ');
+
+  // 趋势用文字补给读屏与悬停：SVG 本身是纯视觉重复（速率数字就在旁边），标 aria-hidden。
+  const head = values.slice(0, Math.max(1, Math.floor(values.length / 3)));
+  const tail = values.slice(-Math.max(1, Math.floor(values.length / 3)));
+  const avg = xs => xs.reduce((n, x) => n + Number(x), 0) / xs.length;
+  const ratio = avg(head) > 0 ? avg(tail) / avg(head) : 1;
+  const trend = ratio > 1.25 ? '正在变快' : ratio < 0.75 ? '正在变慢' : '基本平稳';
+
+  return `<svg class="spark" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"`
+    + ` role="img" aria-hidden="true" focusable="false"><title>最近一分钟：${trend}</title>`
+    + `<polyline points="${points}"/></svg>`;
 }
 
 export function fmtDT(v) {
@@ -695,6 +750,57 @@ export function closeDrawer(skipOnClose = false) {
 }
 export function drawerOpen() { return !!drawerEl; }
 
+/* ── 轮询刷新用的行级增量更新（实施方案 W3）──────────────────────────────
+
+   只在「同一张表每隔几秒刷新一次」的场景用；首屏、筛选、排序变化仍然走 tableHtml 整块重建。
+
+   为什么值得单独写这三十行：整块 innerHTML 重建会把 DOM 节点全部换掉，于是
+     一、CSS 过渡拿不到「上一个值」—— .xfer-bar span 上写着 transition:width，
+         而它从来没有触发过一次，进度条一直是瞬移的；
+     二、用户正在选中/准备复制的主机名被清空；
+     三、hover、title 提示、键盘导航的 kbd-focus 全部重置。
+   这四条都不是性能问题，是「界面看起来很廉价」的直接来源。
+
+   刻意不引虚拟 DOM：这里要解决的只有「同构表格反复刷新」一个场景，
+   一个按 key 的 map + insertBefore 就够，再多的抽象都是负债。 */
+export function patchRows(tbody, rows, keyOf, renderCells, cols) {
+  if (!tbody) return false;
+  const existing = new Map([...tbody.children].map(tr => [tr.dataset.rowKey, tr]));
+  let cursor = null;
+
+  for (const row of rows) {
+    const key = String(keyOf(row));
+    let tr = existing.get(key);
+    const cells = renderCells(row);
+
+    if (tr && tr.children.length === cells.length) {
+      existing.delete(key);
+      // 只写内容真的变了的单元格。没变的 <td> 保持原节点不动——
+      // 里面的 .xfer-bar 因此能拿到上一次的宽度，那条 transition 才有意义。
+      for (let i = 0; i < cells.length; i++) {
+        const td = tr.children[i];
+        if (td && td.innerHTML !== cells[i]) td.innerHTML = cells[i];
+      }
+    } else {
+      if (tr) existing.delete(key);
+      tr = document.createElement('tr');
+      tr.dataset.rowKey = key;
+      tr.innerHTML = cells
+        .map((html, i) => `<td${cols && cols[i] && cols[i].num ? ' class="num"' : ''}>${html}</td>`)
+        .join('');
+    }
+
+    // 顺序对齐：服务端的排序会变（卡住的排最前），但整表重排会让所有行重新入场。
+    // 只在位置真的不对时才 insertBefore。
+    const next = cursor ? cursor.nextSibling : tbody.firstChild;
+    if (next !== tr) tbody.insertBefore(tr, next);
+    cursor = tr;
+  }
+
+  for (const stale of existing.values()) stale.remove();
+  return true;
+}
+
 /* ── §6.2 表格：32px 行高 / 粘性表头 / 数字右对齐 / 排序列 aria-sort / 多选列 ── */
 export function tableHtml(cols, rows, opts = {}) {
   if (!rows || !rows.length) return opts.empty || '<div class="empty">暂无数据</div>';
@@ -714,7 +820,9 @@ export function tableHtml(cols, rows, opts = {}) {
   }).join('');
   const selHead = opts.stateKey
     ? `<th class="tsel"><input type="checkbox" data-selall="${esc(opts.stateKey)}" data-ids="${esc(rows.map(r => r.id).join(','))}" aria-label="全选" ${rows.every(r => sel.has(r.id)) ? 'checked' : ''}></th>` : '';
-  const body = rows.map(r => `<tr>${opts.stateKey ? `<td class="tsel"><input type="checkbox" data-sel="${esc(r.id)}" data-selkey="${esc(opts.stateKey)}" aria-label="选择该行" ${sel.has(r.id) ? 'checked' : ''}></td>` : ''}${cols.map(c => `<td${c.num ? ' class="num"' : ''}>${c.render ? c.render(r) : esc(r[c.k] ?? '—')}</td>`).join('')}</tr>`).join('');
+  // opts.rowKey 给每行盖一个稳定标识，供 patchRows 在后续轮询里认出「还是这一行」。
+  // 不传就不盖——静态表没有增量刷新的需求，多一个属性只是噪音。
+  const body = rows.map(r => `<tr${opts.rowKey ? ` data-row-key="${esc(opts.rowKey(r))}"` : ''}>${opts.stateKey ? `<td class="tsel"><input type="checkbox" data-sel="${esc(r.id)}" data-selkey="${esc(opts.stateKey)}" aria-label="选择该行" ${sel.has(r.id) ? 'checked' : ''}></td>` : ''}${cols.map(c => `<td${c.num ? ' class="num"' : ''}>${c.render ? c.render(r) : esc(r[c.k] ?? '—')}</td>`).join('')}</tr>`).join('');
   return `<table><thead><tr>${selHead}${head}</tr></thead><tbody>${body}</tbody></table>`;
 }
 

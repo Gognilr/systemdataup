@@ -161,6 +161,53 @@ public class UploadCommitWorker : BackgroundService
 
         try
         {
+            // ── 整文件哈希复核（实施方案 T2）────────────────────────────────────
+            //
+            // 这一步原先在 CompleteFileAsync 里，也就是**客户端同步等待的请求路径上**：
+            // 6GB 的备份在慢盘上要整读几分钟，而客户端的 HTTP 超时是 10 分钟——
+            // 正常上传会以超时告终，报出来的错还跟哈希毫无关系。挪到这里之后，
+            // 落盘保证与判定口径一个字没变，变的只是「谁在等」。
+            //
+            // 位置刻意放在**创建任何仓库目录之前**：哈希不符时直接抛出去，
+            // 此刻还没有 commitTemp、没有硬链接、没有半份复制，外层 catch 不需要清理任何东西。
+            // 跨卷复制那条路径因此会多读一遍（复制本可以边读边算），但那是罕见分支，
+            // 而「失败路径不留垃圾」比省掉一次顺序读重要得多。
+            foreach (var file in session.Files)
+            {
+                ct.ThrowIfCancellationRequested();
+                var serverSha = await storage.ComputeFileHashAsync(session.Id, file.Id, ct);
+
+                // 审查 P1-1 的判定原样保留：以预检清单的 expected_sha256 为权威基准
+                // （服务端持有），客户端在 complete 时声明的值只作附加交叉验证——
+                // 它由上传方单方面给出，不能拿它当唯一判据。
+                var mismatchReason =
+                    !string.Equals(serverSha, file.ExpectedSha256, StringComparison.OrdinalIgnoreCase)
+                        ? $"实测哈希与预检期望值不一致（期望 {file.ExpectedSha256}，实测 {serverSha}）"
+                    : !string.IsNullOrWhiteSpace(file.ClientDeclaredSha256)
+                      && !string.Equals(serverSha, file.ClientDeclaredSha256, StringComparison.OrdinalIgnoreCase)
+                        ? $"客户端声明哈希与实测不一致（声明 {file.ClientDeclaredSha256}，实测 {serverSha}）"
+                    : null;
+
+                file.ServerSha256 = serverSha;
+                if (mismatchReason is not null)
+                {
+                    file.Status = UploadFileStatus.Failed;
+                    file.ErrorCode = "FILE_HASH_MISMATCH";
+                    await db.SaveChangesAsync(ct);
+                    throw new FileHashMismatchException(file.RelativePath, mismatchReason);
+                }
+
+                file.Status = UploadFileStatus.Verified;
+            }
+
+            // 复核通过才累加 verified_bytes（实施方案 T3）。
+            //
+            // 原先这一句在 CompleteFileAsync 里，写法是「把本会话已 verified 的所有文件
+            // SUM 一遍」——正是 RecordReceivedChunkAsync 的注释里论证并改掉的那个反模式，
+            // 只是从块级搬到了文件级：N 个文件要扫 N(N+1)/2 行，5000 个文件约 1250 万行，
+            // 全为算一个本可以直接加出来的数。
+            session.VerifiedBytes = session.Files.Sum(f => f.SizeBytes);
+
             var repoRoot = await storage.GetRepositoryRootAsync(ct);
 
             // 正式路径完全由服务端生成（设计书 23.4）
@@ -447,6 +494,31 @@ public class UploadCommitWorker : BackgroundService
             _logger.LogInformation("会话 {SessionId} 入库因服务停止中断，重启后将重新入队", sessionId);
             throw;
         }
+        catch (FileHashMismatchException ex)
+        {
+            // 实施方案 T2：哈希不符和「入库过程出错」是两回事，必须给不同的错误码。
+            // COMMIT_FAILED 的含义是「传上来的东西是对的，存进仓库时出了问题」——
+            // 那种情况重传没用，该查的是服务端磁盘；而 FILE_HASH_MISMATCH 说的是
+            // 「传上来的东西就不对」，正确处置是重传。两者混成一个码，
+            // 现场只能靠猜。走到这里时还没有创建任何仓库目录，没有东西需要清理。
+            _logger.LogError(ex, "会话 {SessionId} 整文件复核未通过", sessionId);
+
+            session.Status = UploadStatus.Failed;
+            session.ErrorCode = "FILE_HASH_MISMATCH";
+            session.ErrorMessage = ex.Message.Length > 1900 ? ex.Message[..1900] : ex.Message;
+            session.UpdatedAt = DateTime.UtcNow;
+            await db.SaveChangesAsync(CancellationToken.None);
+
+            await alerting.RaiseAsync(
+                $"session:{session.Id}:commit_failed",
+                AlertLevel.Critical,
+                "upload_commit_failed",
+                $"备份传完了，但内容和预检时对不上（任务 {task.Name}）",
+                ex.Message,
+                clientId: client.Id,
+                taskId: task.Id,
+                ct: CancellationToken.None);
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "会话 {SessionId} 校验入库失败", sessionId);
@@ -482,6 +554,19 @@ public class UploadCommitWorker : BackgroundService
     {
         public PostCommitException(Exception inner)
             : base("入库事务已提交，提交后的收尾动作失败", inner)
+        {
+        }
+    }
+
+    /// <summary>
+    /// 整文件哈希复核未通过（实施方案 T2）。
+    /// 单独一个类型，是为了让外层 catch 能把它和「入库过程出错」分开：
+    /// 前者要重传，后者重传没用。抛出时尚未创建任何仓库目录。
+    /// </summary>
+    private sealed class FileHashMismatchException : Exception
+    {
+        public FileHashMismatchException(string relativePath, string reason)
+            : base($"文件哈希错误（{relativePath}）：{reason}")
         {
         }
     }

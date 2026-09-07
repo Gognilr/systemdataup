@@ -268,6 +268,9 @@ public class UploadProgressService : IUploadProgressService
                     ? Math.Clamp(Math.Round((decimal)r.UploadedBytes * 100 / r.TotalBytes, 2), 0, 100)
                     : 0,
                 BytesPerSecond = rate,
+                // 一分钟的走势（实施方案 U1）：一个瞬时数字分不出「慢」和「正在变慢」，
+                // 而这两者的处置完全不同——前者等着就好，后者要去查链路。
+                RecentRates = _sampler.HistoryOf(r.Id),
                 // 速度为 0 时不给剩余时间。显示「剩余 0 秒」比不显示更糟：
                 // 它看起来像马上就好了，实际是一点都没在动。
                 EtaSeconds = rate is > 0 ? (long)(remaining / rate.Value) : null,
@@ -320,7 +323,15 @@ public sealed class UploadRateSampler
     /// </summary>
     private static readonly TimeSpan MinSampleGap = TimeSpan.FromSeconds(3);
 
+    /// <summary>
+    /// 每个会话保留多少个历史速率点。5 秒轮询 × 12 ≈ 覆盖最近一分钟，
+    /// 正好是「链路正常 / 正在退化 / 已经卡了」这个判断需要的尺度。
+    /// 内存开销是 12 个 long × 并发会话数，可以忽略。
+    /// </summary>
+    private const int HistoryPoints = 12;
+
     private readonly Dictionary<Guid, Sample> _samples = [];
+    private readonly Dictionary<Guid, Queue<long>> _history = [];
     private readonly object _gate = new();
 
     /// <summary>
@@ -350,7 +361,38 @@ public sealed class UploadRateSampler
             var delta = Math.Max(0, uploadedBytes - previous.Bytes);
             long? rate = delta > 0 ? (long)(delta / gap.TotalSeconds) : null;
             _samples[sessionId] = new Sample(uploadedBytes, nowUtc, rate);
+
+            // 只把真正采到的点记进历史（实施方案 U1）。
+            //
+            // rate 为 null 表示「这个窗口里计数没动」——8MB 才推进一次而界面 5 秒一刷，
+            // 采到 null 是常态。把它当 0 记进去会画出一条上下打摆的锯齿，
+            // 而那条线要回答的是趋势，不是采样噪声。
+            if (rate is not null)
+            {
+                if (!_history.TryGetValue(sessionId, out var points))
+                    _history[sessionId] = points = new Queue<long>(HistoryPoints);
+                points.Enqueue(rate.Value);
+                while (points.Count > HistoryPoints)
+                    points.Dequeue();
+            }
+
             return rate;
+        }
+    }
+
+    /// <summary>
+    /// 最近若干次采到的瞬时速率，旧→新。
+    ///
+    /// 不足两点时返回空：调用方据此显示「—」而不是画一条从 0 冲上来的假曲线。
+    /// 补零是这里最容易犯的错——它会让刚开始的传输看起来像刚刚提速。
+    /// </summary>
+    public IReadOnlyList<long> HistoryOf(Guid sessionId)
+    {
+        lock (_gate)
+        {
+            return _history.TryGetValue(sessionId, out var points) && points.Count >= 2
+                ? points.ToArray()
+                : [];
         }
     }
 
@@ -359,9 +401,12 @@ public sealed class UploadRateSampler
     {
         lock (_gate)
         {
-            if (_samples.Count == 0) return;
+            if (_samples.Count == 0 && _history.Count == 0) return;
             foreach (var stale in _samples.Keys.Where(k => !liveSessionIds.Contains(k)).ToList())
                 _samples.Remove(stale);
+            // 历史也要一起清，否则这张表会随会话数一直涨——和 _samples 是同一个理由。
+            foreach (var stale in _history.Keys.Where(k => !liveSessionIds.Contains(k)).ToList())
+                _history.Remove(stale);
         }
     }
 

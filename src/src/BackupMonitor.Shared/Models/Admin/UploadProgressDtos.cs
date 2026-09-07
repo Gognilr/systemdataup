@@ -47,6 +47,18 @@ public class UploadProgressDto
     /// </summary>
     public long? BytesPerSecond { get; set; }
 
+    /// <summary>
+    /// 最近若干次采到的瞬时速率（字节/秒，旧→新），用来在界面上画一条一分钟的走势线。
+    ///
+    /// 存在的理由：一个瞬时数字只答得出「现在多快」，答不出「在变快还是在变慢」，
+    /// 而运维真正要分的是三种状态——链路正常、正在退化、已经卡住。
+    /// 第三种由 <see cref="Stalled"/> 判，第二种此前无处可读。
+    ///
+    /// 采样点不足两个时为空数组，**不补零**：补零会画出一条从 0 冲上来的假曲线，
+    /// 让刚开始的传输看起来像刚刚提速。
+    /// </summary>
+    public IReadOnlyList<long> RecentRates { get; set; } = [];
+
     /// <summary>预计剩余秒数。速度未知或为 0 时为 null——宁可不显示，也不要显示一个假的「剩余 0 秒」。</summary>
     public long? EtaSeconds { get; set; }
 
