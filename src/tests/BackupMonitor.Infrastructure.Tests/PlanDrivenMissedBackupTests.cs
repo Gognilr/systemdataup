@@ -149,6 +149,50 @@ public class PlanDrivenMissedBackupTests : IAsyncLifetime
         }
     }
 
+    // ---------- 重装 / 长期停机后不翻旧账 ----------
+
+    /// <summary>
+    /// 服务端启动之前就已经过完宽限期的那次计划，不该在开机第一轮巡检里报出来。
+    ///
+    /// 现场就是这么炸的：卸载重装了一套新服务端，数据库还是原来那个，
+    /// 里面留着几个「每周五」的计划。新服务端一起来，巡检算出「上一次本该跑」是
+    /// 六天前的那个周五，于是一屏「未按计划产生备份」——而那六天里根本没有服务端
+    /// 在下发指令，这些告警没有任何人能处理，也不代表今天有什么问题。
+    /// </summary>
+    [Fact]
+    public async Task 服务端启动前的计划时刻不在开机第一轮里报漏备份()
+    {
+        var (_, taskId, _) = await SeedPlanWithTaskAsync(
+            planEnabled: true, cron: null, runAt: DateTime.UtcNow.AddHours(-4).TimeOfDay);
+
+        // 不推 ServerStartedAtUtc：模拟服务端刚刚启动，四小时前那次计划它没赶上
+        var worker = new MissedBackupWorker(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            _services.GetRequiredService<ILogger<MissedBackupWorker>>());
+        using (var scope = _services.CreateScope())
+            await worker.RunPassAsync(scope, CancellationToken.None);
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.False(await db.Alerts.AsNoTracking()
+                .AnyAsync(a => a.AlertKey == $"task:{taskId}:missed"));
+        }
+
+        // 而同一份数据，只要服务端在那个时刻确实在跑，判定照旧——
+        // 这道守卫挡的是「翻旧账」，不是把漏备份判定整个关掉。
+        await RunMissedBackupPassAsync();
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var alert = await db.Alerts.AsNoTracking().SingleAsync(a => a.AlertKey == $"task:{taskId}:missed");
+            Assert.Equal(AlertStatus.Open, alert.Status);
+            // 正文里的时长是真实拖了多久（约 4 小时），不是宽限期配置值
+            Assert.Contains("4 小时", alert.Message);
+        }
+    }
+
     // ---------- 基础设施 ----------
 
     private async Task<string?> ScanScheduleAsync(Guid clientId, Guid taskId)
@@ -172,7 +216,13 @@ public class PlanDrivenMissedBackupTests : IAsyncLifetime
     {
         var worker = new MissedBackupWorker(
             _services.GetRequiredService<IServiceScopeFactory>(),
-            _services.GetRequiredService<ILogger<MissedBackupWorker>>());
+            _services.GetRequiredService<ILogger<MissedBackupWorker>>())
+        {
+            // 测试进程刚起来，真实的启动时刻会把种进去的历史计划全挡掉（那道守卫是给
+            // 「重装 / 整夜停机后翻旧账」用的）。这里把服务端启动时刻推到足够早，
+            // 让判定逻辑本身回到被测状态。
+            ServerStartedAtUtc = DateTime.UtcNow.AddDays(-365)
+        };
         using var scope = _services.CreateScope();
         await worker.RunPassAsync(scope, CancellationToken.None);
     }

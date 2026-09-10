@@ -178,7 +178,13 @@ public class AlertEscalationTests : IAsyncLifetime
     {
         var worker = new MissedBackupWorker(
             _services.GetRequiredService<IServiceScopeFactory>(),
-            _services.GetRequiredService<ILogger<MissedBackupWorker>>());
+            _services.GetRequiredService<ILogger<MissedBackupWorker>>())
+        {
+            // 测试进程刚起来，真实的启动时刻会把种进去的历史计划全挡掉（那道守卫是给
+            // 「重装 / 整夜停机后翻旧账」用的）。这里把服务端启动时刻推到足够早，
+            // 让判定逻辑本身回到被测状态。
+            ServerStartedAtUtc = DateTime.UtcNow.AddDays(-365)
+        };
         using var scope = _services.CreateScope();
         await worker.RunPassAsync(scope, CancellationToken.None);
     }

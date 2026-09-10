@@ -35,10 +35,22 @@ public class MissedBackupWorker : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MissedBackupWorker> _logger;
 
+    /// <summary>
+    /// 服务端本次启动的时刻（UTC）。判定「到点没备份」的前提是服务端当时在跑：
+    /// 计划驱动的任务由服务端下发指令，服务端不在，这个时刻本来就没人负责，
+    /// 事后翻旧账只会得到一屏没人能处理的告警。见 <see cref="RunPassAsync"/> 里的守卫。
+    ///
+    /// 可写是为了让测试能把它推到过去——否则测试进程自己刚起来，
+    /// 所有种进去的历史计划都会被这道守卫挡掉。
+    /// </summary>
+    public DateTime ServerStartedAtUtc { get; set; }
+
     public MissedBackupWorker(IServiceScopeFactory scopeFactory, ILogger<MissedBackupWorker> logger)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
+        // 这个 BackgroundService 由 DI 在主机启动时构造，构造时刻即服务端启动时刻。
+        ServerStartedAtUtc = DateTime.UtcNow;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -140,6 +152,7 @@ public class MissedBackupWorker : BackgroundService
 
         var raised = 0;
         var recovered = 0;
+        var heldByStartup = 0;
 
         // 判定与告警对按 cron 和按计划两条路径完全一致，只有「这个时刻是谁定的」那句说明不同。
         // alert_key 也刻意共用：一个任务只可能属于其中一条路径，共用键保证换路径时旧告警会被恢复，
@@ -159,7 +172,7 @@ public class MissedBackupWorker : BackgroundService
                     task.ImportanceLevel >= ImportanceLevel.High ? AlertLevel.Critical : AlertLevel.Warning,
                     "backup_missed",
                     $"任务 {task.Name} 未按计划产生备份",
-                    $"{dueSource}应该在 {localDue:yyyy-MM-dd HH:mm}（{tz.Id}）备份，已经多等了 {graceMinutes} 分钟，仍然没有备份成功",
+                    $"{dueSource}应该在 {localDue:yyyy-MM-dd HH:mm}（{tz.Id}）备份，已经过去 {FormatDelay(now - prevDue)}，仍然没有备份成功",
                     clientId: task.ClientId,
                     taskId: task.Id,
                     ct: ct);
@@ -207,6 +220,17 @@ public class MissedBackupWorker : BackgroundService
             if (now < deadline)
                 continue;   // 还在宽限期内
 
+            if (deadline < ServerStartedAtUtc)
+            {
+                // 坑三：整个「到点 + 宽限期」的窗口都发生在服务端启动之前。
+                // 重装、迁移、整夜停机之后第一轮巡检会把那段时间里的每一次计划都翻出来，
+                // 而那段时间根本没有服务端在下发指令、也没有人能处理这些告警——
+                // 典型现象是刚装完的新服务端一开机就报「上周五没备份」。
+                // 判定推迟到下一次到点：那一次服务端是在跑的，报出来才有人能负责。
+                heldByStartup++;
+                continue;
+            }
+
             await JudgeAsync(task, prevDue.Value, tz, "按计划");
         }
 
@@ -234,8 +258,16 @@ public class MissedBackupWorker : BackgroundService
             if (prevDue is null)
                 continue;
 
-            if (now < prevDue.Value + grace)
+            var planDeadline = prevDue.Value + grace;
+            if (now < planDeadline)
                 continue;   // 还在宽限期内
+
+            // 与按 cron 的分支同一条守卫：服务端启动前就已经过完宽限期的那次计划不翻旧账。
+            if (planDeadline < ServerStartedAtUtc)
+            {
+                heldByStartup += plan.Items.Count;
+                continue;
+            }
 
             foreach (var item in plan.Items)
             {
@@ -264,6 +296,28 @@ public class MissedBackupWorker : BackgroundService
 
         if (raised > 0)
             _logger.LogInformation("漏备份巡检完成：触发 {Raised} 条，恢复 {Recovered} 条", raised, recovered);
+
+        // 跳过的不能只是悄悄跳过：「本该报的没报」和「不该报的报了」一样需要能查。
+        if (heldByStartup > 0)
+            _logger.LogInformation(
+                "漏备份巡检：{Held} 个任务的上一次计划整个落在服务端启动（{StartedAt:yyyy-MM-dd HH:mm:ss}Z）之前，本轮不判，等下一次到点",
+                heldByStartup, ServerStartedAtUtc);
     }
 
+    /// <summary>
+    /// 把「已经过去多久」写成人话。原先这里印的是宽限期配置值（固定「多等了 120 分钟」），
+    /// 而实际可能已经过去六天——排障的人会以为是今天早上的事。
+    /// </summary>
+    private static string FormatDelay(TimeSpan delay)
+    {
+        if (delay < TimeSpan.Zero)
+            delay = TimeSpan.Zero;
+
+        if (delay.TotalDays >= 1)
+            return $"{(int)delay.TotalDays} 天 {delay.Hours} 小时";
+
+        return delay.TotalHours >= 1
+            ? $"{(int)delay.TotalHours} 小时 {delay.Minutes} 分钟"
+            : $"{(int)delay.TotalMinutes} 分钟";
+    }
 }
