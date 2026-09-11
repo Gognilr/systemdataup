@@ -19,6 +19,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly string _shownNotificationPath;
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _statusItem;
+    private readonly ToolStripMenuItem _lastBackupItem;
     private readonly ToolStripMenuItem _refreshItem;
     private readonly ToolStripMenuItem _startServiceItem;
     private readonly ToolStripMenuItem _stopServiceItem;
@@ -37,6 +38,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             Enabled = false
         };
+        // 「服务在跑」回答不了「它到底有没有在备份」。这一项写的是客户端这一侧
+        // 能知道的最晚那个点：上一次把备份传完并交给服务端校验的时刻。
+        _lastBackupItem = new ToolStripMenuItem("上次成功备份：读取中…") { Enabled = false };
         _refreshItem = new ToolStripMenuItem("刷新状态", null, async (_, _) => await RefreshStatusAsync());
 
         // 托盘此前只能"停止服务并退出"。停完之后托盘也没了，想再把服务起回来
@@ -48,6 +52,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         var menu = new ContextMenuStrip();
         menu.Items.Add(new ToolStripMenuItem("BackupMonitor Agent") { Enabled = false });
         menu.Items.Add(_statusItem);
+        menu.Items.Add(_lastBackupItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("打开服务端客户端页", null, (_, _) => OpenServerPage()));
         menu.Items.Add(_refreshItem);
@@ -88,16 +93,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
         try
         {
             var status = await Task.Run(GetServiceStatus);
-            var (label, color) = status switch
-            {
-                ServiceControllerStatus.Running => ("运行中", Color.SeaGreen),
-                ServiceControllerStatus.StartPending or ServiceControllerStatus.ContinuePending => ("启动中", Color.DarkOrange),
-                ServiceControllerStatus.StopPending or ServiceControllerStatus.PausePending => ("停止中", Color.DarkOrange),
-                ServiceControllerStatus.Stopped => ("已停止", Color.Firebrick),
-                _ => ("状态未知", Color.DarkGray)
-            };
+            var state = await Task.Run(ReadAgentState);
+            var (label, color) = Judge(status, state);
 
             _statusItem.Text = $"状态：{label}";
+            _lastBackupItem.Text = "上次成功备份：" + DescribeLastBackup(state);
             _notifyIcon.Text = TruncateTooltip($"BackupMonitor Agent：{label}");
             ReplaceIcon(CreateStatusIcon(color));
             _refreshItem.Enabled = true;
@@ -106,6 +106,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         catch (Exception ex)
         {
             _statusItem.Text = "状态：无法读取服务";
+            _lastBackupItem.Text = "上次成功备份：读不到";
             _notifyIcon.Text = TruncateTooltip($"BackupMonitor Agent：无法读取服务（{ex.Message}）");
             ReplaceIcon(CreateStatusIcon(Color.DarkGray));
             _refreshItem.Enabled = true;
@@ -116,6 +117,126 @@ internal sealed class TrayApplicationContext : ApplicationContext
         finally
         {
             _refreshing = false;
+        }
+    }
+
+    /// <summary>
+    /// 绿灯判据（R7）：**服务在跑 且 最近一次心跳成功 且 无 LastError**。
+    ///
+    /// 改之前只读 ServiceController 一个来源，于是「Agent 服务正常跑着，
+    /// 但连不上服务端 / 证书被拒 / 一直登记失败 / 一个任务都没配」时，
+    /// 托盘照样是绿色的「运行中」。服务在跑 ≠ 备份在做，而托盘是这台机器上
+    /// 唯一有人会看的界面——它说绿，人就不会再去看第二眼。
+    ///
+    /// 中间态一律用橙色并在 tooltip 里写明原因：橙色说的是「它活着，但有件事没成」，
+    /// 这与红色（服务根本没跑）是完全不同的两种处置。
+    ///
+    /// 读不到 state.json 时**退回只按服务状态判**，不降级成橙色：
+    /// 刚装完还没跑起来、文件正被原子替换的那一瞬间都会读不到，
+    /// 拿这个报警等于每天造一批假警报。与 catch 分支同一条原则。
+    /// </summary>
+    private (string Label, Color Color) Judge(ServiceControllerStatus status, AgentStateView? state)
+    {
+        var serviceRunning = status == ServiceControllerStatus.Running;
+        if (!serviceRunning)
+        {
+            return status switch
+            {
+                ServiceControllerStatus.StartPending or ServiceControllerStatus.ContinuePending => ("启动中", Color.DarkOrange),
+                ServiceControllerStatus.StopPending or ServiceControllerStatus.PausePending => ("停止中", Color.DarkOrange),
+                ServiceControllerStatus.Stopped => ("已停止", Color.Firebrick),
+                _ => ("状态未知", Color.DarkGray)
+            };
+        }
+
+        if (state is null)
+            return ("运行中", Color.SeaGreen);
+
+        if (!string.IsNullOrWhiteSpace(state.LastError))
+            return ($"运行中，但有错误：{Shorten(state.LastError!, 40)}", Color.DarkOrange);
+
+        if (state.ClientId is null)
+            return ("运行中，尚未完成登记（可能在等待管理员审批）", Color.DarkOrange);
+
+        if (state.LastHeartbeatAtUtc is null)
+            return ("运行中，还没有成功连上服务端", Color.DarkOrange);
+
+        // 心跳间隔可配（5~300 秒）。托盘不知道当前配置值，用一个宽的固定判据：
+        // 15 分钟没有一次成功心跳，无论配成多久都已经是「联系不上了」。
+        // 判紧了会在正常的长间隔配置下天天误报，而误报几次之后这个颜色就没人信了。
+        var silence = DateTime.UtcNow - state.LastHeartbeatAtUtc.Value;
+        if (silence > TimeSpan.FromMinutes(15))
+            return ($"运行中，但已 {DescribeAge(state.LastHeartbeatAtUtc.Value)}没连上服务端", Color.DarkOrange);
+
+        return ("运行中", Color.SeaGreen);
+    }
+
+    private static string DescribeLastBackup(AgentStateView? state)
+    {
+        if (state is null)
+            return "读不到";
+        if (state.LastSuccessfulUploadAtUtc is null)
+            return "还没有过";
+        return $"{state.LastSuccessfulUploadAtUtc.Value.ToLocalTime():yyyy-MM-dd HH:mm}（{DescribeAge(state.LastSuccessfulUploadAtUtc.Value)}前）";
+    }
+
+    private static string DescribeAge(DateTime utc)
+    {
+        var span = DateTime.UtcNow - utc;
+        if (span < TimeSpan.Zero)
+            return "刚刚";
+        if (span < TimeSpan.FromMinutes(1))
+            return $"{(int)span.TotalSeconds} 秒";
+        if (span < TimeSpan.FromHours(1))
+            return $"{(int)span.TotalMinutes} 分钟";
+        if (span < TimeSpan.FromDays(1))
+            return $"{(int)span.TotalHours} 小时";
+        return $"{(int)span.TotalDays} 天";
+    }
+
+    private static string Shorten(string text, int maxLength) =>
+        text.Length <= maxLength ? text : text[..maxLength] + "…";
+
+    /// <summary>
+    /// 只取托盘用得着的那几个字段。刻意**不**引用 Agent 工程的 AgentState：
+    /// 那个类型带着候选清单、指令 nonce、扫描排期一大摞运行期状态，
+    /// 托盘为了显示三个字段没必要把整个 Agent 工程拖进来，
+    /// 也没必要在 Agent 每加一个状态字段时跟着重新编译。
+    /// </summary>
+    private sealed class AgentStateView
+    {
+        public Guid? ClientId { get; set; }
+        public string? LastError { get; set; }
+        public DateTime? LastHeartbeatAtUtc { get; set; }
+        public DateTime? LastSuccessfulUploadAtUtc { get; set; }
+    }
+
+    /// <summary>
+    /// 读 Agent 数据目录下的 state.json。
+    ///
+    /// 任何读不出来的情形都返回 null（文件不存在、正在被原子替换、JSON 半截、没权限）——
+    /// 调用方会退回「只按服务状态判」。托盘绝不能因为读文件失败而把自己搞崩：
+    /// 它是这台机器上唯一有人会看的界面。
+    /// </summary>
+    private AgentStateView? ReadAgentState()
+    {
+        try
+        {
+            var path = Path.Combine(_dataDirectory, "state.json");
+            if (!File.Exists(path))
+                return null;
+
+            // Agent 用「写临时文件 + File.Move」原子替换 state.json，
+            // 但读的一侧仍然可能撞上正在被替换的句柄，因此要允许共享读写。
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            return JsonSerializer.Deserialize<AgentStateView>(stream, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            return null;
         }
     }
 

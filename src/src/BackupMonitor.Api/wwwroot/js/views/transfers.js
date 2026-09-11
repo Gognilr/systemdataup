@@ -4,7 +4,7 @@
 import { api } from '../api.js';
 import { App, ACTIONS, LOADERS } from '../state.js';
 import {
-  $, esc, status, fmtBytes, fmtRate, fmtDuration, relTime,
+  $, esc, status, fmtBytes, fmtRate, fmtDuration, absTime,
   tableHtml, patchRows, emptyState, xferBar, sparkline, toast, errToast, confirmModal
 } from '../ui.js';
 import { shell, loading, schedulePoll } from '../app.js';
@@ -128,7 +128,7 @@ const FINISHED_COLUMNS = [
     num: true,
     render: r => (r.retryCount ? `<span class="cell-warn">${esc(r.retryCount)}</span>` : '<span class="sub">0</span>')
   },
-  { l: '结束于', render: r => relTime(r.completedAt) },
+  { l: '结束于', render: r => absTime(r.completedAt) },
   {
     // committed 却没有编号，说明那份备份已经被删了。这一格空着本身就是信息，
     // 而不是「数据没取到」——所以要把话写出来，不能留一个横杠。
@@ -317,7 +317,8 @@ const COLUMNS = [
       : esc(fmtDuration(r.idleSeconds)))
   },
   { l: '状态', render: r => status('upload_status', r.status) },
-  { l: '开始于', render: r => relTime(r.startedAt) },
+  // 传输的起止时刻要能跟备份窗口、跟客户端日志对上（R19）。
+  { l: '开始于', render: r => absTime(r.startedAt) },
   {
     // 这张表此前是纯只读的：白天发现某台机器正在把带宽占满时，唯一能做的是等它传完。
     // 暂停会真的停住写入（服务端不再接受分块），暂存与已传的块都留着，恢复时从断点继续。

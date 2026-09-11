@@ -91,6 +91,16 @@ public sealed class AgentApiClient : IDisposable
     public void ReplaceCertificate(X509Certificate2 certificate) => RebuildClient(certificate);
 
     /// <summary>
+    /// 过渡期预备指纹变了之后重建连接池（R9）。
+    ///
+    /// 必须重建：接受哪些指纹是在 RebuildClient 里挂进 SslOptions 的，
+    /// 而连接池里那些已经建好的连接不会再走一次校验回调。
+    /// 不重建的话新指纹要等连接自然过期才生效——而它存在的全部意义
+    /// 就是在服务端换证书那一刻立刻能用上。
+    /// </summary>
+    public void RefreshAcceptedFingerprints() => RecycleConnections();
+
+    /// <summary>
     /// 丢弃当前连接池，下一次请求重新握手，证书不变。
     /// 用于 401 之后的自愈：任何让连接身份与本地证书脱节的情况，
     /// 重新握手都能纠正，代价只是一次 TLS 握手。
@@ -157,7 +167,7 @@ public sealed class AgentApiClient : IDisposable
             || !string.Equals(candidateUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
             return false;
 
-        var expectedFingerprint = NormalizeFingerprint(_options.ServerCertificateFingerprint);
+        var accepted = AcceptedFingerprints();
 
         // 纵深防御：只记录「回调确实跑过并且匹配成功」，不满足于「回调已经挂上」。
         // 这个缺陷本身的形状就是「挂了回调但没跑」，所以返回值不能再依赖同一个假设。
@@ -172,7 +182,7 @@ public sealed class AgentApiClient : IDisposable
             {
                 RemoteCertificateValidationCallback = (_, serverCertificate, _, _) =>
                 {
-                    if (!MatchesFingerprint(serverCertificate, expectedFingerprint))
+                    if (!MatchesAnyFingerprint(serverCertificate, accepted))
                         return false;
 
                     fingerprintVerified = true;
@@ -222,9 +232,15 @@ public sealed class AgentApiClient : IDisposable
         }
         else if (!string.IsNullOrWhiteSpace(_options.ServerCertificateFingerprint))
         {
-            var expectedFingerprint = NormalizeFingerprint(_options.ServerCertificateFingerprint);
+            // 过渡期里同时接受两个指纹（R9）：装机时固定的那个，
+            // 加上服务端通过**签名配置**下发的预备指纹。
+            //
+            // 每次建 handler 时重新取一遍，不缓存到字段里：预备指纹是在运行期
+            // 由配置同步写进 state.json 的，缓存会让它要等下一次重启才生效——
+            // 而真正需要它的那一刻（服务端刚换完证书）恰恰不会有那次重启。
+            var accepted = AcceptedFingerprints();
             handler.SslOptions.RemoteCertificateValidationCallback = (_, serverCertificate, _, _) =>
-                MatchesFingerprint(serverCertificate, expectedFingerprint);
+                MatchesAnyFingerprint(serverCertificate, accepted);
         }
 
         if (certificate is not null)
@@ -436,12 +452,51 @@ public sealed class AgentApiClient : IDisposable
     private static Uri NormalizeBaseAddress(string serverUrl) =>
         new(serverUrl.TrimEnd('/') + "/", UriKind.Absolute);
 
-    private static bool MatchesFingerprint(X509Certificate? serverCertificate, string expectedFingerprint) =>
-        serverCertificate is not null
-        && string.Equals(
-            NormalizeFingerprint(Convert.ToHexString(serverCertificate.GetCertHash(HashAlgorithmName.SHA256))),
-            expectedFingerprint,
-            StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// 本机当前接受的服务端指纹集合（R9 过渡期）。
+    ///
+    /// 正常状态下只有一个元素。过渡期里有两个：旧的（正在用的）和新的（还没启用的）。
+    /// 两个都接受**不会**放松安全：指纹仍然是一一比对的固定值，
+    /// 只是把「哪一个」从一个变成了两个明确的值，而这两个值都来自服务端已认证的通道
+    /// （一个来自装机时的带外核对，一个来自服务端签名过的配置）。
+    /// </summary>
+    private string[] AcceptedFingerprints() =>
+        BuildAcceptedFingerprints(
+            _options.ServerCertificateFingerprint,
+            _stateStore.NextServerCertificateFingerprint);
+
+    /// <summary>
+    /// 纯函数形式，公开只为可测：这段逻辑决定「哪些服务端证书算数」，
+    /// 写错的后果是接受一张不该接受的证书——那正是指纹固定要防的事，
+    /// 不能只靠读代码确认它对。
+    /// </summary>
+    public static string[] BuildAcceptedFingerprints(string? primary, string? next)
+    {
+        var normalizedPrimary = NormalizeFingerprint(primary ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(next))
+            return [normalizedPrimary];
+
+        var normalizedNext = NormalizeFingerprint(next);
+        return string.Equals(normalizedPrimary, normalizedNext, StringComparison.OrdinalIgnoreCase)
+            ? [normalizedPrimary]
+            : [normalizedPrimary, normalizedNext];
+    }
+
+    private static bool MatchesAnyFingerprint(X509Certificate? serverCertificate, string[] accepted)
+    {
+        if (serverCertificate is null)
+            return false;
+
+        var actual = NormalizeFingerprint(
+            Convert.ToHexString(serverCertificate.GetCertHash(HashAlgorithmName.SHA256)));
+        foreach (var expected in accepted)
+        {
+            if (string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
 
     /// <summary>单个候选地址的连接预算；只有存在多个候选时才启用，见 ConnectPreferIPv4Async。</summary>
     private static readonly TimeSpan ConnectAttemptTimeout = TimeSpan.FromSeconds(10);

@@ -49,12 +49,16 @@ async function render() {
 
       <button class="primary" id="st_save">保存设置</button>
       <span class="tip">留空表示不指定，由配置文件或程序目录下的 data 子目录兜底。保存前会实地建目录并试写一个文件，写不进去会直接报错，不会等到下次备份才发现。</span>
-    </div>`;
+    </div>
+    <div class="card" id="cfgBackupCard">${loading()}</div>
+    <div class="card" id="reverifyCard">${loading()}</div>`;
 
     $('#st_save').addEventListener('click', save);
     body.querySelectorAll('[data-pick]').forEach(btn => {
       btn.addEventListener('click', () => pickInto(btn.dataset.pick, btn.dataset.title));
     });
+    renderConfigBackup();
+    renderReverify();
   } catch (e) {
     body.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
   }
@@ -246,6 +250,124 @@ async function save() {
     } });
     toast('存储设置已保存', 'ok');
     await render();
+  } catch (e) {
+    errToast(e);
+    btn.disabled = false;
+  }
+}
+
+/* ── 配置备份包 ────────────────────────────────────────────────────────────
+
+   .bmbp = 服务端密钥 + 客户端 CA + HTTPS 证书 + 整库转储，等于整个系统的命：
+   它丢了，仓库里的备份文件即使还在，「哪个文件属于哪台机器、哪个任务、哪一天」
+   也全没了，同时所有客户端身份作废。
+
+   在此之前唯一的入口是服务器本机上的服务管理台按钮——远程管理的人完全没有入口，
+   于是这件事的实际执行频率取决于有没有人正好去过机房。
+
+   导出是**手动**的（2026-09-10 定板：不做定时自动导出），因此这一页把
+   「上次是什么时候」显式写出来，超期时用告警色——没有定时任务替人记着这件事。 */
+async function renderConfigBackup() {
+  const card = $('#cfgBackupCard');
+  if (!card) return;
+  try {
+    const s = await api('/api/v1/admin/config-backup/status');
+    const age = s.latestExportedAt
+      ? `${s.ageDays === 0 ? '今天' : `${s.ageDays} 天前`} · ${esc(s.latestFileName)} · ${fmtBytes(s.latestSizeBytes || 0)}`
+      : '从未导出过';
+    card.innerHTML = `<h2>配置备份包</h2>
+      <p class="text-muted">包内是服务端密钥、客户端 CA、HTTPS 证书与整库转储。<strong>不含备份文件本体</strong>——那些要靠备份存放目录本身的异地副本。</p>
+      <div class="notice${s.overdue ? ' warning' : ''}">上次配置备份：<strong>${esc(age)}</strong>${s.overdue ? `　超过 ${esc(s.overdueDays)} 天没有导出过，请现在导出一份。` : ''}</div>
+      <div class="notice">落点在服务端的 <code>${esc(s.directory)}</code>，与它保护的数据在同一台机器上。<strong>导出后请把包下载走并存到另一台机器</strong>——服务器系统盘挂掉时，这个包会和数据一起没。</div>
+      ${s.lastRemoteExport && s.lastRemoteExport.status === 'failed'
+        ? `<div class="notice warning">上一次通过本页面导出失败：${esc(s.lastRemoteExport.errorMessage || '未知原因')}</div>`
+        : ''}
+      <button class="primary" id="cb_export">立即导出</button>
+      <button id="cb_download"${s.packageCount ? '' : ' disabled'}>下载最近一份</button>
+      <span class="tip">下载链接一次性、有有效期：包里有 CA 私钥，是全系统最敏感的文件。</span>`;
+
+    $('#cb_export').addEventListener('click', exportConfigBackup);
+    $('#cb_download').addEventListener('click', downloadConfigBackup);
+  } catch (e) {
+    card.innerHTML = `<h2>配置备份包</h2><div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function exportConfigBackup() {
+  const btn = $('#cb_export');
+  btn.disabled = true;
+  // 导出要跑 pg_dump，是秒到分钟级的事，按钮必须自己说明它在干什么，
+  // 否则人会以为没反应而反复点。
+  btn.textContent = '正在导出…';
+  try {
+    await api('/api/v1/admin/config-backup/export', { method: 'POST' });
+    toast('配置备份包已导出，请下载并保存到另一台机器');
+    await renderConfigBackup();
+  } catch (e) {
+    errToast(e);
+    btn.disabled = false;
+    btn.textContent = '立即导出';
+  }
+}
+
+async function downloadConfigBackup() {
+  try {
+    const t = await api('/api/v1/admin/config-backup/download-token', { method: 'POST' });
+    // 令牌本身就是凭据，直接跳转即可；不用 fetch 拿 blob，
+    // 那会把整个包读进浏览器内存，而这个包可以有几百 MB。
+    window.location.href = t.downloadUrl;
+  } catch (e) {
+    errToast(e);
+  }
+}
+
+/* ── 定期复查（整改清单 R18）──────────────────────────────────────────────
+
+   这一层抓的是**入库之后**才会发生的三件事：磁盘静默损坏、误删、勒索软件加密。
+   这三样入库那一次核对无论多严格都看不到——它们全都发生在核对完成之后。
+
+   界面上必须把这句话写出来。不写的话，人看到的只是「又一个后台任务在磨盘」，
+   第一反应是关掉它；而关掉之后，上面那三件事就再也没有任何地方能发现了。
+   所以文案的落点是「建议调稀，而不是关闭」。 */
+async function renderReverify() {
+  const card = $('#reverifyCard');
+  if (!card) return;
+  try {
+    const s = await api('/api/v1/admin/reverify-settings');
+    card.innerHTML = `<h2>备份定期复查</h2>
+      <p class="text-muted">后台按最久没复查的优先，定期重算已入库备份的 SHA-256，与入库时记录的值比对。</p>
+      <div class="notice">它抓的是<strong>入库之后</strong>才会发生的三件事：<strong>磁盘静默损坏、误删、勒索软件加密</strong>。
+        这三样在入库那一次核对里一定看不到——它们全都发生在核对完成之后。
+        复查是纯磁盘读，会和上传抢同一块盘；<strong>盘吃紧时建议调稀，而不是关闭</strong>。</div>
+      <div class="frow"><label><input type="checkbox" id="rv_enabled"${s.enabled ? ' checked' : ''}> 启用定期复查</label>
+        <div class="hint">停用后不再产生任何复查工作项。备份详情页上的「重新校验」按钮不受影响，随时可以手工触发。</div></div>
+      <div class="frow"><label for="rv_interval">复查间隔（小时）</label>
+        <input id="rv_interval" type="number" min="1" max="720" value="${esc(s.intervalHours)}">
+        <div class="hint">1~720。默认 168（7 天）。</div></div>
+      <div class="frow"><label for="rv_batch">每轮复查份数</label>
+        <input id="rv_batch" type="number" min="1" max="200" value="${esc(s.batchSize)}">
+        <div class="hint">1~200。默认 1。份数 × 单份大小 = 每一轮要读多少盘。</div></div>
+      <button class="primary" id="rv_save">保存</button>`;
+    $('#rv_save').addEventListener('click', saveReverify);
+  } catch (e) {
+    card.innerHTML = `<h2>备份定期复查</h2><div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function saveReverify() {
+  const btn = $('#rv_save');
+  btn.disabled = true;
+  try {
+    await api('/api/v1/admin/reverify-settings', {
+      method: 'PUT',
+      body: {
+        enabled: $('#rv_enabled').checked,
+        intervalHours: Number($('#rv_interval').value) || 168,
+        batchSize: Number($('#rv_batch').value) || 1
+      }
+    });
+    toast('定期复查设置已保存');
+    await renderReverify();
   } catch (e) {
     errToast(e);
     btn.disabled = false;

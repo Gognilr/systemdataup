@@ -1,4 +1,4 @@
-using BackupMonitor.Infrastructure.Services;
+﻿using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models;
 using BackupMonitor.Shared.Models.Admin;
@@ -26,6 +26,21 @@ public class AdminNotificationController : ApiBaseController
     {
         var result = await _notificationService.GetDeliveriesAsync(query, ct);
         return OkData(result);
+    }
+
+    /// <summary>
+    /// 通知渠道是否已配置（R5）。
+    ///
+    /// 概览页靠它决定要不要挂那条常驻横幅。权限用 alerts.read 而不是 system.manage：
+    /// 「告警发不出去」是每一个看告警的人都该知道的事，而不只是能改配置的那个人。
+    /// 响应里只有一个布尔值，不含任何渠道细节。
+    /// </summary>
+    [HttpGet("notification-settings/status")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:alerts.read")]
+    public async Task<ActionResult<ApiResponse<NotificationChannelStatusDto>>> GetSettingsStatus(CancellationToken ct)
+    {
+        var configured = await _notificationService.HasEnabledChannelAsync(ct);
+        return OkData(new NotificationChannelStatusDto { Configured = configured });
     }
 
     /// <summary>

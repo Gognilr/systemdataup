@@ -85,6 +85,8 @@ public class ClientConfiguration : IEntityTypeConfiguration<Client>
         builder.Property(e => e.OsVersion).HasColumnName("os_version").HasMaxLength(128);
         builder.Property(e => e.Architecture).HasColumnName("architecture").HasMaxLength(32);
         builder.Property(e => e.AgentVersion).HasColumnName("agent_version").HasMaxLength(64);
+        builder.Property(e => e.AcceptedNextServerFingerprint)
+            .HasColumnName("accepted_next_server_fingerprint").HasMaxLength(128);
         builder.Property(e => e.IpAddresses).HasColumnName("ip_addresses").HasColumnType("jsonb");
         builder.Property(e => e.LastRemoteIp).HasColumnName("last_remote_ip").HasMaxLength(64);
         builder.Property(e => e.Status).HasColumnName("status");

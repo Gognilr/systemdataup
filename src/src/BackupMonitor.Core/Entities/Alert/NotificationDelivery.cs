@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Enums;
+﻿using BackupMonitor.Core.Enums;
 
 namespace BackupMonitor.Core.Entities.Alert;
 
@@ -34,6 +34,17 @@ public class NotificationDelivery
     /// 而且同一条告警可能升级多次，改标题会让前缀越叠越长。
     /// </summary>
     public string? TitlePrefix { get; set; }
+
+    /// <summary>
+    /// 投递自带标题。为空时按关联告警组装（V038 · R8）。
+    ///
+    /// 日报复用这条投递通道但没有对应的告警行——不带上内容的话，
+    /// 发出去的是一封标题「系统告警」、正文空白的邮件。
+    /// </summary>
+    public string? Subject { get; set; }
+
+    /// <summary>投递自带正文。为空时按关联告警组装。</summary>
+    public string? Body { get; set; }
 
     // 导航属性
     public Alert? Alert { get; set; }

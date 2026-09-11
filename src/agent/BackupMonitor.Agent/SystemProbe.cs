@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
@@ -31,7 +31,11 @@ public sealed class SystemProbe
     /// 每次都带上等于把同一份数据重复写进 client_disks / client_services 几万遍。
     /// 指标（CPU/内存/网络）本来就每次都不同，不参与摘要。
     /// </summary>
-    public HeartbeatRequest BuildHeartbeat(long configVersion, AgentConfigResponse? config, IReadOnlyCollection<Guid> activeCommands)
+    public HeartbeatRequest BuildHeartbeat(
+        long configVersion,
+        AgentConfigResponse? config,
+        IReadOnlyCollection<Guid> activeCommands,
+        string? acceptedNextServerFingerprint = null)
     {
         var now = DateTime.UtcNow;
         var process = Process.GetCurrentProcess();
@@ -63,7 +67,11 @@ public sealed class SystemProbe
             IpAddresses = unchanged ? null : ipAddresses,
             SnapshotUnchanged = unchanged,
             ActiveCommands = activeCommands.ToList(),
-            ActiveUploads = []
+            ActiveUploads = [],
+            // 过渡期就绪回报（R9）。每一次心跳都带，不做「变了才报」的优化：
+            // 服务端要的是「此刻还有哪几台没就绪」这个当下的事实，
+            // 而增量上报在丢过一次心跳之后就再也补不回来了。
+            AcceptedNextServerFingerprint = acceptedNextServerFingerprint
         };
     }
 

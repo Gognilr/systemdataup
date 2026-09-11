@@ -115,3 +115,13 @@ public class NotificationTestEmailRequest
     /// <summary>测试收件人；不填则取 Email.Recipients 的第一个</summary>
     public string? Recipient { get; set; }
 }
+
+/// <summary>
+/// 通知渠道是否已配置（R5）。刻意只有一个布尔字段：
+/// 概览页要回答的问题就一个——告警发不发得出去。渠道细节属于配置页。
+/// </summary>
+public class NotificationChannelStatusDto
+{
+    /// <summary>至少有一个渠道已启用且填全。false 表示告警只会出现在管理网页上。</summary>
+    public bool Configured { get; set; }
+}

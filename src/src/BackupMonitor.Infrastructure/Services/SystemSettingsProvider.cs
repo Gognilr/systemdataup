@@ -44,6 +44,39 @@ public class SystemSettingsProvider
         return defaultValue;
     }
 
+    /// <summary>
+    /// 开关类配置。jsonb 里既可能是 true/false，也可能被人手工写成 "true" 字符串——
+    /// 两种都认，认不出来才退回默认值。开关静默失效的后果是「以为关了其实还在跑」，
+    /// 而这类误会在排障时能耗掉一整天。
+    /// </summary>
+    public async Task<bool> GetBoolAsync(string key, bool defaultValue, CancellationToken ct = default)
+    {
+        var settings = await GetSettingsAsync(ct);
+        if (!settings.TryGetValue(key, out var element))
+            return defaultValue;
+
+        return element.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String when bool.TryParse(element.GetString(), out var parsed) => parsed,
+            _ => defaultValue
+        };
+    }
+
+    /// <summary>
+    /// 比例类配置（如历史基线的偏离比例）用得着小数，而这些键在 jsonb 里就是 0.5 这样的数字。
+    /// 走 GetIntAsync 会被 TryGetInt32 挡掉而静默退回默认值——那种失效不会有任何报错。
+    /// </summary>
+    public async Task<double> GetDoubleAsync(string key, double defaultValue, CancellationToken ct = default)
+    {
+        var settings = await GetSettingsAsync(ct);
+        if (settings.TryGetValue(key, out var element) && element.ValueKind == JsonValueKind.Number &&
+            element.TryGetDouble(out var value))
+            return value;
+        return defaultValue;
+    }
+
     public async Task<string?> GetStringAsync(string key, CancellationToken ct = default)
     {
         var settings = await GetSettingsAsync(ct);

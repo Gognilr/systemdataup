@@ -491,6 +491,28 @@ internal sealed class PostgreSqlManager
                  "-w", "-o", $"-p {port} -h 127.0.0.1"],
                 ct);
         }
+
+        await EnsureRecoveryActionsAsync(ct);
+    }
+
+    /// <summary>
+    /// 给库服务补上与 BackupMonitor.Server / BackupMonitor.Agent 同口径的 SCM 崩溃恢复动作。
+    ///
+    /// pg_ctl register 不会设置恢复动作，而库进程崩掉时 API 服务并不会跟着死：
+    /// 服务管理台上 BackupMonitor.Server 依然是绿灯「运行中」，实际上所有备份和页面全废。
+    /// 这是「绿灯下的全盘停摆」，必须让 SCM 自己把库拉起来。
+    ///
+    /// 放在 EnsureServiceRegistrationAsync 的最后而不是 register 分支里面，是因为
+    /// 修复 / 升级安装走的是「服务已存在」分支，那条路上同样要补——老装机没有恢复动作。
+    /// </summary>
+    private static async Task EnsureRecoveryActionsAsync(CancellationToken ct)
+    {
+        var sc = Path.Combine(Environment.SystemDirectory, "sc.exe");
+        await ProcessRunner.RunAsync(sc,
+            ["failure", ServiceName, "reset=", "86400",
+             "actions=", "restart/5000/restart/15000/restart/60000"], ct);
+        await ProcessRunner.RunAsync(sc,
+            ["failureflag", ServiceName, "1"], ct);
     }
 
     private static bool ServiceRegistrationMatches(string pgCtl)

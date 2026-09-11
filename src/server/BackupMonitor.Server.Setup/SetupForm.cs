@@ -20,6 +20,8 @@ internal sealed class SetupForm : Form
     private readonly Button _diagnostics = new();
     private readonly Button _showFingerprint = new();
     private readonly Button _reissueServerCertificate = new();
+    private readonly Button _stageServerCertificate = new();
+    private readonly Button _activateServerCertificate = new();
     private readonly Button _repairPermissions = new();
     private readonly Button _exportKeyPackage = new();
     private readonly Button _importKeyPackage = new();
@@ -239,6 +241,8 @@ internal sealed class SetupForm : Form
         _diagnostics.Text = "运行诊断";
         _showFingerprint.Text = "查看服务端指纹";
         _reissueServerCertificate.Text = "重新签发服务端证书";
+        _stageServerCertificate.Text = "预备新的服务端证书";
+        _activateServerCertificate.Text = "启用预备的服务端证书";
         _uninstall.Text = "卸载";
         _repairPermissions.Text = "修复文件权限";
         _exportKeyPackage.Text = "导出密钥包";
@@ -252,6 +256,7 @@ internal sealed class SetupForm : Form
             [_openWeb, _diagnostics, _showFingerprint]), 0, 1);
         groups.Controls.Add(BuildGroup("密钥与配置",
             [_exportKeyPackage, _importKeyPackage, _exportBackupPackage, _importBackupPackage,
+             _stageServerCertificate, _activateServerCertificate,
              _reissueServerCertificate, _repairPermissions]), 0, 2);
         // 破坏性操作单独一组、放最下、红色文字（不是红色填充按钮——填充红太吵，
         // 会把注意力从状态条上抢走），两个都要二次确认。
@@ -551,6 +556,8 @@ internal sealed class SetupForm : Form
         _diagnostics.Click += async (_, _) => await ShowDiagnosticsAsync();
         _showFingerprint.Click += (_, _) => ShowServerFingerprint();
         _reissueServerCertificate.Click += async (_, _) => await ReissueServerCertificateAsync();
+        _stageServerCertificate.Click += async (_, _) => await StageServerCertificateAsync();
+        _activateServerCertificate.Click += async (_, _) => await ActivateServerCertificateAsync();
         _repairPermissions.Click += async (_, _) => await RepairPermissionsAsync();
         _exportKeyPackage.Click += async (_, _) => await ExportKeyPackageAsync();
         _importKeyPackage.Click += async (_, _) => await ImportKeyPackageAsync();
@@ -696,13 +703,51 @@ internal sealed class SetupForm : Form
         foreach (var button in new[]
         {
             _resetPassword, _startServices, _stopServices, _restartServices,
-            _showFingerprint, _reissueServerCertificate, _repairPermissions,
+            _showFingerprint, _reissueServerCertificate, _stageServerCertificate, _activateServerCertificate, _repairPermissions,
             _exportKeyPackage, _importKeyPackage, _exportBackupPackage, _importBackupPackage,
             _openWeb, _diagnostics, _uninstall
         })
         {
             button.Enabled = enabled;
         }
+
+        if (enabled)
+            ApplyServiceStateToButtons();
+    }
+
+    /// <summary>
+    /// 最近一次读到的服务端服务运行状态；<c>null</c> = 还没读到 / 读失败。
+    /// 三态而不是布尔，是因为「读不到」与「停着」必须区别对待，见 <see cref="ApplyServiceStateToButtons"/>。
+    /// </summary>
+    private bool? _serverRunning;
+
+    /// <summary>
+    /// 按服务状态收窄按钮可用性。
+    ///
+    /// 原来按钮只跟「是否正忙」「是否已安装」走，状态每 2 秒刷新一次却只用来染色。
+    /// 于是服务跑着时点「启动服务」→ sc start 返回 1056（服务已在运行）→
+    /// ProcessRunner 默认 throwOnError → 弹一个红叉「启动失败」。那不是失败，
+    /// 是这个按钮根本不该能点。
+    ///
+    /// 两条不能违反的原则：
+    /// 1. 忙碌态优先级高于状态态——SetBusy(true) 期间一律禁用，所以这里先看 _maintenanceEnabled；
+    /// 2. **状态读取失败时保持全部可用**。读不到状态不该把出路一起藏起来：
+    ///    人来这个窗口多半就是因为出了事，这时候把「启动服务」置灰等于把人锁在门外。
+    ///    与客户端托盘 catch 分支同一条原则。
+    /// </summary>
+    private void ApplyServiceStateToButtons()
+    {
+        if (!_maintenanceEnabled)
+            return;
+
+        if (_serverRunning is not { } running)
+            return;
+
+        _startServices.Enabled = !running;
+        _stopServices.Enabled = running;
+        _restartServices.Enabled = running;
+        // 服务停着时管理网页必然连不上，点了只会等到超时再报错。
+        _openWeb.Enabled = running;
     }
 
     private async Task ResetPasswordAsync()
@@ -820,6 +865,7 @@ internal sealed class SetupForm : Form
         {
             _serverIndicator.Set("未安装", ErrColor);
             _postgresIndicator.Set("未安装", ErrColor);
+            _serverRunning = null;
             return;
         }
 
@@ -829,6 +875,8 @@ internal sealed class SetupForm : Form
             var serverRunning = IsRunning(server);
             _serverIndicator.Set(server, StateColor(server));
             _postgresIndicator.Set(postgres, StateColor(postgres));
+            _serverRunning = serverRunning;
+            ApplyServiceStateToButtons();
             if (_consoleMode && _maintenanceEnabled)
                 UpdatePrimaryButton(serverRunning);
         }
@@ -836,6 +884,9 @@ internal sealed class SetupForm : Form
         {
             _serverIndicator.Set("读取失败", ErrColor);
             _postgresIndicator.Set("读取失败", ErrColor);
+            // 状态读不到就退回「全部可用」：不能因为看不清就把出路一起关掉。
+            _serverRunning = null;
+            SetMaintenanceEnabled(_maintenanceEnabled);
             AppendLogOnce("readfail", "读取服务状态失败：" + ex.Message);
         }
     }
@@ -992,10 +1043,27 @@ internal sealed class SetupForm : Form
         if (!ServerInstaller.IsInstalled())
             return;
 
+        // 预填到数据目录旁的固定子目录：远程导出的包也落在这里，
+        // 两个入口共用一个落点，「上次配置备份是什么时候」才是一笔账而不是两笔。
+        // 目录不存在就建出来——否则对话框会退回上次用过的随便哪个目录，
+        // 落点一散，超期提醒就永远看不见本机手动导出的那些包。
+        var exportDirectory = ConfigBackupPaths.DirectoryFor(_dataDirectory);
+        try
+        {
+            SecureFileSystem.CreateDirectory(exportDirectory, enforceAcl: true, includeCurrentUser: true);
+        }
+        catch (Exception ex)
+        {
+            // 建不出来不拦着人导出，只是回到「没有预填」的老行为。
+            AppendLog("无法创建默认配置备份目录，将不预填保存位置：" + ex.Message);
+            exportDirectory = string.Empty;
+        }
+
         using var dialog = new SaveFileDialog
         {
             Filter = "BackupMonitor 配置备份包 (*.bmbp)|*.bmbp|所有文件 (*.*)|*.*",
-            FileName = $"BackupMonitor-backup-{DateTime.Now:yyyyMMdd-HHmmss}.bmbp",
+            FileName = ConfigBackupPaths.BuildFileName(DateTime.Now),
+            InitialDirectory = exportDirectory,
             AddExtension = true,
             OverwritePrompt = true
         };
@@ -1165,16 +1233,151 @@ internal sealed class SetupForm : Form
         }
     }
 
+    /// <summary>
+    /// 过渡期第 1 步（R9）：预备一张新证书但不启用，并把它的指纹下发给全部 Agent。
+    /// </summary>
+    private async Task StageServerCertificateAsync()
+    {
+        if (!ServerInstaller.IsInstalled())
+            return;
+
+        var confirm = MessageBox.Show(
+            this,
+            "这一步会生成一张新的服务端证书，但**不会**启用它——对外仍然使用当前证书，服务不会中断。\n\n"
+            + "新指纹会随配置下发给全部客户端，让它们在过渡期内同时接受新旧两个指纹。\n"
+            + "等到全部客户端都就绪之后，再点「启用预备的服务端证书」完成切换，全程不必上门。\n\n"
+            + "是否现在预备新证书？",
+            "预备新的服务端证书",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Information);
+        if (confirm != DialogResult.Yes)
+            return;
+
+        SetBusy(true);
+        try
+        {
+            var fingerprint = await _maintenance.StageServerCertificateAsync(
+                _installDirectory, _dataDirectory, CancellationToken.None);
+            AppendLog("已预备新的服务端证书，指纹：" + fingerprint);
+            MessageBox.Show(
+                this,
+                "新证书已预备好，指纹：\n" + fingerprint
+                + "\n\n客户端会在下一次心跳时拿到它。请过一段时间后再点「启用预备的服务端证书」，"
+                + "那一步会先告诉你有多少台客户端已经就绪。",
+                "预备完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "预备失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    /// <summary>
+    /// 过渡期第 4 步（R9）：确认就绪台数之后启用预备证书。
+    ///
+    /// 就绪台数是这一步唯一的判据：没就绪的机器会在切换那一刻掉线，
+    /// 而且再也连不回来（连不上就收不到新指纹），只能上门重跑安装器。
+    /// 所以这里必须把那个数字摆在人眼前，而不是问一句「是否继续」。
+    /// </summary>
+    private async Task ActivateServerCertificateAsync()
+    {
+        if (!ServerInstaller.IsInstalled())
+            return;
+
+        SetBusy(true);
+        ServerMaintenance.CertificateRotationStatus status;
+        try
+        {
+            status = await _maintenance.GetCertificateRotationStatusAsync(
+                _installDirectory, _dataDirectory, CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            SetBusy(false);
+            MessageBox.Show(this, ex.Message, "读取过渡状态失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+
+        if (status.StagedFingerprint is null)
+        {
+            MessageBox.Show(
+                this,
+                "当前没有预备的服务端证书。请先点「预备新的服务端证书」。",
+                "没有可启用的证书", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var notReady = status.TotalClients - status.ReadyClients;
+        var warning = notReady > 0
+            ? $"\n\n⚠ 还有 {notReady} 台客户端没有拿到新指纹。切换之后它们会连不上，"
+              + "而且**再也连不回来**——只能到每一台机器上重跑客户端安装器。\n"
+              + "除非确认这几台本来就已经下线不用了，否则请再等一等。"
+            : "\n\n全部客户端都已就绪，可以安全切换。";
+
+        var confirm = MessageBox.Show(
+            this,
+            $"预备证书指纹：\n{status.StagedFingerprint}\n\n"
+            + $"客户端就绪情况：{status.ReadyClients} / {status.TotalClients}"
+            + warning
+            + "\n\n启用会替换当前证书并重启服务端（管理网页会短暂中断）。是否继续？",
+            "启用预备的服务端证书",
+            MessageBoxButtons.YesNo,
+            notReady > 0 ? MessageBoxIcon.Warning : MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button2);
+        if (confirm != DialogResult.Yes)
+            return;
+
+        SetBusy(true);
+        try
+        {
+            var fingerprint = await _maintenance.ActivateStagedServerCertificateAsync(
+                _installDirectory, _dataDirectory, CancellationToken.None);
+            AppendLog("预备证书已启用，当前指纹：" + fingerprint);
+            MessageBox.Show(
+                this,
+                "新证书已启用，当前指纹：\n" + fingerprint
+                + "\n\n旧证书已另存为 server-certificate.pfx.previous——切换后如果出了问题，"
+                + "把它复制回 server-certificate.pfx 再重启服务就能退回去。",
+                "启用完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, ex.Message, "启用失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
     private async Task ReissueServerCertificateAsync()
     {
         if (!ServerInstaller.IsInstalled())
             return;
+        // R9：这个按钮是**一步到位**的重新签发，指纹立刻变，全网 Agent 立刻掉线。
+        // 它保留下来只为「反正也没有客户端了」这种场景；正常轮换应该走
+        // 预备 → 等就绪 → 启用 这条不必上门的路。文案必须把这个岔路口说清楚，
+        // 否则人会照着最显眼的那个按钮点下去，然后面对几十台连不上的机器。
         var confirm = MessageBox.Show(
             this,
-            "重新签发后服务端 TLS 指纹会变化，已安装的 Agent 需要重新运行客户端安装器更新指纹。是否继续？",
+            "⚠ 这个按钮会立刻更换服务端证书，指纹随即变化。\n\n"
+            + "已安装的 Agent 全部按指纹固定连接，切换之后它们会立刻连不上，"
+            + "而且**连不上就收不到新指纹**——只能到每一台机器上重跑客户端安装器。\n\n"
+            + "如果这台服务端已经有客户端在用，请改用「预备新的服务端证书」→ 等客户端就绪 → "
+            + "「启用预备的服务端证书」，那条路全程不必上门。\n\n"
+            + "确定仍要立即重新签发吗？",
             "确认重新签发",
             MessageBoxButtons.YesNo,
-            MessageBoxIcon.Warning);
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
         if (confirm != DialogResult.Yes)
             return;
 

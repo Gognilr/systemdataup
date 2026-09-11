@@ -2,7 +2,7 @@
 import { api } from '../api.js';
 import { App, ACTIONS, LOADERS } from '../state.js';
 import {
-  $, esc, L, optsOf, status, fmtDT, relTime, prettyJson,
+  $, esc, L, optsOf, status, fmtDT, absTime, prettyJson,
   tableHtml, pagerHtml, skeleton, emptyState, hasFilter, batchBarHtml,
   toast, errToast, formModal, openDrawer
 } from '../ui.js';
@@ -60,7 +60,9 @@ LOADERS.alerts = async function () {
       { l: '客户端 / 任务', render: r => `${esc(r.clientHostname || '—')}<span class="sub">${esc(r.taskName || '')}</span>` },
       { l: '指派给', render: r => esc(r.assignedToName || '—') },
       { l: '次数', num: true, k: 'occurrenceCount' },
-      { l: '最近发生', sort: true, k: 'lastOccurredAt', render: r => relTime(r.lastOccurredAt) },
+      // 告警列表最需要绝对时间：排障时全靠它跟服务端日志、Windows 事件查看器对时刻，
+      // 而「3 分钟前」要人在心里先做一次减法——那一步错一次就是找错方向（R19）。
+      { l: '最近发生', sort: true, k: 'lastOccurredAt', render: r => absTime(r.lastOccurredAt) },
       { l: '操作', render: r => {
         const b = [`<button class="small" data-ui-action="act" data-view="alerts" data-action="detail" data-id="${esc(r.id)}">详情</button>`];
         if (r.status === 'open') b.push(`<button class="small primary" data-ui-action="act" data-view="alerts" data-action="ack" data-id="${esc(r.id)}">确认</button>`);

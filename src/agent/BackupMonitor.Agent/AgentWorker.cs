@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Net.Sockets;
@@ -286,7 +286,12 @@ public sealed class AgentWorker : BackgroundService
 
                 var state = _stateStore.Snapshot();
                 var heartbeat = await _api.HeartbeatAsync(
-                    _probe.BuildHeartbeat(state.ConfigVersion, _config, _activeCommands.Keys.ToList()), ct);
+                    _probe.BuildHeartbeat(
+                        state.ConfigVersion,
+                        _config,
+                        _activeCommands.Keys.ToList(),
+                        _stateStore.NextServerCertificateFingerprint),
+                    ct);
 
                 // 就在这里归零，不放到本轮末尾：心跳本身通了就证明身份和地址都没问题，
                 // 而后面的配置同步、证书续签各有各的失败方式，让它们的失败去
@@ -294,6 +299,10 @@ public sealed class AgentWorker : BackgroundService
                 _identityUnknownStreak = 0;
                 _connectFailureStreak = 0;
                 _reenrollBlockedReported = false;
+
+                // 托盘的绿灯判据（R7）：服务在跑 + 最近一次心跳成功 + 无 LastError。
+                // 这一行是「心跳成功」那一半的唯一证据来源。
+                _stateStore.Update(s => s.LastHeartbeatAtUtc = DateTime.UtcNow);
 
                 ProcessNotifications(heartbeat.Notifications);
 
@@ -909,6 +918,20 @@ public sealed class AgentWorker : BackgroundService
     /// 审计 B-02：整段用信号量互斥。心跳循环和 sync_config 指令都会调它，
     /// 两边同时写 config.json 会写出半份文件，而配置一旦坏掉 Agent 就什么都干不了。
     /// </summary>
+    /// <summary>
+    /// 服务端指纹归一化：去冒号去空格统一大写，空串一律当 null。
+    /// 「不在过渡期」和「过渡指纹是空字符串」必须是同一件事，
+    /// 否则会在某处漏掉一条判断，然后去比对一个空指纹。
+    /// </summary>
+    private static string? NormalizeServerFingerprint(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        var cleaned = value.Replace(":", string.Empty).Replace(" ", string.Empty).Trim().ToUpperInvariant();
+        return cleaned.Length == 0 ? null : cleaned;
+    }
+
     private async Task<AgentConfigResponse?> SyncConfigAsync(CancellationToken ct)
     {
         await _configSync.WaitAsync(ct);
@@ -924,11 +947,33 @@ public sealed class AgentWorker : BackgroundService
                 throw new AgentApiException(498, "服务端配置签名校验失败", "CONFIG_SIGNATURE_INVALID");
 
             _configStore.Save(config);
+
+            // 过渡期预备指纹（R9）。它随**签名过的**配置下来，而签名刚在上面验过——
+            // 这是它唯一可信的来源：一个能被篡改的服务端指纹，正是中间人需要的那样东西。
+            var incomingFingerprint = NormalizeServerFingerprint(
+                config.GlobalSettings.NextServerCertificateFingerprint);
+            var fingerprintChanged = !string.Equals(
+                NormalizeServerFingerprint(_stateStore.NextServerCertificateFingerprint),
+                incomingFingerprint,
+                StringComparison.OrdinalIgnoreCase);
+
             _stateStore.Update(s =>
             {
                 s.ConfigVersion = config.Version;
                 s.LastError = null;
+                s.NextServerCertificateFingerprint = incomingFingerprint;
             });
+
+            if (fingerprintChanged)
+            {
+                // 落盘之后立刻让连接池认这个新指纹，不等下一次重启：
+                // 真正需要它的那一刻（服务端刚换完证书）恰恰不会有那次重启。
+                _api.RefreshAcceptedFingerprints();
+                _logger.LogInformation(
+                    incomingFingerprint is null
+                        ? "服务端证书过渡期已结束，恢复为只接受当前指纹。"
+                        : "已接受服务端预备证书指纹，过渡期内新旧两个指纹都能连上。");
+            }
 
             // 整体替换引用：读侧看到的要么是旧的完整配置，要么是新的完整配置，
             // 不存在「一半新一半旧」的中间态。
@@ -1860,6 +1905,9 @@ public sealed class AgentWorker : BackgroundService
                 TotalFiles = candidate.TotalFiles,
                 TotalBytes = candidate.TotalBytes
             }, ct);
+            // 托盘菜单里的「上次成功备份」（R7）。放在提交校验成功之后：
+            // 客户端这一侧能知道的最晚的那个点就是这里。
+            _stateStore.Update(s => s.LastSuccessfulUploadAtUtc = DateTime.UtcNow);
             return CommandResult.FromSuccess("UPLOAD_ACCEPTED", $"上传会话已提交校验：{completed.VerificationOperationId}");
         }
         // 管理员按了暂停：这是一次人为操作的正常结局，不是故障。

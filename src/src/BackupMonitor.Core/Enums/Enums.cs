@@ -328,3 +328,16 @@ public enum ExecutionItemStatus
     Skipped,
     Cancelled
 }
+
+/// <summary>
+/// 一次配置备份包导出的状态（V036）。
+/// running 之所以存在：导出要跑 pg_dump，几十秒级别，
+/// 中途服务重启会把行留在 running——那正是「上一次导出没跑完」的证据，
+/// 比悄悄消失强。
+/// </summary>
+public enum ConfigBackupExportStatus
+{
+    Running,
+    Succeeded,
+    Failed
+}

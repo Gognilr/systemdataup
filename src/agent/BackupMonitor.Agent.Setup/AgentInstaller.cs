@@ -235,8 +235,12 @@ internal sealed class AgentInstaller
             StopTray();
             StopAndDeleteExistingService();
 
-            using (var runKey = Registry.CurrentUser.OpenSubKey(
-                       @"Software\Microsoft\Windows\CurrentVersion\Run", writable: true))
+            // 两处都清：HKLM 是现在写的地方，HKCU 是老版本写过的地方（R13）。
+            // 只清一处的话，卸载完还会留一个指向已删目录的自启项，
+            // 表现成每次登录弹一个「找不到文件」。
+            using (var machineRunKey = Registry.LocalMachine.OpenSubKey(RunKeyPath, writable: true))
+                machineRunKey?.DeleteValue(RunValueName, throwOnMissingValue: false);
+            using (var runKey = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true))
                 runKey?.DeleteValue(RunValueName, throwOnMissingValue: false);
             Registry.CurrentUser.DeleteSubKeyTree(@"Software\BackupMonitor\AgentSetup", throwOnMissingSubKey: false);
 
@@ -560,12 +564,27 @@ internal sealed class AgentInstaller
         RunSc("failureflag", ServiceName, "1");
     }
 
+    /// <summary>
+    /// 托盘自启注册表路径。用 HKLM 而不是 HKCU（R13）。
+    ///
+    /// HKCU 只对「安装时正好登录着的那个用户」生效。现场装机的往往是实施人员或
+    /// 域管理员，之后日常用这台机器的是另一个账号——那个账号登录时托盘根本不会起来，
+    /// 而托盘是这台机器上唯一能看见备份状态的东西。它不起来，等于这台机器没有界面。
+    /// </summary>
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+
     private static void ConfigureTrayStartup(string installDir, string serverUrl, string dataDir)
     {
         var trayPath = Path.Combine(installDir, "BackupMonitor.Agent.Tray.exe");
         var arguments = BuildTrayArguments(serverUrl, dataDir);
-        using var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run");
+        using var key = Registry.LocalMachine.CreateSubKey(RunKeyPath);
         key?.SetValue(RunValueName, $"\"{trayPath}\" {arguments}", RegistryValueKind.String);
+
+        // 顺手清掉可能存在的 HKCU 旧项：留着会让装机那个用户登录时起两份托盘，
+        // 而托盘自己的 Global 互斥量会让第二份直接退出——看起来「没问题」，
+        // 实际是每次登录都白起一个进程再自杀，日志里毫无痕迹。
+        using var legacy = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true);
+        legacy?.DeleteValue(RunValueName, throwOnMissingValue: false);
     }
 
     /// <summary>

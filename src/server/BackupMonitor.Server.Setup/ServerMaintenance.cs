@@ -124,6 +124,146 @@ internal sealed class ServerMaintenance
         return fingerprint;
     }
 
+    /// <summary>过渡期状态：预备指纹、已就绪台数、在册台数。</summary>
+    public sealed record CertificateRotationStatus(
+        string? StagedFingerprint,
+        int ReadyClients,
+        int TotalClients);
+
+    /// <summary>
+    /// 过渡期第 1 步：生成一张预备证书但**不启用**，并把它的指纹写进 system_settings，
+    /// 由服务端随签名配置下发给全部 Agent。
+    ///
+    /// 直接「重新签发」做不到不上门：Agent 按指纹固定连接，指纹一变它们立刻连不上，
+    /// 而连不上就再也收不到新指纹。预备这一步把「生成」和「启用」拆开，
+    /// 让新指纹能在旧证书还能用的时候先送到。
+    /// </summary>
+    public async Task<string> StageServerCertificateAsync(
+        string installDirectory,
+        string dataDirectory,
+        CancellationToken ct)
+    {
+        var fingerprint = LocalServerBootstrap.StageServerCertificate(
+            BuildConfiguration(installDirectory),
+            BuildBootstrapOptions(installDirectory, dataDirectory));
+
+        await SetSystemSettingAsync(dataDirectory, NextFingerprintSettingKey, fingerprint, ct);
+        // 让每一台 Agent 下一次心跳就发现配置变了，而不是等到下一次任务配置变更。
+        await BumpAllClientConfigRevisionsAsync(dataDirectory, ct);
+        return fingerprint;
+    }
+
+    /// <summary>
+    /// 过渡期第 3 步的判据：多少台在册客户端已经接受了当前预备指纹。
+    /// 没接受的那几台会在启用那一刻掉线，而且再也连不回来。
+    /// </summary>
+    public async Task<CertificateRotationStatus> GetCertificateRotationStatusAsync(
+        string installDirectory,
+        string dataDirectory,
+        CancellationToken ct)
+    {
+        var staged = LocalServerBootstrap.TryReadStagedFingerprint(
+            BuildConfiguration(installDirectory),
+            BuildBootstrapOptions(installDirectory, dataDirectory));
+        if (staged is null)
+            return new CertificateRotationStatus(null, 0, 0);
+
+        var secrets = await ReadSecretsAsync(Path.Combine(dataDirectory, "server-secrets.json"), ct);
+        await using var connection = new NpgsqlConnection(BuildConnectionString(ResolveEndpoint(secrets)));
+        await connection.OpenAsync(ct);
+
+        // 只算在册的机器：待审批 / 已注销的本来就不在服役，把它们算进分母
+        // 会让「N / M 就绪」永远差几台，然后这个数字就没人信了。
+        await using var command = new NpgsqlCommand(
+            """
+            SELECT
+                count(*) FILTER (WHERE upper(replace(coalesce(accepted_next_server_fingerprint, ''), ':', '')) = upper(replace(@fp, ':', ''))),
+                count(*)
+            FROM clients
+            WHERE status IN ('online', 'suspected_offline', 'offline')
+            """, connection);
+        command.Parameters.AddWithValue("fp", staged);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct))
+            return new CertificateRotationStatus(staged, 0, 0);
+
+        return new CertificateRotationStatus(staged, (int)reader.GetInt64(0), (int)reader.GetInt64(1));
+    }
+
+    /// <summary>
+    /// 过渡期第 4 步：启用预备证书并重启服务。
+    ///
+    /// 启用之后把预备指纹从配置里清掉：它已经变成正在用的那一个，
+    /// 继续下发只会让 Agent 一直挂着一个多余的接受项，下一轮轮换时分不清新旧。
+    /// </summary>
+    public async Task<string> ActivateStagedServerCertificateAsync(
+        string installDirectory,
+        string dataDirectory,
+        CancellationToken ct)
+    {
+        var fingerprint = LocalServerBootstrap.ActivateStagedServerCertificate(
+            BuildConfiguration(installDirectory),
+            BuildBootstrapOptions(installDirectory, dataDirectory));
+
+        await SetSystemSettingAsync(dataDirectory, NextFingerprintSettingKey, string.Empty, ct);
+        await BumpAllClientConfigRevisionsAsync(dataDirectory, ct);
+        await RestartServicesAsync(ct);
+        return fingerprint;
+    }
+
+    private const string NextFingerprintSettingKey = "server_certificate_next_fingerprint";
+
+    private static IConfiguration BuildConfiguration(string installDirectory) =>
+        new ConfigurationBuilder()
+            .AddJsonFile(Path.Combine(installDirectory, "appsettings.Turnkey.json"), optional: false, reloadOnChange: false)
+            .Build();
+
+    private static LocalServerBootstrapOptions BuildBootstrapOptions(string installDirectory, string dataDirectory)
+    {
+        var configuration = BuildConfiguration(installDirectory);
+        return new LocalServerBootstrapOptions
+        {
+            Enabled = true,
+            DataDirectory = dataDirectory,
+            SecretsPath = Path.Combine(dataDirectory, "server-secrets.json"),
+            DiscoveryEnabled = configuration.GetValue("LanMode:DiscoveryEnabled", true),
+            DiscoveryPort = configuration.GetValue("LanMode:DiscoveryPort", 45808)
+        };
+    }
+
+    private async Task SetSystemSettingAsync(string dataDirectory, string key, string value, CancellationToken ct)
+    {
+        var secrets = await ReadSecretsAsync(Path.Combine(dataDirectory, "server-secrets.json"), ct);
+        await using var connection = new NpgsqlConnection(BuildConnectionString(ResolveEndpoint(secrets)));
+        await connection.OpenAsync(ct);
+        await using var command = new NpgsqlCommand(
+            """
+            INSERT INTO system_settings (setting_key, setting_value, encrypted, updated_at)
+            VALUES (@k, to_jsonb(@v::text), false, now())
+            ON CONFLICT (setting_key) DO UPDATE
+                SET setting_value = EXCLUDED.setting_value, updated_at = now()
+            """, connection);
+        command.Parameters.AddWithValue("k", key);
+        command.Parameters.AddWithValue("v", value);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// 把全部客户端的配置版本推高一格，逼它们下一次心跳就来拉新配置。
+    ///
+    /// 不推的话，一台任务配置一年没动过的机器可能几个月都不会再拉一次配置——
+    /// 而预备指纹正是要在有限的过渡窗口里送到每一台机器手上。
+    /// </summary>
+    private async Task BumpAllClientConfigRevisionsAsync(string dataDirectory, CancellationToken ct)
+    {
+        var secrets = await ReadSecretsAsync(Path.Combine(dataDirectory, "server-secrets.json"), ct);
+        await using var connection = new NpgsqlConnection(BuildConnectionString(ResolveEndpoint(secrets)));
+        await connection.OpenAsync(ct);
+        await using var command = new NpgsqlCommand(
+            "UPDATE clients SET config_revision = config_revision + 1", connection);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
     /// <summary>
     /// 读取当前服务端 TLS 证书指纹，供操作员带外核对——客户端安装器会显示同一个值，
     /// 由人比对两边是否一致，这是识破中间人的唯一手段（自签名证书没有公共 CA 背书）。
@@ -660,7 +800,9 @@ internal sealed class ServerMaintenance
 
         return string.Join(Environment.NewLine,
             $"服务端服务：{serverStatus}",
+            $"　崩溃恢复：{DescribeRecoveryActions(ServerServiceName)}",
             $"PostgreSQL 服务：{postgresStatus}",
+            $"　崩溃恢复：{DescribeRecoveryActions(PostgreSqlServiceName)}",
             $"API /health：{apiStatus}",
             $"内部密钥文件：{(File.Exists(secretPath) ? "存在" : "缺失")}",
             $"API 端口：{apiPort}",
@@ -680,6 +822,11 @@ internal sealed class ServerMaintenance
         var postgresDataDirectory = DefaultPostgreSqlDataDirectory;
         EnsureSafePath(postgresDataDirectory, Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BackupMonitor"));
+
+        // 托盘先停：它占着安装目录里的 exe，不停就会在删目录那一步撞上
+        // 「文件正被另一进程使用」，而卸载已经把服务删了——留下一个半卸的状态（R6）。
+        ServerInstaller.StopTray();
+        ServerInstaller.RemoveTrayStartup();
 
         var sc = Path.Combine(Environment.SystemDirectory, "sc.exe");
         await ProcessRunner.RunAsync(sc, ["stop", ServerServiceName], ct, throwOnError: false);
@@ -1447,6 +1594,63 @@ internal sealed class ServerMaintenance
         catch (InvalidOperationException)
         {
             return "未安装";
+        }
+    }
+
+    /// <summary>
+    /// 描述某个服务的 SCM 崩溃恢复动作，供「运行诊断」现场确认用。
+    ///
+    /// 不去解析 sc qfailure 的输出：那段文字是本地化的（日文/中文/英文系统各不相同），
+    /// 拿字符串匹配迟早在某台机器上失灵。直接读注册表里的 FailureActions 二进制结构，
+    /// 布局是 SERVICE_FAILURE_ACTIONS 落盘后的形式：
+    /// [0]=重置周期秒 [4]=重启消息偏移 [8]=命令偏移 [12]=动作个数 [16]=动作数组偏移，
+    /// 其后是 cActions 个 {DWORD 类型, DWORD 延迟毫秒}。
+    /// </summary>
+    private static string DescribeRecoveryActions(string serviceName)
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                $@"SYSTEM\CurrentControlSet\Services\{serviceName}");
+            if (key is null)
+                return "未安装";
+
+            if (key.GetValue("FailureActions") is not byte[] blob || blob.Length < 20)
+                return "未配置（崩溃后不会自动拉起）";
+
+            var resetSeconds = BitConverter.ToUInt32(blob, 0);
+            var actionCount = BitConverter.ToInt32(blob, 12);
+            var actions = new List<string>();
+            for (var i = 0; i < actionCount; i++)
+            {
+                var offset = 20 + (i * 8);
+                if (offset + 8 > blob.Length)
+                    break;
+                var type = BitConverter.ToUInt32(blob, offset);
+                var delayMs = BitConverter.ToUInt32(blob, offset + 4);
+                var name = type switch
+                {
+                    1 => "重启服务",
+                    2 => "重启计算机",
+                    3 => "运行命令",
+                    _ => "不操作"
+                };
+                actions.Add($"{name}/{delayMs}ms");
+            }
+
+            if (actions.Count == 0)
+                return "未配置（崩溃后不会自动拉起）";
+
+            // failureflag（FailureActionsOnNonCrashFailures）决定「非崩溃退出」算不算失败。
+            // 只配 actions 不配这个标志时，服务自己 return 非零码退出不会触发恢复动作，
+            // 现场看起来就是「明明配了重启却没重启」。所以诊断里必须把它一并显示出来。
+            var nonCrash = key.GetValue("FailureActionsOnNonCrashFailures") is int flag && flag != 0;
+            return $"{string.Join(" → ", actions)}；重置周期 {resetSeconds}s；" +
+                   $"非崩溃退出{(nonCrash ? "也" : "不")}触发";
+        }
+        catch (Exception ex) when (ex is System.Security.SecurityException or UnauthorizedAccessException or IOException)
+        {
+            return "读取失败";
         }
     }
 

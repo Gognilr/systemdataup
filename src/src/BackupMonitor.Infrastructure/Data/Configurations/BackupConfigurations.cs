@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Entities.Backup;
+﻿using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Enums;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
@@ -157,6 +157,8 @@ public class CandidateBackupSetConfiguration : IEntityTypeConfiguration<Candidat
         builder.Property(e => e.QuickFingerprint).HasColumnName("quick_fingerprint").HasMaxLength(128);
         builder.Property(e => e.FailureCode).HasColumnName("failure_code").HasMaxLength(64);
         builder.Property(e => e.FailureMessage).HasColumnName("failure_message").HasMaxLength(2000);
+        builder.Property(e => e.SizeSuspicious).HasColumnName("size_suspicious").HasDefaultValue(false);
+        builder.Property(e => e.SizeSuspicionReason).HasColumnName("size_suspicion_reason");
         builder.Property(e => e.ExpiresAt).HasColumnName("expires_at");
         builder.Property(e => e.SupersededById).HasColumnName("superseded_by_id");
         builder.Property(e => e.CancelledAt).HasColumnName("cancelled_at");
@@ -306,6 +308,8 @@ public class BackupSetConfiguration : IEntityTypeConfiguration<BackupSet>
         builder.Property(e => e.ManifestSha256).HasColumnName("manifest_sha256").HasMaxLength(64);
         builder.Property(e => e.TotalFiles).HasColumnName("total_files");
         builder.Property(e => e.TotalBytes).HasColumnName("total_bytes");
+        builder.Property(e => e.SizeSuspicious).HasColumnName("size_suspicious").HasDefaultValue(false);
+        builder.Property(e => e.SizeSuspicionReason).HasColumnName("size_suspicion_reason");
         builder.Property(e => e.Locked).HasColumnName("locked").HasDefaultValue(false);
         builder.Property(e => e.RetentionUntil).HasColumnName("retention_until");
         builder.Property(e => e.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("now()").ValueGeneratedOnAdd();

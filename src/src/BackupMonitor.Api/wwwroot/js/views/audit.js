@@ -2,7 +2,7 @@
 import { api } from '../api.js';
 import { App, ACTIONS, LOADERS } from '../state.js';
 import {
-  $, esc, status, fmtDT, relTime, prettyJson, tableHtml, pagerHtml,
+  $, esc, status, fmtDT, absTime, prettyJson, tableHtml, pagerHtml,
   emptyState, hasFilter, openDrawer, errToast
 } from '../ui.js';
 import { shell, loading } from '../app.js';
@@ -36,7 +36,8 @@ LOADERS.audit = async function () {
       ? emptyState('filter', { key: 'audit', title: '没有匹配当前筛选条件的审计记录' })
       : emptyState('first', { glyph: '≡', title: '暂无审计记录', sub: '管理员动作会在这里留下只读、不可修改的记录' });
     wrap.innerHTML = tableHtml([
-      { l: '时间', render: r => relTime(r.occurredAt) },
+      // 审计存在的意义就是「什么时候谁做了什么」，时间必须是可对照的绝对时刻（R19）。
+      { l: '时间', render: r => absTime(r.occurredAt) },
       { l: '用户', k: 'usernameSnapshot' },
       { l: '动作', render: r => `<span class="mono">${esc(r.action)}</span>` },
       { l: '资源', render: r => `${esc(r.resourceType || '—')}<br><span class="mono sub">${esc(String(r.resourceId || '').slice(0, 8) || '—')}</span>` },

@@ -215,6 +215,7 @@ $agentPublish = Join-Path $stageRoot 'agent'
 $trayPublish = Join-Path $stageRoot 'tray'
 $agentSetupPublish = Join-Path $stageRoot 'agent-setup'
 $serverSetupPublish = Join-Path $stageRoot 'server-setup'
+$serverTrayPublish = Join-Path $stageRoot 'server-tray'
 $databaseStage = Join-Path $stageRoot 'database'
 $postgresStage = Join-Path $stageRoot 'postgresql'
 $postgresExtract = Join-Path $stageRoot 'postgresql-extract'
@@ -244,10 +245,23 @@ Invoke-Dotnet @('restore', (Join-Path $srcRoot 'agent\BackupMonitor.Agent\Backup
 Invoke-Dotnet @('restore', (Join-Path $srcRoot 'agent\BackupMonitor.Agent.Tray\BackupMonitor.Agent.Tray.csproj'), '-r', $Runtime)
 Invoke-Dotnet @('restore', (Join-Path $srcRoot 'agent\BackupMonitor.Agent.Setup\BackupMonitor.Agent.Setup.csproj'), '-r', $Runtime)
 Invoke-Dotnet @('restore', (Join-Path $srcRoot 'server\BackupMonitor.Server.Setup\BackupMonitor.Server.Setup.csproj'), '-r', $Runtime)
+Invoke-Dotnet @('restore', (Join-Path $srcRoot 'server\BackupMonitor.Server.Tray\BackupMonitor.Server.Tray.csproj'), '-r', $Runtime)
 Invoke-Dotnet @('publish', (Join-Path $srcRoot 'src\BackupMonitor.Api\BackupMonitor.Api.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-o', $apiPublish)
 Invoke-Dotnet @('publish', (Join-Path $srcRoot 'agent\BackupMonitor.Agent\BackupMonitor.Agent.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-o', $agentPublish)
 Invoke-Dotnet @('publish', (Join-Path $srcRoot 'agent\BackupMonitor.Agent.Tray\BackupMonitor.Agent.Tray.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-o', $trayPublish)
 Invoke-Dotnet @('publish', (Join-Path $srcRoot 'agent\BackupMonitor.Agent.Setup\BackupMonitor.Agent.Setup.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-p:PublishSingleFile=true', '-p:IncludeNativeLibrariesForSelfExtract=true', '-o', $agentSetupPublish)
+
+# 服务端托盘（R6）与 API 一起装进安装目录：payload 里的 api\ 目录就是安装目录本身。
+# 两者都是同一 RID 的自包含发布，共用的运行时文件逐字节相同，覆盖是安全的——
+# 客户端包里 Agent + Agent.Tray 用的也是这个办法。
+# 排除 .pdb：调试符号对运行没用，只是把安装包撑大。
+Invoke-Dotnet @('publish', (Join-Path $srcRoot 'server\BackupMonitor.Server.Tray\BackupMonitor.Server.Tray.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-o', $serverTrayPublish)
+if (-not (Test-Path -LiteralPath (Join-Path $serverTrayPublish 'BackupMonitor.Server.Tray.exe'))) {
+    throw 'Server tray publish did not produce BackupMonitor.Server.Tray.exe.'
+}
+Get-ChildItem -LiteralPath $serverTrayPublish -Force |
+    Where-Object { $_.Extension -ne '.pdb' } |
+    Copy-Item -Destination $apiPublish -Recurse -Force
 
 New-Item -ItemType Directory -Path (Join-Path $apiPublish 'wwwroot\downloads') -Force | Out-Null
 $agentExe = Join-Path $agentPublish 'BackupMonitor.Agent.exe'
@@ -278,6 +292,16 @@ Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\README.md'
 # 表现都是「装不上」，其中缺 UCRT 那条连日志都不会留。这个纯批处理脚本是双击
 # 安装程序之前唯一能把问题指出来的东西。
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\check-prereq.cmd') -Destination (Join-Path $clientPackageStage 'check-prereq.cmd') -Force
+
+# 随附的 Agent 版本号（R11）。服务端要能回答「这台机器落后了没有」，
+# 就必须知道「现在随包发出去的是哪一版」——而那个数字在此之前只存在于
+# BackupMonitor.Agent.csproj 里，运行期无从得知。
+# 取自实际发布出来的那个 exe，不是从 csproj 抄一份：抄的那份迟早和发布物分家。
+$agentVersion = (Get-Item -LiteralPath $agentExe).VersionInfo.ProductVersion
+if ([string]::IsNullOrWhiteSpace($agentVersion)) {
+    throw 'Unable to read the published agent version from BackupMonitor.Agent.exe.'
+}
+Set-Content -LiteralPath (Join-Path $apiPublish 'wwwroot\downloadsgent-version.txt') -Value $agentVersion.Trim() -Encoding utf8 -NoNewline
 
 $clientZip = Join-Path $apiPublish 'wwwroot\downloads\BackupMonitor.Agent.zip'
 # 这几个名字与 AgentInstaller.ValidatePayload / install-agent.ps1 的期望一致：
@@ -333,7 +357,9 @@ $payloadZip = Join-Path $setupPayloadRoot 'server-payload.zip'
 # 要到运行期才炸。客户端下载入口同理——缺了它网页上那个下载按钮就是 404。
 $payloadRequired = @(
     'api\BackupMonitor.Api.exe',
+    'api\BackupMonitor.Server.Tray.exe',
     'api\wwwroot\downloads\BackupMonitor.Agent.zip',
+    'api\wwwroot\downloadsgent-version.txt',
     'api\wwwroot\downloads\BackupMonitor.Agent.Setup.exe',
     'api\wwwroot\downloads\VC_redist.x64.exe',
     'api\wwwroot\downloads\check-prereq.cmd',

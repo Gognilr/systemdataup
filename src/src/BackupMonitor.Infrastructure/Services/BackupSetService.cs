@@ -241,7 +241,9 @@ public class BackupSetService : IBackupSetService
                 s.TotalFiles,
                 s.TotalBytes,
                 s.Locked,
-                s.RetentionUntil
+                s.RetentionUntil,
+                s.SizeSuspicious,
+                s.SizeSuspicionReason
             })
             .ToListAsync(ct);
 
@@ -263,7 +265,9 @@ public class BackupSetService : IBackupSetService
             TotalFiles = s.TotalFiles,
             TotalBytes = s.TotalBytes,
             Locked = s.Locked,
-            RetentionUntil = s.RetentionUntil
+            RetentionUntil = s.RetentionUntil,
+            SizeSuspicious = s.SizeSuspicious,
+            SizeSuspicionReason = s.SizeSuspicionReason
         }).ToList();
 
         return PagedResult<BackupSetListItemDto>.Create(items, totalCount, query.Page, query.PageSize);
@@ -299,6 +303,8 @@ public class BackupSetService : IBackupSetService
             TotalBytes = set.TotalBytes,
             Locked = set.Locked,
             RetentionUntil = set.RetentionUntil,
+            SizeSuspicious = set.SizeSuspicious,
+            SizeSuspicionReason = set.SizeSuspicionReason,
 
             SourceCandidateId = set.SourceCandidateId,
             UploadSessionId = set.UploadSessionId,

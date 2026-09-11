@@ -2,7 +2,7 @@
 import { api } from '../api.js';
 import { App, ACTIONS, LOADERS } from '../state.js';
 import {
-  $, esc, L, optsOf, status, fmtBytes, fmtDT, relTime,
+  $, esc, L, optsOf, status, fmtBytes, fmtDT, absTime,
   tableHtml, pagerHtml, skeleton, emptyState, hasFilter, batchBarHtml,
   toast, errToast, confirmModal, formModal
 } from '../ui.js';
@@ -100,14 +100,21 @@ const BACKUP_COLUMNS = [
       // 长得一模一样，不显示单元就分不清哪一行是哪个账套——而保留份数正是按账套各算各的。
       { l: '客户端 / 任务', render: r => `${esc(r.clientHostname)}<span class="sub">${esc(r.taskName)}${r.businessUnitName ? ' · ' + esc(r.businessUnitName) : ''}</span>` },
       { l: '应用', k: 'applicationName' },
-      { l: '状态', k: 'status', sort: true, render: r => status('backup_set_status', r.status) },
+      // 「大小可疑」不是一个状态，是一个挂在状态旁边的标记（R15）：
+      // 这一份照常收下、照常可用，只是它比历史基线小得离谱，需要人看一眼。
+      // 单开一列会让这个极少数情况占掉一整列宽度，挂在状态后面正合适。
+      { l: '状态', k: 'status', sort: true,
+        render: r => status('backup_set_status', r.status)
+          + (r.sizeSuspicious ? ` <span class="status status--wait pill" title="${esc(r.sizeSuspicionReason || '')}">大小可疑</span>` : '') },
       // 「3 天前」回答不了「这份是不是周二那次」——精确时间当主行，相对时间降为副行。
       // 此前精确值只藏在鼠标悬停的 title 里，等于没有。
       { l: '业务时间', k: 'backupBusinessTime', sort: true,
-        render: r => `${esc(fmtDT(r.backupBusinessTime))}<span class="sub">${relTime(r.backupBusinessTime)}</span>` },
+        // 这一列本来就是「绝对为主 + 相对为辅」，改用 absTime 让全站口径统一（R19）：
+        // 当年省年份、跨年补上、title 带秒，这些规则不该在每个列表里各写一份。
+        render: r => absTime(r.backupBusinessTime) },
       { l: '大小', k: 'totalBytes', sort: true, num: true, render: r => `${esc(r.totalFiles)} 个文件 / ${fmtBytes(r.totalBytes)}` },
       { l: '锁定', render: r => r.locked ? '<span class="status status--wait pill">已锁定</span>' : '—' },
-      { l: '保留至', k: 'retentionUntil', sort: true, render: r => relTime(r.retentionUntil) },
+      { l: '保留至', k: 'retentionUntil', sort: true, render: r => absTime(r.retentionUntil) },
       { l: '操作', render: r => {
         const b = [];
         if (r.status === 'available') {
@@ -424,13 +431,24 @@ export async function vBackupDetail(id) {
     </div>
     <div class="card"><b class="mono">${esc(d.backupSetCode)}</b> ${status('backup_set_status', d.status)}
       ${d.locked ? '<span class="status status--wait pill">已锁定</span>' : ''}
+      ${d.sizeSuspicious ? '<span class="status status--wait pill">大小可疑</span>' : ''}
+      ${d.sizeSuspicious
+        ? `<div class="notice warning" style="margin-top:12px">${esc(d.sizeSuspicionReason || '这一份的大小与历史基线偏离过大。')}<br>
+           这一份<strong>已经正常入库、可以恢复</strong>——标记的意思是「请人看一眼它是不是完整的」，不是「它不能用」。
+           一份可疑的备份，比没有备份好。</div>`
+        : ''}
       <div class="kv" style="margin-top:12px">
         <div class="row"><div class="k">客户端 / 任务</div><div class="v">${esc(d.clientHostname)} / ${esc(d.taskName)}</div></div>
         <div class="row"><div class="k">应用</div><div class="v">${esc(d.applicationName)}</div></div>
         <div class="row"><div class="k">业务时间</div><div class="v">${fmtDT(d.backupBusinessTime)}</div></div>
         <div class="row"><div class="k">上传时间</div><div class="v">${fmtDT(d.uploadedAt)}</div></div>
         <div class="row"><div class="k">规模</div><div class="v">${esc(d.totalFiles)} 个文件 · ${fmtBytes(d.totalBytes)}</div></div>
-        <div class="row"><div class="k">校验时间</div><div class="v">${fmtDT(d.verifiedAt)}</div></div>
+        <!-- R17：「校验」两个字太含糊，容易被理解成「服务端自己算了一遍」，
+             而实际含义是「服务端实测的 SHA-256 与客户端在预检清单里报的哈希一致」。
+             这是信任度问题，不只是文案——管理员要能不看代码就说清这个状态核对了什么。 -->
+        <div class="row"><div class="k">与客户端核对</div><div class="v">${d.verifiedAt
+          ? `已与客户端核对一致 · ${esc(fmtDT(d.verifiedAt))}`
+          : '尚未核对'}<span class="sub">服务端实测的 SHA-256 与客户端上报的哈希逐文件一致</span></div></div>
         <!-- 浏览器打不开服务器上的资源管理器，也点不开 file:// 链接（Chrome/Edge 一律拦截）。
              能做的是把路径原样交到手里：复制出来粘到资源管理器地址栏就行；
              把仓库根做成只读 SMB 共享之后，这个路径直接就是 \\服务器\repo\… 的形式。 -->
@@ -447,7 +465,12 @@ export async function vBackupDetail(id) {
       { l: '相对路径', render: r => `<span class="mono" style="font-size:12px">${esc(r.relativePath)}</span>` },
       { l: '大小', num: true, render: r => fmtBytes(r.sizeBytes) }, { l: '修改时间', render: r => fmtDT(r.lastModifiedAt) },
       { l: 'SHA-256', render: r => `<span class="mono" style="font-size:11px">${esc((r.sha256 || '').slice(0, 16))}…</span>` },
-      { l: '校验', render: r => status('result', r.verificationStatus) }
+      // 同上：这一列说的是「这个文件与客户端上报的哈希对得上」，不是「服务端另算了一份」。
+      { l: '与客户端核对', render: r => r.verificationStatus === 'success'
+          ? '<span class="status status--ok pill">一致</span>'
+          : (r.verificationStatus === 'failure'
+            ? '<span class="status status--err pill">不一致</span>'
+            : status('result', r.verificationStatus)) }
     ], d.files, { empty: emptyState('first', { title: '无文件记录' }) })}</div>`;
   } catch (e) { $('#view').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }

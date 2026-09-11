@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Entities.Client;
+﻿using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
@@ -89,6 +89,11 @@ public class AgentHeartbeatService : IAgentHeartbeatService
         client.LastHeartbeatAt = now;
         if (!string.IsNullOrWhiteSpace(agentVersion))
             client.AgentVersion = agentVersion;
+        // 过渡期就绪回报（R9）。每次心跳原样覆盖，包括覆盖成 null——
+        // 过渡期结束时服务端会把预备指纹清掉，Agent 随之报空，
+        // 库里这一列必须跟着清干净，否则下一轮轮换会拿着上一轮的残留值判「已就绪」。
+        client.AcceptedNextServerFingerprint = NormalizeFingerprint(request.AcceptedNextServerFingerprint);
+
         if (request.ClientTime is not null)
             client.TimeOffsetSeconds = (int)Math.Clamp((now - request.ClientTime.Value.ToUniversalTime()).TotalSeconds, int.MinValue, int.MaxValue);
 
@@ -462,5 +467,15 @@ public class AgentHeartbeatService : IAgentHeartbeatService
             return null;
         var trimmed = value.Trim();
         return trimmed.Length <= maxLength ? trimmed : trimmed[..maxLength];
+    }
+
+    /// <summary>指纹归一化，与 AgentConfigService / Agent 侧同一口径。</summary>
+    private static string? NormalizeFingerprint(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        var cleaned = value.Replace(":", string.Empty).Replace(" ", string.Empty).Trim().ToUpperInvariant();
+        return cleaned.Length is 0 or > 128 ? null : cleaned;
     }
 }

@@ -193,6 +193,40 @@ export function relTime(v) {
   const p = x => String(x).padStart(2, '0');
   return `<time title="${abs}">${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}</time>`;
 }
+/* 相对时间的纯文字版本（不带标签），供「绝对时间 + 相对时间」并排的单元格复用。
+   与 relTime 的差别只有一处：超过 7 天不回退成日期，仍然说「23 天前」——
+   在 absTime 里日期已经摆在主位了，这里再重复一遍没有意义。 */
+export function relText(v) {
+  if (!v) return '';
+  const d = new Date(v);
+  if (isNaN(d)) return '';
+  const diff = Date.now() - d.getTime();
+  if (diff < 0) return '';
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return '刚刚';
+  if (m < 60) return `${m} 分钟前`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} 小时前`;
+  return `${Math.floor(h / 24)} 天前`;
+}
+
+/* 绝对时间为主、相对时间为辅。
+   「3 分钟前」一眼能看出新鲜度，但要跟服务端日志、Windows 事件查看器、
+   告警时间对照时它用不了——人得先在心里做一次减法，而那一步最容易错，
+   排障时错一次就是找错方向。所以列表里把绝对时间摆在主位，
+   相对时间降为灰字提示；title 仍然是带秒的完整时间。
+   当年的时间省掉年份（列宽有限），跨年的补上。 */
+export function absTime(v) {
+  if (!v) return '—';
+  const d = new Date(v);
+  if (isNaN(d)) return esc(v);
+  const p = x => String(x).padStart(2, '0');
+  const md = `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  const main = d.getFullYear() === new Date().getFullYear() ? md : `${d.getFullYear()}-${md}`;
+  const rel = relText(v);
+  return `<time title="${fmtDT(v)}">${main}</time>${rel ? ` <span class="hint">${rel}</span>` : ''}`;
+}
+
 export function shortId(g) { return g ? String(g).slice(0, 8) : '—'; }
 
 /* 客户端在界面上的称呼。

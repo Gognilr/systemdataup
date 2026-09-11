@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Abstractions;
+﻿using BackupMonitor.Core.Abstractions;
 using BackupMonitor.Core.Entities.Alert;
 using BackupMonitor.Core.Entities.Audit;
 using BackupMonitor.Core.Entities.Backup;
@@ -100,6 +100,8 @@ public class AppDbContext : DbContext
     public DbSet<ScheduledLock> ScheduledLocks => Set<ScheduledLock>();
 
     public DbSet<IdempotencyKey> IdempotencyKeys => Set<IdempotencyKey>();
+
+    public DbSet<ConfigBackupExport> ConfigBackupExports => Set<ConfigBackupExport>();
 
     #endregion
 

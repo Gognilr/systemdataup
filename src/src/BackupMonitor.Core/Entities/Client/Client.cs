@@ -31,6 +31,15 @@ public class Client : IHasRowVersion
     public string? AgentVersion { get; set; }
 
     /// <summary>
+    /// 这台 Agent 已经接受的「预备服务端指纹」（V039 · R9 过渡期）。
+    ///
+    /// 与当前预备指纹一致才算就绪。启用新证书之前必须先看这一列：
+    /// 没拿到的机器会在切换那一刻掉线，而且再也连不回来——
+    /// 它连不上就收不到新指纹，只能上门重跑安装器。
+    /// </summary>
+    public string? AcceptedNextServerFingerprint { get; set; }
+
+    /// <summary>
     /// Agent 自报的本机网卡地址列表（jsonb 字符串数组）。
     ///
     /// 原先只在注册时写一次，之后永不刷新；现在心跳会在网卡列表变化时带上并覆盖。

@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Enums;
+﻿using BackupMonitor.Core.Enums;
 
 namespace BackupMonitor.Core.Entities.Backup;
 
@@ -65,6 +65,17 @@ public class BackupSet
     public int TotalFiles { get; set; }
 
     public long TotalBytes { get; set; }
+
+    /// <summary>
+    /// 大小/文件数可疑（V037 · R15）。
+    ///
+    /// 可疑**不阻断**：这一份照样收下、照样入库，只是打上标记并发 size_abnormal 告警。
+    /// 一份可疑的备份，比没有备份好——判断权交给人，不由系统替人决定这份不要了。
+    /// </summary>
+    public bool SizeSuspicious { get; set; }
+
+    /// <summary>可疑的具体理由（哪条判据、差多少），写给人看。</summary>
+    public string? SizeSuspicionReason { get; set; }
 
     /// <summary>是否被锁定（禁止清理）</summary>
     public bool Locked { get; set; }

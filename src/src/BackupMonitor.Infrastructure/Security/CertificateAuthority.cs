@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using BackupMonitor.Shared.Exceptions;
 using Microsoft.Extensions.Configuration;
@@ -7,7 +7,22 @@ using Microsoft.Extensions.Logging;
 namespace BackupMonitor.Infrastructure.Security;
 
 /// <summary>签发客户端证书的结果</summary>
-public record IssuedCertificate(string CertificatePem, string Thumbprint, DateTime IssuedAt, DateTime ExpiresAt, string SerialNumber);
+/// <param name="TruncatedByCa">
+/// 本次签发的有效期被 CA 的 NotAfter 截断（R10）。
+///
+/// 客户端证书本来是 365 天，但它不能活得比签它的 CA 更久。CA 是 10 年，
+/// 于是第 9 年起签出来的证书会一年比一年短，而在此之前这件事**没有任何痕迹**——
+/// 界面上看到的只是一张有效期很短的证书，没人会去想为什么。
+/// 到第 10 年，续签只能签出一张已经过期的证书，全体 Agent 同一天失效。
+/// 这个标记是那之前唯一的早期信号。
+/// </param>
+public record IssuedCertificate(
+    string CertificatePem,
+    string Thumbprint,
+    DateTime IssuedAt,
+    DateTime ExpiresAt,
+    string SerialNumber,
+    bool TruncatedByCa = false);
 
 /// <summary>
 /// 客户端证书签发服务（设计书 10.2 证书签发结果 / 23.1 客户端认证）。
@@ -51,8 +66,17 @@ public class CertificateAuthority
         var notBefore = issuerNotBefore > now.AddMinutes(-5) ? issuerNotBefore : now.AddMinutes(-5);
         var validityDays = _configuration.GetValue("Security:ClientCa:ClientCertValidityDays", 365);
         var notAfter = now.AddDays(validityDays);
-        if (notAfter > issuerNotAfter)
+        var truncatedByCa = notAfter > issuerNotAfter;
+        if (truncatedByCa)
+        {
             notAfter = issuerNotAfter;
+            // 日志是这条信号的第一处落点，告警由调用方发（这里没有 alerting，
+            // 而且 CA 是长生命周期对象，不该把告警链路挂进来）。
+            _logger.LogWarning(
+                "客户端 {ClientId} 的证书有效期被 CA 截断：请求 {Requested} 天，实际到 {NotAfter:yyyy-MM-dd}（CA 到期日）。"
+                + "CA 到期当天全体 Agent 会同时失效，请尽早安排重建 CA。",
+                clientId, validityDays, notAfter.UtcDateTime);
+        }
         if (notAfter <= notBefore)
             throw new BusinessException("SERVICE_UNAVAILABLE", "客户端证书 CA 的有效期不足，无法签发客户端证书", 503);
         var serial = CreateRandomSerial();
@@ -78,7 +102,8 @@ public class CertificateAuthority
             signed.Thumbprint.ToLowerInvariant(),
             notBefore.UtcDateTime,
             notAfter.UtcDateTime,
-            Convert.ToHexString(serial).ToLowerInvariant());
+            Convert.ToHexString(serial).ToLowerInvariant(),
+            truncatedByCa);
     }
 
     /// <summary>校验公钥可解析（注册提交时提前发现错误）</summary>

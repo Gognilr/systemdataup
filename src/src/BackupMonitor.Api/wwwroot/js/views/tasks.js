@@ -2,7 +2,7 @@
 import { api } from '../api.js';
 import { App, ACTIONS, LOADERS } from '../state.js';
 import {
-  $, esc, L, optsOf, status, fmtBytes, fmtDT, relTime, prettyJson,
+  $, esc, L, optsOf, status, fmtBytes, fmtDT, absTime, prettyJson,
   tableHtml, pagerHtml, skeleton, emptyState, hasFilter, batchBarHtml,
   toast, errToast, confirmModal, formModal, openDrawer, openModal, closeModal, clientLabel, clientName,
   describeCron, searchPickerHtml, initSearchPicker
@@ -57,7 +57,8 @@ LOADERS.tasks = async function () {
       { l: '启用', k: 'enabled', sort: true, render: r => r.enabled ? '是' : '否' },
       { l: '重要级', render: r => esc(L.importance[r.importanceLevel] || r.importanceLevel) },
       { l: '上次检查结果', render: r => r.lastPrecheckStatus ? status('precheck', r.lastPrecheckStatus) : '—' },
-      { l: '最近成功', k: 'lastSuccessAt', sort: true, render: r => relTime(r.lastSuccessAt) },
+      // 「最近成功」是判断这个任务还正不正常的主要依据，要能直接跟计划时刻对上（R19）。
+      { l: '最近成功', k: 'lastSuccessAt', sort: true, render: r => absTime(r.lastSuccessAt) },
       { l: '操作', render: r => {
         const b = [`<button class="small" data-ui-action="act" data-view="tasks" data-action="detail" data-id="${esc(r.id)}">详情</button>`,
           `<button class="small" data-ui-action="act" data-view="tasks" data-action="edit" data-id="${esc(r.id)}">编辑</button>`];

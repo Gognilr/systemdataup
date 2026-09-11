@@ -92,6 +92,15 @@ public class BackupSetListItemDto
     public long TotalBytes { get; set; }
     public bool Locked { get; set; }
     public DateTime? RetentionUntil { get; set; }
+
+    /// <summary>
+    /// 入库时大小/文件数可疑（R15）。备份本身仍然可用——
+    /// 这是一个「请人看一眼」的标记，不是「这份不能用」。
+    /// </summary>
+    public bool SizeSuspicious { get; set; }
+
+    /// <summary>可疑的具体理由（哪条判据、差多少）。</summary>
+    public string? SizeSuspicionReason { get; set; }
 }
 
 /// <summary>备份详情（设计书 18.2）</summary>
@@ -192,4 +201,22 @@ public class BackupSetBatchResult
     public int SuccessCount { get; set; }
 
     public List<BackupSetBatchFailure> Failed { get; set; } = new();
+}
+
+/// <summary>
+/// 定期复查设置（R18）。
+///
+/// 这一层抓的是入库之后才会发生的三件事：磁盘静默损坏、误删、勒索软件加密。
+/// 界面上要把这句话写出来——否则人看到「又一个后台任务」，第一反应是关掉它。
+/// </summary>
+public class ReverifySettingsDto
+{
+    /// <summary>停用后不再产生任何复查工作项。默认启用。</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>复查间隔（小时），1~720。默认 168（7 天）。</summary>
+    public int IntervalHours { get; set; } = 168;
+
+    /// <summary>每轮入队份数，1~200。默认 1。</summary>
+    public int BatchSize { get; set; } = 1;
 }

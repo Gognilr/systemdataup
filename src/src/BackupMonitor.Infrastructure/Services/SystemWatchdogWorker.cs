@@ -1,5 +1,7 @@
 ﻿using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
+using BackupMonitor.Shared.Exceptions;
+using BackupMonitor.Shared.Models.Admin;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -105,7 +107,125 @@ public class SystemWatchdogWorker : BackgroundService
     {
         await RunClientLivenessAsync(scope, ct);
         await RunStorageSelfCheckAsync(scope, ct);
+        await RunConfigBackupOverdueCheckAsync(scope, ct);
+        await RunCertificateLifecycleCheckAsync(scope, ct);
+        await RunAgentVersionDriftCheckAsync(scope, ct);
     }
+
+    /// <summary>
+    /// R11：Agent 版本漂移。
+    ///
+    /// 一条聚合告警而不是每台一条：十台机器落后不是十件事，是一件事，
+    /// 而且处置动作是同一个——去升级页面批量下发。
+    /// 每台一条只会把告警中心刷满，然后没人再看它。
+    /// </summary>
+    private async Task RunAgentVersionDriftCheckAsync(IServiceScope scope, CancellationToken ct)
+    {
+        try
+        {
+            var alerting = scope.ServiceProvider.GetRequiredService<IAlertingService>();
+            var versions = scope.ServiceProvider.GetRequiredService<IAgentVersionService>();
+            var status = await versions.GetStatusAsync(ct);
+
+            if (!status.Overdue)
+            {
+                await alerting.RecoverAsync(AgentVersionDriftAlertKey, ct);
+                return;
+            }
+
+            var names = string.Join("、", status.OutdatedClients
+                .Take(5)
+                .Select(c => string.IsNullOrWhiteSpace(c.DisplayName) ? c.Hostname : c.DisplayName));
+            var more = status.OutdatedClients.Count > 5 ? $" 等 {status.OutdatedClients.Count} 台" : string.Empty;
+
+            await alerting.RaiseAsync(
+                AgentVersionDriftAlertKey,
+                AlertLevel.Warning,
+                "agent_version_drift",
+                $"{status.OutdatedClients.Count} 台客户端仍在旧版本",
+                $"服务端随附版本 {status.BundledVersion} 从 {status.BundledAvailableSince:yyyy-MM-dd} 起可用，"
+                + $"已超过 {status.DriftAlertDays} 天，以下机器仍低于它：{names}{more}。"
+                + "版本落后本身不影响已经入库的备份，但只在新版本里修好的缺陷会在这些机器上继续复现。",
+                ct: ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Agent 版本漂移巡检异常");
+        }
+    }
+
+    /// <summary>Agent 版本漂移告警键（聚合，全局一条）。</summary>
+    private const string AgentVersionDriftAlertKey = "system:agent_version:drift";
+
+    /// <summary>
+    /// R9 / R10：服务端 TLS 证书与客户端 CA 的到期巡检。
+    ///
+    /// 挂在这个 worker 上而不是启动时跑一次：证书到期是一个随时间推进的状态，
+    /// 只在启动时检查意味着一台连续跑一年的服务端永远不会再检查第二次——
+    /// 而它恰恰是最可能跑到证书到期的那一台。
+    /// </summary>
+    private async Task RunCertificateLifecycleCheckAsync(IServiceScope scope, CancellationToken ct)
+    {
+        try
+        {
+            var checker = scope.ServiceProvider.GetRequiredService<ICertificateLifecycleChecker>();
+            await checker.CheckAsync(ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "证书到期巡检异常");
+        }
+    }
+
+    /// <summary>
+    /// R4：配置备份包超期巡检。
+    ///
+    /// 导出是**手动触发**的（2026-09-10 定板：不做定时自动导出），
+    /// 于是这条告警是唯一的兜底——没有任何定时任务替人记着这件事。
+    /// 从未导出过同样算超期：那恰恰是最该被看见的状态。
+    ///
+    /// 公开是为了能单测。
+    /// </summary>
+    public async Task RunConfigBackupOverdueCheckAsync(IServiceScope scope, CancellationToken ct)
+    {
+        var alerting = scope.ServiceProvider.GetRequiredService<IAlertingService>();
+        var configBackup = scope.ServiceProvider.GetRequiredService<IConfigBackupService>();
+
+        ConfigBackupStatusDto status;
+        try
+        {
+            status = await configBackup.GetStatusAsync(ct);
+        }
+        catch (BusinessException)
+        {
+            // 非一键部署形态下没有服务端数据目录，这件事不适用，也就没什么可报的。
+            return;
+        }
+
+        if (!status.Overdue)
+        {
+            await alerting.RecoverAsync(ConfigBackupOverdueAlertKey, ct);
+            return;
+        }
+
+        var message = status.LatestExportedAt is null
+            ? $"从未导出过配置备份包。包内是服务端密钥、客户端 CA 与整库转储——"
+              + $"没有它，仓库里的备份文件即使还在，也认不出哪个文件属于哪台机器、哪个任务、哪一天，"
+              + $"同时所有客户端身份作废。请在「系统设置 → 配置备份」中导出一份并复制到另一台机器。"
+            : $"最近一份配置备份包是 {status.LatestExportedAt:yyyy-MM-dd HH:mm} UTC 导出的，"
+              + $"已经过去 {status.AgeDays} 天（阈值 {status.OverdueDays} 天）。导出是手动触发的，没有定时任务替你记着。";
+
+        await alerting.RaiseAsync(
+            ConfigBackupOverdueAlertKey,
+            AlertLevel.Critical,
+            "config_backup_overdue",
+            "配置备份包超期未导出",
+            message,
+            ct: ct);
+    }
+
+    /// <summary>配置备份包超期告警键。</summary>
+    private const string ConfigBackupOverdueAlertKey = "system:config_backup:overdue";
 
     /// <summary>
     /// A1：客户端存活判定。
@@ -203,7 +323,11 @@ public class SystemWatchdogWorker : BackgroundService
     private static DateTime? Later(DateTime? left, DateTime? right) =>
         left is null ? right : right is null ? left : (left > right ? left : right);
 
-    private async Task RunStorageSelfCheckAsync(IServiceScope scope, CancellationToken ct)
+    /// <summary>
+    /// 公开是为了能单测：这一段原本有两条静默路径（解析失败 return、盘未就绪 continue），
+    /// 结果是「磁盘快满了」会报警，「磁盘整个不见了」反而一声不响。这种反向的沉默必须钉住。
+    /// </summary>
+    public async Task RunStorageSelfCheckAsync(IServiceScope scope, CancellationToken ct)
     {
         var settings = scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>();
         var alerting = scope.ServiceProvider.GetRequiredService<IAlertingService>();
@@ -211,35 +335,50 @@ public class SystemWatchdogWorker : BackgroundService
 
         var warnPercent = Math.Clamp(await settings.GetIntAsync(StorageAlertPercentKey, 15, ct), 1, 99);
 
-        string repositoryRoot;
-        string stagingRoot;
-        try
+        // 两个根分别解析、分别报警。原先合在一个 try 里，仓库路径没了会把暂存区的检查
+        // 一起带走——恰恰是「盘没了」这种最该说话的时候，整轮自检全哑。
+        var roots = new List<(string Name, string? Root)>
         {
-            // 根目录解析会对配置路径执行 CreateDirectory，路径不存在或没权限时抛异常。
-            // 巡检不该因此整轮失败，取不到就跳过本轮磁盘自检。
-            repositoryRoot = await storage.GetRepositoryRootAsync(ct);
-            stagingRoot = await storage.GetStagingRootAsync(ct);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "服务端存储根目录解析失败，本轮跳过磁盘自检");
-            return;
-        }
+            ("仓库", await ResolveStorageRootAsync("仓库", () => storage.GetRepositoryRootAsync(ct), alerting, ct)),
+            ("暂存区", await ResolveStorageRootAsync("暂存区", () => storage.GetStagingRootAsync(ct), alerting, ct))
+        };
 
-        foreach (var (name, root) in new[] { ("仓库", repositoryRoot), ("暂存区", stagingRoot) })
+        foreach (var (name, root) in roots)
         {
             ct.ThrowIfCancellationRequested();
+
+            if (root is null)
+                continue;   // 解析阶段已经报过 server_storage_unavailable
 
             var alertKey = $"system:storage:{name}";
             try
             {
                 var pathRoot = Path.GetPathRoot(Path.GetFullPath(root));
                 if (string.IsNullOrWhiteSpace(pathRoot))
+                {
+                    await RaiseStorageUnavailableAsync(alerting, name,
+                        $"无法从路径 {root} 判定所在卷", ct);
                     continue;
+                }
 
                 var drive = new DriveInfo(pathRoot);
-                if (!drive.IsReady || drive.TotalSize <= 0)
+                if (!drive.IsReady)
+                {
+                    // 外挂盘掉电、网络盘断开、卷未挂载都落在这里。原来是 continue：
+                    // 盘整个不见了，系统一个字都不说。
+                    await RaiseStorageUnavailableAsync(alerting, name,
+                        $"{pathRoot} 未就绪（外挂盘掉线 / 网络盘断开 / 卷未挂载）", ct);
                     continue;
+                }
+
+                if (drive.TotalSize <= 0)
+                {
+                    await RaiseStorageUnavailableAsync(alerting, name,
+                        $"{drive.Name} 报告的总容量为 0，无法判定剩余空间", ct);
+                    continue;
+                }
+
+                await alerting.RecoverAsync(StorageUnavailableAlertKey(name), ct);
 
                 var freePercent = drive.AvailableFreeSpace * 100.0 / drive.TotalSize;
                 if (freePercent <= warnPercent)
@@ -260,7 +399,51 @@ public class SystemWatchdogWorker : BackgroundService
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "服务端{Name}磁盘容量读取失败：{Root}", name, root);
+                await RaiseStorageUnavailableAsync(alerting, name, $"读取 {root} 的卷信息失败：{ex.Message}", ct);
             }
         }
     }
+
+    /// <summary>
+    /// 解析一个存储根；失败时报 Critical 并返回 null（本轮跳过这个根的容量检查）。
+    /// 解析内部会对配置路径执行 CreateDirectory，路径被删、盘符不存在、NAS 掉线、
+    /// 权限丢了都会在这里抛出来——每一种都是「备份现在就落不了地」，不是可以忽略的小事。
+    /// </summary>
+    private async Task<string?> ResolveStorageRootAsync(
+        string name,
+        Func<Task<string>> resolve,
+        IAlertingService alerting,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await resolve();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "服务端{Name}存储根目录解析失败", name);
+            await RaiseStorageUnavailableAsync(alerting, name, $"存储根目录不可用：{ex.Message}", ct);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 「盘没了」的告警键刻意与 server_storage_low 的 <c>system:storage:{name}</c> 分开。
+    /// 共用一个键会让两件事互相覆盖：盘掉线时把「快满了」顶掉，盘回来时又把「没了」顶掉，
+    /// 而这两件事的处置完全不同（一个是加盘，一个是插线）。
+    /// </summary>
+    private static string StorageUnavailableAlertKey(string name) => $"system:storage:{name}:unavailable";
+
+    private static Task RaiseStorageUnavailableAsync(
+        IAlertingService alerting,
+        string name,
+        string detail,
+        CancellationToken ct) =>
+        alerting.RaiseAsync(
+            StorageUnavailableAlertKey(name),
+            AlertLevel.Critical,
+            "server_storage_unavailable",
+            $"服务端{name}存储不可达",
+            detail,
+            ct: ct);
 }

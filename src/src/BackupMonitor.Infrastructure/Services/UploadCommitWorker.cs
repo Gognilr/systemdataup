@@ -306,7 +306,11 @@ public class UploadCommitWorker : BackgroundService
                     DiscoveredAt = candidate.DiscoveredAt,
                     UploadedAt = uploadedAt,
                     TotalFiles = session.Files.Count,
-                    TotalBytes = session.Files.Sum(f => f.SizeBytes)
+                    TotalBytes = session.Files.Sum(f => f.SizeBytes),
+                    // 「大小可疑」跟着备份集走（R15）。候选在入库之后就不再是使用者会打开的东西，
+                    // 而人是在备份列表和详情页上看这件事的——标记留在候选上等于没有标记。
+                    SizeSuspicious = candidate.SizeSuspicious,
+                    SizeSuspicionReason = candidate.SizeSuspicionReason
                 };
                 db.BackupSets.Add(backupSet);
                 await db.SaveChangesAsync(ct);

@@ -1,4 +1,5 @@
-﻿using System.IO.Compression;
+﻿using System.Diagnostics;
+using System.IO.Compression;
 using System.Reflection;
 using System.Security.Principal;
 using System.Text.Json;
@@ -163,6 +164,9 @@ internal sealed class ServerInstaller
                 await ConfigureStoragePathsAsync(applicationConnection, request.DataDirectory, ct);
             }
 
+            StageSetupExecutable(request.InstallDirectory);
+            StopTray();
+
             progress.Report(new ServerInstallProgress("正在注册 Windows 服务和防火墙规则…", 70));
             await RegisterApiServiceAsync(request.InstallDirectory, ct);
             serviceCreated = !apiServiceExisted;
@@ -171,6 +175,8 @@ internal sealed class ServerInstaller
             progress.Report(new ServerInstallProgress("正在启动服务并检查管理网页…", 82));
             await StartServiceAndWaitAsync(request.ApiPort, applicationConnection, serverCertificateFingerprint, ct);
             progress.Report(new ServerInstallProgress("安装完成，正在打开管理网页…", 100));
+            ConfigureTrayStartup(request.InstallDirectory);
+            StartTray(request.InstallDirectory);
             OpenBrowser($"https://{Environment.MachineName}:{request.ApiPort}/");
         }
         catch
@@ -189,6 +195,146 @@ internal sealed class ServerInstaller
         finally
         {
             TryDeleteDirectory(payloadTemp);
+        }
+    }
+
+    /// <summary>服务端托盘可执行文件名（R6）。</summary>
+    public const string TrayExecutableName = "BackupMonitor.Server.Tray.exe";
+
+    /// <summary>托盘自启的注册表值名。</summary>
+    private const string TrayRunValueName = "BackupMonitor.Server.Tray";
+
+    /// <summary>
+    /// 托盘自启路径用 HKLM 而不是 HKCU（R13）：HKCU 只对「安装时正好登录着的那个用户」生效，
+    /// 而装机的往往是实施人员，日常盯着这台服务器的是另一个账号。
+    /// </summary>
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+
+    /// <summary>
+    /// 注册服务端托盘的开机自启，对所有登录用户生效。
+    ///
+    /// 托盘存在的意义是「服务管理台不再是唯一入口」——关掉那个窗口之后，
+    /// 这台机器上仍然有东西会在服务端出事时说话。自启注册不上就没有这个意义了，
+    /// 但它也不该让整个安装失败：装机本身与它无关。
+    /// </summary>
+    private static void ConfigureTrayStartup(string installDirectory)
+    {
+        try
+        {
+            var trayPath = Path.Combine(installDirectory, TrayExecutableName);
+            if (!File.Exists(trayPath))
+                return;
+
+            using var key = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(RunKeyPath);
+            key?.SetValue(
+                TrayRunValueName,
+                $"\"{trayPath}\" --install-directory \"{installDirectory}\"",
+                Microsoft.Win32.RegistryValueKind.String);
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    /// <summary>清理托盘自启项。卸载时不清，下次登录会弹一个「找不到文件」。</summary>
+    public static void RemoveTrayStartup()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(RunKeyPath, writable: true);
+            key?.DeleteValue(TrayRunValueName, throwOnMissingValue: false);
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    private static void StartTray(string installDirectory)
+    {
+        try
+        {
+            var trayPath = Path.Combine(installDirectory, TrayExecutableName);
+            if (!File.Exists(trayPath))
+                return;
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = trayPath,
+                Arguments = $"--install-directory \"{installDirectory}\"",
+                UseShellExecute = true
+            });
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    /// <summary>
+    /// 停掉正在运行的托盘。升级安装前必须先停：它占着安装目录里的 exe，
+    /// 不停就会在覆盖文件那一步撞上「文件正被另一进程使用」。
+    /// </summary>
+    public static void StopTray()
+    {
+        foreach (var process in Process.GetProcessesByName("BackupMonitor.Server.Tray"))
+        {
+            try
+            {
+                process.CloseMainWindow();
+                if (!process.WaitForExit(3000))
+                {
+                    process.Kill(entireProcessTree: true);
+                    // Kill 只是投递终止请求，句柄要等进程真正退出才释放；
+                    // 不等这一下，紧接着覆盖/删除安装目录就会撞上托盘还占着的文件。
+                    process.WaitForExit(5000);
+                }
+            }
+            catch (Exception)
+            {
+            }
+            finally
+            {
+                process.Dispose();
+            }
+        }
+    }
+
+    /// <summary>安装目录里那份服务管理台可执行文件的文件名。</summary>
+    public const string SetupExecutableName = "BackupMonitor.Server.Setup.exe";
+
+    /// <summary>安装目录中服务管理台可执行文件的完整路径。</summary>
+    public static string SetupExecutablePathIn(string installDirectory) =>
+        Path.Combine(installDirectory, SetupExecutableName);
+
+    /// <summary>
+    /// 把正在运行的这个安装器复制进安装目录，作为常驻的「服务管理台」。
+    ///
+    /// 在此之前它只存在于管理员当初下载它的那个位置——桌面、U 盘、下载目录，
+    /// 换个人来就找不着了。而它现在还多了一个身份：管理网页的远程导出
+    /// 要以 <c>--export-backup-package</c> 起它做实际导出，
+    /// API 必须能在一个确定的路径上找到它，否则「远程导出」根本无从谈起。
+    ///
+    /// 复制失败不让安装失败：装机本身与这份副本无关，缺了它只是少一个入口。
+    /// </summary>
+    private static void StageSetupExecutable(string installDirectory)
+    {
+        try
+        {
+            var source = Environment.ProcessPath;
+            if (string.IsNullOrWhiteSpace(source) || !File.Exists(source))
+                return;
+
+            var target = SetupExecutablePathIn(installDirectory);
+            // 管理员直接从安装目录里双击运行时，源和目标是同一个文件，复制会失败。
+            if (string.Equals(Path.GetFullPath(source), Path.GetFullPath(target), StringComparison.OrdinalIgnoreCase))
+                return;
+
+            Directory.CreateDirectory(installDirectory);
+            File.Copy(source, target, overwrite: true);
+        }
+        catch (Exception)
+        {
+            // 目标被占用（上一份正开着）或磁盘写不进去都会落到这里。
+            // 不记详细路径日志：这条路径本身不敏感，但这里没有 logger，且失败是非致命的。
         }
     }
 

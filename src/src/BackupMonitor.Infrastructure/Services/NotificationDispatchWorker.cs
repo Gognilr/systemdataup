@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -259,6 +259,16 @@ public class NotificationDispatchWorker : BackgroundService
         TimeZoneInfo reportTimezone,
         CancellationToken ct)
     {
+        // 投递自带内容优先（R8 的日报走这条路）：它没有对应的告警行，
+        // 按告警组装出来的是一封标题「系统告警」、正文空白的邮件。
+        if (!string.IsNullOrWhiteSpace(delivery.Subject))
+        {
+            return SendEmailCoreAsync(
+                email, delivery.Recipient,
+                $"[备份监控] {delivery.Subject}",
+                delivery.Body ?? string.Empty, ct);
+        }
+
         var occurredAtUtc = delivery.Alert?.LastOccurredAt;
         var occurredLocal = occurredAtUtc is null
             ? (DateTime?)null
@@ -346,7 +356,10 @@ public class NotificationDispatchWorker : BackgroundService
         if (string.IsNullOrWhiteSpace(webhookUrl) || !Uri.TryCreate(webhookUrl, UriKind.Absolute, out _))
             throw new InvalidOperationException("webhook 地址无效");
 
-        var content = new StringBuilder()
+        // 与邮件同一条口径：投递自带内容优先。
+        var content = !string.IsNullOrWhiteSpace(delivery.Subject)
+            ? $"[备份监控] {delivery.Subject}{Environment.NewLine}{delivery.Body}"
+            : new StringBuilder()
             .AppendLine($"[备份监控告警] {delivery.TitlePrefix}{delivery.Alert?.Title ?? "系统告警"}")
             .AppendLine($"等级: {delivery.Alert?.Level}")
             .AppendLine($"时间: {delivery.Alert?.LastOccurredAt:yyyy-MM-dd HH:mm:ss} UTC")

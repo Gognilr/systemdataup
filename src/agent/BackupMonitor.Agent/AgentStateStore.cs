@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -19,6 +19,32 @@ public sealed class AgentState
     public string? CertificateThumbprint { get; set; }
     public DateTime? CertificateExpiresAt { get; set; }
     public string? LastError { get; set; }
+
+    /// <summary>
+    /// 最近一次**成功**的心跳时刻（UTC）。托盘的绿灯判据之一（R7）。
+    ///
+    /// 原先托盘只读 Windows 服务状态，于是「服务正常跑着，但连不上服务端 /
+    /// 证书被拒 / 一直登记失败 / 一个任务都没配」时，托盘照样绿色「运行中」。
+    /// 服务在跑不等于备份在做——这个字段就是把这两件事分开的那一处证据。
+    /// </summary>
+    public DateTime? LastHeartbeatAtUtc { get; set; }
+
+    /// <summary>
+    /// 最近一次成功上传（完成上传会话）的时刻（UTC）。托盘菜单里的「上次成功备份」。
+    ///
+    /// 注意口径：这是「客户端把这份传完并交给服务端校验」的时刻，
+    /// 不是服务端入库完成的时刻——客户端这一侧知道的最晚的那个点就是这里。
+    /// </summary>
+    public DateTime? LastSuccessfulUploadAtUtc { get; set; }
+
+    /// <summary>
+    /// 过渡期里额外接受的服务端 TLS 指纹（R9）。
+    ///
+    /// 来源只有一处：服务端**签名过的**配置下发。存进 state.json 是因为它必须
+    /// 熬过重启——真正要用到它的那一刻（服务端刚换完证书），Agent 多半正好也要重连，
+    /// 而那时旧指纹已经失效，配置也拉不下来了。这个字段就是那一刻唯一的出路。
+    /// </summary>
+    public string? NextServerCertificateFingerprint { get; set; }
 
     /// <summary>
     /// 本 Agent 认定的服务端实例 ID（LAN 发现应答里的 ServerInstanceId）。
@@ -237,6 +263,18 @@ public sealed class AgentStateStore
         {
             lock (_sync)
                 return _state.CertificateExpiresAt;
+        }
+    }
+
+    /// <summary>过渡期额外接受的服务端指纹（R9）；未在过渡期时为 null。</summary>
+    public string? NextServerCertificateFingerprint
+    {
+        get
+        {
+            lock (_sync)
+                return string.IsNullOrWhiteSpace(_state.NextServerCertificateFingerprint)
+                    ? null
+                    : _state.NextServerCertificateFingerprint;
         }
     }
 

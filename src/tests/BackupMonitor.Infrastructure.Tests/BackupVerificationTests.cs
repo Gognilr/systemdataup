@@ -1,4 +1,4 @@
-using System.Threading.Channels;
+﻿using System.Threading.Channels;
 using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Enums;
@@ -182,6 +182,33 @@ public class BackupVerificationTests : IAsyncLifetime
         await using var scope = _services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         Assert.Null((await db.BackupSets.AsNoTracking().SingleAsync(s => s.Id == setId)).VerifyingSince);
+    }
+
+    /// <summary>
+    /// 关掉之后一个复查工作项都不产生（R18）。
+    ///
+    /// 原来没有关闭的办法：间隔 clamp 在 1~720 小时，现场真要临时停掉它
+    /// 只能把间隔改成 720 小时——那是「关掉」的一个变相写法，而不是关掉。
+    /// 开关不生效比没有开关更糟：人以为关了，盘却还在被磨。
+    /// </summary>
+    [Fact]
+    public async Task 停用定期复查后不再产生工作项()
+    {
+        var setId = await SeedSetAsync(BackupSetStatus.Available, verifiedAt: DateTime.UtcNow.AddDays(-365));
+        await SetSettingAsync(BackupReverifyWorker.BatchSizeKey, "50");
+        await SetSettingAsync(BackupReverifyWorker.EnabledKey, "false");
+        try
+        {
+            Assert.Equal(0, await RunReverifyPassAsync());
+
+            await using var scope = _services.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.Null((await db.BackupSets.AsNoTracking().SingleAsync(s => s.Id == setId)).VerifyingSince);
+        }
+        finally
+        {
+            await SetSettingAsync(BackupReverifyWorker.EnabledKey, "true");
+        }
     }
 
     // ---------- 基础设施 ----------

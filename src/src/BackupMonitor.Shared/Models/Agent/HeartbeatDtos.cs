@@ -1,4 +1,4 @@
-using System.ComponentModel.DataAnnotations;
+﻿using System.ComponentModel.DataAnnotations;
 
 namespace BackupMonitor.Shared.Models.Agent;
 
@@ -31,6 +31,16 @@ public class HeartbeatRequest
     /// 原先这份数据只在注册请求里出现过一次，换网段之后库里就是错的。
     /// </summary>
     public List<string>? IpAddresses { get; set; }
+
+    /// <summary>
+    /// 本机当前已接受的「预备服务端指纹」（R9 过渡期）。
+    ///
+    /// 服务端拿它回答一个问题：**现在切换证书，哪几台会掉线**。
+    /// 没有这个回报，第 4 步（启用新证书）就是一次闭着眼睛的赌博——
+    /// 而赌输的代价是挨台机器上门重跑安装器。
+    /// 为空表示这台机器还没拿到，或当前不在过渡期。
+    /// </summary>
+    public string? AcceptedNextServerFingerprint { get; set; }
 
     /// <summary>Agent 侧活动指令 ID 列表</summary>
     public List<Guid>? ActiveCommands { get; set; }

@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Entities.Alert;
+﻿using BackupMonitor.Core.Entities.Alert;
 using BackupMonitor.Core.Entities.Audit;
 using BackupMonitor.Core.Entities.Restore;
 using BackupMonitor.Core.Entities.System;
@@ -160,6 +160,8 @@ public class NotificationDeliveryConfiguration : IEntityTypeConfiguration<Notifi
         builder.Property(e => e.SentAt).HasColumnName("sent_at");
         builder.Property(e => e.ErrorMessage).HasColumnName("error_message").HasMaxLength(2000);
         builder.Property(e => e.TitlePrefix).HasColumnName("title_prefix").HasMaxLength(32);
+        builder.Property(e => e.Subject).HasColumnName("subject").HasMaxLength(200);
+        builder.Property(e => e.Body).HasColumnName("body");
 
         builder.HasIndex(e => e.AlertId).HasDatabaseName("idx_notification_deliveries_alert");
         builder.HasIndex(e => e.Status).HasDatabaseName("idx_notification_deliveries_status");
@@ -261,5 +263,31 @@ public class IdempotencyKeyConfiguration : IEntityTypeConfiguration<IdempotencyK
         builder.Property(e => e.ExpiresAt).HasColumnName("expires_at").IsRequired();
 
         builder.HasIndex(e => e.ExpiresAt).HasDatabaseName("ix_idempotency_keys_expires_at");
+    }
+}
+
+/// <summary>管理网页发起的配置备份包导出（V036 · 整改清单 R4）。</summary>
+public class ConfigBackupExportConfiguration : IEntityTypeConfiguration<ConfigBackupExport>
+{
+    public void Configure(EntityTypeBuilder<ConfigBackupExport> builder)
+    {
+        builder.ToTable("config_backup_exports");
+
+        builder.HasKey(e => e.Id);
+        builder.Property(e => e.Id).HasColumnName("id");
+        builder.Property(e => e.Status).HasColumnName("status").HasMaxLength(20);
+        builder.Property(e => e.FilePath).HasColumnName("file_path");
+        builder.Property(e => e.FileName).HasColumnName("file_name").HasMaxLength(255);
+        builder.Property(e => e.SizeBytes).HasColumnName("size_bytes");
+        builder.Property(e => e.ErrorMessage).HasColumnName("error_message");
+        builder.Property(e => e.StartedAt).HasColumnName("started_at");
+        builder.Property(e => e.CompletedAt).HasColumnName("completed_at");
+        builder.Property(e => e.RequestedBy).HasColumnName("requested_by");
+        builder.Property(e => e.RequestedByName).HasColumnName("requested_by_name").HasMaxLength(100);
+        builder.Property(e => e.DownloadTokenHash).HasColumnName("download_token_hash").HasMaxLength(255);
+        builder.Property(e => e.DownloadExpiresAt).HasColumnName("download_expires_at");
+        builder.Property(e => e.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("now()").ValueGeneratedOnAdd();
+
+        builder.HasIndex(e => e.StartedAt).HasDatabaseName("idx_config_backup_exports_started");
     }
 }

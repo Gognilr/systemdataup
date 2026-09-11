@@ -1,4 +1,4 @@
-using System.Threading.Channels;
+﻿using System.Threading.Channels;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
 using Microsoft.EntityFrameworkCore;
@@ -26,11 +26,26 @@ namespace BackupMonitor.Infrastructure.Services;
 /// </summary>
 public class BackupReverifyWorker : BackgroundService
 {
-    /// <summary>复查间隔（小时）system_settings 键（V033，默认 24）</summary>
+    /// <summary>
+    /// 显式的启用 / 停用开关（V040 · R18）。
+    ///
+    /// 原来没有关闭的办法：clamp 是 1~720 小时，现场真要临时停掉它
+    /// （比如正在做一次全量迁移，盘已经满负荷），只能把间隔改成 720 小时——
+    /// 那是「关掉」的一个变相写法，而不是关掉，而且没人看得出它被关过。
+    /// </summary>
+    public const string EnabledKey = "backup_reverify_enabled";
+
+    /// <summary>复查间隔（小时）system_settings 键（V040 起默认 168 = 7 天）</summary>
     public const string IntervalHoursKey = "backup_reverify_interval_hours";
 
-    /// <summary>每轮入队的份数 system_settings 键（V033，默认 5）</summary>
+    /// <summary>每轮入队的份数 system_settings 键（V040 起默认 1）</summary>
     public const string BatchSizeKey = "backup_reverify_batch_size";
+
+    /// <summary>默认复查间隔（小时）。7 天：复查是纯磁盘读，与上传抢同一块盘。</summary>
+    public const int DefaultIntervalHours = 168;
+
+    /// <summary>默认每轮份数。</summary>
+    public const int DefaultBatchSize = 1;
 
     /// <summary>单实例锁键（设计书 §25，scheduled_locks.lock_key）</summary>
     public const string LockKey = "worker:backup_reverify";
@@ -65,12 +80,21 @@ public class BackupReverifyWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            var intervalHours = 24;
+            var intervalHours = DefaultIntervalHours;
             try
             {
                 using var scope = _scopeFactory.CreateScope();
                 var settings = scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>();
-                intervalHours = Math.Clamp(await settings.GetIntAsync(IntervalHoursKey, 24, stoppingToken), 1, 720);
+                intervalHours = Math.Clamp(
+                    await settings.GetIntAsync(IntervalHoursKey, DefaultIntervalHours, stoppingToken), 1, 720);
+
+                // 关掉之后**一个工作项都不产生**（R18）。仍然按间隔醒来重读配置，
+                // 这样重新打开不必等重启服务端——现场把它关掉往往是临时的。
+                if (!await settings.GetBoolAsync(EnabledKey, true, stoppingToken))
+                {
+                    await Task.Delay(TimeSpan.FromHours(intervalHours), stoppingToken);
+                    continue;
+                }
 
                 var scheduledLock = scope.ServiceProvider.GetRequiredService<IScheduledLockService>();
                 if (await scheduledLock.TryAcquireAsync(LockKey, LockTtl, stoppingToken))
@@ -115,7 +139,12 @@ public class BackupReverifyWorker : BackgroundService
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var settings = scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>();
 
-        var batchSize = Math.Clamp(await settings.GetIntAsync(BatchSizeKey, 5, ct), 1, 200);
+        // 关掉时这里也要挡一道：RunPassAsync 是公开的（测试与手工触发都走它），
+        // 只在循环里判断的话，关掉之后仍然有别的入口能把工作项排进去。
+        if (!await settings.GetBoolAsync(EnabledKey, true, ct))
+            return 0;
+
+        var batchSize = Math.Clamp(await settings.GetIntAsync(BatchSizeKey, DefaultBatchSize, ct), 1, 200);
         var cutoff = DateTime.UtcNow - MinAgeBeforeReverify;
 
         // 只复查「还活着而且真的能复查」的那些：

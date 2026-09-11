@@ -194,6 +194,41 @@ function renderTransfers(rows) {
     ], top)}</section>`;
 }
 
+/* 未配通知渠道的常驻横幅（整改清单 R5）。
+
+   AlertingService.CreateDeliveriesForAsync 第一件事是读 system_settings 里的通知配置，
+   这行不存在就直接 return。新装的系统没人配过 → 所有告警只活在这个网页和客户端托盘气泡里，
+   而在此之前没有任何地方提示过「你还没配通知渠道」。
+   于是「告警系统装好了」和「告警一条都发不出去」在界面上长得一模一样。
+
+   刻意用**不可关闭的常驻横幅**，不用一次性 toast：关掉就等于回到静默，
+   而这条横幅描述的是一个持续存在的状态，不是一个事件。
+   读不到状态（端点失败、权限不足）时不显示——宁可漏提示，也不要在正常系统上挂一条假警报。 */
+function notificationBannerHtml(s) {
+  if (!s || s.configured) return '';
+  return `<div class="notice warning">当前没有任何通知渠道，<strong>告警只会出现在本页面</strong>——
+    没有人盯着这个页面的时候，备份出事不会有任何人被通知到。
+    <a href="#/notifications">去配置通知渠道 →</a></div>`;
+}
+
+/* 上次配置备份（整改清单 R4）。
+   .bmbp 里是服务端密钥、客户端 CA 与整库转储——它丢了，仓库里的备份文件即使还在，
+   「哪个文件属于哪台机器、哪个任务、哪一天」也全没了，同时所有客户端身份作废。
+   导出是手动的（定板：不做定时自动导出），所以「上次是什么时候」必须写在人每天都看的这一页上；
+   从没导出过是最该被看见的状态，用告警色而不是灰字。 */
+function configBackupHtml(s) {
+  if (!s) return '';
+  const what = s.latestExportedAt
+    ? (s.ageDays === 0 ? '今天导出过' : `${s.ageDays} 天前`)
+    : '从未导出过';
+  if (!s.overdue) {
+    return `<div class="notice text-muted">上次配置备份：${esc(what)} · <a href="#/settings">配置备份</a></div>`;
+  }
+  return `<div class="notice warning">上次配置备份：<strong>${esc(what)}</strong>${s.latestExportedAt ? `，超过 ${esc(s.overdueDays)} 天阈值` : ''}。
+    配置备份包里是服务端密钥、客户端 CA 与整库转储，丢了就认不出仓库里的文件属于谁、也没有一个客户端还能连上。
+    <a href="#/settings">现在去导出一份 →</a></div>`;
+}
+
 export async function vDashboard() {
   $('#app').innerHTML = shell('overview', '概览', loading());
   await LOADERS.overview();
@@ -207,7 +242,7 @@ LOADERS.overview = async function () {
     // 六个一起发（实施方案 W2）。后两个原先串在 Promise.all 之后 await，
     // 首屏因此是三波串行往返；而它们各自带着 .catch —— 那正说明它们是
     // 「失败不阻断」的附加信息，本来就不该排在关键路径后面等。
-    const [clientSummary, backupSummary, taskSummary, todoSummary, clientResources, rawTransfers] =
+    const [clientSummary, backupSummary, taskSummary, todoSummary, clientResources, rawTransfers, configBackup, notifyStatus] =
       await Promise.all([
         api('/api/v1/admin/reports/client-summary'),
         api('/api/v1/admin/reports/backup-summary'),
@@ -215,7 +250,11 @@ LOADERS.overview = async function () {
         api('/api/v1/admin/reports/todo-summary'),
         // 资源列表失败不该把整个概览拖垮——它是附加视图，不是概览的前提。
         api('/api/v1/admin/clients/resource-overview?limit=50').catch(() => []),
-        api('/api/v1/admin/upload-sessions/active').catch(() => [])
+        api('/api/v1/admin/upload-sessions/active').catch(() => []),
+        // 配置备份状态失败不阻断概览：它是附加信息，不是概览的前提
+        //（非一键部署形态下这个端点会直接 400，那是预期内的）。
+        api('/api/v1/admin/config-backup/status').catch(() => null),
+        api('/api/v1/admin/notification-settings/status').catch(() => null)
       ]);
     const transfers = rawTransfers || [];
     // 横幅上的「N 项需要关注」与待办页横幅同源，两边不会再各报各的数。
@@ -228,6 +267,8 @@ LOADERS.overview = async function () {
       <span class="status-mark" aria-hidden="true">${todoCount ? '!' : '✓'}</span><strong class="status-title">${todoCount ? `${todoCount} 项需要关注` : '一切正常'}</strong>
       <span class="status-meta"><span>${esc(online)} 台在线${offline ? ` · ${esc(offline)} 台离线或疑似离线` : ''}</span><span>${esc(lastUpload)}</span><span>${esc(taskSummary.totalTasks || 0)} 个备份任务</span>${freshnessHtml()}</span>
     </div>
+    ${notificationBannerHtml(notifyStatus)}
+    ${configBackupHtml(configBackup)}
     ${renderTransfers(transfers)}
     <div class="dashboard-columns">
       <section class="card"><div class="dashboard-section-head"><h2>待办队列</h2><a href="#/todo">查看全部 →</a></div><div class="dashboard-todo">${renderTodoQueue(todoSummary)}</div></section>

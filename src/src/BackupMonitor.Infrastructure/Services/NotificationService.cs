@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using BackupMonitor.Core.Entities.Alert;
 using BackupMonitor.Core.Entities.System;
 using BackupMonitor.Core.Enums;
@@ -27,6 +27,15 @@ public interface INotificationService
 
     /// <summary>控制器用：凭据字段替换为掩码（<see cref="NotificationSecretMask"/>），绝不回显明文</summary>
     Task<NotificationSettingsDto> GetSettingsForDisplayAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// 通知渠道是否至少有一个在用（R5）。
+    ///
+    /// 单开一个方法而不是让前端读整份配置：概览页人人看得见，
+    /// 而整份配置要 perm:system.manage 且带着 SMTP 主机、收件人、webhook 地址——
+    /// 为了回答一个「是/否」把那些一并发出去没有道理。
+    /// </summary>
+    Task<bool> HasEnabledChannelAsync(CancellationToken ct = default);
 
     Task<NotificationSettingsDto> UpdateSettingsAsync(NotificationSettingsDto request, CancellationToken ct = default);
 }
@@ -171,6 +180,16 @@ public class NotificationService : INotificationService
     }
 
     /// <summary>控制器用：凭据字段替换为掩码，绝不回显明文（C1 第3点）</summary>
+    public async Task<bool> HasEnabledChannelAsync(CancellationToken ct = default)
+    {
+        // 「配置行不存在」和「三个渠道全部 Enabled = false」是同一件事：
+        // 告警只会出现在网页上。后者尤其容易被当成已配置——界面上明明填着 SMTP 服务器。
+        var settings = await GetSettingsAsync(ct);
+        return settings.Email.Enabled
+               || (settings.Wecom.Enabled && !string.IsNullOrWhiteSpace(settings.Wecom.WebhookUrl))
+               || (settings.Dingtalk.Enabled && !string.IsNullOrWhiteSpace(settings.Dingtalk.WebhookUrl));
+    }
+
     public async Task<NotificationSettingsDto> GetSettingsForDisplayAsync(CancellationToken ct = default)
     {
         var settings = await GetSettingsAsync(ct);

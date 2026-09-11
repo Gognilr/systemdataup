@@ -328,6 +328,124 @@ public static class LocalServerBootstrap
         return ServerCertificateFactory.GetFingerprint(certificate);
     }
 
+    /// <summary>预备证书的文件名后缀。它就放在正式证书旁边，同一套 ACL。</summary>
+    public const string StagedServerCertificateSuffix = ".next";
+
+    /// <summary>
+    /// 生成一张**预备**的服务端 TLS 证书但不启用（R9 过渡期第 1 步）。
+    ///
+    /// 直接「重新签发」是做不到不上门的：Agent 按指纹固定连接，指纹一变它们立刻连不上，
+    /// 而连不上就收不到新指纹——唯一的出路是挨台机器重跑安装器。
+    /// 预备这一步把「生成」和「启用」拆开：新指纹在旧证书还能用的时候就能下发下去，
+    /// 等全网 Agent 都接受了它，再切换。
+    ///
+    /// 返回预备证书的指纹。反复调用会覆盖上一张预备证书——那是有意的：
+    /// 过渡还没开始就改主意时，重来一次比留一堆半成品干净。
+    /// </summary>
+    public static string StageServerCertificate(
+        IConfiguration configuration,
+        LocalServerBootstrapOptions options)
+    {
+        var bootstrap = Initialize(configuration, options);
+        var activePath = bootstrap.Values["Security:ServerCertificate:CertPath"]
+            ?? throw new InvalidOperationException("找不到服务端证书路径。");
+        var password = bootstrap.Values["Security:ServerCertificate:Password"]
+            ?? throw new InvalidOperationException("找不到服务端证书保护口令。");
+
+        // 与正式证书同一个保护口令：启用那一步是纯文件替换，换口令会让替换之后
+        // 服务端读不出自己的证书，而那时旧证书已经被覆盖，没有退路。
+        var stagedPath = StagedPathFor(activePath);
+        using var certificate = ServerCertificateFactory.CreateAndWrite(
+            stagedPath,
+            password,
+            protectTemporaryFile: options.EnforceAcl
+                ? path => SecureFileSystem.ApplyFileAcl(path)
+                : null);
+        if (options.EnforceAcl)
+            ApplySecretAcl(stagedPath);
+        return ServerCertificateFactory.GetFingerprint(certificate);
+    }
+
+    /// <summary>
+    /// 启用预备证书（R9 过渡期第 4 步）：预备文件顶替正式证书。
+    ///
+    /// 调用方必须先确认全网 Agent 都已经接受了预备指纹——没接受的那几台
+    /// 会在这一刻掉线，而且再也连不回来（连不上就收不到新指纹）。
+    /// 这里只做文件替换，不做那个判断：判断需要数据库，而这一层不该碰库。
+    ///
+    /// 旧证书移到 .previous 留一份：切换之后发现问题时，把它移回来是唯一的退路。
+    /// </summary>
+    public static string ActivateStagedServerCertificate(
+        IConfiguration configuration,
+        LocalServerBootstrapOptions options)
+    {
+        var bootstrap = Initialize(configuration, options);
+        var activePath = bootstrap.Values["Security:ServerCertificate:CertPath"]
+            ?? throw new InvalidOperationException("找不到服务端证书路径。");
+        var password = bootstrap.Values["Security:ServerCertificate:Password"]
+            ?? throw new InvalidOperationException("找不到服务端证书保护口令。");
+
+        var stagedPath = StagedPathFor(activePath);
+        if (!File.Exists(stagedPath))
+            throw new InvalidOperationException(
+                $"没有找到预备的服务端证书：{stagedPath}。请先执行「预备新的服务端证书」。");
+
+        // 先确认这张预备证书真的读得出来。读不出来的话再往下走就会把一张好证书
+        // 换成一张打不开的，而服务端起不来之后连管理网页都没有了。
+        string fingerprint;
+        using (var staged = new X509Certificate2(stagedPath, password, X509KeyStorageFlags.EphemeralKeySet))
+        {
+            if (!staged.HasPrivateKey)
+                throw new InvalidOperationException("预备的服务端证书不包含私钥，拒绝启用。");
+            fingerprint = ServerCertificateFactory.GetFingerprint(staged);
+        }
+
+        if (File.Exists(activePath))
+        {
+            var previousPath = activePath + ".previous";
+            File.Copy(activePath, previousPath, overwrite: true);
+            if (options.EnforceAcl)
+                ApplySecretAcl(previousPath);
+        }
+
+        File.Copy(stagedPath, activePath, overwrite: true);
+        if (options.EnforceAcl)
+            ApplySecretAcl(activePath);
+        File.Delete(stagedPath);
+        return fingerprint;
+    }
+
+    /// <summary>预备证书是否已经生成；有则返回它的指纹。</summary>
+    public static string? TryReadStagedFingerprint(
+        IConfiguration configuration,
+        LocalServerBootstrapOptions options)
+    {
+        var bootstrap = Initialize(configuration, options);
+        var activePath = bootstrap.Values["Security:ServerCertificate:CertPath"];
+        var password = bootstrap.Values["Security:ServerCertificate:Password"];
+        if (string.IsNullOrWhiteSpace(activePath) || string.IsNullOrWhiteSpace(password))
+            return null;
+
+        var stagedPath = StagedPathFor(activePath);
+        if (!File.Exists(stagedPath))
+            return null;
+
+        try
+        {
+            using var staged = new X509Certificate2(stagedPath, password, X509KeyStorageFlags.EphemeralKeySet);
+            return ServerCertificateFactory.GetFingerprint(staged);
+        }
+        catch (CryptographicException)
+        {
+            return null;
+        }
+    }
+
+    private static string StagedPathFor(string activePath) =>
+        Path.Combine(
+            Path.GetDirectoryName(activePath)!,
+            Path.GetFileNameWithoutExtension(activePath) + StagedServerCertificateSuffix + Path.GetExtension(activePath));
+
     private static LocalServerSecrets? ReadSecrets(string path)
     {
         if (!File.Exists(path))

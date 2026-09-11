@@ -1,4 +1,4 @@
-namespace BackupMonitor.Shared.Models.Agent;
+﻿namespace BackupMonitor.Shared.Models.Agent;
 
 /// <summary>Agent 配置响应（设计书 11.2）</summary>
 public class AgentConfigResponse
@@ -110,4 +110,16 @@ public class AgentGlobalSettingsDto
 {
     public int HeartbeatIntervalSeconds { get; set; } = 60;
     public int MaxConcurrentUploads { get; set; } = 2;
+
+    /// <summary>
+    /// 过渡期里额外接受的服务端 TLS 指纹（R9）。为空表示当前不在过渡期。
+    ///
+    /// Agent 拿到它之后同时接受新旧两个指纹。这是「重新签发服务端证书」
+    /// 能够不上门完成的唯一办法：新指纹必须在旧证书还能用的时候就送到，
+    /// 否则切换那一刻 Agent 连不上，而连不上就再也收不到新指纹。
+    ///
+    /// 走签名配置下发（整份 config 带服务端签名），不走心跳里的裸字段——
+    /// 一个能被篡改的指纹比没有指纹更糟：它正好是中间人需要的那一样东西。
+    /// </summary>
+    public string? NextServerCertificateFingerprint { get; set; }
 }

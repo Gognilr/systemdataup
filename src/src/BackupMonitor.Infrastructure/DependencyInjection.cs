@@ -69,6 +69,9 @@ public static class DependencyInjection
         services.AddScoped<IUploadSessionControlService, UploadSessionControlService>();
         services.AddScoped<IUploadSessionService, UploadSessionService>();
         services.AddScoped<IStorageSettingsService, StorageSettingsService>();
+        services.AddScoped<IConfigBackupService, ConfigBackupService>();
+        services.AddScoped<ICertificateLifecycleChecker, CertificateLifecycleChecker>();
+        services.AddScoped<IAgentVersionService, AgentVersionService>();
 
         services.AddScoped<IClientAdminService, ClientAdminService>();
         services.AddScoped<IMonitoredServiceAdminService, MonitoredServiceAdminService>();
@@ -102,6 +105,7 @@ public static class DependencyInjection
         services.AddHostedService<UploadCommitWorker>();
         services.AddHostedService<VerificationWorker>();
         services.AddHostedService<NotificationDispatchWorker>();
+        services.AddHostedService<DailyDigestWorker>();
         services.AddHostedService<RetentionCleanupWorker>();
         services.AddHostedService<PartitionMaintenanceWorker>();
         services.AddHostedService<SystemWatchdogWorker>();

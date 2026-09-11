@@ -338,3 +338,38 @@ public class ClientResourceRowDto
 
     public int ActiveAlertCount { get; set; }
 }
+
+/// <summary>
+/// Agent 版本漂移现状（R11）。
+///
+/// 「随附版本」= 当前这台服务端发出去的客户端包是哪一版。
+/// 界面靠它把落后的机器标出来，告警靠它判定「落后太久了」。
+/// </summary>
+public class AgentVersionStatusDto
+{
+    /// <summary>服务端当前随附的 Agent 版本；读不出来时为空，此时一律不判漂移。</summary>
+    public string? BundledVersion { get; set; }
+
+    /// <summary>这一版从什么时候起在这台服务端上可用（= 版本号文件的写入时刻）。</summary>
+    public DateTime? BundledAvailableSince { get; set; }
+
+    /// <summary>落后超过这个天数才告警。</summary>
+    public int DriftAlertDays { get; set; }
+
+    /// <summary>当前已经落后阈值天数（告警条件成立）。</summary>
+    public bool Overdue { get; set; }
+
+    /// <summary>低于随附版本、或从未上报过版本号的机器。</summary>
+    public List<AgentVersionDriftItemDto> OutdatedClients { get; set; } = [];
+}
+
+/// <summary>一台落后的客户端。</summary>
+public class AgentVersionDriftItemDto
+{
+    public Guid ClientId { get; set; }
+    public string Hostname { get; set; } = null!;
+    public string? DisplayName { get; set; }
+
+    /// <summary>它自报的版本；从未上报过时为空。</summary>
+    public string? AgentVersion { get; set; }
+}

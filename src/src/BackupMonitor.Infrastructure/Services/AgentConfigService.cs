@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Enums;
+﻿using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Infrastructure.Security;
@@ -123,7 +123,11 @@ public class AgentConfigService : IAgentConfigService
             GlobalSettings = new AgentGlobalSettingsDto
             {
                 HeartbeatIntervalSeconds = await _settings.GetIntAsync("heartbeat_interval_seconds", 60, ct),
-                MaxConcurrentUploads = await _settings.GetIntAsync("max_concurrent_uploads", 2, ct)
+                MaxConcurrentUploads = await _settings.GetIntAsync("max_concurrent_uploads", 2, ct),
+                // 过渡期的预备指纹（R9）。空字符串按「不在过渡期」处理，
+                // 让配置里干净地没有这个字段，而不是下发一个空串让 Agent 去分辨。
+                NextServerCertificateFingerprint = NormalizeFingerprint(
+                    await _settings.GetStringAsync(NextServerFingerprintKey, ct))
             }
         };
 
@@ -177,5 +181,22 @@ public class AgentConfigService : IAgentConfigService
                     })
                     .OrderBy(f => f.ExternalKey, StringComparer.Ordinal)
                     .ToList());
+    }
+
+    /// <summary>过渡期预备指纹的 system_settings 键（R9）。</summary>
+    public const string NextServerFingerprintKey = "server_certificate_next_fingerprint";
+
+    /// <summary>
+    /// 指纹归一化：去掉冒号、空格，统一大写。
+    /// 空串一律当成 null——「不在过渡期」和「过渡指纹是空字符串」必须是同一件事，
+    /// 否则 Agent 那边要为一个空串专门写一条判断，而漏掉那条判断的后果是它去比对空指纹。
+    /// </summary>
+    private static string? NormalizeFingerprint(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        var cleaned = value.Replace(":", string.Empty).Replace(" ", string.Empty).Trim().ToUpperInvariant();
+        return cleaned.Length == 0 ? null : cleaned;
     }
 }

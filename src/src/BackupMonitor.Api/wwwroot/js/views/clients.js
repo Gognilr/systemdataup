@@ -2,7 +2,7 @@
 import { api } from '../api.js';
 import { App, ACTIONS, LOADERS } from '../state.js';
 import {
-  $, esc, L, optsOf, status, fmtBytes, fmtDT, relTime, shortId,
+  $, esc, L, optsOf, status, fmtBytes, fmtDT, relTime, relText, absTime, shortId,
   tableHtml, pagerHtml, skeleton, emptyState, hasFilter, batchBarHtml,
   toast, errToast, confirmModal, formModal, openModal, closeModal, clientName,
   clientCaps, actBtn, actMenu, runtimeBadge, ipCell, ipDetailRows
@@ -81,15 +81,18 @@ function laterOf(a, b) {
 }
 
 /* 心跳明显落后于最近一次通信时，把两个时间都说出来：
-   「刚刚（心跳 6 分钟前）」——那多半是客户端正忙着算校验和，不是它出了问题。 */
+   「09-10 18:23 刚刚（心跳 6 分钟前）」——那多半是客户端正忙着算校验和，
+   不是它出了问题。
+   时间用 absTime 而不是 relTime：这一列是拿来跟日志和告警时间对照的，
+   「几分钟前」在对照的时候要求人先做一次减法。 */
 function lastSeenCell(r) {
   const seen = laterOf(r.lastSeenAt, r.lastHeartbeatAt);
-  if (!seen) return relTime(null);
+  if (!seen) return absTime(null);
   const lagged = r.lastHeartbeatAt && seen !== r.lastHeartbeatAt
     && new Date(seen) - new Date(r.lastHeartbeatAt) > 120000;
   return lagged
-    ? `${relTime(seen)} <span class="hint">（心跳 ${esc(relTime(r.lastHeartbeatAt))}）</span>`
-    : relTime(seen);
+    ? `${absTime(seen)}<span class="hint">（心跳 ${esc(relText(r.lastHeartbeatAt))}）</span>`
+    : absTime(seen);
 }
 
 function scopeOf(st) {
@@ -186,7 +189,14 @@ LOADERS.clients = async function () {
     if (st.status) q.set('status', st.status);
     if (st.includeRevoked) q.set('includeRevoked', 'true');
     if (st.keyword) q.set('keyword', st.keyword);
-    const data = await api('/api/v1/admin/clients?' + q);
+    // 版本漂移状态与列表并行取。它失败不阻断列表——落后标记是附加信息，
+    // 而「客户端列表打不开」是完全不同量级的问题（R11）。
+    const [data, versionStatus] = await Promise.all([
+      api('/api/v1/admin/clients?' + q),
+      api('/api/v1/admin/clients/agent-version-status').catch(() => null)
+    ]);
+    const bundledVersion = versionStatus?.bundledVersion || null;
+    const outdatedIds = new Set((versionStatus?.outdatedClients || []).map(c => c.clientId));
     st.totalCount = data.totalCount;
     // 批量条要按选中行的状态决定哪些按钮能点，判据是整行而不只是 id。
     st.rows = data.items || [];
@@ -198,7 +208,12 @@ LOADERS.clients = async function () {
       { l: '客户端', k: 'hostname', sort: true, render: r => `<a href="#/clients/${esc(r.id)}"><b>${esc(clientName(r))}</b></a><span class="sub mono">${esc(r.hostname)}</span>` },
       { l: '分组', k: 'clientGroupName' },
       { l: '系统', render: r => esc(r.osName || '—') },
-      { l: 'Agent', k: 'agentVersion', sort: true },
+      // 落后的机器要在列表上一眼看得出来（R11）。此前一台两年没升过级的 Agent
+      // 和一台昨天刚装的长得一模一样——直到某个只在新版本里修好的缺陷在它身上复现。
+      { l: 'Agent', k: 'agentVersion', sort: true,
+        render: r => outdatedIds.has(r.id)
+          ? `${esc(r.agentVersion || '未知')}<span class="sub cell-warn">低于随附 ${esc(bundledVersion || '')}</span>`
+          : esc(r.agentVersion || '—') },
       // 找一台机器最常用的线索就是 IP，为看一眼 IP 逐台点进详情抽屉是没有道理的。
       // 这里放服务端观测到的对端地址而不是自报的网卡列表：它只有一个值、永远最新。
       { l: 'IP', render: r => ipCell(r) },

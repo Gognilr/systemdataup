@@ -11,10 +11,12 @@ namespace BackupMonitor.Api.Controllers;
 public class AdminClientController : ApiBaseController
 {
     private readonly IClientAdminService _clientService;
+    private readonly IAgentVersionService _agentVersions;
 
-    public AdminClientController(IClientAdminService clientService)
+    public AdminClientController(IClientAdminService clientService, IAgentVersionService agentVersions)
     {
         _clientService = clientService;
+        _agentVersions = agentVersions;
     }
 
     /// <summary>客户端列表（15.1）</summary>
@@ -82,6 +84,20 @@ public class AdminClientController : ApiBaseController
         [FromQuery] int limit = 50, CancellationToken ct = default)
     {
         var result = await _clientService.GetResourceOverviewAsync(limit, ct);
+        return OkData(result);
+    }
+
+    /// <summary>
+    /// Agent 版本漂移现状（R11）。
+    ///
+    /// 单独一个接口而不是往列表每一行塞一个「是否落后」：判定要拿全表和随附版本比，
+    /// 而列表是分页的——分页里算出来的「落后几台」永远只是当前这一页的数。
+    /// </summary>
+    [HttpGet("agent-version-status")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.read")]
+    public async Task<ActionResult<ApiResponse<AgentVersionStatusDto>>> AgentVersionStatus(CancellationToken ct)
+    {
+        var result = await _agentVersions.GetStatusAsync(ct);
         return OkData(result);
     }
 

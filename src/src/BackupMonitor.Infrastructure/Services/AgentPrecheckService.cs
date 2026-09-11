@@ -24,10 +24,20 @@ public interface IAgentPrecheckService
 /// <summary>预检结果实现</summary>
 public class AgentPrecheckService : IAgentPrecheckService
 {
+    /// <summary>历史基线取样次数（R16）的 system_settings 键。</summary>
+    public const string SizeBaselineSampleCountKey = "size_baseline_sample_count";
+
+    /// <summary>总字节数低于中位数的这个比例即判可疑。</summary>
+    public const string SizeBaselineMinBytesRatioKey = "size_baseline_min_bytes_ratio";
+
+    /// <summary>文件数低于中位数的这个比例即判可疑（宽带宽，见 EvaluateSizeBaselineAsync）。</summary>
+    public const string SizeBaselineMinFileRatioKey = "size_baseline_min_file_ratio";
+
     private readonly AppDbContext _db;
     private readonly ICommandDispatcher _dispatcher;
     private readonly IAlertingService _alerting;
     private readonly IExecutionQueueService _queue;
+    private readonly SystemSettingsProvider _settings;
     private readonly ILogger<AgentPrecheckService> _logger;
 
     public AgentPrecheckService(
@@ -35,12 +45,14 @@ public class AgentPrecheckService : IAgentPrecheckService
         ICommandDispatcher dispatcher,
         IAlertingService alerting,
         IExecutionQueueService queue,
+        SystemSettingsProvider settings,
         ILogger<AgentPrecheckService> logger)
     {
         _db = db;
         _dispatcher = dispatcher;
         _alerting = alerting;
         _queue = queue;
+        _settings = settings;
         _logger = logger;
     }
 
@@ -67,20 +79,6 @@ public class AgentPrecheckService : IAgentPrecheckService
                 status = PrecheckStatus.RequiredFileMissing;
                 failureCode = "SERVER_PRECHECK_VALIDATION_FAILED";
                 failureMessage = validationError;
-            }
-            else
-            {
-                // 大小/文件数阈值判定放服务端而不是 Agent：数据全都已经在预检回报里
-                // （TotalBytes / TotalFiles），放服务端不必改配置 DTO 和签名，旧版 Agent 也立刻受益。
-                // 「备份文件突然变成 0 字节」是备份故障里最经典也最容易检测的一种，
-                // 三个阈值字段建库时就有、界面上一直显示，却从来没有任何一处做过比较。
-                var sizeError = ValidateSizeThresholds(task, request);
-                if (sizeError is not null)
-                {
-                    status = PrecheckStatus.SizeAbnormal;
-                    failureCode = "SIZE_ABNORMAL";
-                    failureMessage = sizeError;
-                }
             }
         }
 
@@ -171,6 +169,28 @@ public class AgentPrecheckService : IAgentPrecheckService
             candidate.BusinessUnitId = unit.Id;
         }
 
+        // 大小/文件数判定（R15 + R16）。
+        //
+        // 判定放服务端而不是 Agent：数据全都已经在预检回报里（TotalBytes / TotalFiles），
+        // 放服务端不必改配置 DTO 和签名，旧版 Agent 也立刻受益。
+        //
+        // **判出可疑不再改 status**。原先它会把 status 顶成 SizeAbnormal，
+        // 于是候选停在非 passed，UploadSessionService 抛 409、BatchOperationService 直接跳过——
+        // 「今天的备份只有平时 10% 大小」时，系统的反应是一个字节都不收。
+        // 现在照收入库、打标记、照发告警，判断权交给人。
+        //
+        // 放在业务单元 upsert 之后：历史基线必须按业务单元比，
+        // 一个 U8 任务下 18 个账套大小差着数量级，按任务混在一起取中位数得到的是一个没有意义的数。
+        string? sizeSuspicion = null;
+        if (status == PrecheckStatus.Passed)
+        {
+            sizeSuspicion = ValidateSizeThresholds(task, request)
+                ?? await EvaluateSizeBaselineAsync(task, candidate, request, ct);
+        }
+
+        candidate.SizeSuspicious = sizeSuspicion is not null;
+        candidate.SizeSuspicionReason = sizeSuspicion;
+
         // 清单是否真的变了，必须在覆盖 ManifestHash 之前判断。
         var manifestUnchanged =
             !isNew
@@ -250,17 +270,20 @@ public class AgentPrecheckService : IAgentPrecheckService
         await _db.SaveChangesAsync(ct);
 
         // 失败告警
-        if (status == PrecheckStatus.SizeAbnormal)
+        if (sizeSuspicion is not null)
         {
             // 大小异常必须比其他预检失败更响：它意味着备份「跑了但是空的/残缺的」，
             // 归进 precheck_failed 的 Notice 等级等于埋掉。单独一个 category，
             // 重要级 high/critical 的任务再升一级到严重。
+            //
+            // 正文里明说「已经收下」：这条告警现在不再伴随拒收，
+            // 不写清楚的话人会以为今天这一份没进来，跑去手工补一次。
             await _alerting.RaiseAsync(
                 $"task:{task.Id}:precheck:size_abnormal",
                 task.ImportanceLevel >= ImportanceLevel.High ? AlertLevel.Critical : AlertLevel.Warning,
                 "size_abnormal",
-                $"任务 {task.Name} 的备份大小不对",
-                failureMessage,
+                $"任务 {task.Name} 的备份大小可疑",
+                sizeSuspicion + "。这一份已照常收下并标记为可疑，请人工确认它是否可用。",
                 clientId: clientId,
                 taskId: task.Id,
                 businessUnitId: candidate.BusinessUnitId,
@@ -401,9 +424,14 @@ public class AgentPrecheckService : IAgentPrecheckService
         EnumMapping.ParseSnakeCase<PrecheckStatus>(value, "precheckStatus");
 
     /// <summary>
-    /// 任务级大小/文件数阈值判定（整改 A3）。三个阈值都留空（null 或 &lt;= 0）时返回 null，
-    /// 行为与改动前完全一致。仅在预检自身已判定为「通过」后调用——
-    /// 失败结果的 TotalBytes/TotalFiles 本来就不可信，不必再拿它们比阈值。
+    /// 任务级大小/文件数**固定**阈值判定（整改 A3）。三个阈值都留空（null 或 &lt;= 0）时返回 null。
+    /// 仅在预检自身已判定为「通过」后调用——失败结果的 TotalBytes/TotalFiles 本来就不可信。
+    ///
+    /// 这一层保留为硬下限：它抓的是「绝对不该低于这个数」，由人显式配出来。
+    /// 抓不到的那个更有价值的信号（「今天这份比过去 N 次的中位数小了 90%」）
+    /// 由 <see cref="EvaluateSizeBaselineAsync"/> 负责。
+    ///
+    /// 返回值是「可疑理由」，不再是「拒收理由」——判出来也照收入库。
     /// </summary>
     private static string? ValidateSizeThresholds(BackupTask task, SubmitPrecheckResultRequest request)
     {
@@ -418,6 +446,97 @@ public class AgentPrecheckService : IAgentPrecheckService
             return $"备份文件数 {files} 少于下限 {task.MinFileCount}";
 
         return null;
+    }
+
+    /// <summary>
+    /// 历史基线偏离判定（R16）。
+    ///
+    /// 固定阈值是死数，绝大多数任务上根本没人配；而最有价值的信号是相对的——
+    /// 「今天这份比过去 N 次的中位数小了 90%」。结构快检（原 R14）已决定不做，
+    /// 「备份跑了但是空的 / 只剩十分之一」这类信号现在全靠这一条兜底。
+    ///
+    /// 三条刻意的设计：
+    /// 1. 用**中位数**不用平均值：一次异常的小备份会把平均值拉下去，
+    ///    于是下一次同样小的备份反而落在「正常」范围里——判据被它要抓的东西污染了。
+    /// 2. 样本不足 N 次就不判。新任务不该因为没有历史就报警
+    ///    （与漏备份巡检「刚建出来的任务不算漏」同一条原则）。
+    /// 3. 按**业务单元**取样。一个 U8 任务下 18 个账套大小差着数量级，
+    ///    混在一起取中位数得到的是一个没有意义的数。
+    ///
+    /// 文件数用宽带宽（默认掉到五分之一才说话）：U8 附件库个数随启用年度不同，
+    /// 个数波动是常态，不能拿它当缺失判据。真正敏感的是总字节数。
+    /// </summary>
+    private async Task<string?> EvaluateSizeBaselineAsync(
+        BackupTask task,
+        CandidateBackupSet candidate,
+        SubmitPrecheckResultRequest request,
+        CancellationToken ct)
+    {
+        var sampleCount = Math.Clamp(
+            await _settings.GetIntAsync(SizeBaselineSampleCountKey, 10, ct), 3, 200);
+        var bytesRatio = Math.Clamp(
+            await _settings.GetDoubleAsync(SizeBaselineMinBytesRatioKey, 0.5, ct), 0.01, 1.0);
+        var fileRatio = Math.Clamp(
+            await _settings.GetDoubleAsync(SizeBaselineMinFileRatioKey, 0.2, ct), 0.01, 1.0);
+
+        var samples = await _db.BackupSets.AsNoTracking()
+            .Where(b => b.TaskId == task.Id
+                        && b.BusinessUnitId == candidate.BusinessUnitId
+                        && BackupSetStatuses.Live.Contains(b.Status))
+            .OrderByDescending(b => b.UploadedAt)
+            .Select(b => new { b.TotalBytes, b.TotalFiles })
+            .Take(sampleCount)
+            .ToListAsync(ct);
+
+        if (samples.Count < sampleCount)
+            return null;
+
+        var medianBytes = Median(samples.Select(s => (double)s.TotalBytes));
+        var medianFiles = Median(samples.Select(s => (double)s.TotalFiles));
+
+        var bytes = request.TotalBytes ?? 0;
+        var files = request.TotalFiles ?? 0;
+
+        if (medianBytes > 0 && bytes < medianBytes * bytesRatio)
+        {
+            return $"备份总大小 {FormatBytes(bytes)} 只有最近 {sampleCount} 次中位数 "
+                 + $"{FormatBytes((long)medianBytes)} 的 {bytes * 100.0 / medianBytes:0.#}%"
+                 + $"（低于 {bytesRatio * 100:0.#}% 即判可疑）——备份可能跑了但是空的或只剩一部分";
+        }
+
+        if (medianFiles > 0 && files < medianFiles * fileRatio)
+        {
+            return $"备份文件数 {files} 只有最近 {sampleCount} 次中位数 {medianFiles:0.#} 的 "
+                 + $"{files * 100.0 / medianFiles:0.#}%（低于 {fileRatio * 100:0.#}% 即判可疑）";
+        }
+
+        return null;
+    }
+
+    /// <summary>中位数。偶数个样本取中间两个的平均。</summary>
+    private static double Median(IEnumerable<double> values)
+    {
+        var sorted = values.OrderBy(v => v).ToList();
+        if (sorted.Count == 0)
+            return 0;
+        var middle = sorted.Count / 2;
+        return sorted.Count % 2 == 1
+            ? sorted[middle]
+            : (sorted[middle - 1] + sorted[middle]) / 2.0;
+    }
+
+    /// <summary>告警正文里的字节数要给人读，不是给机器读——原始字节数看不出量级。</summary>
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        double value = bytes;
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+        return $"{value:0.##} {units[unit]}";
     }
 
     private static string? ValidatePassedResult(string recognizerConfig, SubmitPrecheckResultRequest request)
