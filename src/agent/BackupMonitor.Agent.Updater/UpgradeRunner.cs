@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.ServiceProcess;
 using System.Text.Json;
 
@@ -403,9 +403,17 @@ internal sealed class UpgradeRunner
 
         var arguments = $"--service-name \"{_options.ServiceName}\" --data-directory \"{_options.DataDirectory}\"";
         if (SessionLauncher.TryLaunchInConsoleSession(trayPath, arguments, _log))
-            _log.Info("托盘已在当前登录会话里重新启动");
+        {
+            _log.Info("托盘已在当前登录的会话里重新启动");
+        }
         else
-            _log.Info("当前没有可用的登录会话，托盘将在下次登录时由自启项拉起");
+        {
+            // Warn 而不是 Info：托盘是这台机器上唯一有人会看的界面，
+            // 它没起来这件事值得在日志里留一条显眼的记录，而不是一句轻描淡写的信息。
+            _log.Warn(
+                "托盘没能重新启动（没有正在使用中的登录会话，或启动被拒）。"
+                + "下次登录时会由自启项拉起；要立刻恢复，手工运行一次 " + trayPath);
+        }
     }
 
     private void Fail(string status, string message)
