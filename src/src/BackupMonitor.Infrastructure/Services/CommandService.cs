@@ -485,9 +485,55 @@ public class CommandService : ICommandDispatcher, IAgentCommandService
         }
     }
 
-    /// <summary>指令完成副作用：批次计数、失败告警</summary>
+    /// <summary>
+    /// 升级指令一失败，就把升级下发里对应那台机器判掉（现场实证）。
+    ///
+    /// 在此之前这两件事是断开的：Agent 回报 <c>UPGRADE_PACKAGE_URL_FORBIDDEN</c>
+    /// （升级包地址和它记的服务端地址对不上）之后，指令记录里写着这个原因，
+    /// 而「客户端升级」页面上那一行仍然是「已下发，等版本号」，结果列是一横杠，
+    /// 一直傻等到 30 分钟超时才判失败，而且超时的说法（「版本号仍是 1.2.0」）
+    /// 与真正的原因毫无关系。现场看到的就是「一直没成功」，
+    /// 唯一说得清原因的那句话躺在一个界面上根本没有入口的表里。
+    ///
+    /// <c>UPGRADE_DOWNLOADED_NOT_INSTALLED</c> 虽然是「成功」，这里同样判失败：
+    /// 它的意思正是「下载校验都过了，但这台机器上没有升级执行器，程序一个字节没换」。
+    /// R20 要堵的就是这种「回报成功而实际没装上」。
+    ///
+    /// 这里直接写 agent_upgrade_targets 而不是调 IAgentUpgradeService：
+    /// 那个服务反过来依赖 ICommandDispatcher（也就是本类），注进来就是一个构造环。
+    /// </summary>
+    private async Task SettleUpgradeTargetAsync(Command command, CancellationToken ct)
+    {
+        const string DownloadedNotInstalled = "UPGRADE_DOWNLOADED_NOT_INSTALLED";
+        var failed = command.Status == CommandStatus.Failed
+                     || string.Equals(command.ResultCode, DownloadedNotInstalled, StringComparison.OrdinalIgnoreCase);
+        if (!failed)
+            return;   // 真正的成功要等这台机器心跳自报新版本号，不在这里下结论
+
+        var target = await _db.AgentUpgradeTargets
+            .Where(t => t.CommandId == command.Id
+                        && t.Status == AgentUpgradeTargetStatus.Dispatched)
+            .FirstOrDefaultAsync(ct);
+        if (target is null)
+            return;
+
+        target.Status = AgentUpgradeTargetStatus.Failed;
+        target.CompletedAt = DateTime.UtcNow;
+        target.ErrorCode = Truncate(command.ResultCode, 64);
+        target.ErrorMessage = Truncate(command.ResultMessage ?? command.ResultCode, 2000);
+        await _db.SaveChangesAsync(ct);
+
+        _logger.LogWarning(
+            "升级指令 {CommandId} 失败（{Code}），已把对应的升级目标判为失败：{Message}",
+            command.Id, command.ResultCode, command.ResultMessage);
+    }
+
+    /// <summary>指令完成副作用：批次计数、失败告警、升级下发结算</summary>
     private async Task HandleCompletionSideEffectsAsync(Command command, CancellationToken ct)
     {
+        if (command.CommandType == CommandType.UpgradeAgent)
+            await SettleUpgradeTargetAsync(command, ct);
+
         // 批量上传批次计数
         if (!string.IsNullOrWhiteSpace(command.Payload))
         {

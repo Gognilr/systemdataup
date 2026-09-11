@@ -15,6 +15,7 @@ builder.Services.AddSingleton<BackupMonitor.Agent.AgentTrayNotificationStore>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentConfigStore>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentCandidateFileStore>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentApiClient>();
+builder.Services.AddSingleton<BackupMonitor.Agent.AgentUpgradeCoordinator>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentSignatureVerifier>();
 builder.Services.AddSingleton<BackupMonitor.Agent.SystemProbe>();
 builder.Services.AddSingleton<BackupMonitor.Agent.AgentFileHashCache>();

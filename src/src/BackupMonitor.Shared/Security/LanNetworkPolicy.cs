@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 
 namespace BackupMonitor.Shared.Security;
@@ -9,6 +9,22 @@ namespace BackupMonitor.Shared.Security;
 /// </summary>
 public static class LanNetworkPolicy
 {
+    /// <summary>
+    /// 对端是不是本机。比 <see cref="IsPrivateOrLoopback"/> 严格一档：
+    /// 只有同一台机器上的进程算数，整个内网都不算。
+    /// 用于那些「只给本机运维界面看」的端点——托盘、服务管理台。
+    /// </summary>
+    public static bool IsLoopback(IPAddress? address)
+    {
+        if (address is null)
+            return false;
+
+        if (address.IsIPv4MappedToIPv6)
+            address = address.MapToIPv4();
+
+        return IPAddress.IsLoopback(address);
+    }
+
     public static bool IsPrivateOrLoopback(IPAddress? address)
     {
         if (address is null)

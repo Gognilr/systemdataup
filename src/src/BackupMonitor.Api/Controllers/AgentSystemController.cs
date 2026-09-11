@@ -15,15 +15,18 @@ public class AgentSystemController : ApiBaseController
     private readonly IAgentHeartbeatService _heartbeatService;
     private readonly IAgentConfigService _configService;
     private readonly IClientAdminService _clientService;
+    private readonly IAgentUpgradeService _upgradeService;
 
     public AgentSystemController(
         IAgentHeartbeatService heartbeatService,
         IAgentConfigService configService,
-        IClientAdminService clientService)
+        IClientAdminService clientService,
+        IAgentUpgradeService upgradeService)
     {
         _heartbeatService = heartbeatService;
         _configService = configService;
         _clientService = clientService;
+        _upgradeService = upgradeService;
     }
 
     /// <summary>心跳上报（11.1）</summary>
@@ -56,6 +59,20 @@ public class AgentSystemController : ApiBaseController
 
         var config = await _configService.GetConfigAsync(ClientIdentity, currentVersion, ct);
         return OkData(config);
+    }
+
+    /// <summary>
+    /// 升级完成（或回滚）后的主动回报（R20）。
+    ///
+    /// 这是整条升级链路上唯一由**新进程**发出的一句话，也是判「真的换过去了」的依据之一。
+    /// 旧实现拿「指令执行完了」当成功，而那时换文件的动作根本还没发生。
+    /// </summary>
+    [HttpPost("upgrade-result")]
+    public async Task<ActionResult<ApiResponse>> ReportUpgradeResult(
+        [FromBody] AgentUpgradeResultRequest request, CancellationToken ct)
+    {
+        await _upgradeService.ReportResultAsync(ClientIdentity, request, ct);
+        return OkMessage("已记录升级结果");
     }
 
     /// <summary>客户端证书续签；旧证书在新证书生效后保留七天重叠期。</summary>

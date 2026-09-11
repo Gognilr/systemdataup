@@ -8,6 +8,7 @@ param(
     [string] $InstallDir = "$env:ProgramFiles\BackupMonitor\Agent",
     [string] $DataDirectory = "$env:ProgramData\BackupMonitor\Agent",
     [string] $ServiceName = "BackupMonitor Agent",
+    [string] $UpdaterDir = "$env:ProgramFiles\BackupMonitor\Updater",
     [switch] $Silent
 )
 
@@ -26,8 +27,18 @@ New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
 # 递归拷贝：自包含发布除了根目录的运行时 DLL，还带本地化资源子目录（cs/de/ja/zh-Hans...）。
 # 只拷根目录文件会把它们全部丢掉。
 Get-ChildItem -LiteralPath $packageRoot -Force | Where-Object {
-    $_.Name -notin @('install-agent.ps1', 'uninstall-agent.ps1')
+    $_.Name -notin @('install-agent.ps1', 'uninstall-agent.ps1', 'updater')
 } | Copy-Item -Destination $InstallDir -Recurse -Force
+
+# 升级执行器装到安装目录的**同级**目录（R20）。装在安装目录里的话，
+# 远程升级那一刻它自己的文件也被锁着，换文件就做不成——
+# 而换不成的表现恰恰是这次整改要消灭的那种「报成功但什么都没换」。
+$updaterPayload = Join-Path $packageRoot 'updater'
+if (Test-Path -LiteralPath $updaterPayload) {
+    New-Item -ItemType Directory -Path $UpdaterDir -Force | Out-Null
+    Get-ChildItem -LiteralPath $updaterPayload -Force |
+        Copy-Item -Destination $UpdaterDir -Recurse -Force
+}
 
 $settingsPath = Join-Path $InstallDir 'appsettings.json'
 $settings = if (Test-Path -LiteralPath $settingsPath) {

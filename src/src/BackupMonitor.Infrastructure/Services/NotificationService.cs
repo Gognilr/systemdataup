@@ -193,7 +193,11 @@ public class NotificationService : INotificationService
     public async Task<NotificationSettingsDto> GetSettingsForDisplayAsync(CancellationToken ct = default)
     {
         var settings = await GetSettingsAsync(ct);
-        return Mask(settings);
+        var masked = Mask(settings);
+        // 勾选框的选项由服务端这一份唯一清单驱动（R24）：前端再抄一份就会漏项，
+        // 而漏掉的那一项表现为「界面上根本勾不到它」，没人会怀疑是清单抄漏了。
+        masked.AvailableCategories = [.. AlertCategoryCatalog.All];
+        return masked;
     }
 
     public async Task<NotificationSettingsDto> UpdateSettingsAsync(NotificationSettingsDto request, CancellationToken ct = default)
@@ -270,17 +274,20 @@ public class NotificationService : INotificationService
             SmtpUsername = source.Email.SmtpUsername,
             SmtpPassword = _protector.Protect(source.Email.SmtpPassword),
             FromAddress = source.Email.FromAddress,
-            SecurityMode = source.Email.SecurityMode
+            SecurityMode = source.Email.SecurityMode,
+            Filter = source.Email.Filter
         },
         Wecom = new WebhookChannelSettingsDto
         {
             Enabled = source.Wecom.Enabled,
-            WebhookUrl = _protector.Protect(source.Wecom.WebhookUrl)
+            WebhookUrl = _protector.Protect(source.Wecom.WebhookUrl),
+            Filter = source.Wecom.Filter
         },
         Dingtalk = new WebhookChannelSettingsDto
         {
             Enabled = source.Dingtalk.Enabled,
-            WebhookUrl = _protector.Protect(source.Dingtalk.WebhookUrl)
+            WebhookUrl = _protector.Protect(source.Dingtalk.WebhookUrl),
+            Filter = source.Dingtalk.Filter
         }
     };
 
@@ -296,22 +303,50 @@ public class NotificationService : INotificationService
             SmtpUsername = source.Email.SmtpUsername,
             SmtpPassword = string.IsNullOrEmpty(source.Email.SmtpPassword) ? null : NotificationSecretMask.Unchanged,
             FromAddress = source.Email.FromAddress,
-            SecurityMode = source.Email.SecurityMode
+            SecurityMode = source.Email.SecurityMode,
+            Filter = source.Email.Filter
         },
         Wecom = new WebhookChannelSettingsDto
         {
             Enabled = source.Wecom.Enabled,
-            WebhookUrl = string.IsNullOrEmpty(source.Wecom.WebhookUrl) ? null : NotificationSecretMask.Unchanged
+            WebhookUrl = string.IsNullOrEmpty(source.Wecom.WebhookUrl) ? null : NotificationSecretMask.Unchanged,
+            Filter = source.Wecom.Filter
         },
         Dingtalk = new WebhookChannelSettingsDto
         {
             Enabled = source.Dingtalk.Enabled,
-            WebhookUrl = string.IsNullOrEmpty(source.Dingtalk.WebhookUrl) ? null : NotificationSecretMask.Unchanged
+            WebhookUrl = string.IsNullOrEmpty(source.Dingtalk.WebhookUrl) ? null : NotificationSecretMask.Unchanged,
+            Filter = source.Dingtalk.Filter
         }
     };
 
+    /// <summary>
+    /// 把筛选配置收进合法取值（R24）。写错的等级名按默认的 warning 处理而不是报错：
+    /// 这是个「发多发少」的旋钮，填出界是手滑，不该让整份设置保存不下去。
+    /// </summary>
+    private static void NormalizeFilter(NotificationFilterDto filter)
+    {
+        var level = (filter.MinLevel ?? string.Empty).Trim().ToLowerInvariant();
+        filter.MinLevel = level is "notice" or "warning" or "critical" ? level : "warning";
+
+        // 只保留清单里认得的键：写进来一个不存在的类别，表现是「勾了却永远不生效」，
+        // 而且它会一直躺在配置里没人发现。
+        var known = AlertCategoryCatalog.All.Select(c => c.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        filter.ExcludedCategories = filter.ExcludedCategories
+            .Where(c => !string.IsNullOrWhiteSpace(c))
+            .Select(c => c.Trim())
+            .Where(known.Contains)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     private static void Validate(NotificationSettingsDto request)
     {
+        NormalizeFilter(request.Email.Filter);
+        NormalizeFilter(request.Wecom.Filter);
+        NormalizeFilter(request.Dingtalk.Filter);
+
+
         if (request.Email.Enabled)
         {
             var recipients = request.Email.Recipients

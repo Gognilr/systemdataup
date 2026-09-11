@@ -50,7 +50,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _stopServiceItem = new ToolStripMenuItem("停止 Agent 服务（托盘保留）", null, async (_, _) => await ToggleServiceAsync(start: false));
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add(new ToolStripMenuItem("BackupMonitor Agent") { Enabled = false });
+        // 版本号写在标题行上。报修时第一句话永远是「你那边是哪个版本」，
+        // 而此前这台机器上没有任何地方能回答——要么去属性页看 exe，要么去服务端的客户端列表里找自己。
+        menu.Items.Add(new ToolStripMenuItem($"BackupMonitor Agent {ReadAgentVersion()}") { Enabled = false });
         menu.Items.Add(_statusItem);
         menu.Items.Add(_lastBackupItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -176,7 +178,14 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (state is null)
             return "读不到";
         if (state.LastSuccessfulUploadAtUtc is null)
-            return "还没有过";
+        {
+            // 「还没有过」这四个字在刚升级完的机器上是会骗人的：这个字段是后加的，
+            // 老版本从不写它，于是一台今天早晨刚备份成功的机器升上来之后也显示「还没有过」。
+            // 把记录起点一并说出来，人就能自己判断这是「真没备份过」还是「升级前的没记下来」。
+            return state.UploadTrackingSinceUtc is { } since
+                ? $"还没有过（自 {since.ToLocalTime():MM-dd HH:mm} 起才开始记录）"
+                : "还没有过";
+        }
         return $"{state.LastSuccessfulUploadAtUtc.Value.ToLocalTime():yyyy-MM-dd HH:mm}（{DescribeAge(state.LastSuccessfulUploadAtUtc.Value)}前）";
     }
 
@@ -209,6 +218,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         public string? LastError { get; set; }
         public DateTime? LastHeartbeatAtUtc { get; set; }
         public DateTime? LastSuccessfulUploadAtUtc { get; set; }
+        public DateTime? UploadTrackingSinceUtc { get; set; }
     }
 
     /// <summary>
@@ -541,6 +551,33 @@ internal sealed class TrayApplicationContext : ApplicationContext
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "BackupMonitor", "Agent")
             : Environment.ExpandEnvironmentVariables(configured);
         return Path.GetFullPath(configured);
+    }
+
+    /// <summary>
+    /// 客户端版本号。取的是同目录下 Agent 服务主程序的版本，而不是托盘自己的——
+    /// 人问「这台机器是哪个版本」时，指的是正在跑备份的那个程序。
+    /// 升级过程中托盘可能还是旧的（它不重启），此时报自己的版本就会报错一个。
+    /// </summary>
+    private static string ReadAgentVersion()
+    {
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "BackupMonitor.Agent.exe");
+            if (File.Exists(path))
+            {
+                var info = FileVersionInfo.GetVersionInfo(path);
+                var version = info.ProductVersion ?? info.FileVersion;
+                if (!string.IsNullOrWhiteSpace(version))
+                    return "v" + version.Split('+')[0];
+            }
+
+            var own = typeof(TrayApplicationContext).Assembly.GetName().Version;
+            return own is null ? "版本未知" : "v" + own.ToString(3);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return "版本未知";
+        }
     }
 
     private static string? GetArgument(IReadOnlyList<string> args, string name)

@@ -1,5 +1,6 @@
 ﻿using Microsoft.Win32;
 
+using System.Reflection;
 using BackupMonitor.Shared.Discovery;
 using BackupMonitor.Shared.Security;
 
@@ -61,7 +62,9 @@ internal sealed class SetupForm : Form
 
         var title = new Label
         {
-            Text = "安装 BackupMonitor Agent",
+            // 版本号跟在标题后面：装之前就该看得见自己拿的是哪一版，
+            // 而不是装完之后去 exe 的属性页里找。
+            Text = $"安装 BackupMonitor Agent {SetupVersion()}",
             AutoSize = true,
             Font = new Font(Font.FontFamily, 18, FontStyle.Bold),
             Margin = new Padding(0, 0, 0, 6)
@@ -577,4 +580,16 @@ internal sealed class SetupForm : Form
         _status.ForeColor = color;
         _progress.Value = Math.Clamp(percent, 0, 100);
     }
+
+    /// <summary>
+    /// 安装器自己的版本，也就是它将要装下去的那一版客户端——两者随同一次构建产出。
+    /// </summary>
+    private static string SetupVersion()
+    {
+        var assembly = Assembly.GetExecutingAssembly();
+        var version = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+            ?? assembly.GetName().Version?.ToString(3);
+        return string.IsNullOrWhiteSpace(version) ? "" : "v" + version.Split('+')[0];
+    }
+
 }

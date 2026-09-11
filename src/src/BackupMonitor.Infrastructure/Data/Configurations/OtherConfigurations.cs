@@ -291,3 +291,61 @@ public class ConfigBackupExportConfiguration : IEntityTypeConfiguration<ConfigBa
         builder.HasIndex(e => e.StartedAt).HasDatabaseName("idx_config_backup_exports_started");
     }
 }
+
+/// <summary>分批升级下发（V041 · 整改清单 R20）。</summary>
+public class AgentUpgradeConfiguration : IEntityTypeConfiguration<AgentUpgrade>
+{
+    public void Configure(EntityTypeBuilder<AgentUpgrade> builder)
+    {
+        builder.ToTable("agent_upgrades");
+
+        builder.HasKey(e => e.Id);
+        builder.Property(e => e.Id).HasColumnName("id");
+        builder.Property(e => e.TargetVersion).HasColumnName("target_version").HasMaxLength(32).IsRequired();
+        builder.Property(e => e.PackageUrl).HasColumnName("package_url").HasMaxLength(2048).IsRequired();
+        builder.Property(e => e.PackageSha256).HasColumnName("package_sha256").HasMaxLength(64).IsRequired();
+        builder.Property(e => e.Note).HasColumnName("note").HasMaxLength(500);
+        builder.Property(e => e.Status).HasColumnName("status").HasMaxLength(20);
+        builder.Property(e => e.BatchPlan).HasColumnName("batch_plan").HasMaxLength(64).IsRequired();
+        builder.Property(e => e.CurrentBatch).HasColumnName("current_batch");
+        builder.Property(e => e.BatchStartedAt).HasColumnName("batch_started_at");
+        builder.Property(e => e.CreatedBy).HasColumnName("created_by");
+        builder.Property(e => e.CreatedByName).HasColumnName("created_by_name").HasMaxLength(100);
+        builder.Property(e => e.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("now()").ValueGeneratedOnAdd();
+        builder.Property(e => e.CompletedAt).HasColumnName("completed_at");
+        builder.Property(e => e.FailureReason).HasColumnName("failure_reason");
+
+        builder.HasMany(e => e.Targets)
+            .WithOne()
+            .HasForeignKey(t => t.UpgradeId)
+            .OnDelete(DeleteBehavior.Cascade);
+
+        builder.HasIndex(e => new { e.Status, e.CreatedAt }).HasDatabaseName("idx_agent_upgrades_status");
+    }
+}
+
+/// <summary>升级下发里的单台机器（V041 · 整改清单 R20）。</summary>
+public class AgentUpgradeTargetConfiguration : IEntityTypeConfiguration<AgentUpgradeTarget>
+{
+    public void Configure(EntityTypeBuilder<AgentUpgradeTarget> builder)
+    {
+        builder.ToTable("agent_upgrade_targets");
+
+        builder.HasKey(e => e.Id);
+        builder.Property(e => e.Id).HasColumnName("id");
+        builder.Property(e => e.UpgradeId).HasColumnName("upgrade_id");
+        builder.Property(e => e.ClientId).HasColumnName("client_id");
+        builder.Property(e => e.BatchIndex).HasColumnName("batch_index");
+        builder.Property(e => e.Status).HasColumnName("status").HasMaxLength(20);
+        builder.Property(e => e.CommandId).HasColumnName("command_id");
+        builder.Property(e => e.VersionBefore).HasColumnName("version_before").HasMaxLength(64);
+        builder.Property(e => e.ReportedVersion).HasColumnName("reported_version").HasMaxLength(64);
+        builder.Property(e => e.DispatchedAt).HasColumnName("dispatched_at");
+        builder.Property(e => e.CompletedAt).HasColumnName("completed_at");
+        builder.Property(e => e.ErrorCode).HasColumnName("error_code").HasMaxLength(64);
+        builder.Property(e => e.ErrorMessage).HasColumnName("error_message");
+
+        builder.HasIndex(e => new { e.UpgradeId, e.BatchIndex }).HasDatabaseName("idx_agent_upgrade_targets_upgrade");
+        builder.HasIndex(e => new { e.ClientId, e.Status }).HasDatabaseName("idx_agent_upgrade_targets_client");
+    }
+}

@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using BackupMonitor.Core.Entities.Alert;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -287,6 +287,41 @@ public class AlertingService : IAlertingService
         }
     }
 
+    /// <summary>
+    /// 这条告警该不该走这个渠道（R24）。
+    ///
+    /// 筛的是**投递**，不是告警本身：被筛掉的告警照样建、照样计数、照样出现在管理网页
+    /// 和客户端托盘上——这里决定的只有「要不要为它单独打扰一次人」。
+    /// 这个区别是这套筛选敢于默认挡掉 Notice 的前提。
+    ///
+    /// 空配置（老数据里没有这个字段）按 warning 处理：升级之后默认 Critical + Warning。
+    /// </summary>
+    internal static bool PassesFilter(NotificationFilterDto? filter, Alert alert)
+    {
+        // AlertLevel 的枚举顺序是 Critical=0 / Warning=1 / Notice=2，
+        // 数值越小越严重。用显式的 severity 名次，免得将来往枚举里插一个值就把判定改了含义。
+        static int Severity(AlertLevel level) => level switch
+        {
+            AlertLevel.Critical => 3,
+            AlertLevel.Warning => 2,
+            _ => 1
+        };
+
+        var minimum = (filter?.MinLevel ?? "warning").Trim().ToLowerInvariant() switch
+        {
+            "notice" => 1,
+            "critical" => 3,
+            _ => 2
+        };
+
+        if (Severity(alert.Level) < minimum)
+            return false;
+
+        return filter?.ExcludedCategories is not { Count: > 0 } excluded
+               || string.IsNullOrWhiteSpace(alert.Category)
+               || !excluded.Any(c => string.Equals(c?.Trim(), alert.Category, StringComparison.OrdinalIgnoreCase));
+    }
+
     /// <summary>告警等级到托盘提示 severity 的映射</summary>
     private static string SeverityOf(AlertLevel level) => level switch
     {
@@ -312,7 +347,7 @@ public class AlertingService : IAlertingService
             if (settings is null)
                 return;
 
-            if (settings.Email.Enabled)
+            if (settings.Email.Enabled && PassesFilter(settings.Email.Filter, alert))
             {
                 foreach (var recipient in settings.Email.Recipients
                              .Where(r => !string.IsNullOrWhiteSpace(r))
@@ -332,7 +367,9 @@ public class AlertingService : IAlertingService
                 }
             }
 
-            if (settings.Wecom.Enabled && !string.IsNullOrWhiteSpace(settings.Wecom.WebhookUrl))
+            if (settings.Wecom.Enabled
+                && !string.IsNullOrWhiteSpace(settings.Wecom.WebhookUrl)
+                && PassesFilter(settings.Wecom.Filter, alert))
             {
                 db.NotificationDeliveries.Add(new NotificationDelivery
                 {
@@ -346,7 +383,9 @@ public class AlertingService : IAlertingService
                 });
             }
 
-            if (settings.Dingtalk.Enabled && !string.IsNullOrWhiteSpace(settings.Dingtalk.WebhookUrl))
+            if (settings.Dingtalk.Enabled
+                && !string.IsNullOrWhiteSpace(settings.Dingtalk.WebhookUrl)
+                && PassesFilter(settings.Dingtalk.Filter, alert))
             {
                 db.NotificationDeliveries.Add(new NotificationDelivery
                 {

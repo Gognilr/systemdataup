@@ -162,6 +162,62 @@ public class AlertChainTests : IAsyncLifetime
         Assert.Equal(1, await DeliveryCountAsync(key));
     }
 
+    /// <summary>
+    /// 默认筛选（Critical + Warning）下，提示级告警不进邮箱——**但告警本身照建**（R24）。
+    ///
+    /// 后半句是这套筛选敢于默认挡掉 Notice 的全部前提：管理网页和客户端托盘上照样看得见，
+    /// 它只是不再单独打扰人一次。真要一条都不漏的人，把「发送哪些告警」改成「全部都发」。
+    /// </summary>
+    [Fact]
+    public async Task 默认筛选挡掉提示级的邮件但不挡告警本身()
+    {
+        await EnableEmailChannelAsync(minLevel: "warning");
+        var noticeKey = $"test:{Guid.NewGuid():N}:notice-filtered";
+        var warningKey = $"test:{Guid.NewGuid():N}:warning-passes";
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var alerting = scope.ServiceProvider.GetRequiredService<IAlertingService>();
+            await alerting.RaiseAsync(noticeKey, AlertLevel.Notice, "client_enrollment", "客户端自动登记成功");
+            await alerting.RaiseAsync(warningKey, AlertLevel.Warning, "backup_missed", "到点没有备份");
+        }
+
+        Assert.Equal(0, await DeliveryCountAsync(noticeKey));
+        Assert.Equal(1, await DeliveryCountAsync(warningKey));
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.True(await db.Alerts.AnyAsync(a => a.AlertKey == noticeKey),
+                "提示级告警本身必须照建：筛掉的是通知，不是告警");
+        }
+    }
+
+    /// <summary>按类别排除：等级够也不发，而告警同样照建。</summary>
+    [Fact]
+    public async Task 被排除的类别不发邮件()
+    {
+        await EnableEmailChannelAsync(minLevel: "warning", excludedCategory: "client_resource");
+
+        var excludedKey = $"test:{Guid.NewGuid():N}:cpu";
+        var keptKey = $"test:{Guid.NewGuid():N}:missed";
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var alerting = scope.ServiceProvider.GetRequiredService<IAlertingService>();
+            await alerting.RaiseAsync(excludedKey, AlertLevel.Warning, "client_resource", "客户端 CPU 使用率过高");
+            await alerting.RaiseAsync(keptKey, AlertLevel.Warning, "backup_missed", "到点没有备份");
+        }
+
+        Assert.Equal(0, await DeliveryCountAsync(excludedKey));
+        Assert.Equal(1, await DeliveryCountAsync(keptKey));
+
+        await using (var scope = _services.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            Assert.True(await db.Alerts.AnyAsync(a => a.AlertKey == excludedKey));
+        }
+    }
+
     // ---------- D9 ----------
 
     /// <summary>
@@ -251,13 +307,21 @@ public class AlertChainTests : IAsyncLifetime
 
     private async Task<int> DeliveryCountAsync(string alertKey) => (await DeliveriesAsync(alertKey)).Count;
 
-    private async Task EnableEmailChannelAsync()
+    /// <summary>
+    /// 启用邮件渠道。<paramref name="minLevel"/> 默认 notice（全发）——
+    /// 这一组测试考的是告警链本身（去重、升级、重发），不是投递筛选（R24 另有测试）。
+    /// 不显式放开的话，默认筛选会挡掉 Notice，把两件事混在一个断言里。
+    /// </summary>
+    private async Task EnableEmailChannelAsync(string minLevel = "notice", string? excludedCategory = null)
     {
         await using var scope = _services.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var settings = new Shared.Models.Admin.NotificationSettingsDto();
         settings.Email.Enabled = true;
         settings.Email.Recipients.Add("ops@example.com");
+        settings.Email.Filter.MinLevel = minLevel;
+        if (excludedCategory is not null)
+            settings.Email.Filter.ExcludedCategories.Add(excludedCategory);
         var json = System.Text.Json.JsonSerializer.Serialize(settings,
             new System.Text.Json.JsonSerializerOptions
             {

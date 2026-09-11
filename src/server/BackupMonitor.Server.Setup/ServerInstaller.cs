@@ -78,6 +78,15 @@ internal sealed class ServerInstaller
                 await StopApiServiceAsync(ct);
             }
 
+            // 托盘必须和服务一起停，而且**同样要停在往安装目录写第一个文件之前**。
+            //
+            // 这一句原先在下面几十行处、解压完才调，于是升级安装必然撞上
+            // 「The process cannot access the file ...\Accessibility.dll because it is being
+            // used by another process」——托盘是 WinForms 程序、按松散文件发布在安装目录里，
+            // 它一运行就锁着 Accessibility.dll / System.Windows.Forms.dll 那一批。
+            // 停服务解决的只有 BackupMonitor.Api.dll 那一半，另一半在托盘手里。
+            StopTray();
+
             progress.Report(new ServerInstallProgress("正在复制服务端和 PostgreSQL 运行时…", 15));
             var postgresRuntime = Path.Combine(request.InstallDirectory, "PostgreSQL");
             // Payload extraction can process thousands of files. Keep that
@@ -86,9 +95,23 @@ internal sealed class ServerInstaller
             await Task.Run(
                 () =>
                 {
-                    ExtractPayloadDirectory(payload, "database", migrationRoot);
-                    ExtractPayloadDirectory(payload, "api", request.InstallDirectory);
-                    EnsurePostgreSqlRuntime(payload, postgresRuntime);
+                    try
+                    {
+                        ExtractPayloadDirectory(payload, "database", migrationRoot);
+                        ExtractPayloadDirectory(payload, "api", request.InstallDirectory);
+                        EnsurePostgreSqlRuntime(payload, postgresRuntime);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        // 原样抛出去的话，管理员看到的是一句英文的
+                        // 「The process cannot access the file ... because it is being used by
+                        // another process」——它说了哪个文件，唯独没说**是谁占着**，
+                        // 而那恰恰是唯一能让人动手解决的信息。
+                        throw new IOException(
+                            "安装目录里有文件正被占用，无法覆盖：" + ex.Message + Environment.NewLine
+                            + DescribeLockingProcesses(request.InstallDirectory),
+                            ex);
+                    }
                 },
                 ct);
 
@@ -164,8 +187,8 @@ internal sealed class ServerInstaller
                 await ConfigureStoragePathsAsync(applicationConnection, request.DataDirectory, ct);
             }
 
+            // 托盘已在解压之前停过（见上），这里不必再停一次。
             StageSetupExecutable(request.InstallDirectory);
-            StopTray();
 
             progress.Report(new ServerInstallProgress("正在注册 Windows 服务和防火墙规则…", 70));
             await RegisterApiServiceAsync(request.InstallDirectory, ct);
@@ -177,10 +200,27 @@ internal sealed class ServerInstaller
             progress.Report(new ServerInstallProgress("安装完成，正在打开管理网页…", 100));
             ConfigureTrayStartup(request.InstallDirectory);
             StartTray(request.InstallDirectory);
-            OpenBrowser($"https://{Environment.MachineName}:{request.ApiPort}/");
+
+            // 这里**不**开浏览器。开页面这件事归调用方（SetupForm 装完会开一次），
+            // 两边都开的结果是升级/安装完蹦出两个标签页，而且地址还不一样
+            // （这边用主机名、那边用 127.0.0.1），看上去像是装了两遍。
+            // 顺带也让安装器这一层不再有「弹出界面」这种副作用，
+            // 将来加静默安装参数时不必再回来拆一遍。
         }
         catch
         {
+            // 升级安装失败时，把开头停掉的那个服务重新起回来。
+            //
+            // 在此之前这条路径什么都不做：装到一半失败 → 服务端服务停在那里 →
+            // **全网客户端从此传不上备份**，而客户端那一侧看到的只是
+            // 「连接尝试失败：连接方在一段时间后没有正确答复」——
+            // 没有任何人会把这句话和「刚才那次升级安装报错了」联系起来。
+            //
+            // 半解压的目录起不起得来另说：起不来是看得见的故障，
+            // 而一个悄悄停着的服务端不是。两害相权，先把它拉起来。
+            if (apiServiceExisted && !serviceCreated)
+                await TryStartApiServiceAsync(ct);
+
             if (serviceCreated)
                 await TryDeleteApiServiceAsync(ct);
             // InitializeAsync may register the PostgreSQL service before a
@@ -439,12 +479,89 @@ internal sealed class ServerInstaller
             }
 
             Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            entry.ExtractToFile(destination, overwrite: true);
+            ExtractOneWithRetry(entry, destination);
             extracted++;
         }
 
         if (extracted == 0)
             throw new InvalidOperationException($"安装 payload 内没有 {directoryName} 目录的内容。");
+    }
+
+    /// <summary>
+    /// 谁占着安装目录里的文件。报占用时把这句话附上——
+    /// 「文件被占用」本身不可操作，「被哪个程序占着」才可操作。
+    /// </summary>
+    private static string DescribeLockingProcesses(string installDirectory)
+    {
+        try
+        {
+            var root = Path.GetFullPath(installDirectory).TrimEnd(Path.DirectorySeparatorChar)
+                       + Path.DirectorySeparatorChar;
+            var names = new List<string>();
+            foreach (var process in Process.GetProcesses())
+            {
+                try
+                {
+                    var path = process.MainModule?.FileName;
+                    if (!string.IsNullOrEmpty(path)
+                        && path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                    {
+                        names.Add($"{process.ProcessName}（PID {process.Id}）");
+                    }
+                }
+                catch (Exception)
+                {
+                    // 拿不到 MainModule 是常事（位数不同、权限不足），跳过即可。
+                }
+                finally
+                {
+                    process.Dispose();
+                }
+            }
+
+            return names.Count == 0
+                ? "没有找到运行在安装目录里的进程；如果开着杀毒软件的实时扫描，稍等片刻再重试一次即可。"
+                : "正在占用安装目录的程序：" + string.Join("、", names.Distinct())
+                  + "。请先把它们关掉再重试。";
+        }
+        catch (Exception)
+        {
+            return "无法列出占用安装目录的进程。";
+        }
+    }
+
+    /// <summary>
+    /// 覆盖一个文件，撞上占用就退避重试。
+    ///
+    /// 停服务、停托盘之后仍然会零星撞上占用，而来源往往不是本系统：
+    /// 实时防护会去扫刚落地的文件（这一批里有 160MB 的客户端安装器和 100MB 的客户端 zip），
+    /// 扫描期间文件被内存映射，覆盖就抛 IOException。这类占用是**秒级**的，
+    /// 退避重试几次就过去了——而失败一次的代价是整个升级安装中断，
+    /// 安装目录停在解压到一半的状态。
+    ///
+    /// 与打包脚本里的 Invoke-ResilientCopy 是同一个成因、同一种处置。
+    /// 真正长期占着文件的进程（还在跑的托盘、被手工打开的程序）不在这里解决——
+    /// 那属于「该停的没停」，退避多少次都没用，5 次之后照原样把异常抛出去。
+    /// </summary>
+    private static void ExtractOneWithRetry(ZipArchiveEntry entry, string destination)
+    {
+        const int maxAttempts = 5;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                entry.ExtractToFile(destination, overwrite: true);
+                return;
+            }
+            catch (IOException) when (attempt < maxAttempts)
+            {
+                Thread.Sleep(300 * attempt);
+            }
+            catch (UnauthorizedAccessException) when (attempt < maxAttempts)
+            {
+                Thread.Sleep(300 * attempt);
+            }
+        }
     }
 
     /// <summary>打包脚本用 Compress-Archive 生成，条目名里可能是反斜杠；两种分隔符都认。</summary>
@@ -716,6 +833,25 @@ internal sealed class ServerInstaller
     /// 停止 API 服务并等到它真正退出。sc.exe stop 只是把停止请求投递给 SCM 就返回，
     /// 立刻去覆盖文件仍会撞上尚未退出的进程，因此必须轮询到 Stopped 为止。
     /// </summary>
+    /// <summary>
+    /// 尽力把服务端服务起回来（失败路径专用，不等健康检查、不抛异常）。
+    /// 起不起得来都不该盖住真正的失败原因——那个异常还要继续往上抛。
+    /// </summary>
+    private static async Task TryStartApiServiceAsync(CancellationToken ct)
+    {
+        try
+        {
+            await ProcessRunner.RunAsync(
+                Path.Combine(Environment.SystemDirectory, "sc.exe"),
+                ["start", ServiceName],
+                ct,
+                throwOnError: false);
+        }
+        catch (Exception)
+        {
+        }
+    }
+
     private static async Task StopApiServiceAsync(CancellationToken ct)
     {
         await ProcessRunner.RunAsync(
@@ -757,18 +893,6 @@ internal sealed class ServerInstaller
     {
         await ProcessRunner.RunAsync(Path.Combine(Environment.SystemDirectory, "sc.exe"), ["stop", serviceName], ct, throwOnError: false);
         await ProcessRunner.RunAsync(Path.Combine(Environment.SystemDirectory, "sc.exe"), ["delete", serviceName], ct, throwOnError: false);
-    }
-
-    private static void OpenBrowser(string url)
-    {
-        try
-        {
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true });
-        }
-        catch
-        {
-            // 打开浏览器失败不影响服务安装结果。
-        }
     }
 
     private static void EnsurePostgreSqlRuntime(ZipArchive payload, string target)

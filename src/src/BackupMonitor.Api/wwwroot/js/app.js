@@ -83,7 +83,7 @@ export function shell(active, title, body) {
       <div class="nav-group-label"><span class="nav-label">${esc(group.label)}</span></div>
       ${group.items.map(([key, label, icon]) => `<a href="#/${key}" class="${key === active ? 'active' : ''}" title="${esc(label)}" aria-label="${esc(label)}"><span class="nav-icon" aria-hidden="true">${icon}</span><span class="nav-label">${esc(label)}</span></a>`).join('')}
     </section>`).join('')}</nav>
-    <div class="foot"><span class="nav-label">Server API v1</span><span class="logo-mark" aria-hidden="true">v1</span></div>
+    <div class="foot" title="${esc(App.serverVersion ? '服务端版本 ' + App.serverVersion + '；API v1' : 'API v1')}"><span class="nav-label">${App.serverVersion ? '服务端 v' + esc(App.serverVersion) : 'Server API v1'}</span><span class="logo-mark" aria-hidden="true">${App.serverVersion ? esc(App.serverVersion.split('.').slice(0, 2).join('.')) : 'v1'}</span></div>
   </aside>
   <div class="main">
     <div class="topbar">
@@ -599,7 +599,36 @@ const VIEW_EXPORTS = {
   settings: 'vSettings'
 };
 const DRAWER_EXPORTS = { tasks: 'openTaskDrawer', restores: 'openRestoreDrawer', alerts: 'openAlertDrawer', audit: 'openAuditDrawer' };
+/* 路由的外壳只做一件事：**不让任何一页无声地打不开**。
+
+   此前 route() 里没有 try：视图模块只要在加载或首屏渲染时抛一次异常
+   （某个 .js 没发布上去、导出名对不上、首屏 innerHTML 前先崩了），
+   promise 静静地 reject，页面停在上一页——点击左边导航「什么反应都没有」。
+   这是最难报修的一类故障：人只能说「点不开」，而控制台里那行错误谁都没看。
+
+   现在一律兜住并当场把原因显示在内容区。技术细节（模块路径、异常消息）照原样给出：
+   看这一屏的人是管理员，他要么自己认得，要么要把这句话转给支持。 */
 async function route() {
+  try {
+    await routeInner();
+  } catch (e) {
+    console.error('[route]', location.hash, e);
+    const message = e && e.message ? e.message : String(e);
+    const body = `<div class="card"><h3>这一页没能打开</h3>
+      <p class="text-muted">页面：<span class="mono">${esc(location.hash || '#/')}</span></p>
+      <p class="mono">${esc(message)}</p>
+      <p class="hint">多半是这一页的脚本没有随服务端一起更新。先按 Ctrl+F5 强制刷新；
+        仍然如此就是服务端上的管理页面文件不全，需要重新执行一次「修复 / 升级安装」。</p>
+      <button class="small" onclick="location.reload()">重新加载</button></div>`;
+    // 视图还没来得及铺开外壳时，连同外壳一起画——否则错误卡片会把左边导航一起吃掉，
+    // 人就被困在这一页上，连换一页都做不到。
+    const view = $('#view');
+    if (view) view.innerHTML = body;
+    else $('#app').innerHTML = shell('', '这一页没能打开', body);
+  }
+}
+
+async function routeInner() {
   clearTimeout(App.timer);
   // 切页时把「等回到前台再刷」的那一笔也丢掉，否则旧页的轮询会在切回来时复活。
   App.pendingPoll = null;
@@ -640,4 +669,15 @@ const density = store.get('density');
 if (density === 'comfortable') document.documentElement.dataset.density = 'comfortable';
 applyTheme();
 try { App.user = await api('/api/v1/auth/me'); } catch (e) {}
+
+/* 版本号取一次就够：它只在服务端重装时才变，而那会让这个页面整个重新加载。
+   走登录前就匿名可见的 /api/v1/public/server-identity（登录页显示指纹用的是同一个），
+   因此这一笔不会因为没登录而失败，也不需要任何权限。
+   取不到就保持原来那行「Server API v1」——版本号缺失不该把侧栏底部变成一行错误。 */
+try {
+  const identity = await api('/api/v1/public/server-identity', { noAuth: true });
+  // InformationalVersion 可能带 +构建元数据（如 1.2.0+9f3a1c），显示到 + 为止就够了。
+  App.serverVersion = identity?.version ? String(identity.version).split('+')[0] : null;
+} catch (e) {}
+
 route();

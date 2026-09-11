@@ -116,6 +116,9 @@ public static class DependencyInjection
         // D8：定期复查备份完整性。校验失败的告警文案一直写着「定期复查没通过」，
         // 而在这条注册之前，系统里根本没有任何东西在定期复查。
         services.AddHostedService<BackupReverifyWorker>();
+        // R20：分批推进客户端升级。没有它，「成功」就还是由指令回报说了算——
+        // 而指令回报能说的最多只是「包解压好了」。
+        services.AddHostedService<AgentUpgradeRolloutWorker>();
 
         return services;
     }

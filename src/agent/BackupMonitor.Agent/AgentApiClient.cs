@@ -310,6 +310,15 @@ public sealed class AgentApiClient : IDisposable
     public Task<HeartbeatResponse> HeartbeatAsync(HeartbeatRequest request, CancellationToken ct) =>
         SendAsync<HeartbeatResponse>(HttpMethod.Post, "api/v1/agent/heartbeat", request, ct);
 
+    /// <summary>
+    /// 回报一次升级的最终结果（R20）。
+    ///
+    /// 由**升级之后的新进程**发出，是整条链路上唯一能证明「真的换过去了」的一句话。
+    /// 旧实现拿「指令执行完了」当成功，而那时换文件的动作根本还没发生。
+    /// </summary>
+    public Task ReportUpgradeResultAsync(AgentUpgradeResultRequest request, CancellationToken ct) =>
+        SendEmptyAsync(HttpMethod.Post, "api/v1/agent/upgrade-result", request, ct);
+
     public Task<CertificateRenewalResponse> RenewCertificateAsync(CancellationToken ct) =>
         SendAsync<CertificateRenewalResponse>(HttpMethod.Post, "api/v1/agent/certificate/renew", null, ct);
 
@@ -438,7 +447,7 @@ public sealed class AgentApiClient : IDisposable
     private HttpRequestMessage CreateRequest(HttpMethod method, string path)
     {
         var request = new HttpRequestMessage(method, path);
-        request.Headers.Add("X-Agent-Version", _options.AgentVersion);
+        request.Headers.Add("X-Agent-Version", _options.ResolvedAgentVersion);
         var clientId = _stateStore.ClientId;
         if (clientId is not null)
             request.Headers.Add("X-Client-Id", clientId.Value.ToString());

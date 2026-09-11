@@ -103,6 +103,10 @@ public class AppDbContext : DbContext
 
     public DbSet<ConfigBackupExport> ConfigBackupExports => Set<ConfigBackupExport>();
 
+    public DbSet<AgentUpgrade> AgentUpgrades => Set<AgentUpgrade>();
+
+    public DbSet<AgentUpgradeTarget> AgentUpgradeTargets => Set<AgentUpgradeTarget>();
+
     #endregion
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)

@@ -1,9 +1,10 @@
-#Requires -Version 3.0
+﻿#Requires -Version 3.0
 [CmdletBinding()]
 param(
     [string] $InstallDir = "$env:ProgramFiles\BackupMonitor\Agent",
     [string] $DataDirectory = "$env:ProgramData\BackupMonitor\Agent",
     [string] $ServiceName = "BackupMonitor Agent",
+    [string] $UpdaterDir = "$env:ProgramFiles\BackupMonitor\Updater",
     [switch] $KeepData
 )
 
@@ -33,6 +34,10 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
 
 if (Test-Path -LiteralPath $InstallDir) {
     Remove-Item -LiteralPath $InstallDir -Recurse -Force
+}
+# 升级执行器在安装目录之外（R20），删安装目录删不到它。
+if (Test-Path -LiteralPath $UpdaterDir) {
+    Remove-Item -LiteralPath $UpdaterDir -Recurse -Force
 }
 if (-not $KeepData -and (Test-Path -LiteralPath $DataDirectory)) {
     Remove-Item -LiteralPath $DataDirectory -Recurse -Force

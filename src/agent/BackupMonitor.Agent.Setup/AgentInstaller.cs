@@ -30,6 +30,16 @@ internal sealed class AgentInstaller
     private const string ServiceName = "BackupMonitor Agent";
     private const string InstallDirectory = @"%ProgramFiles%\BackupMonitor\Agent";
     private const string DataDirectory = @"%ProgramData%\BackupMonitor\Agent";
+
+    /// <summary>
+    /// 升级执行器的安装目录（R20）。它必须在安装目录**之外**：
+    /// 换文件的时候整个安装目录会被改名，执行器要是住在里面，
+    /// 它自己的文件也被锁着，这条升级路径就走不通了。
+    /// </summary>
+    private const string UpdaterDirectory = @"%ProgramFiles%\BackupMonitor\Updater";
+
+    /// <summary>客户端包里存放升级执行器的子目录名，与 build-turnkey.ps1 一致。</summary>
+    private const string UpdaterPayloadFolder = "updater";
     private const string RunValueName = "BackupMonitor.Agent.Tray";
 
     public static bool IsInstalled()
@@ -189,6 +199,7 @@ internal sealed class AgentInstaller
                 Directory.CreateDirectory(installDir);
                 SecureFileSystem.CreateDirectory(dataDir);
                 CopyPayload(payloadRoot, installDir);
+                CopyUpdater(payloadRoot);
 
                 progress.Report(new InstallProgress("正在写入安全配置…", 80));
                 WriteAgentSettings(
@@ -248,6 +259,9 @@ internal sealed class AgentInstaller
             // 数据目录会原封不动留在盘上——里面的 state.json 存着客户端身份和证书，
             // 重装后被沿用，表现成「客户端重装了但服务端看到的还是旧身份」。
             var failures = new List<Exception>();
+            // 升级执行器在安装目录之外，跟着安装目录一起删不到它（R20）。
+            TryDelete(() => DeleteDirectorySafely(Expand(UpdaterDirectory), Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "BackupMonitor")));
             TryDelete(() => DeleteDirectorySafely(Expand(InstallDirectory), Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "BackupMonitor")));
             if (removeData)
@@ -461,6 +475,25 @@ internal sealed class AgentInstaller
                     ex);
             }
         }
+    }
+
+    /// <summary>
+    /// 把升级执行器装到安装目录的同级目录（R20）。
+    ///
+    /// 包里没带它时不报错：那是一份老包，装出来的机器只是没法远程升级，
+    /// 而 Agent 收到升级指令时会明说「需要人工到这台机器上完成安装」——
+    /// 不装的后果是明说的，而不是一句假成功。
+    /// </summary>
+    private static void CopyUpdater(string payloadRoot)
+    {
+        var source = Path.Combine(payloadRoot, UpdaterPayloadFolder);
+        if (!Directory.Exists(source))
+            return;
+
+        var target = Expand(UpdaterDirectory);
+        Directory.CreateDirectory(target);
+        foreach (var sourcePath in Directory.EnumerateFiles(source, "*", SearchOption.TopDirectoryOnly))
+            File.Copy(sourcePath, Path.Combine(target, Path.GetFileName(sourcePath)), overwrite: true);
     }
 
     private static void WriteAgentSettings(

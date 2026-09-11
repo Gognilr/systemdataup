@@ -95,6 +95,18 @@ public class Client : IHasRowVersion
     public long LastConfigVersion { get; set; }
 
     /// <summary>
+    /// 这台客户端从什么时候开始落后于要求的配置版本（UTC）；追上就置空（R27）。
+    ///
+    /// 存起点而不是布尔，因为「落后」本身是正常的：改完配置到下一次心跳之间，
+    /// 每一台都会短暂落后。要报的是「一直没追上」。
+    ///
+    /// 这一列的由来是一次现场故障：某台客户端 6.5 小时每 10 秒拒收一次配置
+    /// （它存的服务端签名公钥对不上），而那是纯客户端侧的失败——
+    /// 服务端只看到它一直在线、心跳正常，配置却一次都没生效。
+    /// </summary>
+    public DateTime? ConfigStaleSince { get; set; }
+
+    /// <summary>
     /// 客户端级配置修订号。监控服务定义的增删改会推进它。
     ///
     /// 必须与任务版本一起参与 requiredConfigVersion 的计算：配置下发里包含监控服务，

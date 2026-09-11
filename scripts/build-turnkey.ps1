@@ -214,6 +214,7 @@ $apiPublish = Join-Path $stageRoot 'api'
 $agentPublish = Join-Path $stageRoot 'agent'
 $trayPublish = Join-Path $stageRoot 'tray'
 $agentSetupPublish = Join-Path $stageRoot 'agent-setup'
+$agentUpdaterPublish = Join-Path $stageRoot 'agent-updater'
 $serverSetupPublish = Join-Path $stageRoot 'server-setup'
 $serverTrayPublish = Join-Path $stageRoot 'server-tray'
 $databaseStage = Join-Path $stageRoot 'database'
@@ -244,12 +245,16 @@ Invoke-Dotnet @('restore', (Join-Path $srcRoot 'src\BackupMonitor.Api\BackupMoni
 Invoke-Dotnet @('restore', (Join-Path $srcRoot 'agent\BackupMonitor.Agent\BackupMonitor.Agent.csproj'), '-r', $Runtime)
 Invoke-Dotnet @('restore', (Join-Path $srcRoot 'agent\BackupMonitor.Agent.Tray\BackupMonitor.Agent.Tray.csproj'), '-r', $Runtime)
 Invoke-Dotnet @('restore', (Join-Path $srcRoot 'agent\BackupMonitor.Agent.Setup\BackupMonitor.Agent.Setup.csproj'), '-r', $Runtime)
+Invoke-Dotnet @('restore', (Join-Path $srcRoot 'agent\BackupMonitor.Agent.Updater\BackupMonitor.Agent.Updater.csproj'), '-r', $Runtime)
 Invoke-Dotnet @('restore', (Join-Path $srcRoot 'server\BackupMonitor.Server.Setup\BackupMonitor.Server.Setup.csproj'), '-r', $Runtime)
 Invoke-Dotnet @('restore', (Join-Path $srcRoot 'server\BackupMonitor.Server.Tray\BackupMonitor.Server.Tray.csproj'), '-r', $Runtime)
 Invoke-Dotnet @('publish', (Join-Path $srcRoot 'src\BackupMonitor.Api\BackupMonitor.Api.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-o', $apiPublish)
 Invoke-Dotnet @('publish', (Join-Path $srcRoot 'agent\BackupMonitor.Agent\BackupMonitor.Agent.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-o', $agentPublish)
 Invoke-Dotnet @('publish', (Join-Path $srcRoot 'agent\BackupMonitor.Agent.Tray\BackupMonitor.Agent.Tray.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-o', $trayPublish)
 Invoke-Dotnet @('publish', (Join-Path $srcRoot 'agent\BackupMonitor.Agent.Setup\BackupMonitor.Agent.Setup.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-p:PublishSingleFile=true', '-p:IncludeNativeLibrariesForSelfExtract=true', '-o', $agentSetupPublish)
+# 升级执行器（R20）。单文件发布：它装在客户端安装目录**之外**的同级目录里，
+# 换文件时不能被锁住；单文件让那个目录的安装与卸载只需要管一个文件。
+Invoke-Dotnet @('publish', (Join-Path $srcRoot 'agent\BackupMonitor.Agent.Updater\BackupMonitor.Agent.Updater.csproj'), '-c', $Configuration, '-r', $Runtime, '--self-contained', 'true', '--no-restore', '-p:PublishSingleFile=true', '-p:IncludeNativeLibrariesForSelfExtract=true', '-o', $agentUpdaterPublish)
 
 # 服务端托盘（R6）与 API 一起装进安装目录：payload 里的 api\ 目录就是安装目录本身。
 # 两者都是同一 RID 的自包含发布，共用的运行时文件逐字节相同，覆盖是安全的——
@@ -284,6 +289,17 @@ foreach ($publishDir in @($agentPublish, $trayPublish)) {
 if (-not (Test-Path -LiteralPath (Join-Path $clientPackageStage 'BackupMonitor.Agent.dll'))) {
     throw 'Client package is missing BackupMonitor.Agent.dll; the self-contained publish was not staged.'
 }
+# 升级执行器放进包里的 updater\ 子目录（R20）。安装器和 install-agent.ps1
+# 都把这个子目录单独装到 …\BackupMonitor\Updater，而不是铺进安装目录——
+# 升级时安装目录整个会被改名，执行器住在里面就会锁住自己。
+$updaterExe = Join-Path $agentUpdaterPublish 'BackupMonitor.Agent.Updater.exe'
+if (-not (Test-Path -LiteralPath $updaterExe)) {
+    throw 'Agent updater publish did not produce BackupMonitor.Agent.Updater.exe.'
+}
+$updaterStage = Join-Path $clientPackageStage 'updater'
+New-Item -ItemType Directory -Path $updaterStage -Force | Out-Null
+Copy-Item -LiteralPath $updaterExe -Destination $updaterStage -Force
+
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\appsettings.json') -Destination (Join-Path $clientPackageStage 'appsettings.json') -Force
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\install-agent.ps1') -Destination (Join-Path $clientPackageStage 'install-agent.ps1') -Force
 Copy-Item -LiteralPath (Join-Path $srcRoot 'agent\BackupMonitor.Agent\uninstall-agent.ps1') -Destination (Join-Path $clientPackageStage 'uninstall-agent.ps1') -Force
@@ -313,9 +329,16 @@ Invoke-VerifiedCompress `
         'BackupMonitor.Agent.exe',
         'BackupMonitor.Agent.dll',
         'BackupMonitor.Agent.Tray.exe',
+        'updater/BackupMonitor.Agent.Updater.exe',
         'appsettings.json',
         'install-agent.ps1',
         'check-prereq.cmd')
+
+# 升级包的 SHA-256 随包写出（R20）。下发表单此前要人工把 64 位哈希抄进去，
+# 而手抄一个 64 位十六进制本身就是个故障源：抄错一位的表现是每台机器
+# 都下载成功、校验失败，那时人只会怀疑包坏了。
+$clientZipHash = (Get-FileHash -LiteralPath $clientZip -Algorithm SHA256).Hash.ToLowerInvariant()
+Set-Content -LiteralPath "$($clientZip).sha256" -Value $clientZipHash -Encoding utf8 -NoNewline
 $clientSetup = Join-Path $agentSetupPublish 'BackupMonitor.Agent.Setup.exe'
 Invoke-ResilientCopy -Path $clientSetup -Destination (Join-Path $apiPublish 'wwwroot\downloads\BackupMonitor.Agent.Setup.exe')
 
@@ -359,6 +382,7 @@ $payloadRequired = @(
     'api\BackupMonitor.Api.exe',
     'api\BackupMonitor.Server.Tray.exe',
     'api\wwwroot\downloads\BackupMonitor.Agent.zip',
+    'api\wwwroot\downloads\BackupMonitor.Agent.zip.sha256',
     'api\wwwroot\downloads\agent-version.txt',
     'api\wwwroot\downloads\BackupMonitor.Agent.Setup.exe',
     'api\wwwroot\downloads\VC_redist.x64.exe',

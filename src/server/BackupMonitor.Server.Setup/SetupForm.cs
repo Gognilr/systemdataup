@@ -113,7 +113,9 @@ internal sealed class SetupForm : Form
 
         root.Controls.Add(new Label
         {
-            Text = "安装 BackupMonitor Server",
+            // 版本号跟在标题后面：装之前就该看得见自己拿的是哪一版，
+            // 而不是装完之后去 exe 的属性页里找。
+            Text = $"安装 BackupMonitor Server {SetupVersion()}",
             AutoSize = true,
             Font = new Font(Font.FontFamily, 18, FontStyle.Bold),
             Margin = new Padding(0, 0, 0, 8)
@@ -175,13 +177,33 @@ internal sealed class SetupForm : Form
     private static readonly Color OkColor = Color.FromArgb(0x0F, 0x7A, 0x4A);      // --ok-fg
     private static readonly Color OffColor = Color.FromArgb(0x7F, 0x8F, 0x99);     // --ink-400
     private static readonly Color ErrColor = Color.FromArgb(0xB3, 0x26, 0x1E);     // --err-fg
+    private static readonly Color WarnColor = Color.FromArgb(0x8A, 0x51, 0x09);    // --warn-fg
     private static readonly Color AccentColor = Color.FromArgb(0x5B, 0x4F, 0xC7);  // --accent
     private static readonly Color BorderColor = Color.FromArgb(0xCC, 0xD5, 0xDA);  // --ink-200
     private static readonly Color MutedColor = Color.FromArgb(0x5E, 0x6D, 0x77);   // --ink-500
 
     private readonly ServiceIndicator _serverIndicator = new("BackupMonitor.Server");
     private readonly ServiceIndicator _postgresIndicator = new("BackupMonitor.PostgreSQL");
+
+    /// <summary>
+    /// 第三行：备份现在收不收得进来。
+    ///
+    /// 上面两个绿点回答的是「Windows 服务在不在跑」，而这不等于系统在工作——
+    /// 数据库连不上时 BackupMonitor.Server 照样是「运行中」的绿点，备份和管理页面
+    /// 却已经全废。只有那两行的状态条因此会骗人：它给出的每一个信号都是绿的，
+    /// 而人来这个窗口要的答案是红的。
+    /// </summary>
+    private readonly ServiceIndicator _healthIndicator = new("备份收得进来吗");
+
     private readonly TextBox _log = new();
+
+    /// <summary>
+    /// 自检轮询。10 秒一次，比服务状态的 2 秒慢——它要跨进程访问 API 并查库，
+    /// 而服务状态只是读一个本地句柄。再密只会给本机 API 加无谓的请求。
+    /// </summary>
+    private System.Windows.Forms.Timer? _healthTimer;
+
+    private bool _healthProbing;
 
     private void BuildConsoleLayout()
     {
@@ -207,7 +229,7 @@ internal sealed class SetupForm : Form
             Dock = DockStyle.Fill,
             AutoSize = true,
             ColumnCount = 2,
-            RowCount = 1,
+            RowCount = 3,
             Margin = new Padding(0, 0, 0, 16),
             Padding = new Padding(12, 10, 12, 10),
             BackColor = Color.FromArgb(0xF4, 0xF6, 0xF8)   // --ink-50
@@ -216,6 +238,23 @@ internal sealed class SetupForm : Form
         statusBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
         statusBar.Controls.Add(_serverIndicator, 0, 0);
         statusBar.Controls.Add(_postgresIndicator, 1, 0);
+        statusBar.SetColumnSpan(_healthIndicator, 2);
+        _healthIndicator.Margin = new Padding(0, 8, 0, 0);
+        statusBar.Controls.Add(_healthIndicator, 0, 1);
+
+        // 版本号：报修、核对升级结果、判断「这台到底升上去没有」都要先看到它。
+        // 管理台与服务端分开写——「修复 / 升级安装」之后两者应该一致，不一致本身就是信息。
+        var installedVersion = _maintenance.GetInstalledServerVersion(_installDirectory);
+        var versionLabel = new Label
+        {
+            Text = $"服务端 {(installedVersion is null ? "版本未知" : "v" + installedVersion)}　·　管理台 {SetupVersion()}",
+            AutoSize = true,
+            ForeColor = MutedColor,
+            Margin = new Padding(0, 8, 0, 0)
+        };
+        statusBar.SetColumnSpan(versionLabel, 2);
+        statusBar.Controls.Add(versionLabel, 0, 2);
+
         root.Controls.Add(statusBar, 0, 0);
 
         // ── 四组操作（S3）。分组关系原先在视觉上完全不存在：
@@ -322,9 +361,19 @@ internal sealed class SetupForm : Form
         _statusTimer = new System.Windows.Forms.Timer { Interval = 2000 };
         _statusTimer.Tick += (_, _) => RefreshServiceStatus();
         _statusTimer.Start();
-        FormClosed += (_, _) => { _statusTimer?.Stop(); _statusTimer?.Dispose(); _statusTimer = null; };
+
+        _healthTimer = new System.Windows.Forms.Timer { Interval = 10000 };
+        _healthTimer.Tick += async (_, _) => await RefreshHealthAsync();
+        _healthTimer.Start();
+
+        FormClosed += (_, _) =>
+        {
+            _statusTimer?.Stop(); _statusTimer?.Dispose(); _statusTimer = null;
+            _healthTimer?.Stop(); _healthTimer?.Dispose(); _healthTimer = null;
+        };
 
         RefreshServiceStatus();
+        _ = RefreshHealthAsync();
         AppendLog("服务管理台已就绪。");
     }
 
@@ -657,7 +706,16 @@ internal sealed class SetupForm : Form
         catch (Exception ex)
         {
             AppendLog("安装失败：" + ex.Message);
-            MessageBox.Show(this, ex.Message, "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            // 升级失败之后最要紧的一句话不是「为什么失败」，而是「现在服务还在不在跑」：
+            // 服务端停着意味着全网客户端此刻都传不上备份，而客户端那边只会显示
+            // 「连接尝试失败」，没人会把它和这次安装联系起来。
+            MessageBox.Show(
+                this,
+                ex.Message + Environment.NewLine + Environment.NewLine
+                + "安装器已尝试把服务端服务重新启动。请看窗口顶部的状态条："
+                + "BackupMonitor.Server 若不是「运行中」，客户端现在全都传不上备份，"
+                + "请先点「启动服务」，再排查上面这条错误。",
+                "安装失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
         {
@@ -795,6 +853,7 @@ internal sealed class SetupForm : Form
         {
             SetBusy(false);
             RefreshServiceStatus();
+            MarkHealthPending();
         }
     }
 
@@ -830,6 +889,7 @@ internal sealed class SetupForm : Form
         {
             SetBusy(false);
             RefreshServiceStatus();
+            MarkHealthPending();
         }
     }
 
@@ -850,6 +910,7 @@ internal sealed class SetupForm : Form
         {
             SetBusy(false);
             RefreshServiceStatus();
+            MarkHealthPending();
         }
     }
 
@@ -889,6 +950,108 @@ internal sealed class SetupForm : Form
             SetMaintenanceEnabled(_maintenanceEnabled);
             AppendLogOnce("readfail", "读取服务状态失败：" + ex.Message);
         }
+    }
+
+    /// <summary>管理台自己的版本（与它内嵌的服务端负载同一次构建产出）。</summary>
+    private static string SetupVersion()
+    {
+        var assembly = System.Reflection.Assembly.GetExecutingAssembly();
+        var version = System.Reflection.CustomAttributeExtensions
+                .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(assembly)?.InformationalVersion
+            ?? assembly.GetName().Version?.ToString(3);
+        return string.IsNullOrWhiteSpace(version) ? "版本未知" : "v" + version.Split('+')[0];
+    }
+
+    /// <summary>
+    /// 服务刚被起停过，这一刻的自检结果必然是假的：API 要几秒才开始监听。
+    /// 与其立刻探一次然后报一个会自己消失的红灯，不如明说「还没测」，等下一轮计时器。
+    /// </summary>
+    private void MarkHealthPending()
+    {
+        if (!IsDisposed && _consoleMode)
+            _healthIndicator.Set("等待自检…", OffColor);
+    }
+
+    /// <summary>
+    /// 刷新本机自检（服务、管理网页、数据库三项里的后两项）。10 秒一次。
+    ///
+    /// 与 <see cref="RefreshServiceStatus"/> 同一条铁律：**任何路径都不能弹窗、不能抛异常**。
+    /// 它自己跑在计时器上，一个弹窗就会变成一串弹窗。
+    ///
+    /// 也不碰按钮可用性：按钮跟着 Windows 服务状态走，而这里说的是「服务活着但系统没在工作」，
+    /// 此时「启动服务」并不会因为库连不上就变得不该点——真要修，多半还得先重启一次。
+    /// </summary>
+    private async Task RefreshHealthAsync()
+    {
+        if (_healthProbing || IsDisposed)
+            return;
+
+        _healthProbing = true;
+        try
+        {
+            if (!ServerInstaller.IsInstalled())
+            {
+                _healthIndicator.Set("未安装", ErrColor);
+                return;
+            }
+
+            var health = await _maintenance.ProbeLocalHealthAsync(_installDirectory, CancellationToken.None);
+            if (IsDisposed)
+                return;
+
+            var (text, color) = DescribeHealth(health);
+            _healthIndicator.Set(text, color);
+        }
+        catch (Exception ex)
+        {
+            if (IsDisposed)
+                return;
+            _healthIndicator.Set("自检未能完成", OffColor);
+            AppendLogOnce("healthfail", "服务端自检未能完成：" + ex.Message);
+        }
+        finally
+        {
+            _healthProbing = false;
+        }
+    }
+
+    /// <summary>
+    /// 把一次自检结果翻成一句人话。
+    ///
+    /// 写法上只有一条规矩：说清楚**此刻备份收不收得进来**，以及**该去做什么**。
+    /// 「Unhealthy」「探测失败」这类词对着屏幕的人没有用——他要决定的是
+    /// 现在是重启服务、去补分区，还是根本什么都不用做。
+    /// </summary>
+    private (string Text, Color Color) DescribeHealth(ServerMaintenance.LocalHealth health)
+    {
+        if (!health.ApiReachable)
+        {
+            // 服务本来就停着，那上面两个灰点已经说明了问题，这里不必再报一次警。
+            return _serverRunning is false
+                ? ("服务未运行，未自检", OffColor)
+                : ("管理网页不应答：服务在跑，但 API 没有响应", ErrColor);
+        }
+
+        return health.Database switch
+        {
+            ServerMaintenance.LocalDatabaseHealth.Ok =>
+                ("正常：服务、管理网页、数据库三项自检均通过", OkColor),
+
+            ServerMaintenance.LocalDatabaseHealth.Failed =>
+                ("数据库不通：备份此刻写不进库，页面也打不开内容——上面两个绿灯不代表系统在工作",
+                 ErrColor),
+
+            // 分区不齐不是「现在坏了」，是「到某一天会坏」：库连得上、备份照收，
+            // 但缺的那一段时间一到，插入就会失败。所以是橙色的待办，不是红色的故障，
+            // 而且要说明白重启服务对它没有用。
+            ServerMaintenance.LocalDatabaseHealth.Degraded =>
+                (health.Reason is { Length: > 0 } reason
+                    ? reason + "（重启服务无效，需要补建分区）"
+                    : "数据库需要维护：未来 30 天的分区不齐（重启服务无效，需要补建分区）",
+                 WarnColor),
+
+            _ => ("数据库未自检：这个版本的服务端没有本机自检端点", OffColor)
+        };
     }
 
     /// <summary>

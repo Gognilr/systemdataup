@@ -32,6 +32,7 @@ public sealed class AgentWorker : BackgroundService
     private readonly AgentConfigStore _configStore;
     private readonly AgentCandidateFileStore _candidateFiles;
     private readonly AgentApiClient _api;
+    private readonly AgentUpgradeCoordinator _upgrades;
     private readonly AgentSignatureVerifier _signatures;
     private readonly SystemProbe _probe;
     private readonly BackupScanner _scanner;
@@ -95,6 +96,16 @@ public sealed class AgentWorker : BackgroundService
     /// </summary>
     private int _identityUnknownStreak;
 
+    /// <summary>
+    /// 计划扫描是否正在跑（R20 空闲判定）。
+    ///
+    /// 指令类的忙碌看 _activeCommands 就够了（上传也是指令），
+    /// 唯独计划扫描不经过指令通道——漏掉它，升级就可能正好落在
+    /// 一次跑了半小时的全量哈希中间。用 int + Interlocked：写在扫描循环，
+    /// 读在升级循环，两条不同的线程。
+    /// </summary>
+    private int _scanBusy;
+
     private int _connectFailureStreak;
 
     /// <summary>
@@ -129,6 +140,7 @@ public sealed class AgentWorker : BackgroundService
         AgentConfigStore configStore,
         AgentCandidateFileStore candidateFiles,
         AgentApiClient api,
+        AgentUpgradeCoordinator upgrades,
         AgentSignatureVerifier signatures,
         SystemProbe probe,
         BackupScanner scanner,
@@ -143,6 +155,7 @@ public sealed class AgentWorker : BackgroundService
         _configStore = configStore;
         _candidateFiles = candidateFiles;
         _api = api;
+        _upgrades = upgrades;
         _signatures = signatures;
         _probe = probe;
         _scanner = scanner;
@@ -154,7 +167,7 @@ public sealed class AgentWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("BackupMonitor Agent {Version} 启动，服务器={Server}", _options.AgentVersion, _api.ServerUrl);
+        _logger.LogInformation("BackupMonitor Agent {Version} 启动，服务器={Server}", _options.ResolvedAgentVersion, _api.ServerUrl);
 
         // 审计 F-08：老版本把候选文件清单内嵌在 state.json 里，升级后必须搬出来。
         // 不搬的话所有候选丢失，已通过预检的备份要重新全量 SHA-256 扫一遍。
@@ -198,7 +211,8 @@ public sealed class AgentWorker : BackgroundService
             await Task.WhenAll(
                 RunHeartbeatLoopAsync(identityLost.Token),
                 RunCommandLoopAsync(identityLost.Token),
-                RunScanLoopAsync(identityLost.Token));
+                RunScanLoopAsync(identityLost.Token),
+                RunUpgradeLoopAsync(identityLost.Token));
 
             _identityLost = null;
             if (stoppingToken.IsCancellationRequested)
@@ -302,7 +316,21 @@ public sealed class AgentWorker : BackgroundService
 
                 // 托盘的绿灯判据（R7）：服务在跑 + 最近一次心跳成功 + 无 LastError。
                 // 这一行是「心跳成功」那一半的唯一证据来源。
-                _stateStore.Update(s => s.LastHeartbeatAtUtc = DateTime.UtcNow);
+                //
+                // LastError 必须在这里一起清掉，否则判据的另一半永远为真：
+                // 服务端重启、升级、网线松一下——任何一次瞬时失败都会写进 LastError，
+                // 而在此之前只有「配置同步」「证书续签」这两条偶发路径会清它。
+                // 于是现场表现是托盘上挂着一句几天前的
+                // 「连接尝试失败：连接方在一段时间后没有正确答复」，
+                // 而这台机器其实一直在正常备份——**一个不会消失的错误等于一个假的错误**，
+                // 它会让人在真出事的那天照样视而不见。
+                //
+                // 心跳通了就证明地址、证书、身份三样都没问题，这正是那句旧错误该作废的时刻。
+                _stateStore.Update(s =>
+                {
+                    s.LastHeartbeatAtUtc = DateTime.UtcNow;
+                    s.LastError = null;
+                });
 
                 ProcessNotifications(heartbeat.Notifications);
 
@@ -704,8 +732,16 @@ public sealed class AgentWorker : BackgroundService
             try
             {
                 var config = _config;
-                await RunScheduledScansAsync(config, ct);
-                await RetryPendingRestabilizeScansAsync(config, ct);
+                Interlocked.Exchange(ref _scanBusy, 1);
+                try
+                {
+                    await RunScheduledScansAsync(config, ct);
+                    await RetryPendingRestabilizeScansAsync(config, ct);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _scanBusy, 0);
+                }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -727,6 +763,151 @@ public sealed class AgentWorker : BackgroundService
                 break;
         }
     }
+
+    /// <summary>
+    /// 升级循环（整改清单 2026-09-10 · R20）。
+    ///
+    /// 它补上的是此前完全不存在的那一半：暂存包一直只写不读，
+    /// **零个读取方**，于是「升级成功」这句话说的只是「包解压好了」。
+    ///
+    /// 两件事：把 updater 写下的上一次升级结果回报给服务端；
+    /// 以及在空闲窗口把暂存的升级包真正装上去。
+    /// 它单独成一条循环而不是挂在心跳里，是因为「等空闲」本身要反复判定，
+    /// 而心跳循环的每一次延迟都会直接影响离线判定。
+    /// </summary>
+    private async Task RunUpgradeLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await ReportUpgradeResultIfAnyAsync(ct);
+                ApplyPendingUpgradeIfIdle();
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (AgentApiException ex)
+            {
+                LogApiFailure(ex);
+            }
+            catch (Exception ex)
+            {
+                // 升级循环出错绝不能把 Agent 拖垮：它是锦上添花的一条，
+                // 而备份本身一刻都不该因为它停。
+                _logger.LogError(ex, "Agent 升级循环异常");
+            }
+
+            if (!await DelayAsync(60, ct))
+                break;
+        }
+    }
+
+    /// <summary>
+    /// 把 updater 写下的升级结果回报给服务端，成功后删掉结果文件。
+    ///
+    /// 这是整条链路上唯一由**升级之后的新进程**发出的一句话。服务端据此判成功，
+    /// 而不是拿「指令执行完了」当成功——那正是这个缺陷的形状。
+    /// </summary>
+    private async Task ReportUpgradeResultIfAnyAsync(CancellationToken ct)
+    {
+        var result = _upgrades.ReadResult();
+        if (result is null)
+            return;
+
+        Guid? commandId = Guid.TryParse(result.CommandId, out var parsed) ? parsed : null;
+        await _api.ReportUpgradeResultAsync(new AgentUpgradeResultRequest
+        {
+            CommandId = commandId,
+            Status = result.Status,
+            TargetVersion = result.TargetVersion,
+            RunningVersion = _options.ResolvedAgentVersion,
+            Message = result.Message
+        }, ct);
+
+        // 回报成功才删：删早了而这次请求没送到，服务端就只能等超时，
+        // 而超时的结论是「这台机器没起来」——一句与事实相反的结论。
+        _upgrades.ClearResult();
+        _logger.LogInformation("已向服务端回报升级结果 {Status}（运行版本 {Version}）", result.Status, _options.ResolvedAgentVersion);
+    }
+
+    /// <summary>空闲时把暂存的升级包交给 updater 安装。</summary>
+    private void ApplyPendingUpgradeIfIdle()
+    {
+        var pending = _upgrades.ReadPending();
+        if (pending is null)
+            return;
+
+        if (!Directory.Exists(pending.PayloadDirectory))
+        {
+            // 暂存目录被清理掉了（现场清磁盘、杀毒软件隔离都可能）。
+            // 留着这条记录只会让每一分钟都重试一次同一个不存在的目录。
+            _logger.LogWarning("暂存的升级包目录已不存在，放弃这次升级：{Directory}", pending.PayloadDirectory);
+            _upgrades.ClearPending();
+            return;
+        }
+
+        if (_upgrades.ResolveUpdaterPath() is null)
+        {
+            LogUpgradePostponed("本机没有安装升级执行器，需要人工到这台机器上完成安装");
+            return;
+        }
+
+        var (idle, reason) = EvaluateUpgradeIdleness();
+        if (!idle)
+        {
+            LogUpgradePostponed(reason);
+            return;
+        }
+
+        _logger.LogWarning("本机当前空闲，开始安装升级包 {Version}", pending.Version);
+        if (!_upgrades.TryLaunchUpdater(pending))
+            LogUpgradePostponed("升级执行器没能启动，将在下一个空闲点重试");
+
+        // 走到这里 updater 已经在停本服务了，后面不要再安排任何收尾动作。
+    }
+
+    /// <summary>
+    /// 空闲判定（R20）——这就是原来那句「将在受控重启时切换」里的**受控**。
+    ///
+    /// 三条：没有指令在跑（上传、预检都是指令）、没有计划扫描在跑、
+    /// 离下一次计划扫描还有足够的余量。不空闲就推迟到下一个空闲点，
+    /// 一刀切下去会让传了一半的备份作废，而那份备份可能正是今晚唯一的一份。
+    /// </summary>
+    private (bool Idle, string Reason) EvaluateUpgradeIdleness()
+    {
+        if (!_activeCommands.IsEmpty)
+            return (false, $"还有 {_activeCommands.Count} 条指令在执行，升级推迟到下一个空闲点");
+
+        if (Volatile.Read(ref _scanBusy) == 1)
+            return (false, "计划扫描正在执行，升级推迟到下一个空闲点");
+
+        var margin = TimeSpan.FromMinutes(Math.Clamp(_options.UpgradeIdleMarginMinutes, 0, 720));
+        var now = DateTime.UtcNow;
+        foreach (var entry in _stateStore.Snapshot().ScheduledScans.Values)
+        {
+            if (entry.NextDueAtUtc > now && entry.NextDueAtUtc - now < margin)
+                return (false, $"距离下一次计划扫描不足 {margin.TotalMinutes:F0} 分钟，升级推迟到那次扫描之后");
+        }
+
+        return (true, string.Empty);
+    }
+
+    /// <summary>
+    /// 推迟原因只在变化时记一条。升级循环一分钟一轮，逐次记录会在一个
+    /// 通宵的备份窗口里刷出几百条一模一样的日志，把真正有用的行压下去。
+    /// </summary>
+    private void LogUpgradePostponed(string reason)
+    {
+        if (string.Equals(_lastUpgradePostponeReason, reason, StringComparison.Ordinal))
+            return;
+
+        _lastUpgradePostponeReason = reason;
+        _logger.LogInformation("升级暂缓：{Reason}", reason);
+    }
+
+    private string? _lastUpgradePostponeReason;
 
     public override void Dispose()
     {
@@ -863,7 +1044,7 @@ public sealed class AgentWorker : BackgroundService
                 OsName = "Windows",
                 OsVersion = Environment.OSVersion.VersionString,
                 Architecture = RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant(),
-                AgentVersion = _options.AgentVersion,
+                AgentVersion = _options.ResolvedAgentVersion,
                 IpAddresses = _probe.GetIpAddresses(),
                 PublicKey = publicKey,
                 ContinuityProof = continuityProof,
@@ -2353,13 +2534,49 @@ public sealed class AgentWorker : BackgroundService
             return CommandResult.FromFailure("UPGRADE_HASH_MISMATCH", "升级包 SHA-256 校验失败");
 
         var updateRoot = Path.Combine(_options.ExpandedDataDirectory, "updates", version);
-        Directory.CreateDirectory(updateRoot);
+        var payloadRoot = Path.Combine(updateRoot, "payload");
+        // 每次重新解压到一个干净的载荷目录：上一次失败留下的半份文件混进来，
+        // 表现是「装上去了但缺文件」，而那时哈希校验早就通过了，没人会往这里想。
+        if (Directory.Exists(payloadRoot))
+            Directory.Delete(payloadRoot, recursive: true);
+        Directory.CreateDirectory(payloadRoot);
+
         var packagePath = Path.Combine(updateRoot, "BackupMonitor.Agent.zip");
         await File.WriteAllBytesAsync(packagePath, bytes, ct);
-        ZipFile.ExtractToDirectory(packagePath, updateRoot, overwriteFiles: true);
-        await File.WriteAllTextAsync(Path.Combine(_options.ExpandedDataDirectory, "pending-update.json"),
-            JsonSerializer.Serialize(new { version, packagePath, sha256 = actualHash, stagedAt = DateTime.UtcNow }), ct);
-        return CommandResult.FromSuccess("UPGRADE_STAGED", $"升级包已安全解压到 {updateRoot}，将在受控重启时切换");
+        ZipFile.ExtractToDirectory(packagePath, payloadRoot, overwriteFiles: true);
+
+        // 哈希对不代表这是一份能跑的发布（可能是别的 zip，也可能是构建出了岔子）。
+        // 在这里就判掉，好过等到服务已经停下来、目录已经改名之后才发现。
+        foreach (var required in new[] { "BackupMonitor.Agent.exe", "BackupMonitor.Agent.dll" })
+        {
+            if (!File.Exists(Path.Combine(payloadRoot, required)))
+                return CommandResult.FromFailure("UPGRADE_PACKAGE_INVALID", $"升级包里没有 {required}，不是一份可运行的客户端发布");
+        }
+
+        await _upgrades.WritePendingAsync(new PendingUpdate
+        {
+            Version = version,
+            PayloadDirectory = payloadRoot,
+            Sha256 = actualHash,
+            StagedAtUtc = DateTime.UtcNow,
+            CommandId = command.Id
+        }, ct);
+
+        // 止损（R20 第一步）：这条回报以前写的是「已安全解压，将在受控重启时切换」，
+        // 而当时**没有任何一处读取暂存包**——界面显示成功、指令回报成功、
+        // 运行的程序一个字节没变。现在分两种情况说实话：
+        // 本机有升级执行器就说「等空闲窗口自动安装，装完会回报新版本号」；
+        // 没有就明说需要人工上门，并且用一个一眼能看出「没装上」的结果码。
+        if (_upgrades.ResolveUpdaterPath() is null)
+        {
+            return CommandResult.FromSuccess(
+                "UPGRADE_DOWNLOADED_NOT_INSTALLED",
+                $"升级包已下载并校验（版本 {version}），但本机没有安装升级执行器，需要人工到这台机器上完成安装");
+        }
+
+        return CommandResult.FromSuccess(
+            "UPGRADE_PENDING_INSTALL",
+            $"升级包已下载并校验（版本 {version}），将在本机空闲时自动安装；安装完成后由新版本回报结果");
     }
 
     // 比的是当前生效的地址而不是 appsettings.json 里那一份：地址重发现（方案 C）

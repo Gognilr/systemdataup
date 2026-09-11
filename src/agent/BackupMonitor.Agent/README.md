@@ -2,9 +2,12 @@
 
 ## Windows 客户端形态与生命周期
 
-安装包包含两个进程：
+安装包包含两个常驻进程，外加一个只在升级那几分钟里运行的执行器：
 
-- `BackupMonitor.Agent.exe`：Windows Service，使用 LocalSystem 账户运行，负责心跳、配置同步、预检、上传和升级暂存；普通用户不应直接停止它。
+- `BackupMonitor.Agent.exe`：Windows Service，使用 LocalSystem 账户运行，负责心跳、配置同步、预检、上传和升级；普通用户不应直接停止它。
+- `BackupMonitor.Agent.Updater.exe`：升级执行器，装在安装目录**同级**的 `%ProgramFiles%\BackupMonitor\Updater`。
+  Windows 服务不能替换自己正在运行的程序文件，换文件这一步只能由住在覆盖范围之外的程序来做：
+  它停服务、把当前安装目录改名做备份、铺新文件、起服务、等心跳恢复，任一步失败立刻回滚旧目录并重新启动服务。
 - `BackupMonitor.Agent.Tray.exe`：当前登录用户的通知区域托盘程序，只显示 Agent 服务状态、打开服务端客户端页面和提供退出入口；关闭托盘不会停止采集服务。
 
 安装时会把 Agent 服务设为自动启动/延迟启动，并配置 Windows Service Control Manager 的失败恢复：异常停止后 5 秒、15 秒、60 秒依次重启。正常从托盘选择“正常退出并停止 Agent 服务”时，服务报告正常停止，Windows 不会把它当作故障反复拉起。
@@ -62,7 +65,7 @@
 
 图形安装器不是离线包：它需要能够访问填写的服务端地址，以下载经过服务端发布的 Agent 组件。生产环境请使用 HTTPS；开发测试可以使用 HTTP。客户端和服务端不在同一台电脑时，不要填写 `127.0.0.1`，应填写服务端实际域名或地址。
 
-`ServerSigningPublicKey` 必须与服务端 `Security:CommandSigningPrivateKey` 对应（Base64 编码的 RSA SubjectPublicKeyInfo）。Agent 默认拒绝未签名或签名不正确的指令/配置；`AllowUnsignedCommands=true` 只允许本地开发联调，生产安装脚本会强制写为 `false`。升级指令必须提供 HTTPS/HTTP 包地址和 64 位 SHA-256，Agent 下载后先校验哈希再解压。
+`ServerSigningPublicKey` 必须与服务端 `Security:CommandSigningPrivateKey` 对应（Base64 编码的 RSA SubjectPublicKeyInfo）。Agent 默认拒绝未签名或签名不正确的指令/配置；`AllowUnsignedCommands=true` 只允许本地开发联调，生产安装脚本会强制写为 `false`。升级指令必须提供 HTTPS/HTTP 包地址和 64 位 SHA-256，Agent 下载后先校验哈希再解压。解压只是暂存：Agent 会等到本机空闲（没有指令在执行、没有计划扫描在跑、距离下一次计划扫描还有余量）才把升级执行器拉起来完成切换；切换完成后由**新版本进程**主动回报结果与自己的版本号，服务端据此判成功，而不是拿「指令执行完了」当成功。
 
 ## 配置与状态
 

@@ -341,3 +341,33 @@ public enum ConfigBackupExportStatus
     Succeeded,
     Failed
 }
+
+/// <summary>
+/// 一次分批升级下发的状态（V041 · R20）。
+///
+/// failed 的含义是「这一批里有机器没起来，后面的批次不再推」——
+/// 分批的全部意义就在这一步刹车上。
+/// </summary>
+public enum AgentUpgradeStatus
+{
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled
+}
+
+/// <summary>
+/// 升级下发里单台机器的状态（V041 · R20）。
+///
+/// dispatched 与 succeeded 之间隔着的正是这次整改要补的那一段：
+/// 指令发下去了不等于装上了，要等这台机器心跳回来、自报的版本号变成目标版本。
+/// </summary>
+public enum AgentUpgradeTargetStatus
+{
+    Waiting,
+    Dispatched,
+    Succeeded,
+    Failed,
+    Cancelled
+}

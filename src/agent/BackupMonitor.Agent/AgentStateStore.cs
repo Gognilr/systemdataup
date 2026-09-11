@@ -38,6 +38,17 @@ public sealed class AgentState
     public DateTime? LastSuccessfulUploadAtUtc { get; set; }
 
     /// <summary>
+    /// 从什么时候开始记录「上次成功备份」（UTC）。第一次跑到有这个字段的版本时写一次，之后不再改。
+    ///
+    /// 为什么需要它：<see cref="LastSuccessfulUploadAtUtc"/> 是后加的字段，
+    /// 老版本从不写它。于是一台刚从旧版升上来的机器，托盘上写的是「上次成功备份：还没有过」——
+    /// 而这台机器今天早晨明明备份成功了。**同一句话在「全新装机」和「刚升级完」两种处境下
+    /// 含义完全相反**，而看托盘的人没有任何线索去分辨。
+    /// 有了这个时刻，那句话就能说全：还没有过，而记录是从某时某刻才开始的。
+    /// </summary>
+    public DateTime? UploadTrackingSinceUtc { get; set; }
+
+    /// <summary>
     /// 过渡期里额外接受的服务端 TLS 指纹（R9）。
     ///
     /// 来源只有一处：服务端**签名过的**配置下发。存进 state.json 是因为它必须
@@ -202,6 +213,17 @@ public sealed class AgentStateStore
         SecureFileSystem.CreateDirectory(_options.ExpandedDataDirectory, _options.EnforceAcl);
         _statePath = Path.Combine(_options.ExpandedDataDirectory, "state.json");
         _state = LoadState();
+
+        // 记录起点只写一次：老状态在这里补上（值是「升上来的这一刻」），
+        // 全新装机也在这里写（值是「装好的这一刻」）。两种情形下它都诚实。
+        if (_state.UploadTrackingSinceUtc is null)
+        {
+            lock (_sync)
+            {
+                _state.UploadTrackingSinceUtc = DateTime.UtcNow;
+                SaveUnsafe();
+            }
+        }
     }
 
     public AgentState Snapshot()

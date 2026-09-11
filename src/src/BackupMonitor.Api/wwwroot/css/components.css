@@ -569,3 +569,12 @@ tr:has(.cell-warn) .spark polyline{stroke:var(--warn-fg)}
 .fold-section>summary{cursor:pointer;user-select:none;font:var(--t-body);color:var(--text)}
 .fold-section>summary:hover{color:var(--accent)}
 .fold-section>summary .sub{margin-left:var(--s-2);color:var(--text-muted);font:var(--t-sm)}
+
+/* 通知筛选里的类别勾选（R24）。20 多项，平铺会把整页撑长，
+   因此折进 <details>，展开后按最小 220px 自动分列。 */
+.cat-filter{margin:0 0 14px}
+.cat-filter>summary{cursor:pointer;color:var(--ink-500);font-size:12px;padding:4px 0}
+.cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:4px 16px;padding:8px 0 4px}
+.cat-pick{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:400}
+.cat-pick input{margin:0}
+

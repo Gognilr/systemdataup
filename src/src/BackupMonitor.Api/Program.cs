@@ -439,7 +439,27 @@ app.UseResponseCompression();
 
 // 内置单页管理控制台（wwwroot）：静态文件匿名可访问，业务接口仍走认证授权
 app.UseDefaultFiles();
-app.UseStaticFiles();
+
+// 每个静态文件都必须回源核对（no-cache = 可以存，但用之前要问一次；
+// 没变就是 304，一个包头的开销，局域网里可以忽略）。
+//
+// 为什么这件事是硬性的：这个控制台是一组互相 import 的 ES 模块，浏览器一个文件一个文件地取。
+// StaticFileMiddleware 默认只发 ETag/Last-Modified，**不发 Cache-Control**，
+// 于是浏览器按启发式规则自己定新鲜期（常见实现是「自上次修改以来时长的 10%」）——
+// 一个几个月没动过的文件可以被判定为好几天内无需回源。
+//
+// 后果不是「看到旧页面」这么温和：升级之后，浏览器手里可能是**新的 app.js 配旧的某个 views/*.js**。
+// 旧模块 import 一个新 ui.js 里已经改名的导出，模块链接就会失败，
+// 表现是点左边导航**什么都不发生**——没有报错、没有空白页、上一页还好端端地留在屏幕上。
+// 这类故障只会发生在升级过的机器上，而且清一次浏览器缓存就「自己好了」，
+// 于是永远查不出来。宁可每次多一轮 304。
+app.UseStaticFiles(new StaticFileOptions
+{
+    OnPrepareResponse = context =>
+    {
+        context.Context.Response.Headers["Cache-Control"] = "no-cache";
+    }
+});
 
 app.UseRateLimiter();
 app.UseAuthentication();
@@ -492,5 +512,46 @@ app.MapHealthChecks("/health/db", new HealthCheckOptions
     }
 })
 .RequireAuthorization("perm:system.manage");
+
+// 本机运维界面专用的数据库自检（仅回环可达）。
+//
+// 存在的理由：/health/db 要 system.manage 令牌，而服务端托盘和服务管理台
+// 手里没有令牌、也不该有——它们是运维界面，不是登录用户。此前托盘直接探
+// /health/db，拿回的永远是 401，于是「数据库不通」这一档**在任何一台健康的
+// 机器上都会亮**，报警变成了背景噪音。
+//
+// 匿名的代价被两件事框住：一是只认回环对端（UseForwardedHeaders 已在更早的
+// 中间件里按 KnownProxies 还原过真实客户端 IP，nginx 形态下外部请求不会伪装成
+// 本机）；二是响应里只有一个档次词，不回显数据库版本、表计数、缺失分区名——
+// 那些是 /health/db 带令牌才看得到的东西，不因为换了个端点就漏出去。
+app.MapGet("/health/db/local", async (
+    HttpContext context,
+    HealthCheckService health,
+    CancellationToken ct) =>
+{
+    if (!BackupMonitor.Shared.Security.LanNetworkPolicy.IsLoopback(context.Connection.RemoteIpAddress))
+        return Results.NotFound();
+
+    var report = await health.CheckHealthAsync(
+        registration => registration.Name == "database", ct);
+
+    // 三档如实往外报：Degraded（库连得上、但未来 30 天缺分区）不该被压成
+    // 「不通」——那会让人去重启数据库，而真正要做的是补分区。
+    var reason = report.Status switch
+    {
+        HealthStatus.Healthy => null,
+        HealthStatus.Degraded => "数据库连接正常，但未来 30 天的分区不齐",
+        _ => "数据库自检失败：连接不上，或库结构不可用"
+    };
+
+    return Results.Ok(new
+    {
+        ok = report.Status == HealthStatus.Healthy,
+        status = report.Status.ToString(),
+        reason,
+        timestamp = DateTime.UtcNow
+    });
+})
+.AllowAnonymous();
 
 app.Run();

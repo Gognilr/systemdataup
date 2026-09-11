@@ -680,6 +680,29 @@ internal sealed class ServerMaintenance
             ?? throw new InvalidOperationException("找不到已安装服务端的数据库连接配置。");
     }
 
+    /// <summary>
+    /// 已安装服务端的版本号。读的是 BackupMonitor.Api.dll——真正在跑的那个程序，
+    /// 而不是管理台自己：升级安装之后两者可以短暂地不一致，而人要核对的是前者。
+    /// 读不到返回 null，由调用方决定怎么说。
+    /// </summary>
+    public string? GetInstalledServerVersion(string installDirectory)
+    {
+        try
+        {
+            var path = Path.Combine(installDirectory, "BackupMonitor.Api.dll");
+            if (!File.Exists(path))
+                return null;
+
+            var info = System.Diagnostics.FileVersionInfo.GetVersionInfo(path);
+            var version = info.ProductVersion ?? info.FileVersion;
+            return string.IsNullOrWhiteSpace(version) ? null : version.Split('+')[0];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
     public int GetInstalledApiPort(string installDirectory)
     {
         var configPath = Path.Combine(installDirectory, "appsettings.Turnkey.json");
@@ -754,6 +777,98 @@ internal sealed class ServerMaintenance
         _ => status
     };
 
+    /// <summary>数据库自检的四种结局。<c>Unknown</c> 是「问不出来」，不是「坏了」。</summary>
+    public enum LocalDatabaseHealth
+    {
+        Ok,
+        Degraded,
+        Failed,
+        Unknown
+    }
+
+    /// <summary>本机自检的一次结果：网页通不通、库通不通、以及一句原因。</summary>
+    public sealed record LocalHealth(bool ApiReachable, LocalDatabaseHealth Database, string? Reason);
+
+    /// <summary>
+    /// 本机自检（服务管理台状态条用）。
+    ///
+    /// 为什么服务管理台需要这个：状态条上那两个绿点回答的是「Windows 服务在不在跑」，
+    /// 而人来这个窗口想知道的是「备份现在收得进来吗」。这两件事会分家——
+    /// 数据库连不上时，BackupMonitor.Server 这个服务照样是「运行中」的绿点，
+    /// 备份和管理页面却已经全废。绿灯这时候不只是没帮上忙，它在骗人。
+    ///
+    /// 走 /health/db/local：那个端点只认回环、不要令牌，正是给本机运维界面准备的。
+    /// **不要改成 /health/db**——它要 system.manage 令牌，管理台手里没有，
+    /// 只会拿回 401，然后在每一台健康的机器上常亮橙灯。
+    ///
+    /// 这段探测逻辑与服务端托盘里的那份是重复的，且有意如此：托盘是个不引用任何
+    /// 项目的独立 exe（见其 csproj），为了二十行共享代码把它接进解决方案的依赖图
+    /// 不划算。两处若要改，一起改。
+    /// </summary>
+    public async Task<LocalHealth> ProbeLocalHealthAsync(string installDirectory, CancellationToken ct)
+    {
+        var apiPort = GetInstalledApiPort(installDirectory);
+
+        // 与托盘同一条取舍：对端是本机自签名证书，而这里既不发凭据也不读业务数据，
+        // 问的只是「这个端口还应不应答」。因此不做指纹固定，代价被限制在回环地址上。
+        using var handler = new HttpClientHandler
+        {
+            ServerCertificateCustomValidationCallback = (request, _, _, _) =>
+                request.RequestUri is not null
+                && System.Net.IPAddress.TryParse(request.RequestUri.Host, out var host)
+                && System.Net.IPAddress.IsLoopback(host)
+        };
+        using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(3) };
+
+        bool apiReachable;
+        try
+        {
+            using var response = await http.GetAsync($"https://127.0.0.1:{apiPort}/health", ct);
+            apiReachable = response.IsSuccessStatusCode;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            return new LocalHealth(false, LocalDatabaseHealth.Unknown, null);
+        }
+
+        if (!apiReachable)
+            return new LocalHealth(false, LocalDatabaseHealth.Unknown, null);
+
+        try
+        {
+            using var response = await http.GetAsync($"https://127.0.0.1:{apiPort}/health/db/local", ct);
+            if (!response.IsSuccessStatusCode)
+            {
+                // 404 = 服务端还没有这个端点（版本比管理台旧）；401/403 = 端点被改回要授权。
+                // 两种都属于「问不出来」，不能当成「库坏了」。
+                return new LocalHealth(true, LocalDatabaseHealth.Unknown, null);
+            }
+
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+            var root = document.RootElement;
+            var reason = root.TryGetProperty("reason", out var reasonValue)
+                && reasonValue.ValueKind == JsonValueKind.String
+                    ? reasonValue.GetString()
+                    : null;
+
+            if (root.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True)
+                return new LocalHealth(true, LocalDatabaseHealth.Ok, null);
+
+            var status = root.TryGetProperty("status", out var statusValue)
+                && statusValue.ValueKind == JsonValueKind.String
+                    ? statusValue.GetString()
+                    : null;
+
+            return string.Equals(status, "Degraded", StringComparison.OrdinalIgnoreCase)
+                ? new LocalHealth(true, LocalDatabaseHealth.Degraded, reason)
+                : new LocalHealth(true, LocalDatabaseHealth.Failed, reason);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            return new LocalHealth(true, LocalDatabaseHealth.Unknown, null);
+        }
+    }
+
     public async Task<string> GetDiagnosticsAsync(
         string installDirectory,
         string dataDirectory,
@@ -798,12 +913,24 @@ internal sealed class ServerMaintenance
             apiStatus = "unreachable";
         }
 
+        // 数据库自检单列一行：服务全是「运行中」而库不通，是这套系统最容易被漏看的故障，
+        // 一份不提数据库的诊断报告会让人以为一切正常。
+        var database = await ProbeLocalHealthAsync(installDirectory, ct);
+        var databaseStatus = database.Database switch
+        {
+            LocalDatabaseHealth.Ok => "正常",
+            LocalDatabaseHealth.Degraded => database.Reason ?? "分区不齐",
+            LocalDatabaseHealth.Failed => database.Reason ?? "自检失败",
+            _ => "未能自检"
+        };
+
         return string.Join(Environment.NewLine,
             $"服务端服务：{serverStatus}",
             $"　崩溃恢复：{DescribeRecoveryActions(ServerServiceName)}",
             $"PostgreSQL 服务：{postgresStatus}",
             $"　崩溃恢复：{DescribeRecoveryActions(PostgreSqlServiceName)}",
             $"API /health：{apiStatus}",
+            $"数据库自检：{databaseStatus}",
             $"内部密钥文件：{(File.Exists(secretPath) ? "存在" : "缺失")}",
             $"API 端口：{apiPort}",
             $"检查时间（UTC）：{DateTime.UtcNow:O}");

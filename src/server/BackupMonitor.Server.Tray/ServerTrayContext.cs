@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Net.Http;
@@ -17,7 +17,7 @@ namespace BackupMonitor.Server.Tray;
 ///
 /// 这个托盘要回答的是一个问题：这台服务器现在能不能收备份。
 /// 因此判定不是「进程在不在」，而是三件事叠起来：
-///   两个 Windows 服务的状态、/health（API 活着吗）、/health/db（库连得上吗）。
+///   两个 Windows 服务的状态、/health（API 活着吗）、/health/db/local（库连得上吗）。
 /// 图标三态对应的正是这三种处境：全绿 / 降级（服务在跑但库不通）/ 红（任一服务停了）。
 /// </summary>
 internal sealed class ServerTrayContext : ApplicationContext
@@ -74,7 +74,8 @@ internal sealed class ServerTrayContext : ApplicationContext
         _stopItem = new ToolStripMenuItem("停止服务", null, async (_, _) => await ControlServicesAsync(start: false));
 
         var menu = new ContextMenuStrip();
-        menu.Items.Add(new ToolStripMenuItem("BackupMonitor 服务端") { Enabled = false });
+        // 版本号写在标题行上：报修的第一句话永远是「你那边是哪个版本」。
+        menu.Items.Add(new ToolStripMenuItem($"BackupMonitor 服务端 {ReadServerVersion(_installDirectory)}") { Enabled = false });
         menu.Items.Add(_statusItem);
         menu.Items.Add(_detailItem);
         menu.Items.Add(new ToolStripSeparator());
@@ -126,9 +127,9 @@ internal sealed class ServerTrayContext : ApplicationContext
             var server = ReadServiceStatus(ServerServiceName);
             var postgres = ReadServiceStatus(PostgreSqlServiceName);
             var apiOk = await ProbeAsync("/health");
-            var dbOk = await ProbeAsync("/health/db");
+            var database = await ProbeDatabaseAsync();
 
-            var (tier, label, detail) = Judge(server, postgres, apiOk, dbOk);
+            var (tier, label, detail) = Judge(server, postgres, apiOk, database);
             var color = tier switch
             {
                 HealthTier.Healthy => Color.SeaGreen,
@@ -169,12 +170,15 @@ internal sealed class ServerTrayContext : ApplicationContext
     /// 三态判定。
     ///
     /// 「降级」这一档单独存在的理由：API 服务在跑、管理页面打得开，
-    /// 而 /health/db 不通——这时服务管理台上 BackupMonitor.Server 是绿灯「运行中」，
-    /// 实际上所有备份和页面全废。这正是整改 R1 要堵的那个洞的另一面：
-    /// 库没了不会把 API 一起带走，所以必须有一处专门显示这件事。
+    /// 而数据库自检不通——两个 Windows 服务这时都是「运行中」，
+    /// 光看服务状态什么都看不出来，实际上所有备份和页面全废。这正是整改 R1
+    /// 要堵的那个洞的另一面：库没了不会把 API 一起带走，所以必须有一处专门显示这件事。
     /// </summary>
     private (HealthTier Tier, string Label, string Detail) Judge(
-        ServiceControllerStatus? server, ServiceControllerStatus? postgres, bool apiOk, bool dbOk)
+        ServiceControllerStatus? server,
+        ServiceControllerStatus? postgres,
+        bool apiOk,
+        (DatabaseProbe State, string? Reason) database)
     {
         if (server is null && postgres is null)
             return (HealthTier.Unknown, "读不到服务状态", "请确认服务端已安装，并以管理员身份运行托盘");
@@ -193,11 +197,28 @@ internal sealed class ServerTrayContext : ApplicationContext
         if (!apiOk)
             return (HealthTier.Degraded, "服务在跑但网页不通", $"127.0.0.1:{_apiPort} 没有应答，管理网页可能打不开");
 
-        if (!dbOk)
-            return (HealthTier.Degraded, "服务在跑但数据库不通",
-                "两个服务都是运行中，但数据库自检失败——此时服务管理台上依然是绿灯，实际上备份和页面全废");
+        switch (database.State)
+        {
+            case DatabaseProbe.Failed:
+                return (HealthTier.Degraded, "服务在跑但数据库不通",
+                    "两个服务都是运行中，但数据库自检失败——备份此刻写不进库，管理页面也打不开内容");
 
-        return (HealthTier.Healthy, "运行正常", "服务、数据库、管理网页三项自检均通过");
+            case DatabaseProbe.Degraded:
+                // 分区不齐不是「现在坏了」，是「到某一天会坏」：库连得上、备份照收，
+                // 但缺的那一段时间一到，插入就会失败。橙灯而不是红灯，
+                // 且话要说成待办事项——重启服务对它没有任何用处。
+                return (HealthTier.Degraded, "数据库需要维护",
+                    database.Reason ?? "数据库连接正常，但未来 30 天的分区不齐");
+
+            case DatabaseProbe.Unknown:
+                // 自检端点够不着（多半是服务端版本比托盘旧）。这时候既不能报「不通」
+                // ——那是整改前那个永远亮着的假警报——也不能说三项全过。
+                return (HealthTier.Healthy, "运行正常",
+                    "服务与管理网页自检通过；数据库自检够不着，无法确认库是否可写");
+
+            default:
+                return (HealthTier.Healthy, "运行正常", "服务、数据库、管理网页三项自检均通过");
+        }
     }
 
     /// <summary>转差才弹一次气泡；恢复和持平都不弹——刷屏的通知等于没有通知。</summary>
@@ -225,6 +246,61 @@ internal sealed class ServerTrayContext : ApplicationContext
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
         {
             return false;
+        }
+    }
+
+    /// <summary>数据库自检的四种结局。<see cref="Unknown"/> 是「问不出来」，不是「坏了」。</summary>
+    private enum DatabaseProbe
+    {
+        Ok,
+        Degraded,
+        Failed,
+        Unknown
+    }
+
+    /// <summary>
+    /// 数据库自检。走 /health/db/local——只认回环、只回一个档次词的那个端点。
+    ///
+    /// **不要改回 /health/db**：那个端点要 system.manage 令牌，托盘手里没有令牌，
+    /// 拿回来的永远是 401。按「非 2xx 即数据库不通」去判，结果就是每一台健康的机器上
+    /// 都常亮橙灯——报警一旦永远为真，它就不再是报警。
+    /// </summary>
+    private async Task<(DatabaseProbe State, string? Reason)> ProbeDatabaseAsync()
+    {
+        try
+        {
+            using var response = await _http.GetAsync($"https://127.0.0.1:{_apiPort}/health/db/local");
+            if (!response.IsSuccessStatusCode)
+            {
+                // 404 = 服务端还没有这个端点（版本比托盘旧）或对端不是回环；
+                // 401/403 = 端点被改回要授权了。三种都属于「问不出来」。
+                return (DatabaseProbe.Unknown, null);
+            }
+
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            var root = document.RootElement;
+            var reason = root.TryGetProperty("reason", out var reasonValue)
+                && reasonValue.ValueKind == JsonValueKind.String
+                    ? reasonValue.GetString()
+                    : null;
+
+            if (root.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True)
+                return (DatabaseProbe.Ok, null);
+
+            var status = root.TryGetProperty("status", out var statusValue)
+                && statusValue.ValueKind == JsonValueKind.String
+                    ? statusValue.GetString()
+                    : null;
+
+            return string.Equals(status, "Degraded", StringComparison.OrdinalIgnoreCase)
+                ? (DatabaseProbe.Degraded, reason)
+                : (DatabaseProbe.Failed, reason);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException)
+        {
+            // 连不上 API 这件事由 /health 那一探负责判定并显示；
+            // 这里再喊一次「数据库不通」只会盖住真正的原因。
+            return (DatabaseProbe.Unknown, null);
         }
     }
 
@@ -389,6 +465,28 @@ internal sealed class ServerTrayContext : ApplicationContext
         _currentIcon?.Dispose();
         _http.Dispose();
         Application.ExitThread();
+    }
+
+    /// <summary>
+    /// 已安装服务端的版本。取的是 BackupMonitor.Api.dll——那是真正在跑的那个程序；
+    /// 托盘自己的版本在升级之后可能还停在旧的（它不随服务重启）。
+    /// </summary>
+    private static string ReadServerVersion(string installDirectory)
+    {
+        try
+        {
+            var path = Path.Combine(installDirectory, "BackupMonitor.Api.dll");
+            if (!File.Exists(path))
+                return "版本未知";
+
+            var info = FileVersionInfo.GetVersionInfo(path);
+            var version = info.ProductVersion ?? info.FileVersion;
+            return string.IsNullOrWhiteSpace(version) ? "版本未知" : "v" + version.Split('+')[0];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return "版本未知";
+        }
     }
 
     /// <summary>与 ServerMaintenance.GetInstalledApiPort 同一口径，读同一个文件。</summary>

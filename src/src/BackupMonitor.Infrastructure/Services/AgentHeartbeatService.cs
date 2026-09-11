@@ -185,6 +185,16 @@ public class AgentHeartbeatService : IAgentHeartbeatService
         if (userSessions is not null)
             await UpsertUserSessionsAsync(client.Id, userSessions, now, ct);
 
+        // 6. 配置有没有真的下去（R27）。要求的版本在这里就要算出来——
+        // 它既是心跳响应里的那个数，也是「这台有没有卡住」的唯一判据，
+        // 而落后起点必须和本次心跳一起落库，不能等到事务提交之后。
+        var requiredVersion = await _configService.GetRequiredVersionAsync(client.Id, ct);
+        var configStale = request.ConfigVersion < requiredVersion;
+        if (!configStale)
+            client.ConfigStaleSince = null;
+        else
+            client.ConfigStaleSince ??= now;
+
         await _db.SaveChangesAsync(ct);
 
         await transaction.CommitAsync(ct);
@@ -220,8 +230,9 @@ public class AgentHeartbeatService : IAgentHeartbeatService
         await EvaluateResourceAlertsAsync(client.Id, request, disks, ct);
         await EvaluateCertificateAlertAsync(client, now, ct);
 
-        // 7. 心跳响应
-        var requiredVersion = await _configService.GetRequiredVersionAsync(client.Id, ct);
+        await EvaluateConfigStalenessAsync(client, request.ConfigVersion, requiredVersion, now, ct);
+
+        // 8. 心跳响应
         var commandsAvailable = await _db.Commands
             .AnyAsync(c => c.ClientId == client.Id && c.Status == CommandStatus.Pending && c.ExpiresAt > now, ct);
         var heartbeatInterval = await _settings.GetIntAsync("heartbeat_interval_seconds", 60, ct);
@@ -251,6 +262,54 @@ public class AgentHeartbeatService : IAgentHeartbeatService
                 await transaction.RollbackAsync(CancellationToken.None);
             throw;
         }
+    }
+
+    /// <summary>
+    /// 配置卡住的告警（R27）。
+    ///
+    /// 来自一次现场故障：某台客户端从 08:01 到 14:42 每 10 秒失败一次配置同步
+    /// （它存的服务端签名公钥与服务端当前的对不上，自己把响应拒了），
+    /// 6.5 小时一个配置都没下去。而这次失败是**纯客户端侧**的：
+    /// 服务端只看到它一直在线、心跳从没断过，客户端列表里是绿的。
+    /// 任务改了不生效、新加的任务永远下不去，而界面上一切正常——
+    /// **一个不生效的配置比一个报错的配置危险得多**，因为没有人会去找它。
+    ///
+    /// 判据不需要客户端配合：心跳里本来就带着它当前持有的版本号。
+    /// 短暂落后是正常的（改完配置到下一次同步之间），所以按「落后了多久」判，
+    /// 而不是「是不是落后」。
+    /// </summary>
+    private async Task EvaluateConfigStalenessAsync(
+        Core.Entities.Client.Client client,
+        long reportedVersion,
+        long requiredVersion,
+        DateTime now,
+        CancellationToken ct)
+    {
+        var alertKey = $"client:{client.Id}:config_stale";
+        if (client.ConfigStaleSince is not { } staleSince)
+        {
+            await _alerting.RecoverAsync(alertKey, ct);
+            return;
+        }
+
+        var thresholdMinutes = Math.Clamp(
+            await _settings.GetIntAsync("agent_config_stale_minutes", 30, ct), 1, 1440);
+        var stuckFor = now - staleSince;
+        if (stuckFor < TimeSpan.FromMinutes(thresholdMinutes))
+            return;
+
+        await _alerting.RaiseAsync(
+            alertKey,
+            AlertLevel.Critical,
+            "agent_config_stale",
+            "客户端一直没拿到新配置",
+            $"这台机器在线、心跳正常，但它持有的配置版本是 {reportedVersion}，要求的是 {requiredVersion}，"
+            + $"已经卡了 {stuckFor.TotalHours:0.#} 小时。"
+            + "任务的增删改在这台机器上不会生效，新加的任务也下不去。"
+            + "常见原因是它存的服务端签名公钥与服务端当前的对不上（服务端重装或换过密钥），"
+            + "客户端日志里会是一串 CONFIG_SIGNATURE_INVALID；这种情况要在这台机器上重新运行客户端安装器。",
+            clientId: client.Id,
+            ct: ct);
     }
 
     private async Task EvaluateResourceAlertsAsync(
