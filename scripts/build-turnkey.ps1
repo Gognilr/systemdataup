@@ -301,7 +301,7 @@ $agentVersion = (Get-Item -LiteralPath $agentExe).VersionInfo.ProductVersion
 if ([string]::IsNullOrWhiteSpace($agentVersion)) {
     throw 'Unable to read the published agent version from BackupMonitor.Agent.exe.'
 }
-Set-Content -LiteralPath (Join-Path $apiPublish 'wwwroot\downloadsgent-version.txt') -Value $agentVersion.Trim() -Encoding utf8 -NoNewline
+Set-Content -LiteralPath (Join-Path $apiPublish 'wwwroot\downloads\agent-version.txt') -Value $agentVersion.Trim() -Encoding utf8 -NoNewline
 
 $clientZip = Join-Path $apiPublish 'wwwroot\downloads\BackupMonitor.Agent.zip'
 # 这几个名字与 AgentInstaller.ValidatePayload / install-agent.ps1 的期望一致：
@@ -359,7 +359,7 @@ $payloadRequired = @(
     'api\BackupMonitor.Api.exe',
     'api\BackupMonitor.Server.Tray.exe',
     'api\wwwroot\downloads\BackupMonitor.Agent.zip',
-    'api\wwwroot\downloadsgent-version.txt',
+    'api\wwwroot\downloads\agent-version.txt',
     'api\wwwroot\downloads\BackupMonitor.Agent.Setup.exe',
     'api\wwwroot\downloads\VC_redist.x64.exe',
     'api\wwwroot\downloads\check-prereq.cmd',
