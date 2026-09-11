@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 
@@ -18,6 +18,15 @@ public sealed class PendingUpdate
 
     /// <summary>下发这次升级的指令 ID，原样带给 updater，再由新 Agent 回报给服务端。</summary>
     public Guid? CommandId { get; set; }
+
+    /// <summary>
+    /// 已经拉起过几次 updater。到达上限就放弃这个包。
+    ///
+    /// 没有这个计数时，任何一种「装不上」都会变成无限重试：updater 失败后不会删
+    /// pending-update.json，Agent 重启后又读到它，再拉一次 updater——2026-09-11
+    /// OA 服务器这样空转了 312 圈，两个半小时。
+    /// </summary>
+    public int AttemptCount { get; set; }
 }
 
 /// <summary>updater 写下的升级结果（data 目录下的 upgrade-result.json）。</summary>
@@ -53,6 +62,18 @@ public sealed class AgentUpgradeCoordinator
 
     private const string UpdaterFileName = "BackupMonitor.Agent.Updater.exe";
 
+    /// <summary>updater 进程名（不含扩展名），用来判断它是否还在收尾。</summary>
+    private const string UpdaterProcessName = "BackupMonitor.Agent.Updater";
+
+    /// <summary>升级包里存放 updater 的子目录名。</summary>
+    private const string UpdaterPayloadFolderName = "updater";
+
+    /// <summary>数据目录下存放升级包的目录名。</summary>
+    private const string UpdatesFolderName = "updates";
+
+    /// <summary>数据目录下暂存「待换上去的新版 updater」的目录名。</summary>
+    private const string StagedUpdaterFolderName = "updater-staged";
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -71,6 +92,10 @@ public sealed class AgentUpgradeCoordinator
     private string PendingPath => Path.Combine(_options.ExpandedDataDirectory, PendingFileName);
 
     private string ResultPath => Path.Combine(_options.ExpandedDataDirectory, ResultFileName);
+
+    private string UpdatesRoot => Path.Combine(_options.ExpandedDataDirectory, UpdatesFolderName);
+
+    private string StagedUpdaterDirectory => Path.Combine(_options.ExpandedDataDirectory, StagedUpdaterFolderName);
 
     /// <summary>
     /// 升级执行器所在路径。
@@ -125,6 +150,29 @@ public sealed class AgentUpgradeCoordinator
     }
 
     public void ClearPending() => TryDelete(PendingPath);
+
+    /// <summary>
+    /// 记一次安装尝试并立即落盘，返回递增后的次数。
+    ///
+    /// 必须在**拉起 updater 之前**调用：updater 一启动就会把本服务停掉，
+    /// 之后这个进程再没有机会写下任何东西——写晚了等于没写。
+    /// </summary>
+    public int RecordAttempt(PendingUpdate pending)
+    {
+        pending.AttemptCount++;
+        try
+        {
+            File.WriteAllText(PendingPath, JsonSerializer.Serialize(pending, JsonOptions));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 写不进去就不计数。这会退化成旧的无限重试行为，但至少不挡住这次升级，
+            // 而写不进 data 目录本身会由 AgentStateStore 那边报出来。
+            _logger.LogWarning(ex, "升级尝试次数写盘失败，本次不计数");
+        }
+
+        return pending.AttemptCount;
+    }
 
     public UpgradeResultRecord? ReadResult()
     {
@@ -200,6 +248,184 @@ public sealed class AgentUpgradeCoordinator
         {
             _logger.LogError(ex, "启动升级执行器失败");
             return false;
+        }
+    }
+
+    /// <summary>
+    /// 从升级包里把新版 updater 抢下来暂存（Agent 启动时调一次）。
+    ///
+    /// updater 住在安装目录的**同级**目录，而升级只换安装目录——所以它换不到自己，
+    /// 每台机器上的 updater 会永久停在当初安装时的版本。对一个「以后都靠 OTA」的系统来说，
+    /// 这个漂移会一直累积，直到某天真要改 updater，才发现全网的 updater 都是老的。
+    ///
+    /// 时机是关键：这里要赶在**正在跑的那个 updater 清理 payload 目录之前**把文件拿走。
+    /// 窗口很宽——Agent 在服务启动后零点几秒就跑起来，而那边 WaitForHeartbeat 至少要等
+    /// 一个心跳周期。而且这一步由 Agent 单方面完成，不需要 updater 配合，
+    /// 所以老 updater 装的机器第一次升上来就能用。
+    /// </summary>
+    public void TryStageUpdaterFromPayload()
+    {
+        try
+        {
+            if (!Directory.Exists(UpdatesRoot))
+                return;
+
+            var installedVersion = ReadProductVersion(ResolveUpdaterPath());
+
+            foreach (var payloadUpdaterDirectory in Directory.EnumerateDirectories(UpdatesRoot)
+                         .Select(d => Path.Combine(d, "payload", UpdaterPayloadFolderName))
+                         .Where(Directory.Exists))
+            {
+                var candidate = Path.Combine(payloadUpdaterDirectory, UpdaterFileName);
+                var candidateVersion = ReadProductVersion(candidate);
+                if (candidateVersion is null)
+                    continue;
+
+                if (installedVersion is not null && candidateVersion <= installedVersion)
+                    continue;
+
+                CopyFilesInto(payloadUpdaterDirectory, StagedUpdaterDirectory);
+                _logger.LogInformation(
+                    "已暂存新版升级执行器 {Candidate}（本机当前 {Installed}），待它退出后替换",
+                    candidateVersion, installedVersion?.ToString() ?? "未知");
+                return;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "暂存新版升级执行器失败，本次跳过");
+        }
+    }
+
+    /// <summary>
+    /// 把暂存的新版 updater 换上去（升级循环每轮调一次）。
+    ///
+    /// **等它退出，不杀它**。新 Agent 起来的时候，那个 updater 正卡在 WaitForHeartbeat 里
+    /// 等这台机器的心跳；它后面还要清备份目录、清暂存包，最后写 upgrade-result.json——
+    /// 而那份文件是服务端唯一的成功凭据。杀掉它等于把「升级成功」这个结论一起杀掉，
+    /// 服务端只能等超时，然后得出「这台机器没起来」这个与事实相反的结论。
+    ///
+    /// 换不成就把暂存留着下一轮重试，绝不留下换到一半的状态。
+    /// </summary>
+    public void TryInstallStagedUpdater()
+    {
+        try
+        {
+            var staged = Path.Combine(StagedUpdaterDirectory, UpdaterFileName);
+            if (!File.Exists(staged))
+                return;
+
+            var installed = ResolveUpdaterPath();
+            if (installed is null)
+            {
+                // 本机压根没装 updater（从老包装上来的机器）。这里不擅自建一个出来：
+                // 那种机器本来就走人工升级，凭空多出一个 updater 只会让现场更难判断。
+                TryDeleteDirectory(StagedUpdaterDirectory);
+                return;
+            }
+
+            var stagedVersion = ReadProductVersion(staged);
+            var installedVersion = ReadProductVersion(installed);
+            if (stagedVersion is null || (installedVersion is not null && stagedVersion <= installedVersion))
+            {
+                TryDeleteDirectory(StagedUpdaterDirectory);
+                return;
+            }
+
+            if (IsUpdaterRunning())
+                return;
+
+            var targetDirectory = Path.GetDirectoryName(installed)!;
+            foreach (var file in Directory.EnumerateFiles(StagedUpdaterDirectory, "*", SearchOption.TopDirectoryOnly))
+                ReplaceFile(file, Path.Combine(targetDirectory, Path.GetFileName(file)));
+
+            _logger.LogInformation(
+                "升级执行器已更新：{Installed} → {Staged}",
+                installedVersion?.ToString() ?? "未知", stagedVersion);
+            TryDeleteDirectory(StagedUpdaterDirectory);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "替换升级执行器失败，保留暂存下一轮重试");
+        }
+    }
+
+    /// <summary>
+    /// 本机 updater 的版本，随心跳上报给服务端；没装 updater 时返回 null。
+    ///
+    /// 服务端拿它回答「哪几台的 updater 还是老的」——在自更新机制上线之前，
+    /// 这个问题只能挨台机器远程上去看文件属性。
+    /// </summary>
+    public string? GetInstalledUpdaterVersion() => ReadProductVersion(ResolveUpdaterPath())?.ToString();
+
+    /// <summary>updater 是否还在跑。判不出来时一律当作「在跑」——宁可晚换一轮，也不要换到一半。</summary>
+    private static bool IsUpdaterRunning()
+    {
+        Process[] processes;
+        try
+        {
+            processes = Process.GetProcessesByName(UpdaterProcessName);
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+
+        try
+        {
+            return processes.Length > 0;
+        }
+        finally
+        {
+            foreach (var process in processes)
+                process.Dispose();
+        }
+    }
+
+    /// <summary>产品版本号；读不到或解析不出来返回 null。构建后缀（1.3.2+abc123）在这里截掉。</summary>
+    private static Version? ReadProductVersion(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return null;
+
+        try
+        {
+            var raw = FileVersionInfo.GetVersionInfo(path).ProductVersion;
+            var core = raw?.Split('+')[0].Trim();
+            return Version.TryParse(core, out var version) ? version : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>先写同目录临时文件再整体改名：断电时要么是旧的要么是新的，不会是半个。</summary>
+    private static void ReplaceFile(string source, string destination)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        var temporary = destination + ".new";
+        File.Copy(source, temporary, overwrite: true);
+        File.Move(temporary, destination, overwrite: true);
+    }
+
+    private static void CopyFilesInto(string sourceDirectory, string destinationDirectory)
+    {
+        Directory.CreateDirectory(destinationDirectory);
+        foreach (var file in Directory.EnumerateFiles(sourceDirectory, "*", SearchOption.TopDirectoryOnly))
+            File.Copy(file, Path.Combine(destinationDirectory, Path.GetFileName(file)), overwrite: true);
+    }
+
+    private void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "删除目录失败 {Path}", path);
         }
     }
 

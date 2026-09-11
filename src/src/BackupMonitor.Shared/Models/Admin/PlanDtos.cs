@@ -1,4 +1,4 @@
-using System.ComponentModel.DataAnnotations;
+﻿using System.ComponentModel.DataAnnotations;
 
 namespace BackupMonitor.Shared.Models.Admin;
 
@@ -10,6 +10,9 @@ public class BackupPlanDto
     public string Name { get; set; } = null!;
 
     public bool Enabled { get; set; }
+
+    /// <inheritdoc cref="BackupPlanUpsertDto.NotifyOnFinish"/>
+    public bool NotifyOnFinish { get; set; }
 
     /// <summary>daily / weekly</summary>
     public string ScheduleKind { get; set; } = "daily";
@@ -61,6 +64,15 @@ public class BackupPlanUpsertDto : IValidatableObject
     public string Name { get; set; } = null!;
 
     public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// 每次到点跑完后发一条汇总回执（成功几项、失败几项、哪几项失败）。默认关闭。
+    ///
+    /// 跑完就发，不只在有失败时发：只在出事时发的摘要会退化成另一种告警，
+    /// 而它真正不可替代的价值恰恰是那条「12 项全成功」——收到它才知道计划确实跑了。
+    /// 只对**到点触发**的执行发；人手点「立即执行」时正盯着页面看，再推一条是纯噪音。
+    /// </summary>
+    public bool NotifyOnFinish { get; set; }
 
     /// <summary>daily / weekly</summary>
     public string ScheduleKind { get; set; } = "daily";

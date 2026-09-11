@@ -143,7 +143,9 @@ pre.json{background:var(--surface-sunk);border:1px solid var(--border);border-ra
 .text-muted,.tip{color:var(--text-muted);font:var(--t-sm)}
 .text-error{color:var(--err-fg)}
 .form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 var(--s-4)}
-.notification-settings{max-width:760px}
+/* 表单页此前刻意收窄到 760px 便于阅读，但全站其他页面都是满宽的，
+   同一个侧栏下两种宽度看起来像是页面没加载完。宽度统一优先。 */
+.notification-settings{max-width:none}
 .tabbar{display:flex;align-items:center;gap:var(--s-1);border-bottom:1px solid var(--border);margin-bottom:var(--s-4)}
 .tab{display:inline-flex;align-items:center;min-height:36px;padding:0 var(--s-3);color:var(--text-muted);border-bottom:2px solid transparent;font:500 var(--t-body)}
 .tab:hover{color:var(--text)}

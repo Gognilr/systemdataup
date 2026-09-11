@@ -50,7 +50,10 @@ public sealed class SystemProbe
         var sessions = GetUserSessions();
         var ipAddresses = GetIpAddresses();
 
-        var digest = ComputeSnapshotDigest(disks, services, sessions, ipAddresses);
+        var osName = GetOsName();
+        var osVersion = Environment.OSVersion.VersionString;
+
+        var digest = ComputeSnapshotDigest(disks, services, sessions, ipAddresses, osName, osVersion);
         var unchanged = _lastSnapshotDigest is not null && _lastSnapshotDigest == digest;
         _lastSnapshotDigest = digest;
 
@@ -65,6 +68,11 @@ public sealed class SystemProbe
             ServiceStates = unchanged ? null : services,
             UserSessions = unchanged ? null : sessions,
             IpAddresses = unchanged ? null : ipAddresses,
+            // 系统信息此前只在注册那一刻上报过一次，之后永不刷新——一台从 2012 R2
+            // 就地升到 2019 的机器，界面上会一直显示 2012 R2。跟着快照走：平时不占带宽，
+            // 真换了系统时摘要会变，下一次心跳自然带上去。
+            OsName = unchanged ? null : osName,
+            OsVersion = unchanged ? null : osVersion,
             SnapshotUnchanged = unchanged,
             ActiveCommands = activeCommands.ToList(),
             ActiveUploads = [],
@@ -85,7 +93,9 @@ public sealed class SystemProbe
         List<HeartbeatDiskDto>? disks,
         List<HeartbeatServiceStateDto>? services,
         List<HeartbeatUserSessionDto>? sessions,
-        List<string>? ipAddresses)
+        List<string>? ipAddresses,
+        string? osName,
+        string? osVersion)
     {
         // 磁盘可用空间按 64MB 粒度取整：它每次采样都会有几 KB 的抖动，
         // 按字节比对会让摘要永不相同，而告警阈值是百分比，这个粒度足够。
@@ -126,6 +136,12 @@ public sealed class SystemProbe
                 .Append(session.State).Append(fieldSeparator)
                 .Append(session.IsRemote ? '1' : '0').Append(itemSeparator);
         }
+
+        // 系统名与版本：正常情况下一辈子不变，一旦变了就是就地升级过系统，
+        // 那恰恰是必须让服务端知道的一次变化。
+        builder.Append(sectionSeparator)
+            .Append(osName).Append(fieldSeparator)
+            .Append(osVersion);
 
         // 网卡地址排序后入摘要：同一台机器上枚举顺序不保证稳定，
         // 不排序会让「地址没变」被误判成「变了」，每次心跳都白写一遍库。
@@ -171,6 +187,42 @@ public sealed class SystemProbe
         catch
         {
             return [];
+        }
+    }
+
+    /// <summary>
+    /// 系统产品全名，取自注册表 ProductName（如 "Windows Server 2016 Standard"）。
+    ///
+    /// 不用 Environment.OSVersion：它给的是内核版本号（"Microsoft Windows NT 10.0.14393.0"），
+    /// 而 10.0.x 这些号在服务器版和桌面版之间共用（14393 既是 Server 2016 也是 Win10 1607），
+    /// 界面上一整列内核版本号，回答不了「哪几台还停在 2012 R2」这个问题。
+    ///
+    /// 已知的坑：Windows 11 的 ProductName 至今仍写着 "Windows 10"，所以 build ≥ 22000 时
+    /// 手工纠正。服务器版没有这个问题，但客户端不一定只装在服务器上。
+    /// 读不到就退回 "Windows"——跟改动之前的行为一致，不会让注册失败。
+    /// </summary>
+    public string GetOsName()
+    {
+        try
+        {
+            using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
+                @"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+            if (key?.GetValue("ProductName") is not string product || string.IsNullOrWhiteSpace(product))
+                return "Windows";
+
+            product = product.Trim();
+            if (key.GetValue("CurrentBuildNumber") is string buildText
+                && int.TryParse(buildText, out var build)
+                && build >= 22000)
+            {
+                product = product.Replace("Windows 10", "Windows 11", StringComparison.OrdinalIgnoreCase);
+            }
+
+            return product;
+        }
+        catch (Exception)
+        {
+            return "Windows";
         }
     }
 

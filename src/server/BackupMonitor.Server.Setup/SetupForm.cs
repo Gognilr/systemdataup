@@ -1070,12 +1070,23 @@ internal sealed class SetupForm : Form
         return ErrColor;
     }
 
+    /// <summary>
+    /// 打开管理网页。地址用机器名而不是 127.0.0.1，与托盘的「打开管理网页」保持一致。
+    ///
+    /// 这不是风格问题，是能不能打开的问题。Windows 代理例外列表里的 &lt;local&gt;
+    /// （界面上叫「跳过本地地址」）只匹配**不含句点的主机名**，PAC 脚本里的
+    /// isPlainHostName() 同理。机器名不含点，命中例外、直连；而 "127.0.0.1" 含三个点，
+    /// 一律被交给代理——在装了上网行为管理的环境里，代理会把它当成一次普通外网访问拦下来，
+    /// 用户看到的是一张拦截页，而不是管理页。
+    ///
+    /// 另外服务端证书是按机器名签的，用机器名打开还少一次证书名称不匹配的警告。
+    /// </summary>
     private void OpenWeb()
     {
         try
         {
             var port = _maintenance.GetInstalledApiPort(_installDirectory);
-            Process.Start(new ProcessStartInfo($"https://127.0.0.1:{port}/") { UseShellExecute = true });
+            Process.Start(new ProcessStartInfo($"https://{Environment.MachineName}:{port}/") { UseShellExecute = true });
         }
         catch (Exception ex)
         {

@@ -149,6 +149,7 @@ public class ClientAdminService : IClientAdminService
                 c.ClientGroupId,
                 GroupName = c.ClientGroup != null ? c.ClientGroup.Name : null,
                 c.OsName,
+                c.OsVersion,
                 c.AgentVersion,
                 c.Status,
                 c.EnrollmentMode,
@@ -211,6 +212,7 @@ public class ClientAdminService : IClientAdminService
             CertificateRemainingDays = r.CertificateExpiresAt is null
                 ? null
                 : Math.Max(0, (int)Math.Ceiling((r.CertificateExpiresAt.Value - DateTime.UtcNow).TotalDays)),
+            OsVersion = r.OsVersion,
             LastHeartbeatAt = r.LastHeartbeatAt,
             LastSeenAt = r.LastSeenAt,
             LastRemoteIp = r.LastRemoteIp,
@@ -261,11 +263,78 @@ public class ClientAdminService : IClientAdminService
         if (TryNormalizeIpv4(lastRemoteIp, out var fromPeer))
             return fromPeer;
 
+        // 自报列表是按网卡枚举顺序排的，第一个未必是能用的那个：VPN、Hyper-V 虚拟交换机、
+        // 存储网这些都可能排在真实业务地址前面（现场见过 10.0.0.1 排在 172.16.11.139 前面，
+        // 于是界面上给出的是一个连不上任何东西的地址）。
+        //
+        // 先挑与服务端处在同一网段的那个——客户端既然连得上服务端，就说明它在那个网段上有腿。
+        // 一个都对不上时才退回第一个：跨网段部署是合法的，那种情况下确实无从判断。
+        var candidates = new List<string>();
         foreach (var candidate in ParseIpAddresses(ipAddressesJson))
-            if (TryNormalizeIpv4(candidate, out var selfReported))
-                return selfReported;
+            if (TryNormalizeIpv4(candidate, out var selfReported) && selfReported is not null)
+                candidates.Add(selfReported);
 
-        return null;
+        foreach (var candidate in candidates)
+            if (IsOnServerSubnet(candidate))
+                return candidate;
+
+        return candidates.FirstOrDefault();
+    }
+
+    /// <summary>
+    /// 服务端自己的 IPv4 地址与子网掩码。
+    ///
+    /// 进程内只算一次：网卡配置在运行期基本不变，而这个值会被客户端列表的每一行调用。
+    /// 掩码取网卡上真实配置的那一份，不硬编码 /24——服务端在 172.16.0.0/16 上时，
+    /// 按 /24 去比会把同一个二层网里的客户端判成「不同网段」。
+    /// </summary>
+    private static readonly Lazy<(uint Address, uint Mask)[]> ServerSubnets = new(LoadServerSubnets);
+
+    private static (uint Address, uint Mask)[] LoadServerSubnets()
+    {
+        try
+        {
+            return System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+                .Where(n => n.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up)
+                .SelectMany(n => n.GetIPProperties().UnicastAddresses.Cast<System.Net.NetworkInformation.UnicastIPAddressInformation>())
+                .Where(a => a.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                            && !System.Net.IPAddress.IsLoopback(a.Address)
+                            && a.IPv4Mask is not null)
+                .Select(a => (Address: ToUInt32(a.Address), Mask: ToUInt32(a.IPv4Mask)))
+                .Where(x => x.Mask != 0)
+                .Distinct()
+                .ToArray();
+        }
+        catch (Exception)
+        {
+            // 拿不到网卡信息就退化成「不判断网段」，回落到列表里的第一个地址——
+            // 与这次改动之前的行为一致，不会因为探测失败而给不出地址。
+            return [];
+        }
+    }
+
+    private static bool IsOnServerSubnet(string ipv4)
+    {
+        if (!System.Net.IPAddress.TryParse(ipv4, out var parsed)
+            || parsed.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+        {
+            return false;
+        }
+
+        var value = ToUInt32(parsed);
+        foreach (var (address, mask) in ServerSubnets.Value)
+            if ((value & mask) == (address & mask))
+                return true;
+
+        return false;
+    }
+
+    private static uint ToUInt32(System.Net.IPAddress address)
+    {
+        var bytes = address.GetAddressBytes();
+        return bytes.Length == 4
+            ? ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3]
+            : 0;
     }
 
     /// <summary>
@@ -388,6 +457,7 @@ public class ClientAdminService : IClientAdminService
             ActiveUploadTaskNames = activeUploads.Distinct().ToList(),
 
             MachineId = client.MachineId,
+            UpdaterVersion = client.UpdaterVersion,
             OsVersion = client.OsVersion,
             Architecture = client.Architecture,
             IpAddresses = ParseIpAddresses(client.IpAddresses),
@@ -572,7 +642,10 @@ public class ClientAdminService : IClientAdminService
                 c.Hostname,
                 c.DisplayName,
                 c.Status,
+                c.OsName,
+                c.OsVersion,
                 c.LastHeartbeatAt,
+                c.LastSeenAt,
                 c.LastRemoteIp,
                 // 与列表页同一个用途：对端地址不是 IPv4 时，从自报网卡里挑一个能用的。
                 c.IpAddresses
@@ -625,7 +698,10 @@ public class ClientAdminService : IClientAdminService
                     Hostname = c.Hostname,
                     DisplayName = c.DisplayName,
                     Status = EnumMapping.ToSnakeCase(c.Status),
+                    OsName = c.OsName,
+                    OsVersion = c.OsVersion,
                     LastHeartbeatAt = c.LastHeartbeatAt,
+                    LastSeenAt = c.LastSeenAt,
                     LastRemoteIp = c.LastRemoteIp,
                     Ipv4Address = ResolveIpv4(c.LastRemoteIp, c.IpAddresses),
                     CpuPercent = heartbeat?.CpuPercent,

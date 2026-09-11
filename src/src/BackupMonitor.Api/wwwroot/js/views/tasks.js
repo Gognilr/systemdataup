@@ -444,6 +444,9 @@ async function taskFormFields(initial, template, prefill, client) {
       hint: pausedHint || '自动：扫到就传走存好（默认，不需要人管）；仅监控：只检查、发现问题告警，但不上传；需审批 / 手动：每一份都要人在这里点一次「立即备份」才会传' },
     { name: 'importanceLevel', label: '重要级', type: 'select', value: v.importanceLevel || 'normal', options: optsOf(L.importance), advanced: true },
     { name: 'enabled', label: '状态', labelText: '启用该任务', type: 'checkbox', value: v.enabled !== false, advanced: true },
+    { name: 'notifyOnSuccess', label: '成功通知', labelText: '备份成功也发一条通知', type: 'checkbox', value: v.notifyOnSuccess === true, advanced: true,
+      hint: '默认不发。只给真正要盯的任务打开——每个任务每天成功一次，开多了群里就全是「都挺好」，'
+        + '真出事的那条反而会被一起划过去。发到哪些渠道由通知设置里各渠道的「另外排除这些类别」决定。' },
     { name: 'priority', label: '优先级', type: 'number', value: v.priority ?? 100, hint: '数值小的优先', advanced: true },
     // 任务进了备份计划之后，它自己的扫描计划就不再下发给客户端（服务端会把它置空下发）。
     // 两者都留着的话，同一个任务一天会跑两次：一次 Agent 按 cron 触发，一次计划驱动。
@@ -556,6 +559,7 @@ function taskFormValues(vals, base, baseConfig) {
   return Object.assign(carried, {
     name: vals.name, applicationName: vals.applicationName, sourcePath: vals.sourcePath,
     recognizerType: vals.recognizerType, taskMode: vals.taskMode, enabled: vals.enabled,
+    notifyOnSuccess: vals.notifyOnSuccess === true,
     priority: Number(vals.priority) || 100, importanceLevel: vals.importanceLevel,
     // 任务在备份计划里时，表单上没有扫描计划这个输入框（由计划驱动）。
     // 这里必须回填原值：读不到就当成 null 的话，一次保存就把它存的 cron 抹掉了，
@@ -615,6 +619,7 @@ export async function openTaskDrawer(id, viaNav = false) {
       <div class="row"><div class="k">识别器</div><div class="v">${esc(L.recognizer[d.recognizerType] || d.recognizerType)}</div></div>
       <div class="row"><div class="k">模式</div><div class="v">${status('task_mode', d.taskMode)}</div></div>
       <div class="row"><div class="k">启用</div><div class="v">${d.enabled ? '是' : '否'}</div></div>
+      <div class="row"><div class="k">成功通知</div><div class="v">${d.notifyOnSuccess ? '是' : '否'}</div></div>
       <div class="row"><div class="k">重要级 / 优先级</div><div class="v">${esc(L.importance[d.importanceLevel] || d.importanceLevel)} / ${esc(d.priority)}</div></div>
       <div class="row"><div class="k">扫描计划</div><div class="v">${d.planName
         ? `由备份计划「${esc(d.planName)}」驱动`
@@ -1055,6 +1060,7 @@ async function applyRequiredFiles(taskId, patterns) {
     body: {
       name: detail.name, applicationName: detail.applicationName, sourcePath: detail.sourcePath,
       recognizerType: detail.recognizerType, taskMode: detail.taskMode, enabled: detail.enabled,
+      notifyOnSuccess: detail.notifyOnSuccess === true,
       priority: detail.priority, importanceLevel: detail.importanceLevel,
       scanSchedule: detail.scanSchedule,
       uploadWindowStart: detail.uploadWindowStart, uploadWindowEnd: detail.uploadWindowEnd,

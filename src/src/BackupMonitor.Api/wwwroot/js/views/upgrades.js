@@ -25,7 +25,7 @@ const TARGET_STATUS = {
 export async function vUpgrades() {
   $('#app').innerHTML = shell('upgrades', 'Agent 升级下发', loading());
   try {
-    $('#view').innerHTML = `<div class="card" style="max-width:900px">
+    $('#view').innerHTML = `<div class="card">
       <p class="text-muted">给选中的客户端下发升级。<b>下发只是开始</b>：每一批都要等这些机器心跳回来、
         并且自报的版本号真的变成目标版本，才会放行下一批；哪一批失败，后面的批次就停在那里。</p>
       <div id="ug_pkg" class="hint"></div>
@@ -40,7 +40,7 @@ export async function vUpgrades() {
         <div class="frow"><label>备注</label><input id="ug_note"></div></div>
       <button class="primary" id="ug_btn">下发升级</button><div id="ug_result" class="result-block"></div>
     </div>
-    <div class="card" style="max-width:900px"><h3>最近的升级下发</h3><div id="ug_list">${loading()}</div></div>`;
+    <div class="card"><h3>最近的升级下发</h3><div id="ug_list">${loading()}</div></div>`;
     // B5：此前一次拉 200 台铺成勾选网格，超过 200 台的部署会静默漏掉后面的机器。
     // 改成按关键字问服务端要匹配项，选中的机器以 chip 形式留在输入框下方。
     const picker = initSearchPicker($('#view'), 'ug-clients', { multi: true, search: searchClients });

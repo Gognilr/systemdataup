@@ -104,4 +104,43 @@ public class AdminNotificationController : ApiBaseController
 
         return OkMessage($"测试邮件已发送至 {recipient}");
     }
+
+    /// <summary>
+    /// 发送测试消息（企业微信 / 钉钉）。与「发送测试邮件」同一条口径：
+    /// 用当前表单里的地址试发一条，机器人返回的原始错误原样带回界面，
+    /// 不必等真实告警触发才发现 webhook 粘错、或钉钉安全设置选了代码不支持的「加签」。
+    /// </summary>
+    [HttpPost("notification-settings/test-webhook")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:system.manage")]
+    public async Task<ActionResult<ApiResponse>> SendTestWebhook(
+        [FromBody] NotificationTestWebhookRequest request, CancellationToken ct)
+    {
+        var channel = (request.Channel ?? string.Empty).Trim().ToLowerInvariant();
+        if (channel is not ("wecom" or "dingtalk"))
+            throw new ValidationFailedException("渠道只能是 wecom 或 dingtalk");
+
+        var webhookUrl = request.WebhookUrl;
+
+        // 表单里的地址框可能仍是掩码（用户没有重新粘贴），换成库中当前保存的明文地址
+        if (string.IsNullOrWhiteSpace(webhookUrl) || webhookUrl == NotificationSecretMask.Unchanged)
+        {
+            var current = await _notificationService.GetSettingsAsync(ct);
+            webhookUrl = channel == "wecom" ? current.Wecom.WebhookUrl : current.Dingtalk.WebhookUrl;
+        }
+
+        if (string.IsNullOrWhiteSpace(webhookUrl))
+            throw new ValidationFailedException("请先填写 webhook 地址");
+
+        try
+        {
+            await NotificationDispatchWorker.SendTestWebhookAsync(webhookUrl.Trim(), ct);
+        }
+        catch (Exception ex)
+        {
+            // 机器人返回的原始错误原样带回界面，不做二次包装
+            throw new BusinessException("WEBHOOK_TEST_FAILED", ex.Message, 400);
+        }
+
+        return OkMessage(channel == "wecom" ? "测试消息已发送到企业微信群" : "测试消息已发送到钉钉群");
+    }
 }

@@ -1,4 +1,4 @@
-using Microsoft.Extensions.Logging.Abstractions;
+﻿using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace BackupMonitor.Agent.Tests;
@@ -74,6 +74,59 @@ public class PendingUpgradeStateTests : IDisposable
         // 找不到就明说找不到，Agent 会据此回报「需要人工到这台机器上完成安装」。
         var coordinator = CreateCoordinator(updaterPath: Path.Combine(_dataDirectory, "not-here.exe"));
         Assert.Null(coordinator.ResolveUpdaterPath());
+    }
+
+    [Fact]
+    public void 暂存目录是空的时候换升级执行器这一步什么都不做()
+    {
+        var coordinator = CreateCoordinator(updaterPath: NewUpdaterFile("installed"));
+
+        // 绝大多数轮次都走这条路径（每个升级循环都会调一次）。
+        // 它必须是纯粹的空操作——在这里抛异常会把整条升级循环带下去。
+        coordinator.TryInstallStagedUpdater();
+        coordinator.TryStageUpdaterFromPayload();
+    }
+
+    [Fact]
+    public void 暂存的升级执行器不比本机的新时直接清掉暂存()
+    {
+        var installed = NewUpdaterFile("installed");
+        var staged = Path.Combine(_dataDirectory, "updater-staged");
+        Directory.CreateDirectory(staged);
+        File.Copy(installed, Path.Combine(staged, "BackupMonitor.Agent.Updater.exe"));
+
+        CreateCoordinator(updaterPath: installed).TryInstallStagedUpdater();
+
+        // 同版本没有替换的必要。留着它的话，每一轮升级循环都会重新比一次版本、
+        // 重新判一次进程，而这份文件永远不会被用掉——那是一个不会自己消失的垃圾。
+        Assert.False(Directory.Exists(staged));
+    }
+
+    [Fact]
+    public void 本机没装升级执行器时不擅自造一个出来()
+    {
+        var staged = Path.Combine(_dataDirectory, "updater-staged");
+        Directory.CreateDirectory(staged);
+        File.Copy(SampleVersionedFile, Path.Combine(staged, "BackupMonitor.Agent.Updater.exe"));
+
+        // 从老包装上来的机器本来就没有 updater，只能人工升级。
+        // 凭空补一个出来只会让现场多出一种没人预料到的状态。
+        CreateCoordinator(updaterPath: Path.Combine(_dataDirectory, "not-here.exe"))
+            .TryInstallStagedUpdater();
+
+        Assert.False(Directory.Exists(staged));
+    }
+
+    /// <summary>带版本资源的真实文件——FileVersionInfo 读不出版本号的文件一律会被跳过。</summary>
+    private static string SampleVersionedFile => typeof(AgentUpgradeCoordinator).Assembly.Location;
+
+    private string NewUpdaterFile(string folder)
+    {
+        var directory = Path.Combine(_dataDirectory, folder);
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "BackupMonitor.Agent.Updater.exe");
+        File.Copy(SampleVersionedFile, path, overwrite: true);
+        return path;
     }
 
     private AgentUpgradeCoordinator CreateCoordinator(string? updaterPath = null)

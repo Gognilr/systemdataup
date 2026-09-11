@@ -1,7 +1,9 @@
-﻿using BackupMonitor.Core.Entities.Execution;
+﻿using System.Diagnostics.CodeAnalysis;
+using BackupMonitor.Core.Entities.Execution;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
+using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Scheduling;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -707,8 +709,10 @@ public class SequentialExecutionWorker : BackgroundService
         run.SucceededItems = succeeded;
         run.FailedItems = failed;
 
+        var justFinished = false;
         if (unfinished == 0 && run.FinishedAt is null)
         {
+            justFinished = true;
             // 取消掉的执行保持 cancelled：它结束的原因是人取消了，不是跑完了
             if (run.Status != BatchStatus.Cancelled)
                 run.Status = failed == 0
@@ -724,5 +728,159 @@ public class SequentialExecutionWorker : BackgroundService
 
         if (changed)
             await db.SaveChangesAsync(ct);
+
+        if (justFinished)
+            await EnqueuePlanFinishNoticeAsync(run, ct);
+    }
+
+    /// <summary>
+    /// 备份计划完成回执：一次计划跑完发一条汇总，而不是每个任务各发一条。
+    ///
+    /// 一个 12 项的计划按任务发就是 12 条「都挺好」，而人要问的是
+    /// 「昨晚那批跑完了吗，有没有翻车的」——一晚上一条就够，还能把失败的项列出来。
+    ///
+    /// 两条刻意的边界：
+    /// **跑完就发**，不只在有失败时发——只在出事时发的摘要会退化成另一种告警，
+    /// 而它不可替代的价值恰恰是那条「12 项全成功」：收到它才知道计划确实跑了。
+    /// **只对到点触发的执行发**——人手点「立即执行」时正盯着页面看，再推一条是纯噪音。
+    ///
+    /// 用自己的作用域：这是收尾之后的附带动作，发不出去不该影响执行记录本身。
+    /// </summary>
+    private async Task EnqueuePlanFinishNoticeAsync(ExecutionRun run, CancellationToken ct)
+    {
+        try
+        {
+            if (run.PlanId is null)
+                return;
+
+            await using var scope = _scopeFactory.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            var plan = await db.BackupPlans.AsNoTracking()
+                .FirstOrDefaultAsync(p => p.Id == run.PlanId.Value, ct);
+            if (!ShouldNotifyPlanFinish(run, plan))
+                return;
+
+            var failedItems = await db.ExecutionRunItems.AsNoTracking()
+                .Where(i => i.RunId == run.Id
+                            && (i.Status == ExecutionItemStatus.Failed
+                                || i.Status == ExecutionItemStatus.Timeout))
+                .OrderBy(i => i.SortOrder)
+                .Select(i => new PlanFinishFailure(
+                    i.Task.Client.DisplayName,
+                    i.Task.Name,
+                    i.Status,
+                    i.Message))
+                .ToListAsync(ct);
+
+            var notifications = scope.ServiceProvider.GetRequiredService<INotificationService>();
+            var channels = await notifications.GetSettingsAsync(ct);
+
+            if (NotificationNotice.Enqueue(
+                    db, channels,
+                    BuildPlanFinishSubject(plan.Name),
+                    BuildPlanFinishBody(plan.Name, run, failedItems),
+                    AlertCategoryCatalog.PlanFinished) > 0)
+            {
+                await db.SaveChangesAsync(ct);
+            }
+        }
+        catch (Exception ex)
+        {
+            // 回执发不出去不能影响执行记录本身——那份记录才是这次计划到底跑成什么样的依据。
+            _logger.LogWarning(ex, "备份计划完成回执入队失败 runId={RunId}", run.Id);
+        }
+    }
+
+    /// <summary>
+    /// 这次执行要不要发完成回执。
+    ///
+    /// 单拎出来是因为它错了不会报错，只会静默地多发或少发——而"群里今天怎么多了/少了一条"
+    /// 这种事没人会去追。三个条件缺一不可：
+    /// 计划驱动的（不是批量上传那种没有计划的执行）、到点触发的（不是人手点的立即执行）、
+    /// 而且这个计划确实开了回执。
+    /// </summary>
+    internal static bool ShouldNotifyPlanFinish(
+        ExecutionRun run,
+        [NotNullWhen(true)] Core.Entities.Backup.BackupPlan? plan)
+    {
+        if (run.PlanId is null || plan is null || !plan.NotifyOnFinish)
+            return false;
+
+        // 人手点「立即执行」时正盯着页面看，再推一条到群里是纯噪音。
+        return string.Equals(run.TriggerSource, "schedule", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>回执里列出的一条失败项。</summary>
+    internal sealed record PlanFinishFailure(
+        string ClientName, string TaskName, ExecutionItemStatus Status, string? Message);
+
+    /// <summary>失败项最多列几条。</summary>
+    internal const int MaxListedFailures = 20;
+
+    internal static string BuildPlanFinishSubject(string planName) => $"备份计划完成：{planName}";
+
+    /// <summary>
+    /// 回执正文。
+    ///
+    /// 排版是按「在手机上扫一眼」定的，不是按「在电脑上细看」：
+    /// 前四行把结论说完（哪个计划、什么结果、几成功几失败、跑了多久），
+    /// 失败的项列在后面——那是唯一需要人动手的部分。
+    ///
+    /// 失败项最多列 <see cref="MaxListedFailures"/> 条。再多也不会有人在手机上一条条看，
+    /// 而「一共失败了几条」这个关键数字第三行已经给全了，剩下的去管理页面看执行详情。
+    /// </summary>
+    internal static string BuildPlanFinishBody(
+        string planName, ExecutionRun run, IReadOnlyList<PlanFinishFailure> failures)
+    {
+        var outcome = run.Status switch
+        {
+            BatchStatus.Completed => "全部成功",
+            BatchStatus.Partial => "部分成功",
+            BatchStatus.Failed => "全部失败",
+            BatchStatus.Cancelled => "已取消",
+            _ => EnumMapping.ToSnakeCase(run.Status)
+        };
+
+        var lines = new List<string>
+        {
+            $"计划: {planName}",
+            $"结果: {outcome}",
+            $"共 {run.TotalItems} 项，成功 {run.SucceededItems}，失败 {run.FailedItems}",
+            $"开始: {ToLocal(run.StartedAt)}    结束: {ToLocal(run.FinishedAt)}"
+        };
+
+        if (failures.Count > 0)
+        {
+            lines.Add(string.Empty);
+            lines.Add("失败的项：");
+            foreach (var failure in failures.Take(MaxListedFailures))
+            {
+                // 超时单独说：它和「跑了但失败了」在处置上完全不同——
+                // 前者多半是机器关着或者网断了，后者才需要去看备份本身。
+                var reason = failure.Status == ExecutionItemStatus.Timeout
+                    ? "超时"
+                    : Shorten(failure.Message) ?? "失败";
+                lines.Add($"  · {failure.ClientName} / {failure.TaskName}（{reason}）");
+            }
+
+            if (failures.Count > MaxListedFailures)
+                lines.Add($"  …… 另有 {failures.Count - MaxListedFailures} 项，详见管理页面");
+        }
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static string ToLocal(DateTime? utc) =>
+        utc is null ? "—" : utc.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+
+    /// <summary>失败原因截到一行能看完的长度：整段堆栈塞进钉钉消息没人会读。</summary>
+    private static string? Shorten(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return null;
+
+        var single = message.ReplaceLineEndings(" ").Trim();
+        return single.Length <= 60 ? single : single[..60] + "…";
     }
 }

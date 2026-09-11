@@ -107,6 +107,17 @@ public class AgentHeartbeatService : IAgentHeartbeatService
 
         // 网卡列表只在变化的那次心跳带上来（SnapshotUnchanged 语义），
         // 为 null 表示「没变」而不是「没有」，不能拿它去覆盖库里已有的值。
+        if (!string.IsNullOrWhiteSpace(request.UpdaterVersion))
+            client.UpdaterVersion = request.UpdaterVersion.Trim();
+
+        // 系统信息跟着快照走：为 null 就是「这次没变」，保留库里的值。
+        // 有值才覆盖——一次就地升级系统之后，界面上不该还写着旧版本。
+        if (!string.IsNullOrWhiteSpace(request.OsName))
+            client.OsName = request.OsName.Trim();
+
+        if (!string.IsNullOrWhiteSpace(request.OsVersion))
+            client.OsVersion = request.OsVersion.Trim();
+
         if (request.IpAddresses is not null)
             client.IpAddresses = request.IpAddresses.Count > 0
                 ? System.Text.Json.JsonSerializer.Serialize(request.IpAddresses)

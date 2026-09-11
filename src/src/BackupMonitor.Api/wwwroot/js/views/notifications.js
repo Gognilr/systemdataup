@@ -74,8 +74,10 @@ async function renderSettings() {
       <div class="frow inline"><button class="small" id="n_email_test">发送测试邮件</button><span class="tip">用当前表单里的配置试发一封，SMTP 服务器返回的原始错误会直接显示</span></div>
       ${filterBlock('n_email_f', s.email.filter, cats)}
       <h3>企业微信机器人</h3><div class="frow inline"><label><input type="checkbox" id="n_wecom_en" ${s.wecom.enabled ? 'checked' : ''}> 启用企业微信</label></div><div class="frow"><label>Webhook 地址</label><input id="n_wecom_url" class="mono" type="password" placeholder="${s.wecom.webhookUrl === UNCHANGED ? '已配置，留空则不修改' : '含 access_token，请从企业微信机器人管理页复制'}"></div>
+      <div class="frow inline"><button class="small" id="n_wecom_test">发送测试消息</button><span class="tip">往群里试发一条，机器人返回的原始错误会直接显示</span></div>
       ${filterBlock('n_wecom_f', s.wecom.filter, cats)}
       <h3>钉钉机器人</h3><div class="frow inline"><label><input type="checkbox" id="n_ding_en" ${s.dingtalk.enabled ? 'checked' : ''}> 启用钉钉</label></div><div class="frow"><label>Webhook 地址</label><input id="n_ding_url" class="mono" type="password" placeholder="${s.dingtalk.webhookUrl === UNCHANGED ? '已配置，留空则不修改' : '含 access_token，请从钉钉机器人管理页复制'}"></div>
+      <div class="frow inline"><button class="small" id="n_ding_test">发送测试消息</button><span class="tip">往群里试发一条；若机器人安全设置选了「加签」会在这里报错，请改用自定义关键词「备份监控」</span></div>
       ${filterBlock('n_ding_f', s.dingtalk.filter, cats)}
       <button class="primary" id="n_save">保存设置</button>
     </div>
@@ -124,6 +126,20 @@ async function renderSettings() {
         toast('测试邮件已发送，请检查收件箱', 'ok');
       } catch (e) { errToast(e); }
     });
+
+    // 企业微信/钉钉试发：地址框留空则沿用库里已保存的地址（与保存逻辑同一套掩码约定）
+    const bindWebhookTest = (btnId, inputId, channel, saved, okMsg) => {
+      $(btnId).addEventListener('click', async () => {
+        try {
+          const url = $(inputId).value.trim() || (saved === UNCHANGED ? UNCHANGED : '');
+          if (!url) { errToast(new Error('请先填写 webhook 地址')); return; }
+          await api('/api/v1/admin/notification-settings/test-webhook', { method: 'POST', body: { channel, webhookUrl: url } });
+          toast(okMsg, 'ok');
+        } catch (e) { errToast(e); }
+      });
+    };
+    bindWebhookTest('#n_wecom_test', '#n_wecom_url', 'wecom', s.wecom.webhookUrl, '测试消息已发送，请检查企业微信群');
+    bindWebhookTest('#n_ding_test', '#n_ding_url', 'dingtalk', s.dingtalk.webhookUrl, '测试消息已发送，请检查钉钉群');
   } catch (e) { body.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 

@@ -221,55 +221,15 @@ public class DailyDigestWorker : BackgroundService
         var subject = $"{businessDate:yyyy-MM-dd} 备份日报" + SubjectSuffixFor(digest);
         var body = BuildBody(businessDate, timezone, digest);
 
-        var created = 0;
-
-        if (channels.Email.Enabled)
-        {
-            foreach (var recipient in channels.Email.Recipients
-                         .Where(r => !string.IsNullOrWhiteSpace(r))
-                         .Distinct()
-                         .Take(20))
-            {
-                db.NotificationDeliveries.Add(NewDelivery(NotificationChannel.Email, recipient.Trim(), subject, body));
-                created++;
-            }
-        }
-
-        if (channels.Wecom.Enabled && !string.IsNullOrWhiteSpace(channels.Wecom.WebhookUrl))
-        {
-            db.NotificationDeliveries.Add(
-                NewDelivery(NotificationChannel.Wecom, channels.Wecom.WebhookUrl.Trim(), subject, body));
-            created++;
-        }
-
-        if (channels.Dingtalk.Enabled && !string.IsNullOrWhiteSpace(channels.Dingtalk.WebhookUrl))
-        {
-            db.NotificationDeliveries.Add(
-                NewDelivery(NotificationChannel.Dingtalk, channels.Dingtalk.WebhookUrl.Trim(), subject, body));
-            created++;
-        }
+        // 不传类别：日报刻意不可按类别关掉。它要证明的恰恰是「这套系统今天还活着」，
+        // 关掉之后「一切正常」和「服务端三天前就死了」在收件人那里长得一模一样。
+        var created = NotificationNotice.Enqueue(db, channels, subject, body);
 
         if (created > 0)
             await db.SaveChangesAsync(ct);
 
         return created;
     }
-
-    private static NotificationDelivery NewDelivery(
-        NotificationChannel channel, string recipient, string subject, string body) =>
-        new()
-        {
-            Id = Guid.NewGuid(),
-            // AlertId 留空：日报不是告警。NotificationDispatchWorker 的
-            // 「告警已恢复就别发了」那道守卫对 alert == null 一律放行，正是这里要的。
-            AlertId = null,
-            Channel = channel,
-            Recipient = recipient.Length <= 255 ? recipient : recipient[..255],
-            Status = NotificationStatus.Pending,
-            AttemptCount = 0,
-            Subject = subject,
-            Body = body
-        };
 
     /// <summary>
     /// 标题后缀。公开是为了能单测「一切正常也要发」那一支——

@@ -227,6 +227,20 @@ export function relText(v) {
    排障时错一次就是找错方向。所以列表里把绝对时间摆在主位，
    相对时间降为灰字提示；title 仍然是带秒的完整时间。
    当年的时间省掉年份（列宽有限），跨年的补上。 */
+/* 两个时间里更晚的那个，都为空时返回 null。
+
+   「这台机器最后一次有动静是什么时候」要看的是最近一次**通信**，不只是心跳：
+   领指令、报扫描进度、传分块——每一次都比心跳更能说明客户端活着，而心跳只是
+   每分钟一次的例行汇报。只认心跳会把一台正在传 5 GB 备份、心跳被大文件哈希
+   拖住的机器显示成很久没消息，而它正在好好干活。
+
+   客户端列表和概览页用的必须是同一套口径，所以放在这里而不是各写各的。 */
+export function laterOf(a, b) {
+  if (!a) return b || null;
+  if (!b) return a;
+  return new Date(a) > new Date(b) ? a : b;
+}
+
 export function absTime(v) {
   if (!v) return '—';
   const d = new Date(v);
@@ -328,6 +342,93 @@ export function runtimeBadge(c) {
    列表里显示的是服务端算好的 ipv4Address：看这一列的人下一步是照着它去 ping、去远程桌面，
    而对端地址很可能是 fe80:: 链路本地地址（Windows 名称解析常把 Agent 领到 IPv6 上去），
    那串东西拿到手上什么也做不了。真实对端地址不丢，收进 title 里并说明这个 IPv4 是哪来的。 */
+/* 版本号的「核心」部分：去掉 +提交号 / -预发布 后缀。
+
+   随附版本号是从发布出来的 exe 上取的 ProductVersion，长这样：
+   "1.3.2+8d1d486fd1cbe72525c73b979034c0700b16e019"。而客户端自报的是 "1.3.2"。
+   拿原串直接比，两个 1.3.2 会被判成不相等；直接显示，界面上会糊上 40 位提交号。
+   服务端 AgentVersionService.TryParse 用的就是这同一条规则（按 '+' 和 '-' 截断）。 */
+export function versionCore(v) {
+  return (v || '').split('+')[0].split('-')[0].trim();
+}
+
+/* 「最近通信」单元格。客户端列表和概览页共用同一个实现。
+
+   时间用 absTime 而不是 relTime：这一列是拿来跟日志、告警时间对照的，
+   而「刚刚」「3 分钟前」在对照的时候要求人先做一次减法——
+   一整列都是「刚刚」的时候，它等于什么都没说。
+
+   心跳明显落后于最近一次通信时，把两个时间都说出来：
+   「09-12 00:45（心跳 6 分钟前）」——那多半是客户端正忙着算校验和，
+   是它在干活，不是它出了问题。 */
+export function lastSeenCell(r) {
+  const seen = laterOf(r.lastSeenAt, r.lastHeartbeatAt);
+  if (!seen) return absTime(null);
+  const lagged = r.lastHeartbeatAt && seen !== r.lastHeartbeatAt
+    && new Date(seen) - new Date(r.lastHeartbeatAt) > 120000;
+  return lagged
+    ? `${absTime(seen)}<span class="hint">（心跳 ${esc(relText(r.lastHeartbeatAt))}）</span>`
+    : absTime(seen);
+}
+
+/* 系统列。显示的是**版本**，不是 osName。
+
+   osName 在 Windows 机器上永远是同一个词，一整列都写着「Windows」等于没有信息；
+   而「哪几台还停在 2012 R2」是排查兼容问题时第一个要回答的问题，答案在 osVersion 里。
+
+   去掉 "Microsoft " 前缀只为省列宽，完整原串留在 title 里，鼠标停上去能看全。
+   客户端列表和概览页共用这一个实现——同一台机器在两个页面上写着不同的系统名，
+   会让人以为是两台机器。 */
+/* 内核版本号 → 产品名。
+
+   老客户端（1.3.1 及以前）只会上报 OsName="Windows" 和
+   OsVersion=Environment.OSVersion.VersionString，也就是 "Microsoft Windows NT 10.0.14393.0"——
+   一整列全是内核版本号，而人要回答的是「哪几台还停在 2012 R2」。这张表把它翻译回来。
+
+   已知的不精确：10.0.x 这些内核版本号在服务器版和桌面版之间是共用的
+   （14393 既是 Server 2016 也是 Win10 1607），光看版本号分不出来。这里按服务器版翻译，
+   因为这是个给服务器做备份的产品。新版客户端会直接上报注册表里的产品全名，
+   到那时走的是 osName 分支，不再需要猜。原始串始终留在 title 里，没有信息被藏起来。 */
+const WINDOWS_BUILD_NAMES = {
+  '10.0.26100': 'Windows Server 2025',
+  '10.0.25398': 'Windows Server 23H2',
+  '10.0.20348': 'Windows Server 2022',
+  '10.0.17763': 'Windows Server 2019',
+  '10.0.14393': 'Windows Server 2016',
+  '6.3': 'Windows Server 2012 R2',
+  '6.2': 'Windows Server 2012',
+  '6.1': 'Windows Server 2008 R2',
+  '6.0': 'Windows Server 2008'
+};
+
+function windowsNameFromVersion(version) {
+  const m = /(\d+)\.(\d+)(?:\.(\d+))?/.exec(version || '');
+  if (!m) return null;
+  const [, major, minor, build] = m;
+  return WINDOWS_BUILD_NAMES[`${major}.${minor}.${build}`]
+      || WINDOWS_BUILD_NAMES[`${major}.${minor}`]
+      || null;
+}
+
+/* 系统列。
+
+   优先用 osName——新版客户端上报的是注册表里的产品全名（"Windows Server 2016 Standard"）。
+   老客户端那里 osName 只有一个「Windows」，等于没有信息，这时退回按内核版本号翻译。
+   两条路都走不通才显示原始串。完整原串永远在 title 里。 */
+export function osCell(c) {
+  const name = (c.osName || '').trim();
+  const version = (c.osVersion || '').trim();
+  const full = [name, version].filter(Boolean).join(' ') || '—';
+  if (full === '—') return '—';
+
+  const informative = name && !/^(windows|linux|unknown)$/i.test(name);
+  const text = informative
+    ? name.replace(/^Microsoft\s+/i, '')
+    : (windowsNameFromVersion(version) || version.replace(/^Microsoft\s+/i, '') || name);
+
+  return `<span title="${esc(full)}">${esc(text || '—')}</span>`;
+}
+
 export function ipCell(c) {
   const peer = (c && c.lastRemoteIp) || '';
   const v4 = (c && c.ipv4Address) || '';

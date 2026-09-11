@@ -146,8 +146,21 @@ public sealed class CommandSignatureTests
     }
 
     private static AgentSignatureVerifier NewVerifier(string publicKey) =>
-        new(Options.Create(new AgentOptions { ServerSigningPublicKey = publicKey }),
+        new(new StaticOptionsMonitor<AgentOptions>(new AgentOptions { ServerSigningPublicKey = publicKey }),
             NullLogger<AgentSignatureVerifier>.Instance);
+
+    /// <summary>
+    /// AgentSignatureVerifier 现在收 IOptionsMonitor（公钥要能在不重启服务的前提下热更新），
+    /// 而 Options.Create 只给得出 IOptions。测试里配置不变，给个恒定值的实现即可。
+    /// </summary>
+    private sealed class StaticOptionsMonitor<T>(T value) : IOptionsMonitor<T>
+    {
+        public T CurrentValue { get; } = value;
+
+        public T Get(string? name) => CurrentValue;
+
+        public IDisposable? OnChange(Action<T, string?> listener) => null;
+    }
 
     private static IConfiguration Configuration(string key, string value) =>
         new ConfigurationBuilder()

@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -167,6 +167,7 @@ public class BackupPlanService : IBackupPlanService
     {
         plan.Name = request.Name.Trim();
         plan.Enabled = request.Enabled;
+        plan.NotifyOnFinish = request.NotifyOnFinish;
         plan.ScheduleKind = request.ScheduleKind == "weekly" ? PlanScheduleKind.Weekly : PlanScheduleKind.Daily;
         plan.RunAt = TimeSpan.TryParse(request.RunAt, out var runAt) ? runAt : new TimeSpan(2, 0, 0);
         plan.DaysOfWeek = plan.ScheduleKind == PlanScheduleKind.Weekly
@@ -266,6 +267,7 @@ public class BackupPlanService : IBackupPlanService
             Id = plan.Id,
             Name = plan.Name,
             Enabled = plan.Enabled,
+            NotifyOnFinish = plan.NotifyOnFinish,
             ScheduleKind = EnumMapping.ToSnakeCase(plan.ScheduleKind),
             RunAt = $"{plan.RunAt.Hours:D2}:{plan.RunAt.Minutes:D2}",
             DaysOfWeek = days,

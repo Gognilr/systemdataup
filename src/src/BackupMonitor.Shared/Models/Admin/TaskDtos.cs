@@ -28,6 +28,15 @@ public class CreateBackupTaskRequest
 
     public bool Enabled { get; set; } = true;
 
+    /// <summary>
+    /// 备份成功后发一条回执通知。默认关闭。
+    ///
+    /// 只给真正要盯的那几个任务打开：每个任务每天成功一次，几台机器就是每天几十条，
+    /// 而收件人一旦开始习惯性划过这些「都挺好」的消息，「备份复查未通过」也会跟着被划过去。
+    /// </summary>
+    public bool NotifyOnSuccess { get; set; }
+
+
     public int Priority { get; set; } = 100;
 
     /// <summary>low / normal / high / critical</summary>
@@ -85,6 +94,14 @@ public class UpdateBackupTaskRequest
 
     public string TaskMode { get; set; } = "automatic";
     public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// 备份成功后发一条回执通知。默认关闭。
+    ///
+    /// 只给真正要盯的那几个任务打开：每个任务每天成功一次，几台机器就是每天几十条，
+    /// 而收件人一旦开始习惯性划过这些「都挺好」的消息，「备份复查未通过」也会跟着被划过去。
+    /// </summary>
+    public bool NotifyOnSuccess { get; set; }
     public int Priority { get; set; } = 100;
     public string ImportanceLevel { get; set; } = "normal";
     public string? ScanSchedule { get; set; }
@@ -162,6 +179,10 @@ public class BackupTaskListItemDto
     public string RecognizerType { get; set; } = null!;
     public string TaskMode { get; set; } = null!;
     public bool Enabled { get; set; }
+
+    /// <inheritdoc cref="CreateBackupTaskRequest.NotifyOnSuccess"/>
+    public bool NotifyOnSuccess { get; set; }
+
     public string ImportanceLevel { get; set; } = null!;
     public string? LastPrecheckStatus { get; set; }
     public DateTime? LastScanAt { get; set; }

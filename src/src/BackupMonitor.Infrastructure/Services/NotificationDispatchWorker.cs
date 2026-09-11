@@ -187,18 +187,26 @@ public class NotificationDispatchWorker : BackgroundService
                         await SendEmailAsync(settings.Email, delivery, reportTimezone, ct);
                     break;
 
+                // webhook 地址一律从**解密后的**渠道配置现取，不用 delivery.Recipient。
+                // Recipient 里存的是「钉钉群机器人」这样的标签而非地址——地址是凭据，
+                // 不该落进一张会被界面原样渲染的表。历史数据里那一列是加密串 "enc:v1:…"，
+                // 直接拿去请求会得到 "The 'enc' scheme is not supported."，这里一并绕过了。
                 case NotificationChannel.Wecom:
                     if (!settings.Wecom.Enabled)
                         error = "企业微信渠道未启用";
+                    else if (string.IsNullOrWhiteSpace(settings.Wecom.WebhookUrl))
+                        error = "企业微信渠道没有配置 webhook 地址";
                     else
-                        await PostWebhookAsync(delivery.Recipient, delivery, ct);
+                        await PostWebhookAsync(settings.Wecom.WebhookUrl.Trim(), delivery, ct);
                     break;
 
                 case NotificationChannel.Dingtalk:
                     if (!settings.Dingtalk.Enabled)
                         error = "钉钉渠道未启用";
+                    else if (string.IsNullOrWhiteSpace(settings.Dingtalk.WebhookUrl))
+                        error = "钉钉渠道没有配置 webhook 地址";
                     else
-                        await PostWebhookAsync(delivery.Recipient, delivery, ct);
+                        await PostWebhookAsync(settings.Dingtalk.WebhookUrl.Trim(), delivery, ct);
                     break;
 
                 default:
@@ -353,9 +361,6 @@ public class NotificationDispatchWorker : BackgroundService
         Core.Entities.Alert.NotificationDelivery delivery,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(webhookUrl) || !Uri.TryCreate(webhookUrl, UriKind.Absolute, out _))
-            throw new InvalidOperationException("webhook 地址无效");
-
         // 与邮件同一条口径：投递自带内容优先。
         var content = !string.IsNullOrWhiteSpace(delivery.Subject)
             ? $"[备份监控] {delivery.Subject}{Environment.NewLine}{delivery.Body}"
@@ -365,6 +370,30 @@ public class NotificationDispatchWorker : BackgroundService
             .AppendLine($"时间: {delivery.Alert?.LastOccurredAt:yyyy-MM-dd HH:mm:ss} UTC")
             .AppendLine(delivery.Alert?.Message)
             .ToString();
+
+        await PostWebhookCoreAsync(webhookUrl, content, ct);
+    }
+
+    /// <summary>
+    /// 管理端「发送测试消息」按钮：往 webhook 发一条固定文本，验证地址可达、安全设置放行。
+    /// 不落 notification_deliveries 记录，错误原样上抛，由调用方带回界面。
+    ///
+    /// 正文刻意以 [备份监控] 开头，与正式告警保持一致——钉钉自定义机器人的「自定义关键词」
+    /// 按正文匹配，测试消息必须过同一道关卡，否则会出现「测试通过了、真告警仍被钉钉挡下」。
+    /// </summary>
+    public static Task SendTestWebhookAsync(string webhookUrl, CancellationToken ct)
+    {
+        var content = $"[备份监控] 测试消息{Environment.NewLine}" +
+                      $"这是一条来自「轻量级集中备份采集与监控系统」的测试消息，用于验证机器人配置是否正确。{Environment.NewLine}" +
+                      $"发送时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}";
+        return PostWebhookCoreAsync(webhookUrl, content, ct);
+    }
+
+    /// <summary>webhook POST 核心逻辑，供正式告警投递与「发送测试消息」共用</summary>
+    private static async Task PostWebhookCoreAsync(string webhookUrl, string content, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(webhookUrl) || !Uri.TryCreate(webhookUrl, UriKind.Absolute, out _))
+            throw new InvalidOperationException("webhook 地址无效");
 
         var payload = JsonSerializer.Serialize(new { msgtype = "text", text = new { content } }, JsonOpts);
         using var request = new HttpRequestMessage(HttpMethod.Post, webhookUrl)

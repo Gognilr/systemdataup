@@ -24,6 +24,12 @@ public sealed class AlertCategoryOptionDto
 /// </summary>
 public static class AlertCategoryCatalog
 {
+    /// <summary>备份成功回执的类别键。它不产生告警，只用于通知筛选。</summary>
+    public const string BackupSucceeded = "backup_succeeded";
+
+    /// <summary>备份计划完成回执的类别键。同样不是告警，只用于通知筛选。</summary>
+    public const string PlanFinished = "plan_finished";
+
     public static IReadOnlyList<AlertCategoryOptionDto> All { get; } =
     [
         New("backup_missed", "到点没有备份", "warning"),
@@ -53,7 +59,10 @@ public static class AlertCategoryCatalog
         New("execution_item_queue_timeout", "备份计划里的项目一直没能开始", "warning"),
         New("config_backup_overdue", "配置备份超期未导出", "critical"),
         New("notification_channel_failed", "通知渠道发不出去", "critical"),
-        New("system", "系统（升级下发等）", "critical")
+        New("system", "系统（升级下发等）", "critical"),
+        // 不是告警，是回执。放进这份清单只为一件事：让它能在「另外排除这些类别」里被关掉。
+        New(BackupSucceeded, "备份成功回执", "notice"),
+        New(PlanFinished, "备份计划完成回执", "notice")
     ];
 
     private static AlertCategoryOptionDto New(string key, string label, string typicalLevel) =>

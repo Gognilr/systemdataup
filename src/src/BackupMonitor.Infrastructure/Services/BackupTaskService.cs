@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -158,6 +158,10 @@ public class BackupTaskService : IBackupTaskService
             request.RetryCount, request.RetryIntervalSeconds, request.RetentionPolicyId,
             request.RecognizerConfig, request.AlertConfig);
 
+        // 单独一行而不是塞进 ApplyEditableFields：那个方法已经二十多个位置参数，
+        // 再加一个 bool 挤在一串 bool 中间，看错位置的代价是「改了 A 生效的是 B」。
+        task.NotifyOnSuccess = request.NotifyOnSuccess;
+
         task.ConfigVersion = 1;
 
         _db.BackupTasks.Add(task);
@@ -200,6 +204,8 @@ public class BackupTaskService : IBackupTaskService
             new TaskParallelism(request.MaxParallelChunks, request.MaxParallelFiles, request.MaxParallelHashes),
             request.RetryCount, request.RetryIntervalSeconds, request.RetentionPolicyId,
             request.RecognizerConfig, request.AlertConfig);
+
+        task.NotifyOnSuccess = request.NotifyOnSuccess;
 
         // 任何配置变更都递增版本号，客户端心跳将感知并重新拉取配置（设计书 11.2）
         task.ConfigVersion++;
@@ -553,6 +559,7 @@ public class BackupTaskService : IBackupTaskService
                 t.RecognizerType,
                 t.TaskMode,
                 t.Enabled,
+                t.NotifyOnSuccess,
                 t.ImportanceLevel,
                 t.LastPrecheckStatus,
                 t.LastScanAt,
@@ -581,6 +588,7 @@ public class BackupTaskService : IBackupTaskService
             RecognizerType = EnumMapping.ToSnakeCase(r.RecognizerType),
             TaskMode = EnumMapping.ToSnakeCase(r.TaskMode),
             Enabled = r.Enabled,
+            NotifyOnSuccess = r.NotifyOnSuccess,
             ImportanceLevel = EnumMapping.ToSnakeCase(r.ImportanceLevel),
             LastPrecheckStatus = r.LastPrecheckStatus.HasValue
                 ? EnumMapping.ToSnakeCase(r.LastPrecheckStatus.Value) : null,
@@ -621,6 +629,7 @@ public class BackupTaskService : IBackupTaskService
             RecognizerType = EnumMapping.ToSnakeCase(task.RecognizerType),
             TaskMode = EnumMapping.ToSnakeCase(task.TaskMode),
             Enabled = task.Enabled,
+            NotifyOnSuccess = task.NotifyOnSuccess,
             ImportanceLevel = EnumMapping.ToSnakeCase(task.ImportanceLevel),
             LastPrecheckStatus = task.LastPrecheckStatus.HasValue
                 ? EnumMapping.ToSnakeCase(task.LastPrecheckStatus.Value) : null,

@@ -122,6 +122,15 @@ internal sealed class UpgradeRunner
             CopyPayload();
             PreserveLocalSettings();
 
+            // 暂存记录必须在**拉起服务之前**删掉。
+            //
+            // 文件已经铺完，这条记录的任务就结束了；而下一行启动的新 Agent 会在零点几秒内
+            // 读 pending-update.json。留到后面的收尾阶段再删，就等于给新 Agent 留了一个窗口：
+            // 它读到这条记录，拉起第二个 updater 把服务停掉，本进程的 WaitForHeartbeat 因此
+            // 永远等不到心跳，也就永远走不到收尾那几行——记录永远删不掉，循环永远停不下来。
+            // 2026-09-11 OA 服务器就是这样空转了 312 圈。
+            TryDeleteFile(Path.Combine(_options.DataDirectory, "pending-update.json"));
+
             _log.Info("正在启动 Agent 服务…");
             if (!StartService())
                 throw new InvalidOperationException($"{ServiceWait.TotalSeconds:F0} 秒内服务没有进入运行状态");
@@ -135,7 +144,6 @@ internal sealed class UpgradeRunner
             _log.Info("升级完成，正在清理备份与暂存包…");
             TryDeleteDirectory(_backupDirectory);
             TryDeleteDirectory(_options.SourceDirectory);
-            TryDeleteFile(Path.Combine(_options.DataDirectory, "pending-update.json"));
             UpgradeResultFile.Write(_options, "succeeded", $"已切换到 {running ?? _options.TargetVersion}", _log);
 
             // 托盘放在最后且失败不影响结论：它是登录会话里的另一个进程，

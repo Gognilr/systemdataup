@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Enums;
+﻿using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Models.Admin;
 using Microsoft.EntityFrameworkCore;
@@ -70,7 +70,7 @@ public class AgentVersionService : IAgentVersionService
             .Where(c => c.Status == ClientStatus.Online
                         || c.Status == ClientStatus.SuspectedOffline
                         || c.Status == ClientStatus.Offline)
-            .Select(c => new { c.Id, c.Hostname, c.DisplayName, c.AgentVersion })
+            .Select(c => new { c.Id, c.Hostname, c.DisplayName, c.AgentVersion, c.UpdaterVersion })
             .ToListAsync(ct);
 
         foreach (var client in clients)
@@ -78,7 +78,20 @@ public class AgentVersionService : IAgentVersionService
             // 版本号读不出来（老版本 Agent 从没上报过）同样算落后：
             // 「不知道它是哪一版」和「知道它是旧版」在处置上是同一件事——都要去看一眼。
             var known = TryParse(client.AgentVersion, out var current);
-            if (known && current >= bundledVersion)
+            var agentOutdated = !known || current < bundledVersion;
+
+            // updater 单独判一次：它住在安装目录之外，升级换不到它自己，所以完全可能
+            // 「Agent 已经是最新的，updater 还停在两年前」——而 updater 侧的修复
+            // 在那台机器上就是不生效的，界面上却一点看不出来。
+            //
+            // 只在**确实读到了一个更低的版本号**时才算落后。读不到不算：
+            // 那既可能是没装 updater（老包装上来的机器，本来就走人工升级），
+            // 也可能是还没升到会上报版本号的 1.3.2。这两种都不是能靠告警催出来的事，
+            // 报了也只会变成一条谁都清不掉的告警。
+            var updaterOutdated = TryParse(client.UpdaterVersion, out var updater)
+                                  && updater < bundledVersion;
+
+            if (!agentOutdated && !updaterOutdated)
                 continue;
 
             result.OutdatedClients.Add(new AgentVersionDriftItemDto
@@ -86,7 +99,8 @@ public class AgentVersionService : IAgentVersionService
                 ClientId = client.Id,
                 Hostname = client.Hostname,
                 DisplayName = client.DisplayName,
-                AgentVersion = known ? client.AgentVersion : null
+                AgentVersion = known ? client.AgentVersion : null,
+                UpdaterVersion = client.UpdaterVersion
             });
         }
 

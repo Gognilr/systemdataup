@@ -33,6 +33,28 @@ public class HeartbeatRequest
     public List<string>? IpAddresses { get; set; }
 
     /// <summary>
+    /// 系统产品名（如 "Windows Server 2016 Standard"）与内核版本号。
+    ///
+    /// 同属快照，为 null 时服务端不动库。此前这两个值只在注册请求里出现过一次、
+    /// 之后永不刷新——一台从 2012 R2 就地升到 2019 的机器，界面上会一直显示 2012 R2，
+    /// 而「哪几台还停在老系统」正是要靠这一列回答的问题。
+    /// </summary>
+    public string? OsName { get; set; }
+
+    /// <inheritdoc cref="OsName"/>
+    public string? OsVersion { get; set; }
+
+    /// <summary>
+    /// 本机升级执行器的版本。
+    ///
+    /// 与系统信息不同，这个值**每次心跳都带**，不做「变了才报」的优化：它就几个字节，
+    /// 而它要回答的问题（「这台机器的 updater 换过来了没有」）恰恰是在换的那几分钟里
+    /// 最需要看到的。增量上报在丢过一次心跳之后就补不回来了。
+    /// 为空表示这台机器没装 updater（老包装上来的），服务端不覆盖库里已有的值。
+    /// </summary>
+    public string? UpdaterVersion { get; set; }
+
+    /// <summary>
     /// 本机当前已接受的「预备服务端指纹」（R9 过渡期）。
     ///
     /// 服务端拿它回答一个问题：**现在切换证书，哪几台会掉线**。
@@ -49,7 +71,7 @@ public class HeartbeatRequest
     public List<Guid>? ActiveUploads { get; set; }
 
     /// <summary>
-    /// 磁盘 / 服务状态 / 用户会话 / 网卡地址四块快照与上一次心跳完全相同（审计 B-09）。
+    /// 磁盘 / 服务状态 / 用户会话 / 网卡地址 / 系统信息几块快照与上一次心跳完全相同（审计 B-09）。
     ///
     /// 为 true 时 Disks / ServiceStates / UserSessions / IpAddresses 一律为 null，不重复上报——
     /// 心跳每分钟一次，而这三块在绝大多数时间里一个字节都不会变。

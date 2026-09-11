@@ -169,6 +169,11 @@ public sealed class AgentWorker : BackgroundService
     {
         _logger.LogInformation("BackupMonitor Agent {Version} 启动，服务器={Server}", _options.ResolvedAgentVersion, _api.ServerUrl);
 
+        // 升级刚换完的这一刻，旧 updater 还在收尾（等心跳、清备份、清暂存包），
+        // 新版 updater 就躺在它即将删掉的那个 payload 目录里。这里赶在删掉之前拿走一份。
+        // 越早越好，所以放在启动日志之后的第一件事。
+        _upgrades.TryStageUpdaterFromPayload();
+
         // 审计 F-08：老版本把候选文件清单内嵌在 state.json 里，升级后必须搬出来。
         // 不搬的话所有候选丢失，已通过预检的备份要重新全量 SHA-256 扫一遍。
         var migrated = _stateStore.MigrateEmbeddedCandidateFiles(_candidateFiles);
@@ -299,13 +304,17 @@ public sealed class AgentWorker : BackgroundService
                 await RenewCertificateIfNeededAsync(ct);
 
                 var state = _stateStore.Snapshot();
-                var heartbeat = await _api.HeartbeatAsync(
-                    _probe.BuildHeartbeat(
-                        state.ConfigVersion,
-                        _config,
-                        _activeCommands.Keys.ToList(),
-                        _stateStore.NextServerCertificateFingerprint),
-                    ct);
+                var request = _probe.BuildHeartbeat(
+                    state.ConfigVersion,
+                    _config,
+                    _activeCommands.Keys.ToList(),
+                    _stateStore.NextServerCertificateFingerprint);
+
+                // updater 版本由升级协调器给（它才知道 updater 装在哪），所以在这里补，
+                // 而不是塞进 SystemProbe——探针不该知道升级这件事。
+                request.UpdaterVersion = _upgrades.GetInstalledUpdaterVersion();
+
+                var heartbeat = await _api.HeartbeatAsync(request, ct);
 
                 // 就在这里归零，不放到本轮末尾：心跳本身通了就证明身份和地址都没问题，
                 // 而后面的配置同步、证书续签各有各的失败方式，让它们的失败去
@@ -782,6 +791,11 @@ public sealed class AgentWorker : BackgroundService
             try
             {
                 await ReportUpgradeResultIfAnyAsync(ct);
+
+                // 暂存里有新版 updater 且它已经退出时换上去。放在装暂存包之前：
+                // 万一这一轮就要升级，用的也该是新 updater。
+                _upgrades.TryInstallStagedUpdater();
+
                 ApplyPendingUpgradeIfIdle();
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -832,12 +846,57 @@ public sealed class AgentWorker : BackgroundService
         _logger.LogInformation("已向服务端回报升级结果 {Status}（运行版本 {Version}）", result.Status, _options.ResolvedAgentVersion);
     }
 
+    /// <summary>
+    /// 同一个升级包最多拉起 updater 几次。超过就放弃，不再重试。
+    ///
+    /// 「装不上」有很多种原因（目录被锁、磁盘满、杀毒拦截），共同点是重试大多不会好转，
+    /// 而每一次重试都要停一次服务、重启一次进程——代价远高于晚一天升级。
+    /// </summary>
+    private const int MaxUpgradeAttempts = 3;
+
+    /// <summary>
+    /// 暂存包的版本是否已经装上了（相同或更旧）。
+    ///
+    /// 版本号解析不出来时退回字符串相等比较：宁可漏掉一次「更旧」的判断，
+    /// 也不要因为解析失败就把闸门整个放开。
+    /// </summary>
+    private bool IsUpgradeAlreadyInstalled(string pendingVersion)
+    {
+        var running = _options.ResolvedAgentVersion;
+        if (string.IsNullOrWhiteSpace(pendingVersion) || string.IsNullOrWhiteSpace(running))
+            return false;
+
+        if (Version.TryParse(pendingVersion.Trim(), out var target)
+            && Version.TryParse(running.Trim(), out var current))
+        {
+            return target <= current;
+        }
+
+        return string.Equals(pendingVersion.Trim(), running.Trim(), StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>空闲时把暂存的升级包交给 updater 安装。</summary>
     private void ApplyPendingUpgradeIfIdle()
     {
         var pending = _upgrades.ReadPending();
         if (pending is null)
             return;
+
+        // 已经是这个版本了就不要再装一遍——这是升级自举死循环的闸门。
+        //
+        // updater 要走到 StartService + WaitForHeartbeat 之后才删 pending-update.json，
+        // 而它启动的新 Agent 在 0.4 秒内就会读到这个文件。没有这道判断，新 Agent 会立刻
+        // 拉起第二个 updater 把自己停掉，于是第一个 updater 永远等不到心跳、永远走不到
+        // 删文件那一步，循环就此闭合。2026-09-11 OA 服务器转了 312 圈，
+        // 从 16:37 到 19:18 没停过，而那次升级其实第一轮就成功了。
+        if (IsUpgradeAlreadyInstalled(pending.Version))
+        {
+            _logger.LogInformation(
+                "暂存的升级包版本 {Version} 不高于当前运行版本 {Running}，无需安装，已清除暂存记录",
+                pending.Version, _options.ResolvedAgentVersion);
+            _upgrades.ClearPending();
+            return;
+        }
 
         if (!Directory.Exists(pending.PayloadDirectory))
         {
@@ -861,7 +920,21 @@ public sealed class AgentWorker : BackgroundService
             return;
         }
 
-        _logger.LogWarning("本机当前空闲，开始安装升级包 {Version}", pending.Version);
+        // 计数写在拉起 updater 之前：updater 一启动就会停掉本服务，之后写什么都来不及。
+        var attempt = _upgrades.RecordAttempt(pending);
+        if (attempt > MaxUpgradeAttempts)
+        {
+            _logger.LogError(
+                "升级包 {Version} 连续 {Count} 次没能装上，放弃这次升级并清除暂存记录，"
+                + "需要人工到这台机器上查 updater 日志（%ProgramData%\\BackupMonitor\\Agent\\logs）",
+                pending.Version, attempt - 1);
+            _upgrades.ClearPending();
+            return;
+        }
+
+        _logger.LogWarning(
+            "本机当前空闲，开始安装升级包 {Version}（第 {Attempt}/{Max} 次尝试）",
+            pending.Version, attempt, MaxUpgradeAttempts);
         if (!_upgrades.TryLaunchUpdater(pending))
             LogUpgradePostponed("升级执行器没能启动，将在下一个空闲点重试");
 
@@ -1041,7 +1114,7 @@ public sealed class AgentWorker : BackgroundService
                 MachineId = machineId,
                 Hostname = Environment.MachineName,
                 DisplayName = string.IsNullOrWhiteSpace(_options.DisplayName) ? Environment.MachineName : _options.DisplayName,
-                OsName = "Windows",
+                OsName = _probe.GetOsName(),
                 OsVersion = Environment.OSVersion.VersionString,
                 Architecture = RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant(),
                 AgentVersion = _options.ResolvedAgentVersion,
@@ -1123,9 +1196,23 @@ public sealed class AgentWorker : BackgroundService
             if (config is null)
                 return RefreshConfigCache();   // 304：本地这份就是最新的
 
+            // 「还没拿到客户端 ID」和「签名验不过」是两件毫不相干的事，
+            // 以前它们共用一个错误码，于是日志把人往密钥方向带，而真实原因可能是注册没完成。
             var clientId = _stateStore.Snapshot().ClientId;
-            if (clientId is null || !_signatures.VerifyConfig(config, clientId.Value))
-                throw new AgentApiException(498, "服务端配置签名校验失败", "CONFIG_SIGNATURE_INVALID");
+            if (clientId is null)
+                throw new AgentApiException(499, "本机还没有客户端 ID，注册尚未完成", "CLIENT_ID_MISSING");
+
+            var verification = _signatures.VerifyConfig(config, clientId.Value);
+            if (verification != ConfigVerificationFailure.None)
+            {
+                // 带上公钥指纹和配置版本：这两个值决定了下一步该去比对什么，
+                // 而它们必须留在客户端的日志文件里——出问题的机器往往在客户现场。
+                throw new AgentApiException(
+                    498,
+                    $"服务端配置签名校验失败（{AgentSignatureVerifier.Describe(verification)}；"
+                        + $"本机公钥指纹 {_signatures.PublicKeyFingerprint ?? "未配置"}，配置版本 {config.Version}）",
+                    "CONFIG_SIGNATURE_INVALID");
+            }
 
             _configStore.Save(config);
 
@@ -2794,7 +2881,7 @@ public sealed class AgentWorker : BackgroundService
         var clientId = _stateStore.Snapshot().ClientId;
         _config = config is not null
                   && clientId is not null
-                  && _signatures.VerifyConfig(config, clientId.Value)
+                  && _signatures.VerifyConfig(config, clientId.Value) == ConfigVerificationFailure.None
             ? config
             : null;
         return _config;

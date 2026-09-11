@@ -1,6 +1,6 @@
 import { api } from '../api.js';
 import { App, LOADERS } from '../state.js';
-import { $, esc, emptyState, fmtBytes, fmtBytesHtml, fmtDT, fmtRate, fmtDuration, relTime, status, tableHtml, clientName, xferBar, ipCell } from '../ui.js';
+import { $, esc, emptyState, fmtBytes, fmtBytesHtml, fmtDT, fmtRate, fmtDuration, status, tableHtml, clientName, xferBar, ipCell, osCell, lastSeenCell } from '../ui.js';
 import { shell, loading, schedulePoll } from '../app.js';
 
 /* 概览是「值守」组的落地页，上面还挂着「正在传输」，此前却一个定时器都没有——
@@ -155,6 +155,7 @@ function renderClientResources(rows) {
       // 连 title 里"这是对端地址还是自报网卡地址"的说明也一并沿用。
       { l: 'IP', render: r => ipCell(r) },
       { l: '状态', render: r => status('client_status', r.status) },
+      { l: '系统', render: r => osCell(r) },
       { l: 'CPU', render: r => `<span${warn(r.cpuPercent, 85)}>${pct(r.cpuPercent)}</span>` },
       { l: '内存', render: r => `<span${warn(r.memoryPercent, 90)}>${pct(r.memoryPercent)}</span>`
           + (r.memoryTotalBytes ? `<span class="sub">${fmtBytes(r.memoryTotalBytes - (r.memoryAvailableBytes || 0))} / ${fmtBytes(r.memoryTotalBytes)}</span>` : '') },
@@ -163,7 +164,9 @@ function renderClientResources(rows) {
           ? '<span class="sub">无源盘</span>'
           : `<span${r.minSourceDiskFreePercent <= 10 ? ' class="cell-warn"' : ''}>${pct(r.minSourceDiskFreePercent)}</span><span class="sub mono">${esc(r.minSourceDiskName || '')}</span>` },
       { l: '告警', render: r => (r.activeAlertCount ? `<a href="#/alerts" class="cell-warn">${esc(r.activeAlertCount)}</a>` : '—') },
-      { l: '最近心跳', render: r => (r.lastHeartbeatAt ? relTime(r.lastHeartbeatAt) : '—') }
+      // 与客户端列表同一口径：看的是最近一次**通信**而不只是心跳。
+      // 同一台机器在两个页面上显示两个不同的「最后一次有动静」，比不显示更糟。
+      { l: '最近通信', render: r => lastSeenCell(r) }
     ],
     rows);
 }
@@ -274,7 +277,7 @@ LOADERS.overview = async function () {
       <section class="card"><div class="dashboard-section-head"><h2>待办队列</h2><a href="#/todo">查看全部 →</a></div><div class="dashboard-todo">${renderTodoQueue(todoSummary)}</div></section>
       <section class="card">${renderCapacity(taskSummary.capacity, backupSummary.totalBytes, backupSummary.dailyUploads)}</section>
     </div>
-    <section class="card"><div class="dashboard-section-head"><h2>客户端资源</h2><small>最近一次心跳 · 告警与内存吃紧的排前</small></div>${renderClientResources(clientResources)}</section>
+    <section class="card"><div class="dashboard-section-head"><h2>客户端资源</h2><small>最近一次通信 · 告警与内存吃紧的排前</small></div>${renderClientResources(clientResources)}</section>
     <section class="card"><div class="dashboard-section-head"><h2>备份时序</h2><small>最近 14 天 · 任务按异常优先</small></div>${renderMatrix(taskSummary)}</section>`;
 
     startFreshnessTicker();

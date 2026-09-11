@@ -813,6 +813,11 @@ internal sealed class ServerMaintenance
         // 问的只是「这个端口还应不应答」。因此不做指纹固定，代价被限制在回环地址上。
         using var handler = new HttpClientHandler
         {
+            // 本机回环请求不走代理：HttpClientHandler 默认 UseProxy=true，会读系统代理设置，
+            // 而 Windows 代理例外里的 <local> 只匹配不含句点的主机名——"127.0.0.1" 含三个点，
+            // 一律被交给代理。装了上网行为管理的环境里，这会让一次纯本机的健康检查变成
+            // 一次「外网访问」并被拦下，症状是服务明明起来了却一直等不到就绪。
+            UseProxy = false,
             ServerCertificateCustomValidationCallback = (request, _, _, _) =>
                 request.RequestUri is not null
                 && System.Net.IPAddress.TryParse(request.RequestUri.Host, out var host)
@@ -897,6 +902,11 @@ internal sealed class ServerMaintenance
             var expectedFingerprint = bootstrap.Values["Security:ServerCertificate:Fingerprint"];
             using var handler = new HttpClientHandler
             {
+                // 本机回环请求不走代理：HttpClientHandler 默认 UseProxy=true，会读系统代理设置，
+                // 而 Windows 代理例外里的 <local> 只匹配不含句点的主机名——"127.0.0.1" 含三个点，
+                // 一律被交给代理。装了上网行为管理的环境里，这会让一次纯本机的健康检查变成
+                // 一次「外网访问」并被拦下，症状是服务明明起来了却一直等不到就绪。
+                UseProxy = false,
                 ServerCertificateCustomValidationCallback = (_, certificate, _, _) =>
                     certificate is not null
                     && string.Equals(

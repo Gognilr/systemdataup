@@ -1,4 +1,4 @@
-using BackupMonitor.Shared.Security;
+﻿using BackupMonitor.Shared.Security;
 using System.Text.Json;
 using System.Threading.Channels;
 using BackupMonitor.Core.Entities.Backup;
@@ -6,6 +6,7 @@ using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Exceptions;
+using BackupMonitor.Shared.Models.Admin;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
@@ -444,6 +445,17 @@ public class UploadCommitWorker : BackgroundService
                     _logger.LogWarning(notificationEx, "备份完成提示入队失败 backupSet={BackupSetId}", backupSet.Id);
                 }
 
+                // 备份成功回执（默认关闭）。和托盘提示一样兜住异常：
+                // 一条通知发不出去，不能让一次已经成功的备份在管理端表现成失败。
+                try
+                {
+                    await EnqueueSuccessNoticeAsync(client, task, backupSet, ct);
+                }
+                catch (Exception noticeEx)
+                {
+                    _logger.LogWarning(noticeEx, "备份成功回执入队失败 backupSet={BackupSetId}", backupSet.Id);
+                }
+
                 _logger.LogInformation(
                     "会话 {SessionId} 入库成功 backupSet={Code} path={Path}",
                     session.Id, backupSet.BackupSetCode, finalPath);
@@ -547,6 +559,77 @@ public class UploadCommitWorker : BackgroundService
                 taskId: task.Id,
                 ct: CancellationToken.None);
         }
+    }
+
+    /// <summary>
+    /// 备份成功回执：一次成功的入库落一条通知。开关关着时什么都不做。
+    ///
+    /// 刻意用**自己的**作用域和 DbContext，而不是 CommitSessionAsync 手上那一个：
+    /// 那一个可能正处在调用方的事务里，往它上面挂几行投递记录，等于让这几行
+    /// 跟着一次与它无关的事务一起成败。这和 AlertingService 用独立作用域是同一条理由。
+    /// </summary>
+    private async Task EnqueueSuccessNoticeAsync(
+        Core.Entities.Client.Client client,
+        BackupTask task,
+        BackupSet backupSet,
+        CancellationToken ct)
+    {
+        // 开关在任务上：只给真正要盯的那几个任务打开。
+        // 产生之后发给哪些渠道，仍由各渠道的「另外排除这些类别」决定
+        // （类别键 AlertCategoryCatalog.BackupSucceeded）。
+        if (!task.NotifyOnSuccess)
+            return;
+
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        if (await IsCoveredByNotifyingPlanAsync(db, task.Id, ct))
+            return;
+
+        var notifications = scope.ServiceProvider.GetRequiredService<INotificationService>();
+        var channels = await notifications.GetSettingsAsync(ct);
+
+        var subject = $"备份成功：{task.Name}";
+        var body = string.Join(Environment.NewLine,
+            $"客户端: {client.DisplayName}（{client.Hostname}）",
+            $"任务: {task.Name}",
+            $"备份集: {backupSet.BackupSetCode}",
+            $"文件数: {backupSet.TotalFiles}",
+            $"大小: {FormatBytes(backupSet.TotalBytes)}",
+            $"入库时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+
+        if (NotificationNotice.Enqueue(db, channels, subject, body, AlertCategoryCatalog.BackupSucceeded) > 0)
+            await db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>
+    /// 这个任务是否已经被某个会发完成回执的计划覆盖了。
+    ///
+    /// 覆盖了就不再单独发任务回执——计划的汇总里已经算上它了，两条一起来是同一件事说两遍，
+    /// 而这类「都挺好」的消息一多，真出事的那条会跟着被一起划过去。
+    ///
+    /// 判据刻意是**两个条件都成立**，而不是「只要在计划里」：
+    /// 任务勾了回执、计划没勾，那就还按任务上勾的发。否则人在任务上勾完什么都收不到，
+    /// 而界面上没有任何地方解释为什么。
+    /// </summary>
+    internal static Task<bool> IsCoveredByNotifyingPlanAsync(
+        AppDbContext db, Guid taskId, CancellationToken ct) =>
+        db.BackupPlanItems.AsNoTracking()
+            .AnyAsync(i => i.TaskId == taskId && i.Plan.Enabled && i.Plan.NotifyOnFinish, ct);
+
+    /// <summary>人看的大小。回执是发到手机上的，"53687091200 字节"在那里没有意义。</summary>
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        double value = bytes;
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return unit == 0 ? $"{bytes} B" : $"{value:0.##} {units[unit]}";
     }
 
     /// <summary>

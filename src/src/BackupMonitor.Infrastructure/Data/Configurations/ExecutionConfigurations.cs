@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Entities.Backup;
+﻿using BackupMonitor.Core.Entities.Backup;
 using BackupMonitor.Core.Entities.Execution;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
@@ -16,6 +16,7 @@ public class BackupPlanConfiguration : IEntityTypeConfiguration<BackupPlan>
         builder.Property(e => e.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
         builder.Property(e => e.Name).HasColumnName("name").HasMaxLength(128).IsRequired();
         builder.Property(e => e.Enabled).HasColumnName("enabled").HasDefaultValue(true);
+        builder.Property(e => e.NotifyOnFinish).HasColumnName("notify_on_finish").HasDefaultValue(false);
         builder.Property(e => e.ScheduleKind).HasColumnName("schedule_kind");
         builder.Property(e => e.RunAt).HasColumnName("run_at").HasColumnType("time");
         builder.Property(e => e.DaysOfWeek).HasColumnName("days_of_week").HasMaxLength(32);

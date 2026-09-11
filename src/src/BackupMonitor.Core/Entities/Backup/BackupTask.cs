@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Abstractions;
+﻿using BackupMonitor.Core.Abstractions;
 using BackupMonitor.Core.Enums;
 
 namespace BackupMonitor.Core.Entities.Backup;
@@ -34,6 +34,16 @@ public class BackupTask : IHasRowVersion
     public TaskMode? PreviousTaskMode { get; set; }
 
     public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// 这个任务备份成功后发一条回执通知。默认关闭。
+    ///
+    /// 按任务而不是全局，是因为这类通知的数量直接决定它的价值：每个任务每天成功一次，
+    /// 几台机器就是每天几十条。收件人一旦开始习惯性划过这些「都挺好」的消息，
+    /// 「备份复查未通过」也会跟着一起被划过去——报警的可信度是整体的。
+    /// 只给真正要盯的那几个任务打开。
+    /// </summary>
+    public bool NotifyOnSuccess { get; set; }
 
     /// <summary>调度优先级（1-1000，越小越优先）</summary>
     public int Priority { get; set; } = 100;

@@ -331,6 +331,28 @@ public class AlertingService : IAlertingService
     };
 
     /// <summary>
+    /// webhook 渠道投递记录里的「收件人」。
+    ///
+    /// 这里刻意**不存 webhook 地址**。原因有两条，各自都足够：
+    ///
+    /// 一是这里读的是 system_settings 的原始 JSON（没走 INotificationService，它才是解密的那一层），
+    /// 拿到的地址是整改批次 C·C1 加密后的密文 "enc:v1:…"。把它塞进 Recipient，投递时就会被
+    /// 当成 URL 去请求，HttpClient 报 "The 'enc' scheme is not supported."——钉钉/企业微信
+    /// 从来就没收到过任何东西。何况密文比 255 字符长，截断之后连解密都救不回来。
+    ///
+    /// 二是就算这里能拿到明文也不该存：webhook 地址本身就是凭据（含 access_token），
+    /// 而投递页会把 Recipient 这一列原样渲染出来（js/views/notifications.js 的「收件人」列）。
+    ///
+    /// 真正发送时用的地址由投递工作器从解密后的渠道配置里现取，见
+    /// <see cref="NotificationDispatchWorker"/>。顺带的好处是：改完 webhook 地址后，
+    /// 早先排队的投递会用新地址重试，而不是抱着下发那一刻的旧快照。
+    /// </summary>
+    private const string WecomRecipientLabel = NotificationNotice.WecomRecipientLabel;
+
+    /// <inheritdoc cref="WecomRecipientLabel"/>
+    private const string DingtalkRecipientLabel = NotificationNotice.DingtalkRecipientLabel;
+
+    /// <summary>
     /// 为告警生成待发送通知记录（渠道配置见 system_settings: notification_channels）。
     /// titlePrefix 供等级提升复用同一套渠道展开逻辑（审计 G-11）。
     /// </summary>
@@ -376,7 +398,7 @@ public class AlertingService : IAlertingService
                     Id = Guid.NewGuid(),
                     Alert = alert,
                     Channel = NotificationChannel.Wecom,
-                    Recipient = Truncate(settings.Wecom.WebhookUrl.Trim(), 255),
+                    Recipient = WecomRecipientLabel,
                     Status = NotificationStatus.Pending,
                     AttemptCount = 0,
                     TitlePrefix = titlePrefix
@@ -392,7 +414,7 @@ public class AlertingService : IAlertingService
                     Id = Guid.NewGuid(),
                     Alert = alert,
                     Channel = NotificationChannel.Dingtalk,
-                    Recipient = Truncate(settings.Dingtalk.WebhookUrl.Trim(), 255),
+                    Recipient = DingtalkRecipientLabel,
                     Status = NotificationStatus.Pending,
                     AttemptCount = 0,
                     TitlePrefix = titlePrefix
@@ -406,6 +428,4 @@ public class AlertingService : IAlertingService
         }
     }
 
-    private static string Truncate(string value, int maxLength) =>
-        value.Length <= maxLength ? value : value[..maxLength];
 }

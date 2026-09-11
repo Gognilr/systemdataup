@@ -159,7 +159,11 @@ function planFields(v) {
     { name: 'itemTimeoutMinutes', label: '单项超时（分钟）', type: 'number', value: v.itemTimeoutMinutes ?? 240, advanced: true,
       hint: '一项等这么久还没结果就判它失败、继续下一项。否则一台关机的客户端能让整晚的计划全部不执行' },
     { name: 'timezone', label: '时区', type: 'text', value: v.timezone || 'Asia/Shanghai', advanced: true },
-    { name: 'enabled', label: '状态', labelText: '启用该计划', type: 'checkbox', value: v.enabled !== false, advanced: true }
+    { name: 'enabled', label: '状态', labelText: '启用该计划', type: 'checkbox', value: v.enabled !== false, advanced: true },
+    { name: 'notifyOnFinish', label: '完成通知', labelText: '每次跑完发一条汇总回执', type: 'checkbox', value: v.notifyOnFinish === true, advanced: true,
+      hint: '一次计划一条，写明共几项、成功几项、失败几项，并列出失败的项。全部成功也会发——'
+        + '收到它才知道计划确实跑了。只对到点触发的执行发，手动点「立即执行」不发。'
+        + '打开后，这个计划里的任务自己那条「备份成功通知」会被压掉，以计划为准。' }
   ];
 }
 
@@ -175,6 +179,7 @@ function openPlanForm(title, initial, okText, submit) {
   const collect = vals => ({
     name: vals.name,
     enabled: vals.enabled,
+    notifyOnFinish: vals.notifyOnFinish === true,
     scheduleKind: vals.scheduleKind,
     runAt: vals.runAt,
     daysOfWeek: state.days,

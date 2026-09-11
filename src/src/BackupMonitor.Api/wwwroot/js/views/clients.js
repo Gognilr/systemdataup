@@ -2,10 +2,10 @@
 import { api } from '../api.js';
 import { App, ACTIONS, LOADERS } from '../state.js';
 import {
-  $, esc, L, optsOf, status, fmtBytes, fmtDT, relTime, relText, absTime, shortId,
+  $, esc, L, optsOf, status, fmtBytes, fmtDT, relTime, shortId,
   tableHtml, pagerHtml, skeleton, emptyState, hasFilter, batchBarHtml,
   toast, errToast, confirmModal, formModal, openModal, closeModal, clientName,
-  clientCaps, actBtn, actMenu, runtimeBadge, ipCell, ipDetailRows
+  clientCaps, actBtn, actMenu, runtimeBadge, ipCell, ipDetailRows, laterOf, osCell, lastSeenCell, versionCore
 } from '../ui.js';
 import { shell, loading, schedulePoll } from '../app.js';
 import { renderClientRuntimeDetail } from './client-runtime.js';
@@ -69,30 +69,21 @@ export async function vClients() {
 /* 「在用 / 已注销 / 全部」三档。
    注销之后那台机器不会再有任何动静，却一直占着列表的一行——而这一页每天被打开
    是为了看在用的机器有没有问题。默认只列在用的，注销的收进第二档，需要时才看。 */
-/* 在线 / 离线看的是「最近一次听到它说话」，不只是心跳。
+/* 「落后」有两种，处置完全不同，所以要说清是哪一种。
 
-   领指令、报扫描进度、传分块——每一次都比心跳更能说明客户端活着，而心跳只是
-   每分钟一次的例行汇报。只认心跳的那一版会把一台正在传 5 GB 备份、
-   心跳被大文件哈希拖住的机器判成离线并发严重告警，而它正在好好干活。 */
-function laterOf(a, b) {
-  if (!a) return b || null;
-  if (!b) return a;
-  return new Date(a) > new Date(b) ? a : b;
-}
-
-/* 心跳明显落后于最近一次通信时，把两个时间都说出来：
-   「09-10 18:23 刚刚（心跳 6 分钟前）」——那多半是客户端正忙着算校验和，
-   不是它出了问题。
-   时间用 absTime 而不是 relTime：这一列是拿来跟日志和告警时间对照的，
-   「几分钟前」在对照的时候要求人先做一次减法。 */
-function lastSeenCell(r) {
-  const seen = laterOf(r.lastSeenAt, r.lastHeartbeatAt);
-  if (!seen) return absTime(null);
-  const lagged = r.lastHeartbeatAt && seen !== r.lastHeartbeatAt
-    && new Date(seen) - new Date(r.lastHeartbeatAt) > 120000;
-  return lagged
-    ? `${absTime(seen)}<span class="hint">（心跳 ${esc(relText(r.lastHeartbeatAt))}）</span>`
-    : absTime(seen);
+   Agent 落后 → 下发一次升级就完事。
+   Agent 已经最新、只有升级执行器落后 → 那是另一回事：它住在安装目录之外，
+   升级换不到它自己，只能等自更新机制把它换过去（1.3.2 起），换不过去要人工上机器。
+   两种都写成「低于随附 X」，看的人会按第一种去处理，然后发现下发了也没用。 */
+function outdatedReason(versionStatus, clientId, agentVersion, bundledVersion) {
+  const item = (versionStatus?.outdatedClients || []).find(c => c.clientId === clientId);
+  // 一律比「核心」版本号：随附版本带 40 位提交号，客户端自报的不带，
+  // 拿原串比会把两个 1.3.2 判成不相等，于是每一台都显示成 Agent 落后。
+  const bundled = versionCore(bundledVersion);
+  const agentCurrent = bundled && versionCore(agentVersion) === bundled;
+  return agentCurrent && item?.updaterVersion
+    ? `升级执行器 ${versionCore(item.updaterVersion)} 低于随附 ${bundled}`
+    : `低于随附 ${bundled}`;
 }
 
 function scopeOf(st) {
@@ -207,12 +198,13 @@ LOADERS.clients = async function () {
     wrap.innerHTML = tableHtml([
       { l: '客户端', k: 'hostname', sort: true, render: r => `<a href="#/clients/${esc(r.id)}"><b>${esc(clientName(r))}</b></a><span class="sub mono">${esc(r.hostname)}</span>` },
       { l: '分组', k: 'clientGroupName' },
-      { l: '系统', render: r => esc(r.osName || '—') },
+      { l: '系统', render: r => osCell(r) },
       // 落后的机器要在列表上一眼看得出来（R11）。此前一台两年没升过级的 Agent
       // 和一台昨天刚装的长得一模一样——直到某个只在新版本里修好的缺陷在它身上复现。
       { l: 'Agent', k: 'agentVersion', sort: true,
         render: r => outdatedIds.has(r.id)
-          ? `${esc(r.agentVersion || '未知')}<span class="sub cell-warn">低于随附 ${esc(bundledVersion || '')}</span>`
+          ? `${esc(r.agentVersion || '未知')}<span class="sub cell-warn">${
+              esc(outdatedReason(versionStatus, r.id, r.agentVersion, bundledVersion))}</span>`
           : esc(r.agentVersion || '—') },
       // 找一台机器最常用的线索就是 IP，为看一眼 IP 逐台点进详情抽屉是没有道理的。
       // 这里放服务端观测到的对端地址而不是自报的网卡列表：它只有一个值、永远最新。
@@ -502,6 +494,9 @@ async function legacyClientDetail(id) {
         <div class="row"><div class="k">系统 / 架构</div><div class="v">${esc(d.osName || '—')} ${esc(d.osVersion || '')} / ${esc(d.architecture || '—')}</div></div>
         ${ipDetailRows(d)}
         <div class="row"><div class="k">Agent 版本</div><div class="v">${esc(d.agentVersion || '—')}</div></div>
+        <div class="row"><div class="k">升级执行器</div><div class="v">${d.updaterVersion
+          ? esc(d.updaterVersion)
+          : '<span class="sub">未装或未上报（1.3.2 起上报）</span>'}</div></div>
         <div class="row"><div class="k">分组</div><div class="v">${esc(d.clientGroupName || '—')}</div></div>
         <div class="row"><div class="k">最近通信</div><div class="v">${fmtDT(laterOf(d.lastSeenAt, d.lastHeartbeatAt))}</div></div>
         <div class="row"><div class="k">最近心跳</div><div class="v">${fmtDT(d.lastHeartbeatAt)}</div></div>

@@ -152,6 +152,21 @@ public class NotificationTestEmailRequest
 }
 
 /// <summary>
+/// 「发送测试消息」请求（企业微信 / 钉钉）。
+/// WebhookUrl 允许传 <see cref="NotificationSecretMask.Unchanged"/>，
+/// 服务端会替换为库中当前保存的地址后再发送——这样用户不必为了测试把
+/// 含 access_token 的地址重新粘一遍。
+/// </summary>
+public class NotificationTestWebhookRequest
+{
+    /// <summary>渠道：wecom / dingtalk</summary>
+    public string Channel { get; set; } = string.Empty;
+
+    /// <summary>待测试的 webhook 地址；传掩码常量则用库中已保存的地址</summary>
+    public string? WebhookUrl { get; set; }
+}
+
+/// <summary>
 /// 通知渠道是否已配置（R5）。刻意只有一个布尔字段：
 /// 概览页要回答的问题就一个——告警发不发得出去。渠道细节属于配置页。
 /// </summary>

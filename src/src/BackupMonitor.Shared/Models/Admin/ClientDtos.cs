@@ -34,6 +34,14 @@ public class ClientListItemDto
     public Guid? ClientGroupId { get; set; }
     public string? ClientGroupName { get; set; }
     public string? OsName { get; set; }
+
+    /// <summary>
+    /// 系统版本（如 "Microsoft Windows Server 2016 Standard"）。
+    /// 只有 OsName 时列表上一整列都是「Windows」，等于没有信息——
+    /// 要判断哪几台还停在老系统上，靠的是这一列。
+    /// </summary>
+    public string? OsVersion { get; set; }
+
     public string? AgentVersion { get; set; }
 
     /// <summary>客户端状态（snake_case）</summary>
@@ -99,7 +107,15 @@ public class ClientListItemDto
 public class ClientDetailDto : ClientListItemDto
 {
     public string? MachineId { get; set; }
-    public string? OsVersion { get; set; }
+
+    /// <summary>
+    /// 升级执行器版本。为空表示没装（老包装上来的机器，只能人工升级）或还没报过。
+    /// 它和 Agent 版本是分开升级的，可以差很多——这一行就是拿来看这个差的。
+    /// </summary>
+    public string? UpdaterVersion { get; set; }
+
+    // OsVersion 现在由 ClientListItemDto 提供（列表页也要显示系统版本），这里不再重复声明。
+
     public string? Architecture { get; set; }
     /// <summary>
     /// Agent 自报的本机网卡地址列表。
@@ -309,7 +325,23 @@ public class ClientResourceRowDto
     public string Hostname { get; set; } = null!;
     public string DisplayName { get; set; } = null!;
     public string Status { get; set; } = null!;
+
+    /// <summary>系统名与版本，口径与客户端列表页一致。</summary>
+    public string? OsName { get; set; }
+
+    /// <inheritdoc cref="ClientListItemDto.OsVersion"/>
+    public string? OsVersion { get; set; }
+
     public DateTime? LastHeartbeatAt { get; set; }
+
+    /// <summary>
+    /// 最近一次收到这台机器任何请求的时间（领指令、报进度、传分块都算）。
+    ///
+    /// 与 <see cref="LastHeartbeatAt"/> 一起决定界面上的「最近通信」：心跳只是每分钟
+    /// 一次的例行汇报，一台正在传大文件、心跳被哈希拖住的机器，只看心跳会显得很久没动静。
+    /// 口径与客户端列表页一致——同一台机器在两个页面上显示两个时间，比不显示更糟。
+    /// </summary>
+    public DateTime? LastSeenAt { get; set; }
 
     /// <summary>
     /// 服务端最近一次心跳观测到的对端 IP。与客户端列表页同源同口径——
@@ -372,4 +404,7 @@ public class AgentVersionDriftItemDto
 
     /// <summary>它自报的版本；从未上报过时为空。</summary>
     public string? AgentVersion { get; set; }
+
+    /// <summary>它自报的升级执行器版本；没装或还没报过时为空。</summary>
+    public string? UpdaterVersion { get; set; }
 }

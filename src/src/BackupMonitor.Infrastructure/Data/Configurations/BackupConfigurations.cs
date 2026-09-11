@@ -51,6 +51,7 @@ public class BackupTaskConfiguration : IEntityTypeConfiguration<BackupTask>
         builder.Property(e => e.TaskMode).HasColumnName("task_mode");
         builder.Property(e => e.PreviousTaskMode).HasColumnName("previous_task_mode");
         builder.Property(e => e.Enabled).HasColumnName("enabled").HasDefaultValue(true);
+        builder.Property(e => e.NotifyOnSuccess).HasColumnName("notify_on_success").HasDefaultValue(false);
         builder.Property(e => e.Priority).HasColumnName("priority").HasDefaultValue(100);
         builder.Property(e => e.ImportanceLevel).HasColumnName("importance_level");
         builder.Property(e => e.ScanSchedule).HasColumnName("scan_schedule").HasMaxLength(255);

@@ -89,6 +89,9 @@ internal sealed class FileLogger : ILogger
 /// </summary>
 internal sealed class FileLogWriter : IDisposable
 {
+    /// <summary>过期清理覆盖的文件名模式：Agent 自己的日志，以及升级执行器留下的日志。</summary>
+    private static readonly string[] LogPatterns = ["agent-*.log", "updater-*.log"];
+
     private readonly object _sync = new();
     private readonly string _directory;
     private readonly int _retentionDays;
@@ -143,10 +146,18 @@ internal sealed class FileLogWriter : IDisposable
         try
         {
             var cutoff = DateTime.Now.AddDays(-_retentionDays);
-            foreach (var path in Directory.EnumerateFiles(_directory, "agent-*.log"))
+
+            // updater-*.log 也要清。它由升级执行器写，每跑一次就是一个新文件，
+            // 而那个进程活不过几分钟、没有任何清理时机——只能由常驻的 Agent 代劳。
+            // 之前这里只清 agent-*.log，于是升级失败重试多少次就攒下多少个文件：
+            // 2026-09-11 OA 服务器一天攒了 312 个。
+            foreach (var pattern in LogPatterns)
             {
-                if (File.GetLastWriteTime(path) < cutoff)
-                    File.Delete(path);
+                foreach (var path in Directory.EnumerateFiles(_directory, pattern))
+                {
+                    if (File.GetLastWriteTime(path) < cutoff)
+                        File.Delete(path);
+                }
             }
         }
         catch

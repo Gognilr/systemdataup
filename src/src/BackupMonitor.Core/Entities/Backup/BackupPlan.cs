@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Enums;
+﻿using BackupMonitor.Core.Enums;
 
 namespace BackupMonitor.Core.Entities.Backup;
 
@@ -16,6 +16,15 @@ public class BackupPlan
     public string Name { get; set; } = null!;
 
     public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// 每次到点跑完后发一条汇总回执（成功几项、失败几项、哪几项失败）。默认关闭。
+    ///
+    /// 计划级而不是任务级：一个 12 项的计划按任务发就是 12 条「都挺好」，
+    /// 而人要问的是「昨晚那批跑完了吗，有没有翻车的」。一晚上一条就够。
+    /// 打开它之后，这个计划里的任务自己那条成功回执会被压掉——以计划为准，不重复报。
+    /// </summary>
+    public bool NotifyOnFinish { get; set; }
 
     public PlanScheduleKind ScheduleKind { get; set; } = PlanScheduleKind.Daily;
 

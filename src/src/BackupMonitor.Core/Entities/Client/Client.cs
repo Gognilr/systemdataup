@@ -31,6 +31,15 @@ public class Client : IHasRowVersion
     public string? AgentVersion { get; set; }
 
     /// <summary>
+    /// 升级执行器（updater）的版本；1.3.2 起由心跳上报，为空表示没装或还没报过。
+    ///
+    /// 单独一列而不是并进 <see cref="AgentVersion"/>：这两个东西是分开升级的。
+    /// updater 住在安装目录之外，升级换不到它自己，所以它可以比 Agent 老很多年——
+    /// 而「哪几台的 updater 还是老的」直接决定了 updater 侧的修复有没有真的到位。
+    /// </summary>
+    public string? UpdaterVersion { get; set; }
+
+    /// <summary>
     /// 这台 Agent 已经接受的「预备服务端指纹」（V039 · R9 过渡期）。
     ///
     /// 与当前预备指纹一致才算就绪。启用新证书之前必须先看这一列：
