@@ -55,6 +55,13 @@ public class DailyDigestTests : IAsyncLifetime
         // 上一条用例留下的值会让下一条什么都不做。
         await ClearLastSentAsync();
         await ConfigureEmailChannelAsync();
+
+        // 发送时刻钉死成 0 点。不钉的话这一组用例是「看钟点」的：
+        // 默认发送时刻是 8 点，测试配置里 Reports:Timezone 为空、按 UTC 解析，
+        // 于是 UTC 00:00~07:59 之间跑，RunOnceAsync 会在「还没到点」那道守卫上直接返回——
+        // 「一切正常也发日报」必然失败，而另外两条（重复执行、关掉后不发）会**空过**：
+        // 什么都没发生，断言照样成立。后者比前者更危险，它让人以为这两条一直在把关。
+        await SetSettingAsync(DailyDigestWorker.HourKey, "0");
         return;
     }
 

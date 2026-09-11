@@ -545,7 +545,12 @@ tr:has(.cell-warn) .spark polyline{stroke:var(--warn-fg)}
 .bsgroup>summary::-webkit-details-marker{display:none}
 .bsgroup>summary::before{content:'▸';color:var(--text-muted);flex:none}
 .bsgroup[open]>summary::before{content:'▾'}
-.bsgroup>summary:hover .bsg-title{color:var(--accent-fg,var(--text))}
+/* 悬停高亮用 --accent 而不是 --accent-fg。
+   --accent-fg 是「铺在强调色背景上的字色」：浅色主题下是纯白、深色主题下接近纯黑，
+   拿它当普通背景上的字色，两个主题各自变成白底白字和深底黑字——任务名一悬停就消失。
+   （原写法的 var(--accent-fg, var(--text)) 兜底永远不会生效：--accent-fg 是有定义的。）
+   --accent 才是为「普通背景上的可交互文字」准备的那一档，两个主题都够对比度。 */
+.bsgroup>summary:hover .bsg-title{color:var(--accent)}
 .bsgroup .bsg-title{font:600 var(--t-md)}
 .bsgroup .bsg-sub{color:var(--text-muted);font:var(--t-sm)}
 .bsgroup .bsg-meta{display:flex;gap:var(--s-3);flex-wrap:wrap;margin-left:auto;color:var(--text-muted);font:var(--t-sm)}

@@ -111,6 +111,16 @@ public class BackupSetDetailDto : BackupSetListItemDto
     public DateTime DiscoveredAt { get; set; }
     public DateTime? VerifiedAt { get; set; }
     public string? RepositoryPath { get; set; }
+
+    /// <summary>
+    /// 这一份备份在客户端上的源目录（候选的 SourceRoot）。
+    ///
+    /// 刻意取候选上报的值而不是任务配置的 SourcePath：识别器是按业务单元分的，
+    /// 一个 U8 任务下 18 个账套各有各的目录，拿任务根路径显示等于告诉人一个
+    /// 「这一份到底是从哪儿来的」答不上来的位置。
+    /// </summary>
+    public string? SourceRoot { get; set; }
+
     public string? ManifestPath { get; set; }
     public string? ManifestSha256 { get; set; }
     public DateTime CreatedAt { get; set; }

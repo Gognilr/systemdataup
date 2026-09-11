@@ -281,6 +281,8 @@ public class BackupSetService : IBackupSetService
             .Include(s => s.BusinessUnit)
             .Include(s => s.Files)
             .Include(s => s.RetentionLocks).ThenInclude(l => l.LockedByUser)
+            // 源目录在候选上（Agent 预检时按业务单元上报的 SourceRoot）
+            .Include(s => s.SourceCandidate)
             .FirstOrDefaultAsync(s => s.Id == backupSetId, ct)
             ?? throw new NotFoundException("备份版本", backupSetId);
 
@@ -311,6 +313,7 @@ public class BackupSetService : IBackupSetService
             DiscoveredAt = set.DiscoveredAt,
             VerifiedAt = set.VerifiedAt,
             RepositoryPath = set.RepositoryPath,
+            SourceRoot = set.SourceCandidate?.SourceRoot,
             ManifestPath = set.ManifestPath,
             ManifestSha256 = set.ManifestSha256,
             CreatedAt = set.CreatedAt,

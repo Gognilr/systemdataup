@@ -384,8 +384,7 @@ App.batchActs.backups = [
     fn: ids => runBackupBatch('/api/v1/admin/backups/purge-batch', ids, '彻底删除') }
 ];
 
-ACTIONS['backups:copy-path'] = async () => {
-  const path = App.state.backupDetailPath || '';
+async function copyPath(path) {
   if (!path) return;
   try {
     await navigator.clipboard.writeText(path);
@@ -394,7 +393,10 @@ ACTIONS['backups:copy-path'] = async () => {
     // 非安全上下文（http 访问）下 clipboard API 不可用，退回选中让人自己复制
     toast('浏览器不允许自动复制，请手动选中路径复制', 'err');
   }
-};
+}
+ACTIONS['backups:copy-path'] = async () => copyPath(App.state.backupDetailPath || '');
+// 源数据路径是客户端上的路径，复制出来是拿去那台机器上核对的
+ACTIONS['backups:copy-source-path'] = async () => copyPath(App.state.backupDetailSourcePath || '');
 ACTIONS['backups:restore'] = async id => createRestore(id);
 function createRestore(backupSetId) {
   formModal('创建恢复请求', [
@@ -413,6 +415,7 @@ export async function vBackupDetail(id) {
   try {
     const d = await api(`/api/v1/admin/backups/${id}`);
     App.state.backupDetailPath = d.repositoryPath || '';
+    App.state.backupDetailSourcePath = d.sourceRoot || '';
     $('#view').innerHTML = `
     <div class="toolbar"><a href="#/backups">← 返回备份集列表</a><div class="spacer"></div>
       ${d.status === 'available' ? `<button class="primary" data-ui-action="act" data-view="backups" data-action="restore" data-id="${esc(d.id)}">发起恢复</button>
@@ -454,6 +457,11 @@ export async function vBackupDetail(id) {
              把仓库根做成只读 SMB 共享之后，这个路径直接就是 \\服务器\repo\… 的形式。 -->
         <div class="row"><div class="k">仓库路径</div><div class="v mono">${esc(d.repositoryPath || '—')}
           ${d.repositoryPath ? ' <button class="small" data-ui-action="act" data-view="backups" data-action="copy-path">复制路径</button>' : ''}</div></div>
+        <!-- 源数据路径与仓库路径成对出现：排障时第一个问题永远是「这一份到底是从哪儿来的」，
+             而只给仓库路径答不了。取的是候选上报的 SourceRoot（按业务单元细分），
+             不是任务配置的根路径——一个 U8 任务下 18 个账套各有各的目录。 -->
+        <div class="row"><div class="k">源数据路径</div><div class="v mono">${esc(d.sourceRoot || '—')}
+          ${d.sourceRoot ? ' <button class="small" data-ui-action="act" data-view="backups" data-action="copy-source-path">复制路径</button>' : ''}</div></div>
         <div class="row"><div class="k">清单 SHA-256</div><div class="v mono">${esc(d.manifestSha256 || '—')}</div></div>
         <div class="row"><div class="k">保留至</div><div class="v">${fmtDT(d.retentionUntil)}</div></div>
       </div></div>
