@@ -72,6 +72,8 @@ public static class DependencyInjection
         services.AddScoped<IConfigBackupService, ConfigBackupService>();
         services.AddScoped<ICertificateLifecycleChecker, CertificateLifecycleChecker>();
         services.AddScoped<IAgentVersionService, AgentVersionService>();
+        services.AddSingleton<IEndpointProber, EndpointProber>();
+        services.AddScoped<IMonitoredEndpointService, MonitoredEndpointService>();
 
         services.AddScoped<IClientAdminService, ClientAdminService>();
         services.AddScoped<IMonitoredServiceAdminService, MonitoredServiceAdminService>();
@@ -109,6 +111,7 @@ public static class DependencyInjection
         services.AddHostedService<RetentionCleanupWorker>();
         services.AddHostedService<PartitionMaintenanceWorker>();
         services.AddHostedService<SystemWatchdogWorker>();
+        services.AddHostedService<EndpointProbeWorker>();
         services.AddHostedService<MissedBackupWorker>();
         services.AddHostedService<LifecycleExpiryWorker>();
         services.AddHostedService<RepositoryReconcileWorker>();

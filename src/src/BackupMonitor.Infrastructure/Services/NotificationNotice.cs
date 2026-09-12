@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Entities.Alert;
+﻿using BackupMonitor.Core.Entities.Alert;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Models.Admin;
@@ -82,6 +82,21 @@ public static class NotificationNotice
         }
 
         return created;
+    }
+
+    /// <summary>人看的大小。回执是发到手机上的，"53687091200 字节"在那里没有意义。</summary>
+    internal static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        double value = bytes;
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return unit == 0 ? $"{bytes} B" : $"{value:0.##} {units[unit]}";
     }
 
     private static bool Allows(NotificationFilterDto? filter, string? category) =>

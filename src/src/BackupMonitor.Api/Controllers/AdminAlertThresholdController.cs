@@ -51,7 +51,8 @@ public class AdminAlertThresholdController : ApiBaseController
             ClientDiskFreePercent = Math.Clamp(await _settings.GetIntAsync(DiskFreeKey, 10, ct), 1, 99),
             RenotifyHours = Math.Clamp(
                 await _settings.GetIntAsync(
-                    AlertingService.RenotifyHoursKey, AlertingService.DefaultRenotifyHours, ct), 1, 720)
+                    AlertingService.RenotifyHoursKey, AlertingService.DefaultRenotifyHours, ct), 1, 720),
+            RecoveryNotify = await _settings.GetBoolAsync(AlertingService.RecoveryNotifyKey, true, ct)
         });
     }
 
@@ -66,13 +67,16 @@ public class AdminAlertThresholdController : ApiBaseController
             ClientCpuPercent = Math.Clamp(request.ClientCpuPercent, 1, 100),
             ClientMemoryPercent = Math.Clamp(request.ClientMemoryPercent, 1, 100),
             ClientDiskFreePercent = Math.Clamp(request.ClientDiskFreePercent, 1, 99),
-            RenotifyHours = Math.Clamp(request.RenotifyHours, 1, 720)
+            RenotifyHours = Math.Clamp(request.RenotifyHours, 1, 720),
+            RecoveryNotify = request.RecoveryNotify
         };
 
         await UpsertAsync(CpuKey, result.ClientCpuPercent.ToString(), ct);
         await UpsertAsync(MemoryKey, result.ClientMemoryPercent.ToString(), ct);
         await UpsertAsync(DiskFreeKey, result.ClientDiskFreePercent.ToString(), ct);
         await UpsertAsync(AlertingService.RenotifyHoursKey, result.RenotifyHours.ToString(), ct);
+        await UpsertAsync(
+            AlertingService.RecoveryNotifyKey, result.RecoveryNotify ? "true" : "false", ct);
         await _db.SaveChangesAsync(ct);
 
         // 缓存 TTL 是 60 秒。不清缓存的话，刚点了保存正盯着页面的人

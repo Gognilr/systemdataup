@@ -44,6 +44,7 @@ public class AppDbContext : DbContext
     public DbSet<ClientHeartbeat> ClientHeartbeats => Set<ClientHeartbeat>();
     public DbSet<ClientDisk> ClientDisks => Set<ClientDisk>();
     public DbSet<MonitoredServiceDefinition> MonitoredServiceDefinitions => Set<MonitoredServiceDefinition>();
+    public DbSet<MonitoredEndpoint> MonitoredEndpoints => Set<MonitoredEndpoint>();
     public DbSet<ClientServiceState> ClientServiceStates => Set<ClientServiceState>();
     public DbSet<ClientUserSession> ClientUserSessions => Set<ClientUserSession>();
     public DbSet<AgentNotification> AgentNotifications => Set<AgentNotification>();

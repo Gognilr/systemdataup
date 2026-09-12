@@ -54,7 +54,8 @@ export const NAV_GROUPS = [
     ['overview', '概览', ICON.overview], ['transfers', '传输中', ICON.transfers], ['todo', '待办', ICON.todo], ['alerts', '告警', ICON.alerts]
   ] },
   { key: 'fleet', label: '机群', items: [
-    ['clients', '客户端', ICON.clients], ['tasks', '备份任务', ICON.tasks], ['plans', '备份计划', ICON.plans]
+    ['clients', '客户端', ICON.clients], ['tasks', '备份任务', ICON.tasks], ['plans', '备份计划', ICON.plans],
+    ['endpoints', '业务探测', ICON.alerts]
   ] },
   { key: 'data', label: '数据', items: [
     ['backups', '备份集', ICON.backups], ['restores', '恢复', ICON.restores]
@@ -589,13 +590,14 @@ const VIEW_LOADERS = {
   alerts: () => import('./views/alerts.js'), notifications: () => import('./views/notifications.js'),
   audit: () => import('./views/audit.js'), retention: () => import('./views/retention.js'),
   runs: () => import('./views/runs.js'), upgrades: () => import('./views/upgrades.js'),
+  endpoints: () => import('./views/endpoints.js'),
   settings: () => import('./views/settings.js')
 };
 const VIEW_EXPORTS = {
   overview: 'vDashboard', transfers: 'vTransfers', todo: 'vTodo', clients: 'vClients', tasks: 'vTasks', plans: 'vPlans', backups: 'vBackups',
   restores: 'vRestores', alerts: 'vAlerts', notifications: 'vNotifications', audit: 'vAudit',
   'registration-tokens': 'vRegistrationTokens',
-  retention: 'vRetention', runs: 'vRuns', upgrades: 'vUpgrades',
+  retention: 'vRetention', runs: 'vRuns', upgrades: 'vUpgrades', endpoints: 'vEndpoints',
   settings: 'vSettings'
 };
 const DRAWER_EXPORTS = { tasks: 'openTaskDrawer', restores: 'openRestoreDrawer', alerts: 'openAlertDrawer', audit: 'openAuditDrawer' };

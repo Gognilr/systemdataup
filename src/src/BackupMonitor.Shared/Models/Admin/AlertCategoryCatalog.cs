@@ -30,6 +30,9 @@ public static class AlertCategoryCatalog
     /// <summary>备份计划完成回执的类别键。同样不是告警，只用于通知筛选。</summary>
     public const string PlanFinished = "plan_finished";
 
+    /// <summary>业务系统探测失败（V047）。这个是真告警。</summary>
+    public const string EndpointDown = "endpoint_down";
+
     public static IReadOnlyList<AlertCategoryOptionDto> All { get; } =
     [
         New("backup_missed", "到点没有备份", "warning"),
@@ -43,6 +46,7 @@ public static class AlertCategoryCatalog
         New("client_resource", "客户端资源吃紧（CPU / 内存 / 源盘）", "warning"),
         New("client_enrollment", "客户端登记", "notice"),
         New("service_state", "被监控的服务状态异常", "warning"),
+        New(EndpointDown, "业务系统探测失败（端口 / 页面）", "critical"),
         New("certificate_expiry", "客户端证书即将到期", "warning"),
         New("server_certificate_expiring", "服务端 TLS 证书即将到期", "warning"),
         New("client_ca_expiring", "客户端 CA 即将到期", "warning"),

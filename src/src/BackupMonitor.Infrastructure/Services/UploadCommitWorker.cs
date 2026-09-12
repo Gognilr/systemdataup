@@ -595,7 +595,7 @@ public class UploadCommitWorker : BackgroundService
             $"任务: {task.Name}",
             $"备份集: {backupSet.BackupSetCode}",
             $"文件数: {backupSet.TotalFiles}",
-            $"大小: {FormatBytes(backupSet.TotalBytes)}",
+            $"大小: {NotificationNotice.FormatBytes(backupSet.TotalBytes)}",
             $"入库时间: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
 
         if (NotificationNotice.Enqueue(db, channels, subject, body, AlertCategoryCatalog.BackupSucceeded) > 0)
@@ -616,21 +616,6 @@ public class UploadCommitWorker : BackgroundService
         AppDbContext db, Guid taskId, CancellationToken ct) =>
         db.BackupPlanItems.AsNoTracking()
             .AnyAsync(i => i.TaskId == taskId && i.Plan.Enabled && i.Plan.NotifyOnFinish, ct);
-
-    /// <summary>人看的大小。回执是发到手机上的，"53687091200 字节"在那里没有意义。</summary>
-    private static string FormatBytes(long bytes)
-    {
-        string[] units = ["B", "KB", "MB", "GB", "TB"];
-        double value = bytes;
-        var unit = 0;
-        while (value >= 1024 && unit < units.Length - 1)
-        {
-            value /= 1024;
-            unit++;
-        }
-
-        return unit == 0 ? $"{bytes} B" : $"{value:0.##} {units[unit]}";
-    }
 
     /// <summary>
     /// 提交之后的收尾动作失败（审计 E-07）。

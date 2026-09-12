@@ -243,6 +243,65 @@ public class AlertingService : IAlertingService
         }
     }
 
+    /// <summary>
+    /// 恢复通知的开关（system_settings 键），默认**开**。
+    ///
+    /// 「没有新消息」在收件人那里读起来和「已经好了」是一样的——而这两者差别很大。
+    /// 收到一条明确的「已恢复」，人才知道可以不用管了；否则只能自己去翻管理页面确认。
+    ///
+    /// 留一个开关是因为它确实会让消息量接近翻倍：坏一次、好一次。
+    /// 嫌吵可以关掉，关掉之后回到「只报坏消息」。
+    /// </summary>
+    public const string RecoveryNotifyKey = "alert_recovery_notify_enabled";
+
+    /// <summary>
+    /// 告警恢复了，给当初收到过坏消息的那些渠道补一条「已恢复」。
+    ///
+    /// 复用 CreateDeliveriesForAsync：渠道启用状态、等级筛选、排除类别全都跟着告警本身走，
+    /// 于是「坏消息发到哪，好消息就发到哪」——不会出现钉钉收到恢复、邮箱没收到的错位。
+    /// </summary>
+    private async Task NotifyRecoveryAsync(
+        IServiceScope scope, AppDbContext db, string alertKey,
+        IReadOnlyList<Guid> recoveringIds, DateTime now, CancellationToken ct)
+    {
+        var settings = scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>();
+        if (!await settings.GetBoolAsync(RecoveryNotifyKey, true, ct))
+            return;
+
+        // 只给**真的收到过**坏消息的人发恢复。
+        //
+        // 判据是「至少有一条投递已经发出去了」，不是「这条告警建过投递」——
+        // 抖动恢复时那封还躺在队列里就被上面取消了，没有任何人听说过它坏过，
+        // 这时候突然来一条「已恢复」，收件人只会困惑：恢复什么？
+        // 同理，被静默挡下、被渠道筛选滤掉、或者压根没配渠道的告警，也都不该有恢复通知。
+        var notifiedIds = await db.NotificationDeliveries.AsNoTracking()
+            .Where(d => d.AlertId != null
+                        && recoveringIds.Contains(d.AlertId.Value)
+                        && d.Status == NotificationStatus.Sent)
+            .Select(d => d.AlertId!.Value)
+            .Distinct()
+            .ToListAsync(ct);
+
+        if (notifiedIds.Count == 0)
+            return;
+
+        // 静默期间不发恢复——维护窗口里机器起起落落是正常的，
+        // 每恢复一次就响一声，静默就等于没静默。
+        var silenced = await db.AlertSilences
+            .AnyAsync(s => s.Until > now && EF.Functions.Like(alertKey, s.AlertKeyPattern), ct);
+        if (silenced)
+            return;
+
+        var alerts = await db.Alerts
+            .Where(a => notifiedIds.Contains(a.Id))
+            .ToListAsync(ct);
+
+        foreach (var alert in alerts)
+            await CreateDeliveriesForAsync(db, alert, ct, titlePrefix: "【已恢复】");
+
+        await db.SaveChangesAsync(ct);
+    }
+
     public async Task RecoverAsync(string alertKey, CancellationToken ct = default)
     {
         try
@@ -259,6 +318,7 @@ public class AlertingService : IAlertingService
             // 审计 G-12：这里取的是 ID 列表而不是直接 ExecuteUpdate——
             // ExecuteUpdate 不支持跨表条件，而下面取消投递必须按 alert_id 定位。
             var now = DateTime.UtcNow;
+
             var recoveringIds = await db.Alerts
                 .Where(a => a.AlertKey == alertKey && ActiveStatuses.Contains(a.Status))
                 .Select(a => a.Id)
@@ -280,6 +340,8 @@ public class AlertingService : IAlertingService
                             && recoveringIds.Contains(d.AlertId.Value)
                             && d.Status == NotificationStatus.Pending)
                 .ExecuteUpdateAsync(s => s.SetProperty(d => d.Status, NotificationStatus.Cancelled), ct);
+
+            await NotifyRecoveryAsync(scope, db, alertKey, recoveringIds, now, ct);
         }
         catch (Exception ex)
         {

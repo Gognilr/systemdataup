@@ -185,8 +185,26 @@ public class NotificationChannelStatusDto
 ///
 /// 注意这里管的是**告警什么时候产生**，与通知筛选（管的是产生之后发不发）是两件事。
 /// </summary>
+/// <summary>每日健康快报的开关与发送时刻。</summary>
+public class DailyDigestSettingsDto
+{
+    /// <summary>开着才发。默认关——备份节奏稀疏时它会退化成每天一封「什么都没发生」。</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>按报表时区的发送小时（0~23）。</summary>
+    public int Hour { get; set; } = 9;
+}
+
 public class AlertThresholdSettingsDto
 {
+    /// <summary>
+    /// 告警恢复时补发一条「已恢复」。默认开。
+    ///
+    /// 「没有新消息」在收件人那里读起来和「已经好了」是一样的，而这两者差别很大。
+    /// 代价是消息量接近翻倍：坏一次、好一次。嫌吵可以关掉。
+    /// </summary>
+    public bool RecoveryNotify { get; set; } = true;
+
     /// <summary>CPU 使用率达到多少报警（%），1~100。默认 85。</summary>
     public int ClientCpuPercent { get; set; } = 85;
 

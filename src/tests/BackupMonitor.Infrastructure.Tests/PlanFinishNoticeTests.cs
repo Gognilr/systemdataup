@@ -103,23 +103,83 @@ public class PlanFinishNoticeTests : IAsyncLifetime
 
     // ── 回执正文 ─────────────────────────────────────────────────────
 
-    /// <summary>全部成功时：四行说完，不带「失败的项」那一段。</summary>
+    /// <summary>
+    /// 结论里必须带上「入库几份、共多大」。
+    ///
+    /// 「跑完了」和「真的备进东西了」是两回事：一个全部成功但 0 份入库的计划，
+    /// 只看项数那一行完全看不出异常，而那恰恰是最该被看见的一种异常。
+    /// </summary>
     [Fact]
-    public void 全部成功的正文只有结论四行()
+    public void 结论里带上入库份数和总大小()
     {
         var run = NewRun("schedule", Guid.NewGuid());
         run.Status = BatchStatus.Completed;
-        run.TotalItems = 12;
-        run.SucceededItems = 12;
+        run.TotalItems = 2;
+        run.SucceededItems = 2;
 
-        var body = SequentialExecutionWorker.BuildPlanFinishBody("每日凌晨备份", run, []);
+        var body = SequentialExecutionWorker.BuildPlanFinishBody("恒源服务器数据备份", run,
+        [
+            Ok("恒源_OA服务器", "OA 数据库全量", 1, 3L * 1024 * 1024 * 1024),
+            Ok("恒源_U8服务器", "U8 账套备份", 18, 21L * 1024 * 1024 * 1024)
+        ]);
 
-        Assert.Contains("计划: 每日凌晨备份", body);
+        Assert.Contains("计划: 恒源服务器数据备份", body);
         Assert.Contains("结果: 全部成功", body);
-        Assert.Contains("共 12 项，成功 12，失败 0", body);
-        Assert.Contains("开始:", body);
-        // 一条都没失败的时候不该出现这个小标题——底下空着一行「失败的项：」很像出了问题
-        Assert.DoesNotContain("失败的项", body);
+        Assert.Contains("共 2 项，成功 2，失败 0", body);
+        Assert.Contains("入库 19 份，共 24 GB", body);
+    }
+
+    /// <summary>
+    /// 明细一行一个任务，不是一行一个备份集。
+    ///
+    /// U8 那种一个任务底下十几个账套，按备份集列就是十几行——那正是任务级回执
+    /// 被关掉的原因（18 个账套发 18 条）。这里必须压成一行。
+    /// </summary>
+    [Fact]
+    public void 明细一行一个任务并带上份数和大小()
+    {
+        var run = NewRun("schedule", Guid.NewGuid());
+        run.Status = BatchStatus.Completed;
+
+        var body = SequentialExecutionWorker.BuildPlanFinishBody("计划", run,
+            [Ok("瑞来_U8服务器", "U8 账套备份", 18, 21L * 1024 * 1024 * 1024)]);
+
+        Assert.Contains("明细：", body);
+        Assert.Contains("✓ 瑞来_U8服务器 / U8 账套备份 — 18 份，21 GB", body);
+        Assert.Single(body.Split(Environment.NewLine).Where(l => l.Contains("U8 账套备份")));
+    }
+
+    /// <summary>
+    /// 成功但一份都没进，要显示成「无新备份」。
+    ///
+    /// 预检通过、源目录没有新文件，也算成功。一周才备一两次的现场这种情况很常见，
+    /// 而它和「真的备进去了」显示成一样的话，「这周到底备没备」就看不出来了——
+    /// 这一行可能比其他所有行都重要。
+    /// </summary>
+    [Fact]
+    public void 成功但没有新备份要单独说明()
+    {
+        var run = NewRun("schedule", Guid.NewGuid());
+        run.Status = BatchStatus.Completed;
+
+        var body = SequentialExecutionWorker.BuildPlanFinishBody("计划", run,
+            [Ok("机器", "任务", 0, 0)]);
+
+        Assert.Contains("✓ 机器 / 任务 — 无新备份", body);
+        Assert.DoesNotContain("0 份，0 B", body);
+    }
+
+    /// <summary>耗时要写出来：这周 13 分钟、下周 2 小时，说明有东西不对劲。</summary>
+    [Fact]
+    public void 结束时间带上耗时()
+    {
+        var run = NewRun("schedule", Guid.NewGuid());
+        run.StartedAt = new DateTime(2026, 9, 12, 0, 0, 4, DateTimeKind.Utc);
+        run.FinishedAt = run.StartedAt.Value.AddMinutes(13).AddSeconds(10);
+
+        var body = SequentialExecutionWorker.BuildPlanFinishBody("计划", run, []);
+
+        Assert.Contains("（耗时 13 分 10 秒）", body);
     }
 
     /// <summary>失败项要带上是哪台机器的哪个任务，以及为什么——这是唯一需要人动手的部分。</summary>
@@ -134,19 +194,18 @@ public class PlanFinishNoticeTests : IAsyncLifetime
 
         var body = SequentialExecutionWorker.BuildPlanFinishBody("每日凌晨备份", run,
         [
-            new("恒源_OA服务器", "OA 数据库全量", ExecutionItemStatus.Timeout, null),
-            new("瑞来_U8服务器", "U8 附件库", ExecutionItemStatus.Failed, "预检未通过：源目录 3 天没有新文件")
+            new("恒源_OA服务器", "OA 数据库全量", ExecutionItemStatus.Timeout, null, 0, 0),
+            new("瑞来_U8服务器", "U8 附件库", ExecutionItemStatus.Failed, "预检未通过：源目录 3 天没有新文件", 0, 0)
         ]);
 
         Assert.Contains("结果: 部分成功", body);
-        Assert.Contains("失败的项：", body);
         // 超时要和「跑了但失败了」分开说：前者多半是机器关着或网断了，
         // 后者才需要去看备份本身——处置完全不同。
-        Assert.Contains("· 恒源_OA服务器 / OA 数据库全量（超时）", body);
-        Assert.Contains("· 瑞来_U8服务器 / U8 附件库（预检未通过：源目录 3 天没有新文件）", body);
+        Assert.Contains("✗ 恒源_OA服务器 / OA 数据库全量 — 超时", body);
+        Assert.Contains("✗ 瑞来_U8服务器 / U8 附件库 — 预检未通过：源目录 3 天没有新文件", body);
     }
 
-    /// <summary>没有原因文本的失败不能显示成「（）」，兜个「失败」。</summary>
+    /// <summary>没有原因文本的失败不能只留一个破折号,兜个「失败」。</summary>
     [Fact]
     public void 失败原因为空时兜一个失败()
     {
@@ -154,16 +213,15 @@ public class PlanFinishNoticeTests : IAsyncLifetime
         run.Status = BatchStatus.Failed;
 
         var body = SequentialExecutionWorker.BuildPlanFinishBody("计划", run,
-            [new("机器", "任务", ExecutionItemStatus.Failed, "   ")]);
+            [new("机器", "任务", ExecutionItemStatus.Failed, "   ", 0, 0)]);
 
-        Assert.Contains("· 机器 / 任务（失败）", body);
-        Assert.DoesNotContain("（）", body);
+        Assert.Contains("✗ 机器 / 任务 — 失败", body);
     }
 
     /// <summary>
-    /// 长原因要截断，而且不能把换行原样带进去。
+    /// 长原因要截断,而且不能把换行原样带进去。
     ///
-    /// 失败原因里塞进整段堆栈是常事，原样发到钉钉群会把一条消息撑成一屏。
+    /// 失败原因里塞进整段堆栈是常事,原样发到钉钉群会把一条消息撑成一屏。
     /// </summary>
     [Fact]
     public void 长原因截断且不带换行()
@@ -172,48 +230,52 @@ public class PlanFinishNoticeTests : IAsyncLifetime
         var message = "第一行" + Environment.NewLine + new string('长', 200);
 
         var body = SequentialExecutionWorker.BuildPlanFinishBody("计划", run,
-            [new("机器", "任务", ExecutionItemStatus.Failed, message)]);
+            [new("机器", "任务", ExecutionItemStatus.Failed, message, 0, 0)]);
 
-        var line = body.Split(Environment.NewLine).Single(l => l.Contains("· 机器"));
-        Assert.EndsWith("…）", line);
+        var line = body.Split(Environment.NewLine).Single(l => l.Contains("✗ 机器"));
+        Assert.EndsWith("…", line);
         Assert.True(line.Length < 100, $"失败行太长了：{line.Length} 字");
         Assert.DoesNotContain(new string('长', 200), body);
     }
 
     /// <summary>
-    /// 失败项太多时只列前 20 条，并说明还有多少。
+    /// 明细太多时只列前 20 条,并说明还有多少。
     ///
-    /// 关键数字（一共失败几条）在上面第三行已经给全了，这里列的是给人直接动手用的，
-    /// 而没有人会在手机上一条条看完 50 行。
+    /// 计划里通常只有几项,这个上限是防御性的。关键数字(共几项、成功几项、入库几份)
+    /// 在上面已经给全了,列表截断不影响结论。
     /// </summary>
     [Fact]
-    public void 失败项超过二十条只列前二十()
+    public void 明细超过二十条只列前二十()
     {
         var run = NewRun("schedule", Guid.NewGuid());
         run.Status = BatchStatus.Failed;
         run.TotalItems = 25;
         run.FailedItems = 25;
 
-        var failures = Enumerable.Range(1, 25)
-            .Select(i => new SequentialExecutionWorker.PlanFinishFailure(
-                "机器", $"任务{i}", ExecutionItemStatus.Failed, "失败"))
+        var items = Enumerable.Range(1, 25)
+            .Select(i => new SequentialExecutionWorker.PlanFinishItem(
+                "机器", $"任务{i}", ExecutionItemStatus.Failed, "失败", 0, 0))
             .ToList();
 
-        var body = SequentialExecutionWorker.BuildPlanFinishBody("计划", run, failures);
+        var body = SequentialExecutionWorker.BuildPlanFinishBody("计划", run, items);
 
-        Assert.Equal(20, body.Split(Environment.NewLine).Count(l => l.TrimStart().StartsWith('·')));
+        Assert.Equal(20, body.Split(Environment.NewLine).Count(l => l.TrimStart().StartsWith('✗')));
         Assert.Contains("另有 5 项，详见管理页面", body);
         // 总数仍然要说全：列表截断了，结论不能跟着截断
         Assert.Contains("失败 25", body);
     }
 
-    /// <summary>标题要带计划名——群里同时有几个计划时，光看「备份计划完成」分不出是哪个。</summary>
+    /// <summary>标题要带计划名——群里同时有几个计划时,光看「备份计划完成」分不出是哪个。</summary>
     [Fact]
     public void 标题带上计划名()
     {
         Assert.Equal("备份计划完成：每日凌晨备份",
             SequentialExecutionWorker.BuildPlanFinishSubject("每日凌晨备份"));
     }
+
+    private static SequentialExecutionWorker.PlanFinishItem Ok(
+        string client, string task, int sets, long bytes) =>
+        new(client, task, ExecutionItemStatus.Succeeded, null, sets, bytes);
 
     // ── 判断二：任务是否已被计划覆盖 ──────────────────────────────────
 

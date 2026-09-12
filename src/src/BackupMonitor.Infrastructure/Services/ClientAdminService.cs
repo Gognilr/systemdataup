@@ -1,4 +1,5 @@
 ﻿using System.Text.Json;
+using BackupMonitor.Core.Entities.Alert;
 using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Common;
@@ -35,6 +36,13 @@ public interface IClientAdminService
     /// <summary>删除一台已注销机器的记录（名下还有备份任务时拒绝）</summary>
     Task DeleteAsync(Guid clientId, CancellationToken ct = default);
     Task<DispatchCommandResponse> RefreshMetricsAsync(Guid clientId, CancellationToken ct = default);
+
+    /// <summary>让一台客户端进入维护窗口：期间它的告警只累加、不通知。</summary>
+    Task<ClientDetailDto> StartMaintenanceAsync(
+        Guid clientId, StartMaintenanceRequest request, CancellationToken ct = default);
+
+    /// <summary>提前结束维护窗口。</summary>
+    Task<ClientDetailDto> EndMaintenanceAsync(Guid clientId, CancellationToken ct = default);
 }
 
 /// <summary>客户端管理实现（列表/详情/审批签发证书/拒绝/禁用/注销/刷新主机状态）</summary>
@@ -165,6 +173,7 @@ public class ClientAdminService : IClientAdminService
             .ToListAsync(ct);
 
         var pageIds = rows.Select(r => r.Id).ToList();
+        var maintenance = await MaintenanceByClientAsync(pageIds, ct);
 
         var alertCounts = await _db.Alerts
             .Where(a => a.ClientId != null && pageIds.Contains(a.ClientId.Value)
@@ -213,6 +222,8 @@ public class ClientAdminService : IClientAdminService
                 ? null
                 : Math.Max(0, (int)Math.Ceiling((r.CertificateExpiresAt.Value - DateTime.UtcNow).TotalDays)),
             OsVersion = r.OsVersion,
+            MaintenanceUntil = maintenance.TryGetValue(r.Id, out var window) ? window.Until : null,
+            MaintenanceReason = maintenance.TryGetValue(r.Id, out var w2) ? w2.Reason : null,
             LastHeartbeatAt = r.LastHeartbeatAt,
             LastSeenAt = r.LastSeenAt,
             LastRemoteIp = r.LastRemoteIp,
@@ -249,6 +260,116 @@ public class ClientAdminService : IClientAdminService
         {
             return [];
         }
+    }
+
+    /// <summary>
+    /// 维护窗口就是一条 client:{id}:% 的告警静默。
+    ///
+    /// 不另起一套状态：静默机制已经有了「命中的只累加次数、不发通知、不推托盘，
+    /// 但告警本身照常产生」这套语义，而那正是维护期间想要的——
+    /// 界面上仍然显示真相（离线就是离线），只是不往钉钉发。
+    ///
+    /// 所有与客户端有关的告警键都是 client:{id}:… 这个形状（离线、资源、服务状态、
+    /// 配置卡住、证书到期、业务探测），所以一条模式全罩得住。
+    /// </summary>
+    internal static string MaintenancePatternOf(Guid clientId) => $"client:{clientId}:%";
+
+    public async Task<ClientDetailDto> StartMaintenanceAsync(
+        Guid clientId, StartMaintenanceRequest request, CancellationToken ct = default)
+    {
+        var client = await _db.Clients.AsNoTracking().FirstOrDefaultAsync(c => c.Id == clientId, ct)
+            ?? throw new NotFoundException("客户端", clientId);
+
+        if (string.IsNullOrWhiteSpace(request.Reason))
+            throw new ValidationFailedException("请填写维护原因");
+
+        // 上限 30 天：再长就不是「维护窗口」而是「忘了关」。
+        var hours = Math.Clamp(request.Hours, 1, 720);
+
+        var userId = _context.UserId
+            ?? throw new BusinessException("UNAUTHORIZED", "进入维护模式需要管理员身份", 401);
+
+        var pattern = MaintenancePatternOf(clientId);
+        var now = DateTime.UtcNow;
+
+        // 已经在维护中就续期，不叠加第二条——两条重叠的静默谁都说不清什么时候到期。
+        var existing = await _db.AlertSilences
+            .Where(s => s.AlertKeyPattern == pattern && s.Until > now)
+            .OrderByDescending(s => s.Until)
+            .FirstOrDefaultAsync(ct);
+
+        if (existing is not null)
+        {
+            existing.Until = now.AddHours(hours);
+            existing.Reason = request.Reason.Trim();
+        }
+        else
+        {
+            _db.AlertSilences.Add(new AlertSilence
+            {
+                Id = Guid.NewGuid(),
+                AlertKeyPattern = pattern,
+                Reason = request.Reason.Trim(),
+                Until = now.AddHours(hours),
+                CreatedBy = userId,
+                CreatedAt = now
+            });
+        }
+
+        await _db.SaveChangesAsync(ct);
+        await _audit.RecordAsync("client.maintenance.start", AuditResult.Success, "client", clientId,
+            afterData: JsonSerializer.Serialize(new { hours, request.Reason }), ct: ct);
+
+        _logger.LogInformation(
+            "客户端 {Client} 进入维护模式 {Hours} 小时：{Reason}", client.Hostname, hours, request.Reason);
+
+        return await GetDetailAsync(clientId, ct);
+    }
+
+    public async Task<ClientDetailDto> EndMaintenanceAsync(Guid clientId, CancellationToken ct = default)
+    {
+        _ = await _db.Clients.AsNoTracking().FirstOrDefaultAsync(c => c.Id == clientId, ct)
+            ?? throw new NotFoundException("客户端", clientId);
+
+        var pattern = MaintenancePatternOf(clientId);
+        var now = DateTime.UtcNow;
+
+        // 把 Until 拨到当下而不是删记录：审计里要留下「谁在什么时候提前结束的」。
+        var active = await _db.AlertSilences
+            .Where(s => s.AlertKeyPattern == pattern && s.Until > now)
+            .ToListAsync(ct);
+
+        foreach (var silence in active)
+            silence.Until = now;
+
+        if (active.Count > 0)
+        {
+            await _db.SaveChangesAsync(ct);
+            await _audit.RecordAsync("client.maintenance.end", AuditResult.Success, "client", clientId, ct: ct);
+        }
+
+        return await GetDetailAsync(clientId, ct);
+    }
+
+    /// <summary>这些客户端此刻各自的维护窗口（没有就不在字典里）。</summary>
+    private async Task<Dictionary<Guid, AlertSilence>> MaintenanceByClientAsync(
+        IReadOnlyCollection<Guid> clientIds, CancellationToken ct)
+    {
+        if (clientIds.Count == 0)
+            return [];
+
+        var patterns = clientIds.Select(MaintenancePatternOf).ToList();
+        var now = DateTime.UtcNow;
+
+        var rows = await _db.AlertSilences.AsNoTracking()
+            .Where(s => patterns.Contains(s.AlertKeyPattern) && s.Until > now)
+            .ToListAsync(ct);
+
+        return rows
+            .GroupBy(s => s.AlertKeyPattern)
+            .ToDictionary(
+                g => clientIds.First(id => MaintenancePatternOf(id) == g.Key),
+                g => g.OrderByDescending(s => s.Until).First());
     }
 
     /// <summary>
@@ -433,6 +554,9 @@ public class ClientAdminService : IClientAdminService
             })
             .FirstOrDefaultAsync(ct);
 
+        var detailMaintenance = (await MaintenanceByClientAsync([clientId], ct))
+            .GetValueOrDefault(clientId);
+
         return new ClientDetailDto
         {
             Id = client.Id,
@@ -457,6 +581,8 @@ public class ClientAdminService : IClientAdminService
             ActiveUploadTaskNames = activeUploads.Distinct().ToList(),
 
             MachineId = client.MachineId,
+            MaintenanceUntil = detailMaintenance?.Until,
+            MaintenanceReason = detailMaintenance?.Reason,
             UpdaterVersion = client.UpdaterVersion,
             OsVersion = client.OsVersion,
             Architecture = client.Architecture,

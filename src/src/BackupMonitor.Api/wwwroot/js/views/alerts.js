@@ -6,7 +6,12 @@ import {
   tableHtml, pagerHtml, skeleton, emptyState, hasFilter, batchBarHtml,
   toast, errToast, formModal, openDrawer
 } from '../ui.js';
-import { shell, loading } from '../app.js';
+import { shell, loading, schedulePoll } from '../app.js';
+
+/* 15 秒。告警页是人会开着不动、等着东西冒出来的地方——
+   要手动刷新才更新的话，一屏不动的空列表和「真的什么都没发生」长得一模一样，
+   而这两者恰恰是这一页要分开的。 */
+const POLL_MS = 15000;
 
 export async function vAlerts() {
   App.state.alerts = App.state.alerts || { page: 1, pageSize: 20, level: '', status: '', assignedToMe: false, totalCount: 0, selected: [], sortKey: 'lastOccurredAt', sortDesc: true };
@@ -79,6 +84,7 @@ LOADERS.alerts = async function () {
     ], data.items, { empty, stateKey: 'alerts' }) + pagerHtml('alerts', st);
     const bb = $('#bb-alerts');
     if (bb) bb.outerHTML = `<div id="bb-alerts">${batchBarHtml('alerts')}</div>`;
+    schedulePoll('alerts', LOADERS.alerts, POLL_MS);
   } catch (e) { wrap.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 };
 

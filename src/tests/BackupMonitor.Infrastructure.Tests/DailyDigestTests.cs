@@ -45,6 +45,8 @@ public class DailyDigestTests : IAsyncLifetime
         sc.AddSingleton<BackupMonitor.Infrastructure.Security.ISecretProtector,
             BackupMonitor.Infrastructure.Security.SecretProtector>();
         sc.AddScoped<INotificationService, NotificationService>();
+        // 快报正文里那张客户端健康表复用的是概览页那份资源快照。
+        sc.AddScoped<IClientAdminService, ClientAdminService>();
         sc.AddScoped<IScheduledLockService, ScheduledLockService>();
         sc.AddSingleton(sp => new SystemSettingsProvider(
             sp.GetRequiredService<IServiceScopeFactory>(),
@@ -62,6 +64,12 @@ public class DailyDigestTests : IAsyncLifetime
         // 「一切正常也发日报」必然失败，而另外两条（重复执行、关掉后不发）会**空过**：
         // 什么都没发生，断言照样成立。后者比前者更危险，它让人以为这两条一直在把关。
         await SetSettingAsync(DailyDigestWorker.HourKey, "0");
+
+        // 开关也要显式打开。V046 之后日报默认是**关**的（哨兵接管了「证明系统还活着」，
+        // 而每周一两次的备份节奏配每天一封「0 份入库」只会让人养成划过去的习惯）。
+        // 不显式打开的话，这一组会整体空过——什么都没发生，断言照样成立，
+        // 而那比直接失败更危险：它让人以为这几条一直在把关。
+        await SetSettingAsync(DailyDigestWorker.EnabledKey, "true");
         return;
     }
 
@@ -83,12 +91,15 @@ public class DailyDigestTests : IAsyncLifetime
         // 会被这些残留污染——而那也不是本条要证明的事。
         // 要证明的是：不管昨天有事没事，日报都产生了投递。
         var latest = await LatestDigestAsync();
-        Assert.Contains("备份日报", latest.Subject!);
+        // 标题从「备份日报」改成了「客户端健康」：内容的重心从「昨天备了几份」
+        // 挪到了「每台机器现在什么状况」——前者在一周备一两次的现场天天是 0。
+        Assert.Contains("客户端健康", latest.Subject!);
         // 正文里必须写清楚「收不到它就说明服务端可能停了」——那是日报唯一无可替代的作用
         Assert.Contains("连续收不到", latest.Body!);
         // 「一切正常」那一支不能只存在于代码里：它是这条整改的核心，单独钉一次。
         Assert.Contains("一切正常", DailyDigestWorker.SubjectSuffixFor(
-            new DailyDigestWorker.DigestData(3, 1024, 0, 0, 0, 0, 0)));
+            new DailyDigestWorker.DigestData(3, 1024, 0, 0, 0, 0, 0, [],
+                new DailyDigestWorker.HealthThresholds(85, 90, 10))));
     }
 
     /// <summary>同一个业务日只发一次：服务端一天重启几次不该变成几封日报。</summary>

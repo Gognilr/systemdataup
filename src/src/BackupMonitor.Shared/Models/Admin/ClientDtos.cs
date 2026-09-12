@@ -33,6 +33,18 @@ public class ClientListItemDto
     public string DisplayName { get; set; } = null!;
     public Guid? ClientGroupId { get; set; }
     public string? ClientGroupName { get; set; }
+    /// <summary>
+    /// 维护窗口的结束时刻；为空表示当前不在维护。
+    ///
+    /// 维护期间这台机器的告警只累加不通知——停机检修时不该有人被半夜叫醒。
+    /// 但它**必须有结束时刻**：没有到期时间的维护模式是个经典陷阱，
+    /// 有人开了忘了关，那台机器几个月没人监控，而界面上一切正常。
+    /// </summary>
+    public DateTime? MaintenanceUntil { get; set; }
+
+    /// <summary>维护原因。三个月后回头看，「为什么那天静默了」是唯一想知道的事。</summary>
+    public string? MaintenanceReason { get; set; }
+
     public string? OsName { get; set; }
 
     /// <summary>
@@ -393,6 +405,16 @@ public class AgentVersionStatusDto
 
     /// <summary>低于随附版本、或从未上报过版本号的机器。</summary>
     public List<AgentVersionDriftItemDto> OutdatedClients { get; set; } = [];
+}
+
+/// <summary>进入维护模式的请求。</summary>
+public class StartMaintenanceRequest
+{
+    /// <summary>维护多少小时。必须有值——没有到期时间的维护模式会被人忘掉。</summary>
+    public int Hours { get; set; } = 4;
+
+    /// <summary>维护原因，必填。</summary>
+    public string Reason { get; set; } = null!;
 }
 
 /// <summary>一台落后的客户端。</summary>

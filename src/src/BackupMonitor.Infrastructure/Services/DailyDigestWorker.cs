@@ -39,6 +39,12 @@ public class DailyDigestWorker : BackgroundService
     public const string HourKey = "daily_digest_hour";
 
     /// <summary>
+    /// 默认发送时刻。9 点：等早上的备份计划都跑完，快报里的数字反映的是备份之后的状态，
+    /// 也不会和计划完成回执挤在同一分钟里。
+    /// </summary>
+    public const int DefaultHour = 9;
+
+    /// <summary>
     /// 已经发过日报的最后一个业务日（报表时区的 yyyy-MM-dd）。
     ///
     /// 幂等键放在库里而不是进程内存里：服务端重启是常事，
@@ -119,11 +125,13 @@ public class DailyDigestWorker : BackgroundService
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var settings = scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>();
 
-        if (!await settings.GetBoolAsync(EnabledKey, true, ct))
+        // 默认关：这封信的价值取决于内容密度，而那取决于现场的备份节奏。
+        // 由人在界面上打开，比默认发出去再让人来关更合适。
+        if (!await settings.GetBoolAsync(EnabledKey, false, ct))
             return;
 
         var timezone = PlanSchedule.ResolveTimeZone(_configuration["Reports:Timezone"]);
-        var sendHour = Math.Clamp(await settings.GetIntAsync(HourKey, 8, ct), 0, 23);
+        var sendHour = Math.Clamp(await settings.GetIntAsync(HourKey, DefaultHour, ct), 0, 23);
         var nowLocal = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, timezone);
 
         if (nowLocal.Hour < sendHour)
@@ -142,7 +150,7 @@ public class DailyDigestWorker : BackgroundService
             DateTime.SpecifyKind(businessDate, DateTimeKind.Unspecified), timezone);
         var toUtc = fromUtc.AddDays(1);
 
-        var digest = await BuildDigestAsync(db, fromUtc, toUtc, ct);
+        var digest = await WithClientHealthAsync(scope, await BuildDigestAsync(db, fromUtc, toUtc, ct), ct);
         var created = await EnqueueDeliveriesAsync(scope, db, businessDate, timezone, digest, ct);
 
         // 无论有没有渠道可发，都要记下这一天已经处理过——否则没配渠道的系统
@@ -154,7 +162,26 @@ public class DailyDigestWorker : BackgroundService
             stamp, digest.SuccessCount, digest.FailedCount, digest.MissedCount, digest.OfflineClients, created);
     }
 
-    /// <summary>昨日一天的执行情况。</summary>
+    /// <summary>
+    /// 一台客户端的健康快照。
+    ///
+    /// 这几个数字告警也在看，但告警是**踩线才响**：内存从 78% 慢慢爬到 92%、
+    /// 源盘从 49% 慢慢降到 15%，这个过程告警一声不吭，只在踩线那天炸一下——
+    /// 而炸的时候往往已经没有从容处理的余地了。每天一张快照，看的就是这个过程。
+    /// </summary>
+    public sealed record ClientHealth(
+        string Name,
+        bool Online,
+        decimal? CpuPercent,
+        decimal? MemoryPercent,
+        decimal? DiskFreePercent,
+        string? DiskName,
+        int ActiveAlerts);
+
+    /// <summary>资源告警阈值，用来给快报里的数字打 ⚠。与告警用的是同一组配置。</summary>
+    public sealed record HealthThresholds(int CpuPercent, int MemoryPercent, int DiskFreePercent);
+
+    /// <summary>昨日一天的执行情况，以及此刻每台客户端的健康度。</summary>
     public sealed record DigestData(
         int SuccessCount,
         long SuccessBytes,
@@ -162,7 +189,9 @@ public class DailyDigestWorker : BackgroundService
         int FailedCount,
         int MissedCount,
         int OfflineClients,
-        int OpenCriticalAlerts);
+        int OpenCriticalAlerts,
+        IReadOnlyList<ClientHealth> Clients,
+        HealthThresholds Thresholds);
 
     private static async Task<DigestData> BuildDigestAsync(
         AppDbContext db, DateTime fromUtc, DateTime toUtc, CancellationToken ct)
@@ -200,7 +229,58 @@ public class DailyDigestWorker : BackgroundService
             failed,
             missed,
             offline,
-            openCritical);
+            openCritical,
+            [],
+            new HealthThresholds(85, 90, 10));
+    }
+
+    /// <summary>
+    /// 每台客户端此刻的健康度。
+    ///
+    /// 复用概览页那份资源快照，不自己再查一遍：两处各算各的，迟早在某个口径上对不上，
+    /// 而「快报上说内存 78%、概览页上说 92%」比两边都没有更糟。
+    /// </summary>
+    private async Task<DigestData> WithClientHealthAsync(
+        IServiceScope scope, DigestData digest, CancellationToken ct)
+    {
+        try
+        {
+            return await LoadClientHealthAsync(scope, digest, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // 取不到健康快照，信照发。这封信最不可替代的作用是「收到了 = 服务端还活着」，
+            // 为了一张表把整封信拖没，等于把那个信号也一起丢了。
+            _logger.LogWarning(ex, "健康快报：客户端健康快照取失败，本次只发备份部分");
+            return digest;
+        }
+    }
+
+    private static async Task<DigestData> LoadClientHealthAsync(
+        IServiceScope scope, DigestData digest, CancellationToken ct)
+    {
+        var clients = await scope.ServiceProvider.GetRequiredService<IClientAdminService>()
+            .GetResourceOverviewAsync(200, ct);
+
+        var settings = scope.ServiceProvider.GetRequiredService<SystemSettingsProvider>();
+        var thresholds = new HealthThresholds(
+            Math.Clamp(await settings.GetIntAsync("client_cpu_alert_percent", 85, ct), 1, 100),
+            Math.Clamp(await settings.GetIntAsync("client_memory_alert_percent", 90, ct), 1, 100),
+            Math.Clamp(await settings.GetIntAsync("client_disk_free_alert_percent", 10, ct), 1, 99));
+
+        var rows = clients
+            .OrderBy(c => c.DisplayName, StringComparer.CurrentCulture)
+            .Select(c => new ClientHealth(
+                string.IsNullOrWhiteSpace(c.DisplayName) ? c.Hostname : c.DisplayName,
+                c.Status == "online",
+                c.CpuPercent,
+                c.MemoryPercent,
+                c.MinSourceDiskFreePercent,
+                c.MinSourceDiskName,
+                c.ActiveAlertCount))
+            .ToList();
+
+        return digest with { Clients = rows, Thresholds = thresholds };
     }
 
     /// <summary>
@@ -218,7 +298,7 @@ public class DailyDigestWorker : BackgroundService
         var notifications = scope.ServiceProvider.GetRequiredService<INotificationService>();
         var channels = await notifications.GetSettingsAsync(ct);
 
-        var subject = $"{businessDate:yyyy-MM-dd} 备份日报" + SubjectSuffixFor(digest);
+        var subject = $"{businessDate:yyyy-MM-dd} 客户端健康" + SubjectSuffixFor(digest);
         var body = BuildBody(businessDate, timezone, digest);
 
         // 不传类别：日报刻意不可按类别关掉。它要证明的恰恰是「这套系统今天还活着」，
@@ -239,7 +319,14 @@ public class DailyDigestWorker : BackgroundService
         IsAllClear(digest) ? "：一切正常" : $"：{Trouble(digest)}";
 
     private static bool IsAllClear(DigestData d) =>
-        d.FailedCount == 0 && d.MissedCount == 0 && d.OfflineClients == 0 && d.SuspiciousCount == 0;
+        d.FailedCount == 0 && d.MissedCount == 0 && d.OfflineClients == 0 && d.SuspiciousCount == 0
+        && d.Clients.Count(c => IsStrained(c, d.Thresholds)) == 0;
+
+    /// <summary>这台机器有没有踩到资源阈值。踩了就在快报里打 ⚠，并写进标题。</summary>
+    private static bool IsStrained(ClientHealth c, HealthThresholds t) =>
+        c.CpuPercent >= t.CpuPercent
+        || c.MemoryPercent >= t.MemoryPercent
+        || (c.DiskFreePercent is not null && c.DiskFreePercent <= t.DiskFreePercent);
 
     private static string Trouble(DigestData d)
     {
@@ -248,25 +335,42 @@ public class DailyDigestWorker : BackgroundService
         if (d.FailedCount > 0) parts.Add($"{d.FailedCount} 次传输失败");
         if (d.SuspiciousCount > 0) parts.Add($"{d.SuspiciousCount} 份大小可疑");
         if (d.OfflineClients > 0) parts.Add($"{d.OfflineClients} 台离线");
+
+        var strained = d.Clients.Count(c => IsStrained(c, d.Thresholds));
+        if (strained > 0) parts.Add($"{strained} 台资源吃紧");
+
         return string.Join("、", parts);
     }
 
     private static string BuildBody(DateTime businessDate, TimeZoneInfo timezone, DigestData d)
     {
-        var body = new StringBuilder()
-            .AppendLine($"业务日：{businessDate:yyyy-MM-dd}（{timezone.Id}）")
-            .AppendLine()
-            .AppendLine($"成功入库：{d.SuccessCount} 份，共 {FormatBytes(d.SuccessBytes)}")
-            .AppendLine($"大小可疑：{d.SuspiciousCount} 份")
-            .AppendLine($"传输失败：{d.FailedCount} 次")
-            .AppendLine($"未按计划产生备份：{d.MissedCount} 项")
-            .AppendLine($"当前离线客户端：{d.OfflineClients} 台")
-            .AppendLine($"当前未处理的严重告警：{d.OpenCriticalAlerts} 条")
+        var body = new StringBuilder();
+
+        // 客户端健康排在最前：这是这封信每天都有新内容的那一部分。
+        // 备份数字放后面且能省则省——一周备一两次的现场，天天写「0 份入库」
+        // 会让人养成划过去的习惯，而那个习惯会连带把真正要紧的行一起划走。
+        foreach (var c in d.Clients)
+            body.AppendLine(FormatClient(c, d.Thresholds));
+
+        if (d.Clients.Count > 0)
+            body.AppendLine();
+
+        if (d.SuccessCount > 0)
+            body.AppendLine($"昨日入库：{d.SuccessCount} 份，共 {FormatBytes(d.SuccessBytes)}（{businessDate:MM-dd}，{timezone.Id}）");
+
+        if (d.SuspiciousCount > 0)
+            body.AppendLine($"大小可疑：{d.SuspiciousCount} 份");
+        if (d.FailedCount > 0)
+            body.AppendLine($"传输失败：{d.FailedCount} 次");
+        if (d.MissedCount > 0)
+            body.AppendLine($"未按计划产生备份：{d.MissedCount} 项");
+
+        body.AppendLine($"未处理的严重告警：{d.OpenCriticalAlerts} 条")
             .AppendLine();
 
         if (IsAllClear(d))
         {
-            body.AppendLine("昨天没有发现问题。");
+            body.AppendLine("没有发现问题。");
         }
         else
         {
@@ -279,11 +383,44 @@ public class DailyDigestWorker : BackgroundService
         // 这一句是日报存在的理由，必须写在正文里：
         // 收件人要能靠「有没有收到这封信」判断服务端本身是不是还活着。
         body.AppendLine()
-            .AppendLine("这封日报每天固定发送。连续收不到它，说明服务端本身可能已经停了——");
+            .AppendLine("这封快报每天固定发送。连续收不到它，说明服务端本身可能已经停了——");
         body.AppendLine("那是这套系统唯一无法自己报出来的故障。");
 
         return body.ToString();
     }
+
+    /// <summary>
+    /// 快报里的一行客户端。
+    ///
+    /// 踩到阈值的数字后面打 ⚠：平时这封信干干净净，一旦有东西开始不对，
+    /// 眼睛会自己被那个符号抓住，而不需要人逐个数字去比。
+    /// </summary>
+    private static string FormatClient(ClientHealth c, HealthThresholds t)
+    {
+        if (!c.Online)
+            return $"{c.Name}  离线 ⚠";
+
+        var parts = new List<string>
+        {
+            $"CPU {Percent(c.CpuPercent)}{Mark(c.CpuPercent >= t.CpuPercent)}",
+            $"内存 {Percent(c.MemoryPercent)}{Mark(c.MemoryPercent >= t.MemoryPercent)}"
+        };
+
+        parts.Add(c.DiskFreePercent is null
+            ? "无源盘"
+            : $"{c.DiskName}可用 {Percent(c.DiskFreePercent)}"
+              + Mark(c.DiskFreePercent <= t.DiskFreePercent));
+
+        if (c.ActiveAlerts > 0)
+            parts.Add($"{c.ActiveAlerts} 条告警");
+
+        return $"{c.Name}  在线  {string.Join("  ", parts)}";
+    }
+
+    private static string Percent(decimal? value) =>
+        value is null ? "—" : $"{Math.Round(value.Value)}%";
+
+    private static string Mark(bool strained) => strained ? " ⚠" : string.Empty;
 
     private static async Task MarkSentAsync(
         AppDbContext db, SystemSettingsProvider settings, string stamp, CancellationToken ct)

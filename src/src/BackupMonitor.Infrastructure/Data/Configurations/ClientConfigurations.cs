@@ -350,3 +350,45 @@ public class AgentNotificationConfiguration : IEntityTypeConfiguration<AgentNoti
             .OnDelete(DeleteBehavior.SetNull);
     }
 }
+
+/// <summary>业务系统探测（V047）。</summary>
+public class MonitoredEndpointConfiguration : IEntityTypeConfiguration<MonitoredEndpoint>
+{
+    public void Configure(EntityTypeBuilder<MonitoredEndpoint> builder)
+    {
+        builder.ToTable("monitored_endpoints");
+
+        builder.HasKey(e => e.Id);
+        builder.Property(e => e.Id).HasColumnName("id").HasDefaultValueSql("gen_random_uuid()");
+        builder.Property(e => e.Name).HasColumnName("name").HasMaxLength(128).IsRequired();
+        builder.Property(e => e.ClientId).HasColumnName("client_id");
+        builder.Property(e => e.ProbeType).HasColumnName("probe_type")
+            .HasConversion(v => v == EndpointProbeType.Http ? "http" : "tcp",
+                           v => v == "http" ? EndpointProbeType.Http : EndpointProbeType.Tcp)
+            .HasMaxLength(16);
+        builder.Property(e => e.Target).HasColumnName("target").HasMaxLength(1024).IsRequired();
+        builder.Property(e => e.Port).HasColumnName("port");
+        builder.Property(e => e.ExpectedStatus).HasColumnName("expected_status").HasMaxLength(64);
+        builder.Property(e => e.ExpectedContent).HasColumnName("expected_content").HasMaxLength(512);
+        builder.Property(e => e.TimeoutSeconds).HasColumnName("timeout_seconds").HasDefaultValue(10);
+        builder.Property(e => e.IntervalSeconds).HasColumnName("interval_seconds").HasDefaultValue(60);
+        builder.Property(e => e.FailureThreshold).HasColumnName("failure_threshold").HasDefaultValue(3);
+        builder.Property(e => e.SlowMilliseconds).HasColumnName("slow_milliseconds");
+        builder.Property(e => e.Enabled).HasColumnName("enabled").HasDefaultValue(true);
+        builder.Property(e => e.AlertOnFailure).HasColumnName("alert_on_failure").HasDefaultValue(true);
+        builder.Property(e => e.LastProbedAt).HasColumnName("last_probed_at");
+        builder.Property(e => e.LastSuccessAt).HasColumnName("last_success_at");
+        builder.Property(e => e.LastStatus).HasColumnName("last_status").HasMaxLength(16);
+        builder.Property(e => e.LastLatencyMs).HasColumnName("last_latency_ms");
+        builder.Property(e => e.LastError).HasColumnName("last_error").HasMaxLength(512);
+        builder.Property(e => e.ConsecutiveFailures).HasColumnName("consecutive_failures").HasDefaultValue(0);
+        builder.Property(e => e.CreatedBy).HasColumnName("created_by");
+        builder.Property(e => e.CreatedAt).HasColumnName("created_at")
+            .HasDefaultValueSql("now()").ValueGeneratedOnAdd();
+        builder.Property(e => e.UpdatedAt).HasColumnName("updated_at")
+            .HasDefaultValueSql("now()").ValueGeneratedOnAddOrUpdate();
+
+        builder.HasOne(e => e.Client).WithMany()
+            .HasForeignKey(e => e.ClientId).OnDelete(DeleteBehavior.SetNull);
+    }
+}

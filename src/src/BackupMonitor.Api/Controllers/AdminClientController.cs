@@ -195,4 +195,24 @@ public class AdminClientController : ApiBaseController
         var result = await _clientService.RefreshMetricsAsync(clientId, ct);
         return OkData(result, "指令已下发");
     }
+
+    /// <summary>
+    /// 进入维护窗口：期间这台机器的告警只累加、不通知。
+    ///
+    /// 停机检修时不该有人被半夜叫醒，但**必须有结束时刻**——
+    /// 没有到期时间的维护模式是个经典陷阱：有人开了忘了关，
+    /// 那台机器几个月没人监控，而界面上一切正常。
+    /// </summary>
+    [HttpPost("{clientId:guid}/maintenance")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.manage")]
+    public async Task<ActionResult<ApiResponse<ClientDetailDto>>> StartMaintenance(
+        Guid clientId, [FromBody] StartMaintenanceRequest request, CancellationToken ct)
+        => OkData(await _clientService.StartMaintenanceAsync(clientId, request, ct), "已进入维护模式");
+
+    /// <summary>提前结束维护窗口。</summary>
+    [HttpDelete("{clientId:guid}/maintenance")]
+    [Authorize(AuthenticationSchemes = "Bearer", Policy = "perm:clients.manage")]
+    public async Task<ActionResult<ApiResponse<ClientDetailDto>>> EndMaintenance(
+        Guid clientId, CancellationToken ct)
+        => OkData(await _clientService.EndMaintenanceAsync(clientId, ct), "维护模式已结束");
 }

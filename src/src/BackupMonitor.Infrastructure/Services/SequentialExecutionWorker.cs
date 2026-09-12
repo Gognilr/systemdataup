@@ -761,17 +761,41 @@ public class SequentialExecutionWorker : BackgroundService
             if (!ShouldNotifyPlanFinish(run, plan))
                 return;
 
-            var failedItems = await db.ExecutionRunItems.AsNoTracking()
-                .Where(i => i.RunId == run.Id
-                            && (i.Status == ExecutionItemStatus.Failed
-                                || i.Status == ExecutionItemStatus.Timeout))
+            var rows = await db.ExecutionRunItems.AsNoTracking()
+                .Where(i => i.RunId == run.Id)
                 .OrderBy(i => i.SortOrder)
-                .Select(i => new PlanFinishFailure(
-                    i.Task.Client.DisplayName,
-                    i.Task.Name,
+                .Select(i => new
+                {
+                    i.TaskId,
                     i.Status,
-                    i.Message))
+                    i.Message,
+                    TaskName = i.Task.Name,
+                    ClientName = i.Task.Client.DisplayName
+                })
                 .ToListAsync(ct);
+
+            // 这一趟到底存进去了多少——「跑完了」和「真的备进东西了」是两回事，
+            // 而后者才是备份这件事本身。按任务聚合：U8 那种一个任务底下十几个账套，
+            // 在这里压成一行「18 份，21.5 GB」，而不是十八条消息。
+            var taskIds = rows.Select(r => r.TaskId).Distinct().ToList();
+            var windowStart = run.StartedAt ?? run.CreatedAt;
+            var windowEnd = run.FinishedAt ?? DateTime.UtcNow;
+            var landed = await db.BackupSets.AsNoTracking()
+                .Where(b => taskIds.Contains(b.TaskId)
+                            && b.UploadedAt >= windowStart
+                            && b.UploadedAt <= windowEnd)
+                .GroupBy(b => b.TaskId)
+                .Select(g => new { TaskId = g.Key, Count = g.Count(), Bytes = g.Sum(x => x.TotalBytes) })
+                .ToListAsync(ct);
+            var landedByTask = landed.ToDictionary(x => x.TaskId);
+
+            var items = rows.Select(r =>
+            {
+                landedByTask.TryGetValue(r.TaskId, out var stat);
+                return new PlanFinishItem(
+                    r.ClientName, r.TaskName, r.Status, r.Message,
+                    stat?.Count ?? 0, stat?.Bytes ?? 0);
+            }).ToList();
 
             var notifications = scope.ServiceProvider.GetRequiredService<INotificationService>();
             var channels = await notifications.GetSettingsAsync(ct);
@@ -779,7 +803,7 @@ public class SequentialExecutionWorker : BackgroundService
             if (NotificationNotice.Enqueue(
                     db, channels,
                     BuildPlanFinishSubject(plan.Name),
-                    BuildPlanFinishBody(plan.Name, run, failedItems),
+                    BuildPlanFinishBody(plan.Name, run, items),
                     AlertCategoryCatalog.PlanFinished) > 0)
             {
                 await db.SaveChangesAsync(ct);
@@ -811,12 +835,17 @@ public class SequentialExecutionWorker : BackgroundService
         return string.Equals(run.TriggerSource, "schedule", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>回执里列出的一条失败项。</summary>
-    internal sealed record PlanFinishFailure(
-        string ClientName, string TaskName, ExecutionItemStatus Status, string? Message);
+    /// <summary>回执明细里的一项：计划里的一个任务，以及它这一趟存进去了多少。</summary>
+    internal sealed record PlanFinishItem(
+        string ClientName,
+        string TaskName,
+        ExecutionItemStatus Status,
+        string? Message,
+        int BackupSetCount,
+        long TotalBytes);
 
-    /// <summary>失败项最多列几条。</summary>
-    internal const int MaxListedFailures = 20;
+    /// <summary>明细最多列几条。计划里通常只有几项，这个上限是防御性的。</summary>
+    internal const int MaxListedItems = 20;
 
     internal static string BuildPlanFinishSubject(string planName) => $"备份计划完成：{planName}";
 
@@ -831,7 +860,7 @@ public class SequentialExecutionWorker : BackgroundService
     /// 而「一共失败了几条」这个关键数字第三行已经给全了，剩下的去管理页面看执行详情。
     /// </summary>
     internal static string BuildPlanFinishBody(
-        string planName, ExecutionRun run, IReadOnlyList<PlanFinishFailure> failures)
+        string planName, ExecutionRun run, IReadOnlyList<PlanFinishItem> items)
     {
         var outcome = run.Status switch
         {
@@ -842,33 +871,72 @@ public class SequentialExecutionWorker : BackgroundService
             _ => EnumMapping.ToSnakeCase(run.Status)
         };
 
+        var totalSets = items.Sum(i => i.BackupSetCount);
+        var totalBytes = items.Sum(i => i.TotalBytes);
+
         var lines = new List<string>
         {
             $"计划: {planName}",
             $"结果: {outcome}",
             $"共 {run.TotalItems} 项，成功 {run.SucceededItems}，失败 {run.FailedItems}",
-            $"开始: {ToLocal(run.StartedAt)}    结束: {ToLocal(run.FinishedAt)}"
+            $"入库 {totalSets} 份，共 {NotificationNotice.FormatBytes(totalBytes)}",
+            $"开始: {ToLocal(run.StartedAt)}",
+            $"结束: {ToLocal(run.FinishedAt)}{FormatElapsed(run.StartedAt, run.FinishedAt)}"
         };
 
-        if (failures.Count > 0)
+        if (items.Count > 0)
         {
             lines.Add(string.Empty);
-            lines.Add("失败的项：");
-            foreach (var failure in failures.Take(MaxListedFailures))
-            {
-                // 超时单独说：它和「跑了但失败了」在处置上完全不同——
-                // 前者多半是机器关着或者网断了，后者才需要去看备份本身。
-                var reason = failure.Status == ExecutionItemStatus.Timeout
-                    ? "超时"
-                    : Shorten(failure.Message) ?? "失败";
-                lines.Add($"  · {failure.ClientName} / {failure.TaskName}（{reason}）");
-            }
+            lines.Add("明细：");
+            foreach (var item in items.Take(MaxListedItems))
+                lines.Add("  " + FormatItem(item));
 
-            if (failures.Count > MaxListedFailures)
-                lines.Add($"  …… 另有 {failures.Count - MaxListedFailures} 项，详见管理页面");
+            if (items.Count > MaxListedItems)
+                lines.Add($"  …… 另有 {items.Count - MaxListedItems} 项，详见管理页面");
         }
 
         return string.Join(Environment.NewLine, lines);
+    }
+
+    /// <summary>明细里的一行。</summary>
+    private static string FormatItem(PlanFinishItem item)
+    {
+        var who = $"{item.ClientName} / {item.TaskName}";
+
+        if (item.Status is ExecutionItemStatus.Failed or ExecutionItemStatus.Timeout)
+        {
+            // 超时单独说：它和「跑了但失败了」在处置上完全不同——
+            // 前者多半是机器关着或者网断了，后者才需要去看备份本身。
+            var reason = item.Status == ExecutionItemStatus.Timeout
+                ? "超时"
+                : Shorten(item.Message) ?? "失败";
+            return $"✗ {who} — {reason}";
+        }
+
+        if (item.Status != ExecutionItemStatus.Succeeded)
+            return $"· {who} — {EnumMapping.ToSnakeCase(item.Status)}";
+
+        // 「成功但一份都没进」必须和「成功且备进去了」分开说。
+        // 预检通过、源目录没有新文件，也算成功——而一周才备一两次的现场，
+        // 这种情况很常见，两者显示成一样的话，「这周到底备没备」就看不出来了。
+        return item.BackupSetCount == 0
+            ? $"✓ {who} — 无新备份"
+            : $"✓ {who} — {item.BackupSetCount} 份，{NotificationNotice.FormatBytes(item.TotalBytes)}";
+    }
+
+    /// <summary>耗时。这周 13 分钟、下周 2 小时，说明有东西不对劲——而这只有写出来才看得见。</summary>
+    private static string FormatElapsed(DateTime? startedAt, DateTime? finishedAt)
+    {
+        if (startedAt is null || finishedAt is null || finishedAt < startedAt)
+            return string.Empty;
+
+        var elapsed = finishedAt.Value - startedAt.Value;
+        var text = elapsed.TotalHours >= 1
+            ? $"{(int)elapsed.TotalHours} 小时 {elapsed.Minutes} 分"
+            : elapsed.TotalMinutes >= 1
+                ? $"{elapsed.Minutes} 分 {elapsed.Seconds} 秒"
+                : $"{elapsed.Seconds} 秒";
+        return $"（耗时 {text}）";
     }
 
     private static string ToLocal(DateTime? utc) =>

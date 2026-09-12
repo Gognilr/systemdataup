@@ -7,7 +7,11 @@
 import { api } from '../api.js';
 import { ACTIONS, LOADERS } from '../state.js';
 import { $, esc, L, relTime, emptyState, confirmModal, toast } from '../ui.js';
-import { shell, loading } from '../app.js';
+import { shell, loading, schedulePoll } from '../app.js';
+
+/* 30 秒。待办比告警慢一档：它汇总的是「等待决定的事项」，
+   而那些事项的产生速度以分钟计，不以秒计。 */
+const POLL_MS = 30000;
 
 const items = section => section?.items || [];
 const count = section => section?.count ?? 0;
@@ -96,6 +100,7 @@ LOADERS.todo = async function () {
     ? `<button data-ui-action="act" data-view="todo" data-action="confirm-enrollments" data-id="${esc(recentAutoEnrollments.map(c => c.id).join(','))}" data-after-loader="todo">确认全部登记（${recentAutoEnrollments.length} 台）</button>`
     : '';
     wrap.innerHTML = `<div class="todo-toolbar"><div><h2>待办</h2><p class="text-muted">把等待决定的事项集中在这里，处理后会从队列移除。</p></div><div style="display:flex;gap:8px">${batchApprove}${batchConfirm}<button data-ui-action="loader" data-loader="todo">重新检查</button></div></div><div class="todo-summary ${totalCount ? 'has-work' : 'is-clear'}"><span class="todo-summary-icon" aria-hidden="true">${totalCount ? '!' : '✓'}</span><strong>${totalCount ? `${totalCount} 项需要处理` : '没有待处理事项'}</strong><span>最后检查 ${checkedAt}</span></div><section class="todo-list" aria-label="待办事项">${parts.join('') || emptyState('ok', { title: '没有待处理事项', sub: `最后检查 ${checkedAt}` })}</section>`;
+  schedulePoll('todo', LOADERS.todo, POLL_MS);
 };
 
 /* 批量审批只处理当前列出的这一批（服务端预览上限 20 条），处理完刷新后下一批自然补位。

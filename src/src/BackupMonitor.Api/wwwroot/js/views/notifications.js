@@ -81,7 +81,8 @@ async function renderSettings() {
       ${filterBlock('n_ding_f', s.dingtalk.filter, cats)}
       <button class="primary" id="n_save">保存设置</button>
     </div>
-    <div class="card" id="thresholdCard">${loading()}</div>`;
+    <div class="card" id="thresholdCard">${loading()}</div>
+    <div class="card" id="digestCard">${loading()}</div>`;
 
     const buildEmail = () => ({
       enabled: $('#n_email_en').checked,
@@ -151,6 +152,8 @@ async function renderSettings() {
    一台常年 90% CPU 的 ERP 服务器要把阈值调到 95%，此前唯一的办法是连进数据库改 JSON。
    于是实际发生的是没人调，告警每天照报，报到没人看。 */
 async function renderThresholds() {
+  renderDigest();
+
   const card = $('#thresholdCard');
   if (!card) return;
   try {
@@ -172,10 +175,56 @@ async function renderThresholds() {
           <input id="th_renotify" type="number" min="1" max="720" value="${esc(t.renotifyHours)}">
           <div class="hint">默认 24。同一条告警一直不恢复时隔这么久重发一封「【仍未恢复】」。</div></div>
       </div>
+      <div class="frow inline"><label><input type="checkbox" id="th_recover" ${t.recoveryNotify === false ? '' : 'checked'}> 告警恢复时也发一条「已恢复」</label></div>
+      <div class="hint">默认开。「没有新消息」在收件人那里读起来和「已经好了」是一样的，
+        而这两者差别很大——收到一条明确的恢复，人才知道可以不用管了。
+        代价是消息量接近翻倍（坏一次、好一次），嫌吵可以关掉。
+        只发给<b>当初真的收到过那条告警</b>的渠道，静默期间不发。</div>
       <button class="primary" id="th_save">保存阈值</button>`;
     $('#th_save').addEventListener('click', saveThresholds);
   } catch (e) {
     card.innerHTML = `<h3>告警触发阈值</h3><div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+/* 每日健康快报。
+
+   这两个设置一直只能改数据库——于是每次开关它都要写一个迁移脚本，
+   我们前两天就是这么干的。缺的就是这张卡。 */
+async function renderDigest() {
+  const card = $('#digestCard');
+  if (!card) return;
+  try {
+    const d = await api('/api/v1/admin/daily-digest');
+    card.innerHTML = `<h3>每日健康快报</h3>
+      <p class="text-muted">每天固定时刻发一封，逐台列出客户端的在线状态、CPU、内存和源盘可用，
+        超过上面那组阈值的数字会标上 ⚠。备份数字只在有内容时才出现。</p>
+      <div class="frow inline"><label><input type="checkbox" id="dg_en" ${d.enabled ? 'checked' : ''}> 启用每日健康快报</label></div>
+      <div class="frow"><label for="dg_hour">发送时刻（整点，0~23）</label>
+        <input id="dg_hour" type="number" min="0" max="23" value="${esc(d.hour)}">
+        <div class="hint">默认 9 点：等早上的备份计划都跑完，数字反映的是备份之后的状态。</div></div>
+      <div class="hint">它还有一个说不出口的作用：<b>连续收不到这封信，说明服务端本身可能已经停了</b>——
+        那是这套系统唯一无法自己报出来的故障。关掉它就等于放弃这个信号。</div>
+      <button class="primary" id="dg_save">保存快报设置</button>`;
+    $('#dg_save').addEventListener('click', saveDigest);
+  } catch (e) {
+    card.innerHTML = `<h3>每日健康快报</h3><div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function saveDigest() {
+  const btn = $('#dg_save');
+  btn.disabled = true;
+  try {
+    await api('/api/v1/admin/daily-digest', { method: 'PUT', body: {
+      enabled: $('#dg_en').checked,
+      hour: Number($('#dg_hour').value) || 0
+    } });
+    toast('健康快报设置已保存', 'ok');
+    await renderDigest();
+  } catch (e) {
+    errToast(e);
+    btn.disabled = false;
   }
 }
 
@@ -187,7 +236,8 @@ async function saveThresholds() {
       clientCpuPercent: Number($('#th_cpu').value) || 85,
       clientMemoryPercent: Number($('#th_mem').value) || 90,
       clientDiskFreePercent: Number($('#th_disk').value) || 10,
-      renotifyHours: Number($('#th_renotify').value) || 24
+      renotifyHours: Number($('#th_renotify').value) || 24,
+      recoveryNotify: $('#th_recover').checked
     } });
     toast('告警阈值已保存', 'ok');
     await renderThresholds();

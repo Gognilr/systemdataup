@@ -196,7 +196,7 @@ LOADERS.clients = async function () {
       ? emptyState('first', { glyph: '⌗', title: '还没有客户端', sub: '从上方下载客户端安装程序并完成安装后，客户端会自动出现在这里' })
       : emptyState('filter', { key: 'clients', title: `没有匹配「${st.keyword || L.client_status[st.status] || ''}」的客户端` });
     wrap.innerHTML = tableHtml([
-      { l: '客户端', k: 'hostname', sort: true, render: r => `<a href="#/clients/${esc(r.id)}"><b>${esc(clientName(r))}</b></a><span class="sub mono">${esc(r.hostname)}</span>` },
+      { l: '客户端', k: 'hostname', sort: true, render: r => `<a href="#/clients/${esc(r.id)}"><b>${esc(clientName(r))}</b></a>${maintenanceBadge(r)}<span class="sub mono">${esc(r.hostname)}</span>` },
       { l: '分组', k: 'clientGroupName' },
       { l: '系统', render: r => osCell(r) },
       // 落后的机器要在列表上一眼看得出来（R11）。此前一台两年没升过级的 Agent
@@ -245,6 +245,11 @@ LOADERS.clients = async function () {
           caps.canEnable
             ? actBtn({ label: '启用', view: 'clients', action: 'enable', id: r.id, cls: 'primary', small: false })
             : actBtn({ label: '禁用', view: 'clients', action: 'disable', id: r.id, allowed: caps.canDisable, why: caps.whyDisable, small: false }),
+          // 停机检修时不该有人被半夜叫醒。维护期间告警照常产生（界面上仍是真相），
+          // 只是不往钉钉和邮箱发。
+          r.maintenanceUntil
+            ? actBtn({ label: '结束维护', view: 'clients', action: 'maintenance-end', id: r.id, small: false })
+            : actBtn({ label: '进入维护模式', view: 'clients', action: 'maintenance', id: r.id, small: false }),
           actBtn({ label: '注销', view: 'clients', action: 'revoke', id: r.id, cls: 'danger', allowed: caps.canRevoke, why: caps.whyRevoke, small: false }),
           // 已注销的机器不会再有任何动静，它那一行留着只是占地方。
           // 删除只清这条记录本身（连同心跳、指令、告警这些附属行）——名下还有备份任务时
@@ -337,6 +342,47 @@ function openClientUploadBatch(clientIds) {
 
 /* 删除一条已注销的记录。服务端只接受已注销的，并且名下还有备份任务时会拒绝——
    那句拒绝原样弹给人看，它比这里能写的任何提示都准确。 */
+/* 维护中的标记。
+
+   必须显眼：不标的话，事后「为什么这台停了两天没人报警」会变成悬案。
+   剩余时间也写出来——「维护中」三个字不告诉你它还要静默多久。 */
+function maintenanceBadge(r) {
+  if (!r.maintenanceUntil) return '';
+  const left = new Date(r.maintenanceUntil) - Date.now();
+  if (left <= 0) return '';
+  const h = Math.floor(left / 3600000);
+  const m = Math.floor((left % 3600000) / 60000);
+  const text = h > 0 ? `还剩 ${h} 小时 ${m} 分` : `还剩 ${m} 分`;
+  return ` <span class="status status--mut pill" title="${esc(r.maintenanceReason || '')}">维护中 · ${esc(text)}</span>`;
+}
+
+ACTIONS['clients:maintenance'] = async id => {
+  const vals = await formModal('进入维护模式', [
+    { name: 'hours', label: '维护多久', type: 'select', value: '4',
+      options: [
+        { v: '1', t: '1 小时' }, { v: '2', t: '2 小时' }, { v: '4', t: '4 小时' },
+        { v: '8', t: '8 小时' }, { v: '24', t: '24 小时' }, { v: '72', t: '3 天' }
+      ],
+      hint: '到点自动恢复，不需要你记得关。提前做完可以随时点「结束维护」。' },
+    { name: 'reason', label: '维护原因', type: 'text', value: '',
+      hint: '必填。三个月后回头看审计日志，「为什么那天静默了」是唯一想知道的事。' }
+  ], '进入维护');
+  if (!vals) return;
+  if (!vals.reason || !vals.reason.trim()) { errToast(new Error('请填写维护原因')); return; }
+
+  await api(`/api/v1/admin/clients/${id}/maintenance`, { method: 'POST', body: {
+    hours: Number(vals.hours) || 4, reason: vals.reason.trim()
+  } });
+  toast('已进入维护模式：期间告警照常产生，但不再发通知', 'ok');
+  await LOADERS.clients();
+};
+
+ACTIONS['clients:maintenance-end'] = async id => {
+  await api(`/api/v1/admin/clients/${id}/maintenance`, { method: 'DELETE' });
+  toast('维护模式已结束，通知恢复', 'ok');
+  await LOADERS.clients();
+};
+
 ACTIONS['clients:delete'] = async id => {
   if (!await confirmModal('删除这台已注销机器的记录？删掉之后它不再出现在列表里。它的备份集不受影响，但如果名下还有备份任务，需要先在「备份任务」页删除那些任务。')) return;
   try {
