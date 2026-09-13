@@ -2,6 +2,8 @@
 using BackupMonitor.Core.Entities.Alert;
 using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
+using BackupMonitor.Core.Entities.Client;
+using BackupMonitor.Shared.Models.Admin;
 using BackupMonitor.Shared.Scheduling;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
@@ -150,7 +152,9 @@ public class DailyDigestWorker : BackgroundService
             DateTime.SpecifyKind(businessDate, DateTimeKind.Unspecified), timezone);
         var toUtc = fromUtc.AddDays(1);
 
-        var digest = await WithClientHealthAsync(scope, await BuildDigestAsync(db, fromUtc, toUtc, ct), ct);
+        var digest = await BuildDigestAsync(db, fromUtc, toUtc, ct);
+        digest = await WithClientHealthAsync(scope, digest, ct);
+        digest = await WithEndpointHealthAsync(scope, digest, ct);
         var created = await EnqueueDeliveriesAsync(scope, db, businessDate, timezone, digest, ct);
 
         // 无论有没有渠道可发，都要记下这一天已经处理过——否则没配渠道的系统
@@ -158,8 +162,9 @@ public class DailyDigestWorker : BackgroundService
         await MarkSentAsync(db, settings, stamp, ct);
 
         _logger.LogInformation(
-            "每日摘要（{Date}）已生成：成功 {Success} 失败 {Failed} 未按计划 {Missed} 离线 {Offline}，投递 {Deliveries} 条",
-            stamp, digest.SuccessCount, digest.FailedCount, digest.MissedCount, digest.OfflineClients, created);
+            "每日摘要（{Date}）已生成：成功 {Success} 失败 {Failed} 未按计划 {Missed} 离线 {Offline} 探测不通 {EndpointsDown}/{Endpoints}，投递 {Deliveries} 条",
+            stamp, digest.SuccessCount, digest.FailedCount, digest.MissedCount, digest.OfflineClients,
+            digest.Endpoints.Count(IsDown), digest.Endpoints.Count, created);
     }
 
     /// <summary>
@@ -181,7 +186,31 @@ public class DailyDigestWorker : BackgroundService
     /// <summary>资源告警阈值，用来给快报里的数字打 ⚠。与告警用的是同一组配置。</summary>
     public sealed record HealthThresholds(int CpuPercent, int MemoryPercent, int DiskFreePercent);
 
-    /// <summary>昨日一天的执行情况，以及此刻每台客户端的健康度。</summary>
+    /// <summary>
+    /// 一条业务探测此刻的样子。
+    ///
+    /// 和客户端健康同一个性质：**此刻的快照**，不是昨天的回顾。
+    /// 差别在于它回答的问题不一样——客户端健康说的是「这台机器还有没有余量」，
+    /// 探测说的是「这套业务现在还用不用得了」，而后者才是现场最先被问到的那一句。
+    ///
+    /// 字段比界面上多，是因为快报没有「点进去看」这一步：
+    /// 阈值、连续失败次数、多久没通过、失败原因，全都得在这一屏里写完，
+    /// 否则人还是得开电脑，而那时候他多半就不看了。
+    /// </summary>
+    public sealed record EndpointHealth(
+        string Name,
+        string? ClientName,
+        string Target,
+        string? Status,
+        int? LatencyMs,
+        int ConsecutiveFailures,
+        int FailureThreshold,
+        int IntervalSeconds,
+        string? Error,
+        DateTime? LastProbedAtUtc,
+        DateTime? LastSuccessAtUtc);
+
+    /// <summary>昨日一天的执行情况，以及此刻每台客户端的健康度与每条业务探测的状态。</summary>
     public sealed record DigestData(
         int SuccessCount,
         long SuccessBytes,
@@ -191,7 +220,10 @@ public class DailyDigestWorker : BackgroundService
         int OfflineClients,
         int OpenCriticalAlerts,
         IReadOnlyList<ClientHealth> Clients,
-        HealthThresholds Thresholds);
+        HealthThresholds Thresholds,
+        IReadOnlyList<EndpointHealth> Endpoints,
+        int DisabledEndpoints,
+        int EndpointOutages);
 
     private static async Task<DigestData> BuildDigestAsync(
         AppDbContext db, DateTime fromUtc, DateTime toUtc, CancellationToken ct)
@@ -216,6 +248,13 @@ public class DailyDigestWorker : BackgroundService
         var offline = await db.Clients.AsNoTracking()
             .CountAsync(c => c.Status == ClientStatus.Offline, ct);
 
+        // 昨天业务探测报了几次。取告警条数而不是自己数探测失败：
+        // 一次故障里几十轮探测全失败，数探测得出「昨天失败 847 次」，那个数字没有意义。
+        // 告警是按「一件事」合并过的，「昨天业务中断 2 次」才是人要的那个量。
+        var endpointOutages = await db.Alerts.AsNoTracking()
+            .CountAsync(a => a.Category == AlertCategoryCatalog.EndpointDown
+                             && a.FirstOccurredAt >= fromUtc && a.FirstOccurredAt < toUtc, ct);
+
         var openCritical = await db.Alerts.AsNoTracking()
             .CountAsync(a => a.Level == AlertLevel.Critical
                              && (a.Status == AlertStatus.Open
@@ -231,7 +270,10 @@ public class DailyDigestWorker : BackgroundService
             offline,
             openCritical,
             [],
-            new HealthThresholds(85, 90, 10));
+            new HealthThresholds(85, 90, 10),
+            [],
+            0,
+            endpointOutages);
     }
 
     /// <summary>
@@ -284,6 +326,66 @@ public class DailyDigestWorker : BackgroundService
     }
 
     /// <summary>
+    /// 每条业务探测此刻的状态。
+    ///
+    /// 和客户端健康一样，取不到就只发别的部分：这封信最不可替代的作用是
+    /// 「收到了 = 服务端还活着」，为了一张表把整封信拖没，等于把那个信号也一起丢了。
+    /// </summary>
+    private async Task<DigestData> WithEndpointHealthAsync(
+        IServiceScope scope, DigestData digest, CancellationToken ct)
+    {
+        try
+        {
+            return await LoadEndpointHealthAsync(scope, digest, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "健康快报：业务探测快照取失败，本次不带探测部分");
+            return digest;
+        }
+    }
+
+    private static async Task<DigestData> LoadEndpointHealthAsync(
+        IServiceScope scope, DigestData digest, CancellationToken ct)
+    {
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        // 连客户端名一起取：一条叫「加密服务」的探测，光看名字不知道是哪台机器上的，
+        // 而快报上人要的下一个动作就是「去那台机器上看」。
+        var rows = await db.MonitoredEndpoints.AsNoTracking()
+            .Select(e => new { Endpoint = e, ClientName = e.Client!.DisplayName })
+            .ToListAsync(ct);
+
+        // 停用的不列，只报个数。不列是因为那是人自己关的，天天列出来只会变成噪声；
+        // 报个数是因为「我明明配了探测，快报里怎么没有」这个疑问必须有地方回答。
+        var disabled = rows.Count(r => !r.Endpoint.Enabled);
+
+        var endpoints = rows
+            .Where(r => r.Endpoint.Enabled)
+            .Select(r => new EndpointHealth(
+                r.Endpoint.Name,
+                string.IsNullOrWhiteSpace(r.ClientName) ? null : r.ClientName,
+                EndpointProbeWorker.DescribeTarget(r.Endpoint),
+                r.Endpoint.LastStatus,
+                r.Endpoint.LastLatencyMs,
+                r.Endpoint.ConsecutiveFailures,
+                r.Endpoint.FailureThreshold,
+                r.Endpoint.IntervalSeconds,
+                r.Endpoint.LastError,
+                r.Endpoint.LastProbedAt,
+                r.Endpoint.LastSuccessAt))
+            // 不通的排最前，然后是在抖的、还没探过的，正常的垫底。
+            // 正常的那几行不是废话——它们说明网络是通的，坏的是上面跑的业务，
+            // 而这个区分决定了人接下来是去重启服务还是去看网络。
+            .OrderBy(e => IsDown(e) ? 0 : IsFlapping(e) ? 1 : e.Status is null ? 2 : 3)
+            .ThenBy(e => e.ClientName, StringComparer.CurrentCulture)
+            .ThenBy(e => e.Name, StringComparer.CurrentCulture)
+            .ToList();
+
+        return digest with { Endpoints = endpoints, DisabledEndpoints = disabled };
+    }
+
+    /// <summary>
     /// 按当前启用的渠道排队投递。渠道一个都没配时不产生投递——
     /// 那种情况下要看见的是概览页那条常驻横幅（R5），不是往库里堆一批永远发不出去的记录。
     /// </summary>
@@ -320,7 +422,9 @@ public class DailyDigestWorker : BackgroundService
 
     private static bool IsAllClear(DigestData d) =>
         d.FailedCount == 0 && d.MissedCount == 0 && d.OfflineClients == 0 && d.SuspiciousCount == 0
-        && d.Clients.Count(c => IsStrained(c, d.Thresholds)) == 0;
+        && d.Clients.Count(c => IsStrained(c, d.Thresholds)) == 0
+        && !d.Endpoints.Any(IsDown)
+        && !AnyStale(d.Endpoints);
 
     /// <summary>这台机器有没有踩到资源阈值。踩了就在快报里打 ⚠，并写进标题。</summary>
     private static bool IsStrained(ClientHealth c, HealthThresholds t) =>
@@ -328,9 +432,52 @@ public class DailyDigestWorker : BackgroundService
         || c.MemoryPercent >= t.MemoryPercent
         || (c.DiskFreePercent is not null && c.DiskFreePercent <= t.DiskFreePercent);
 
+    /// <summary>
+    /// 这条探测算不算「不通」。
+    ///
+    /// 门槛和告警同一个口径（连续失败到它自己的阈值），但**不看 AlertOnFailure**：
+    /// 那个开关管的是「要不要在群里炸一条」，而快报是一份清单，
+    /// 关掉告警的那条照样得出现在上面——不然它就成了一条谁也看不见的探测。
+    /// </summary>
+    private static bool IsDown(EndpointHealth e) =>
+        e.Status == "down" && e.ConsecutiveFailures >= Math.Clamp(e.FailureThreshold, 1, 100);
+
+    /// <summary>
+    /// 刚开始失败、还没到阈值。
+    ///
+    /// 单拎出来是因为它既不能算「不通」（一次抖动就报，练几次人就麻木了），
+    /// 也不该当没发生过——昨晚开始抖、今早还在抖，那通常就是塌之前的样子。
+    /// </summary>
+    private static bool IsFlapping(EndpointHealth e) =>
+        e.Status == "down" && !IsDown(e);
+
+    /// <summary>
+    /// 这条探测自己已经很久没被探过了。
+    ///
+    /// 这是整块里最要紧的一种异常，而且它长得最像「正常」：
+    /// 探测工作器停了之后，所有探测的 last_status 会永远停在最后一次的值上，
+    /// 满屏的 ✓ 说的其实是「昨天下午三点的时候是通的」。
+    /// 宽限给到 5 个间隔或 30 分钟，取大的——偶尔一轮卡住不该报。
+    /// </summary>
+    private static bool IsStale(EndpointHealth e) =>
+        e.LastProbedAtUtc is not null
+        && DateTime.UtcNow - e.LastProbedAtUtc.Value > TimeSpan.FromSeconds(
+            Math.Max(1800, Math.Clamp(e.IntervalSeconds, 10, 86400) * 5));
+
+    private static bool AnyStale(IReadOnlyList<EndpointHealth> endpoints) => endpoints.Any(IsStale);
+
     private static string Trouble(DigestData d)
     {
         var parts = new List<string>();
+
+        // 业务不通排最前。「3 台资源吃紧」可以明天再说，
+        // 「U8 用不了」是现在就有人在打电话——标题会被截断，最该活下来的是这一条。
+        var down = d.Endpoints.Count(IsDown);
+        if (down > 0) parts.Add($"{down} 项业务不通");
+
+        // 紧随其后：探测停了意味着上面那个数字本身不可信。
+        if (AnyStale(d.Endpoints)) parts.Add("业务探测已停");
+
         if (d.MissedCount > 0) parts.Add($"{d.MissedCount} 项未按计划");
         if (d.FailedCount > 0) parts.Add($"{d.FailedCount} 次传输失败");
         if (d.SuspiciousCount > 0) parts.Add($"{d.SuspiciousCount} 份大小可疑");
@@ -342,7 +489,12 @@ public class DailyDigestWorker : BackgroundService
         return string.Join("、", parts);
     }
 
-    private static string BuildBody(DateTime businessDate, TimeZoneInfo timezone, DigestData d)
+    /// <summary>
+    /// 快报正文。公开是为了能单测——尤其是业务探测那一块：
+    /// 它写的是「不通多久了、为什么不通」，而这两样写错了不会报错，
+    /// 只会让人每天读到一份看着很详细、其实指错方向的清单。
+    /// </summary>
+    public static string BuildBody(DateTime businessDate, TimeZoneInfo timezone, DigestData d)
     {
         var body = new StringBuilder();
 
@@ -354,6 +506,11 @@ public class DailyDigestWorker : BackgroundService
 
         if (d.Clients.Count > 0)
             body.AppendLine();
+
+        AppendEndpoints(body, d);
+
+        if (d.EndpointOutages > 0)
+            body.AppendLine($"昨日业务中断：{d.EndpointOutages} 次");
 
         if (d.SuccessCount > 0)
             body.AppendLine($"昨日入库：{d.SuccessCount} 份，共 {FormatBytes(d.SuccessBytes)}（{businessDate:MM-dd}，{timezone.Id}）");
@@ -378,6 +535,10 @@ public class DailyDigestWorker : BackgroundService
                 body.AppendLine("「大小可疑」的备份**已经正常入库**，只是比历史基线小得反常，请到备份列表里确认它们是否完整。");
             if (d.MissedCount > 0)
                 body.AppendLine("「未按计划」表示到了计划时刻仍然没有收到新备份，请到告警中心查看是哪些任务。");
+            if (d.Endpoints.Any(IsDown))
+                body.AppendLine("✗ 的那几项是**业务本身连不上**，不是备份失败——进程可能还好好的，但用户已经用不了了。");
+            if (AnyStale(d.Endpoints))
+                body.AppendLine("探测已经很久没有跑了，上面的探测状态是旧的，不能当作「现在是通的」来看。");
         }
 
         // 这一句是日报存在的理由，必须写在正文里：
@@ -415,6 +576,106 @@ public class DailyDigestWorker : BackgroundService
             parts.Add($"{c.ActiveAlerts} 条告警");
 
         return $"{c.Name}  在线  {string.Join("  ", parts)}";
+    }
+
+    /// <summary>
+    /// 业务探测那一块。
+    ///
+    /// 排在客户端健康之后、昨日备份之前：它回答的是「现在还能不能用」，
+    /// 比「昨天备了几份」更靠近人打开这封信时心里的那个问题。
+    ///
+    /// 不通的那几条写两行（第二行是原因），正常的一行带上耗时。
+    /// 耗时对正常的那些不是装饰——从 200 毫秒变成 8 秒是最早的预警，
+    /// 而那个时候状态码还是 200，告警一声不吭。
+    /// </summary>
+    private static void AppendEndpoints(StringBuilder body, DigestData d)
+    {
+        if (d.Endpoints.Count == 0)
+        {
+            // 一条探测都没配时整块不出现。这里刻意不写「未配置业务探测」去劝人来配：
+            // 快报是拿来看状态的，不是拿来推销功能的。
+            if (d.DisabledEndpoints > 0)
+                body.AppendLine($"业务探测：{d.DisabledEndpoints} 项全部已停用").AppendLine();
+            return;
+        }
+
+        var down = d.Endpoints.Count(IsDown);
+        var flapping = d.Endpoints.Count(IsFlapping);
+        var never = d.Endpoints.Count(e => e.Status is null);
+        var ok = d.Endpoints.Count - down - flapping - never;
+
+        var summary = new List<string> { $"{ok} 项正常" };
+        if (down > 0) summary.Add($"{down} 项不通");
+        if (flapping > 0) summary.Add($"{flapping} 项在抖");
+        if (never > 0) summary.Add($"{never} 项尚未探测");
+        if (d.DisabledEndpoints > 0) summary.Add($"{d.DisabledEndpoints} 项已停用");
+
+        body.AppendLine($"业务探测：{string.Join("，", summary)}");
+
+        // 这一句要在清单之前：清单上满屏的 ✓ 说的是「最后一次探的时候是通的」，
+        // 人得先知道那是什么时候的事，再去看下面每一行。
+        if (AnyStale(d.Endpoints))
+        {
+            var latest = d.Endpoints.Where(e => e.LastProbedAtUtc is not null)
+                .Max(e => e.LastProbedAtUtc);
+            body.AppendLine(latest is null
+                ? "⚠ 探测已停：下面的状态都是旧的。"
+                : $"⚠ 探测已停：最近一次探测在 {Ago(latest.Value)}前，下面的状态都是那时候的。");
+        }
+
+        foreach (var e in d.Endpoints)
+            AppendEndpoint(body, e);
+
+        body.AppendLine();
+    }
+
+    private static void AppendEndpoint(StringBuilder body, EndpointHealth e)
+    {
+        var who = e.ClientName is null ? e.Name : $"{e.Name} · {e.ClientName}";
+
+        if (e.Status is null)
+        {
+            body.AppendLine($"? {who}  {e.Target}  尚未探测");
+            return;
+        }
+
+        if (e.Status != "down")
+        {
+            // 耗时带上：正常项里唯一会变化的就是这个数，而它变慢是塌之前最早能看见的信号。
+            var latency = e.LatencyMs is null ? string.Empty : $"  {e.LatencyMs} ms";
+            var mark = IsStale(e) ? "  ⚠ 状态已旧" : string.Empty;
+            body.AppendLine($"✓ {who}  {e.Target}{latency}{mark}");
+            return;
+        }
+
+        // 不通 / 在抖：第一行是「是什么、在哪、有多久」，第二行是原因原文。
+        // 原因不概括——「状态码 200 正常，但响应里找不到「欢迎登录」」和
+        // 「10 秒内没有响应」指向完全不同的两件事，概括掉就只剩「失败」了。
+        // ✗ 是「已经不通了」，! 是「开始抖但还没到门槛」。
+        // 两者刻意不同形：一眼扫过去，该现在处理的和该留意的不该长成一个样子。
+        var head = IsDown(e) ? "✗" : "!";
+        var howLong = e.LastSuccessAtUtc is null
+            ? "从来没有通过过"
+            : $"已 {Ago(e.LastSuccessAtUtc.Value)}没有通过";
+        var threshold = IsDown(e)
+            ? $"连续失败 {e.ConsecutiveFailures} 次"
+            : $"连续失败 {e.ConsecutiveFailures} 次（还没到 {Math.Clamp(e.FailureThreshold, 1, 100)} 次的报警门槛）";
+
+        body.AppendLine($"{head} {who}  {e.Target}");
+        body.AppendLine($"    {threshold}，{howLong}");
+        body.AppendLine($"    {e.Error ?? "失败"}");
+    }
+
+    /// <summary>「已 3 小时 12 分钟」这种说法。绝对时刻还要人心算，而这里要的就是那个差值。</summary>
+    private static string Ago(DateTime utc)
+    {
+        var d = DateTime.UtcNow - utc;
+        if (d < TimeSpan.Zero) d = TimeSpan.Zero;
+
+        return d.TotalMinutes < 1 ? "不到 1 分钟"
+            : d.TotalHours < 1 ? $"{(int)d.TotalMinutes} 分钟"
+            : d.TotalDays < 1 ? $"{(int)d.TotalHours} 小时 {d.Minutes} 分钟"
+            : $"{(int)d.TotalDays} 天 {d.Hours} 小时";
     }
 
     private static string Percent(decimal? value) =>

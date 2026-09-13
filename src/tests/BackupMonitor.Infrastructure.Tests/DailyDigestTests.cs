@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Enums;
+﻿using BackupMonitor.Core.Enums;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Infrastructure.Services;
 using BackupMonitor.Shared.Models.Admin;
@@ -99,7 +99,7 @@ public class DailyDigestTests : IAsyncLifetime
         // 「一切正常」那一支不能只存在于代码里：它是这条整改的核心，单独钉一次。
         Assert.Contains("一切正常", DailyDigestWorker.SubjectSuffixFor(
             new DailyDigestWorker.DigestData(3, 1024, 0, 0, 0, 0, 0, [],
-                new DailyDigestWorker.HealthThresholds(85, 90, 10))));
+                new DailyDigestWorker.HealthThresholds(85, 90, 10), [], 0, 0)));
     }
 
     /// <summary>同一个业务日只发一次：服务端一天重启几次不该变成几封日报。</summary>
