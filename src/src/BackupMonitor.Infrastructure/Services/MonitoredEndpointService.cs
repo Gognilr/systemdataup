@@ -1,4 +1,4 @@
-using BackupMonitor.Core.Entities.Client;
+﻿using BackupMonitor.Core.Entities.Client;
 using BackupMonitor.Infrastructure.Data;
 using BackupMonitor.Shared.Exceptions;
 using BackupMonitor.Shared.Models.Admin;
@@ -128,11 +128,13 @@ public class MonitoredEndpointService : IMonitoredEndpointService
             if (request.Port is not (> 0 and <= 65535))
                 throw new ValidationFailedException("TCP 探测必须填写 1~65535 之间的端口");
 
-            // TCP 用不到这几项。留着的话界面上会出现「填了却不生效」的输入框，
+            // 状态码和正文是 HTTP 才有的概念，TCP 上留着就成了「填了却不生效」的输入框，
             // 而那种东西比没有更糟——人以为配了，实际没有。
+            //
+            // 慢阈值不在此列：TCP 连接耗时同样有意义，而且对堆开得大的 JVM 特别有意义——
+            // Full GC 停顿期间连 accept 都会卡住，那是 OOM 之前最早能看见的信号。
             request.ExpectedStatus = null;
             request.ExpectedContent = null;
-            request.SlowMilliseconds = null;
         }
         else
         {

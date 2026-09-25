@@ -131,17 +131,20 @@ function openForm(row) {
       <input id="ep_target" class="mono" value="${esc(v.target || '')}"
         placeholder="TCP 填 IP，如 172.16.11.141；HTTP 填完整 URL，如 http://172.16.11.175:8088/seeyon/index.jsp"></div>
 
-    <div class="frow" id="ep_portRow"><label for="ep_port">端口</label>
-      <input id="ep_port" type="number" min="1" max="65535" value="${esc(v.port ?? '')}"></div>
+    <div class="form-grid">
+      <div class="frow" id="ep_portRow"><label for="ep_port">端口</label>
+        <input id="ep_port" type="number" min="1" max="65535" value="${esc(v.port ?? '')}"></div>
+      <div class="frow"><label for="ep_slow">慢于（毫秒，可留空）</label>
+        <input id="ep_slow" type="number" min="1" value="${esc(v.slowMilliseconds ?? '')}" placeholder="不判">
+        <div class="hint">超过就算异常。HTTP 比响应耗时，TCP 比连接耗时。
+          堆开得大的 Java 进程在 Full GC 停顿时连 accept 都会卡住——
+          那是崩之前最早能看见的信号，而那时端口还开着。</div></div>
+    </div>
 
     <div id="ep_httpRows">
-      <div class="form-grid">
-        <div class="frow"><label for="ep_status">期望状态码</label>
-          <input id="ep_status" value="${esc(v.expectedStatus || '')}" placeholder="200">
-          <div class="hint">留空按 200 算。登录页常会 302，可以填 <span class="mono">200,302</span>。</div></div>
-        <div class="frow"><label for="ep_slow">响应慢于（毫秒，可留空）</label>
-          <input id="ep_slow" type="number" min="1" value="${esc(v.slowMilliseconds ?? '')}" placeholder="不判"></div>
-      </div>
+      <div class="frow"><label for="ep_status">期望状态码</label>
+        <input id="ep_status" value="${esc(v.expectedStatus || '')}" placeholder="200">
+        <div class="hint">留空按 200 算。登录页常会 302，可以填 <span class="mono">200,302</span>。</div></div>
       <div class="frow"><label for="ep_content">期望包含文本</label>
         <input id="ep_content" value="${esc(v.expectedContent || '')}" placeholder="例如登录页上某个只有正常时才出现的字段名">
         <div class="hint"><b>这一项才是 HTTP 探测真正管用的地方。</b>只看状态码基本没用——
@@ -191,7 +194,7 @@ function collect() {
     port: http ? null : (Number($('#ep_port').value) || null),
     expectedStatus: http ? ($('#ep_status').value.trim() || null) : null,
     expectedContent: http ? ($('#ep_content').value.trim() || null) : null,
-    slowMilliseconds: http ? (Number($('#ep_slow').value) || null) : null,
+    slowMilliseconds: Number($('#ep_slow').value) || null,
     intervalSeconds: Number($('#ep_interval').value) || 60,
     timeoutSeconds: Number($('#ep_timeout').value) || 10,
     failureThreshold: Number($('#ep_threshold').value) || 3,

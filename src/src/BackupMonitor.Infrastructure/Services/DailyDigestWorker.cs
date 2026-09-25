@@ -493,73 +493,92 @@ public class DailyDigestWorker : BackgroundService
     /// 快报正文。公开是为了能单测——尤其是业务探测那一块：
     /// 它写的是「不通多久了、为什么不通」，而这两样写错了不会报错，
     /// 只会让人每天读到一份看着很详细、其实指错方向的清单。
+    ///
+    /// ── 为什么排版要迁就手机 ─────────────────────────────
+    /// 这封信真正被读的地方是钉钉群，而钉钉群是在手机上看的：
+    /// 一行超过 20 个全角字符就会折，折下来的那半行顶格开始，
+    /// 和下一台机器的行首长得一模一样，整块就糊成一片。
+    /// 所以这里刻意把每台机器拆成「名字一行、数字缩进一行」——
+    /// 主动换行比被动折行好读，而且机器名多长都不会破相。
+    ///
+    /// 同样的道理，正文里不能出现 Markdown：钉钉的 text 消息不解析它，
+    /// 写星号粗体到那边看见的就是两个星号。
     /// </summary>
     public static string BuildBody(DateTime businessDate, TimeZoneInfo timezone, DigestData d)
     {
         var body = new StringBuilder();
 
-        // 客户端健康排在最前：这是这封信每天都有新内容的那一部分。
-        // 备份数字放后面且能省则省——一周备一两次的现场，天天写「0 份入库」
-        // 会让人养成划过去的习惯，而那个习惯会连带把真正要紧的行一起划走。
-        foreach (var c in d.Clients)
-            body.AppendLine(FormatClient(c, d.Thresholds));
-
-        if (d.Clients.Count > 0)
-            body.AppendLine();
-
+        AppendClients(body, d);
         AppendEndpoints(body, d);
-
-        if (d.EndpointOutages > 0)
-            body.AppendLine($"昨日业务中断：{d.EndpointOutages} 次");
-
-        if (d.SuccessCount > 0)
-            body.AppendLine($"昨日入库：{d.SuccessCount} 份，共 {FormatBytes(d.SuccessBytes)}（{businessDate:MM-dd}，{timezone.Id}）");
-
-        if (d.SuspiciousCount > 0)
-            body.AppendLine($"大小可疑：{d.SuspiciousCount} 份");
-        if (d.FailedCount > 0)
-            body.AppendLine($"传输失败：{d.FailedCount} 次");
-        if (d.MissedCount > 0)
-            body.AppendLine($"未按计划产生备份：{d.MissedCount} 项");
+        AppendYesterday(body, d);
 
         body.AppendLine($"未处理的严重告警：{d.OpenCriticalAlerts} 条")
             .AppendLine();
 
-        if (IsAllClear(d))
-        {
-            body.AppendLine("没有发现问题。");
-        }
-        else
-        {
-            if (d.SuspiciousCount > 0)
-                body.AppendLine("「大小可疑」的备份**已经正常入库**，只是比历史基线小得反常，请到备份列表里确认它们是否完整。");
-            if (d.MissedCount > 0)
-                body.AppendLine("「未按计划」表示到了计划时刻仍然没有收到新备份，请到告警中心查看是哪些任务。");
-            if (d.Endpoints.Any(IsDown))
-                body.AppendLine("✗ 的那几项是**业务本身连不上**，不是备份失败——进程可能还好好的，但用户已经用不了了。");
-            if (AnyStale(d.Endpoints))
-                body.AppendLine("探测已经很久没有跑了，上面的探测状态是旧的，不能当作「现在是通的」来看。");
-        }
+        AppendNotes(body, d);
+
+        // 统计区间落在末尾：它一年也不会有人看一次，但真要对账的时候
+        // 「昨天」到底指哪 24 小时必须查得到。
+        body.AppendLine($"统计口径：{businessDate:MM-dd} 全天（{timezone.Id}）");
 
         // 这一句是日报存在的理由，必须写在正文里：
         // 收件人要能靠「有没有收到这封信」判断服务端本身是不是还活着。
-        body.AppendLine()
-            .AppendLine("这封快报每天固定发送。连续收不到它，说明服务端本身可能已经停了——");
+        body.AppendLine("这封快报每天固定发送。连续收不到它，说明服务端本身可能已经停了——");
         body.AppendLine("那是这套系统唯一无法自己报出来的故障。");
 
         return body.ToString();
     }
 
     /// <summary>
-    /// 快报里的一行客户端。
+    /// 客户端那一块。
+    ///
+    /// 排最前：这是这封信每天都有新内容的那一部分。
+    /// 这几个数字告警也在看，但告警是踩线才响——内存从 78% 慢慢爬到 92%，
+    /// 这个过程告警一声不吭，只在踩线那天炸一下，而那时候往往已经没有从容处理的余地了。
+    ///
+    /// 顺序按名字排，不按严重程度排：这是一封每天都来的信，
+    /// 同一台机器每天待在同一个位置，本身就是一种可读性——
+    /// 异常有 ⚠ 和标题负责抓眼睛，不需要再把行也挪来挪去。
+    /// </summary>
+    private static void AppendClients(StringBuilder body, DigestData d)
+    {
+        if (d.Clients.Count == 0)
+            return;
+
+        var offline = d.Clients.Count(c => !c.Online);
+        var strained = d.Clients.Count(c => c.Online && IsStrained(c, d.Thresholds));
+
+        var head = new List<string>();
+        if (offline > 0) head.Add($"{offline} 台离线");
+        if (strained > 0) head.Add($"{strained} 台资源吃紧");
+
+        body.AppendLine(head.Count == 0
+            ? $"【客户端】{d.Clients.Count} 台全部在线"
+            : $"【客户端】{d.Clients.Count} 台，{string.Join("、", head)}");
+
+        foreach (var c in d.Clients)
+            AppendClient(body, c, d.Thresholds);
+
+        body.AppendLine();
+    }
+
+    /// <summary>
+    /// 一台客户端。名字一行，数字缩进一行。
     ///
     /// 踩到阈值的数字后面打 ⚠：平时这封信干干净净，一旦有东西开始不对，
     /// 眼睛会自己被那个符号抓住，而不需要人逐个数字去比。
     /// </summary>
-    private static string FormatClient(ClientHealth c, HealthThresholds t)
+    private static void AppendClient(StringBuilder body, ClientHealth c, HealthThresholds t)
     {
         if (!c.Online)
-            return $"{c.Name}  离线 ⚠";
+        {
+            body.AppendLine($"{c.Name}  离线 ⚠");
+            return;
+        }
+
+        // 「在线」不写：全在线时表头已经说了，不在线的那几台自己带「离线 ⚠」。
+        // 五台机器重复五遍「在线」，占掉的是手机上最贵的那点宽度。
+        body.AppendLine(c.ActiveAlerts > 0 ? $"{c.Name}  {c.ActiveAlerts} 条告警" : c.Name);
 
         var parts = new List<string>
         {
@@ -569,24 +588,35 @@ public class DailyDigestWorker : BackgroundService
 
         parts.Add(c.DiskFreePercent is null
             ? "无源盘"
-            : $"{c.DiskName}可用 {Percent(c.DiskFreePercent)}"
+            : $"{DriveLabel(c.DiskName)}余 {Percent(c.DiskFreePercent)}"
               + Mark(c.DiskFreePercent <= t.DiskFreePercent));
 
-        if (c.ActiveAlerts > 0)
-            parts.Add($"{c.ActiveAlerts} 条告警");
+        body.AppendLine("  " + string.Join("  ", parts));
+    }
 
-        return $"{c.Name}  在线  {string.Join("  ", parts)}";
+    /// <summary>盘符只留字母：完整盘符在手机上要占掉半行，而那半行是留给数字的。</summary>
+    private static string DriveLabel(string? driveName)
+    {
+        if (string.IsNullOrWhiteSpace(driveName))
+            return "源盘";
+
+        var trimmed = driveName.Trim();
+        return char.IsLetter(trimmed[0]) ? $"{char.ToUpperInvariant(trimmed[0])}盘" : trimmed;
     }
 
     /// <summary>
     /// 业务探测那一块。
     ///
-    /// 排在客户端健康之后、昨日备份之前：它回答的是「现在还能不能用」，
+    /// 排在客户端之后、昨日备份之前：它回答的是「现在还能不能用」，
     /// 比「昨天备了几份」更靠近人打开这封信时心里的那个问题。
     ///
-    /// 不通的那几条写两行（第二行是原因），正常的一行带上耗时。
-    /// 耗时对正常的那些不是装饰——从 200 毫秒变成 8 秒是最早的预警，
-    /// 而那个时候状态码还是 200，告警一声不吭。
+    /// ── 正常的那些为什么收成一行 ────────────────────────
+    /// 十条探测全绿的时候，逐条列出来就是十行一模一样的对勾，
+    /// 占掉大半屏、而且天天如此——人会因此养成划过去的习惯，
+    /// 而那个习惯迟早会把出事那天的 ✗ 一起划走。
+    /// 所以正常项只留一个总数和「最慢的那条」：总数回答「都还在」，
+    /// 最慢回答「有没有在变慢」，剩下的九行不提供任何新信息。
+    /// 要逐条看的时候，探测页在那儿。
     /// </summary>
     private static void AppendEndpoints(StringBuilder body, DigestData d)
     {
@@ -595,75 +625,190 @@ public class DailyDigestWorker : BackgroundService
             // 一条探测都没配时整块不出现。这里刻意不写「未配置业务探测」去劝人来配：
             // 快报是拿来看状态的，不是拿来推销功能的。
             if (d.DisabledEndpoints > 0)
-                body.AppendLine($"业务探测：{d.DisabledEndpoints} 项全部已停用").AppendLine();
+                body.AppendLine($"【业务探测】{d.DisabledEndpoints} 项全部已停用").AppendLine();
             return;
         }
 
-        var down = d.Endpoints.Count(IsDown);
-        var flapping = d.Endpoints.Count(IsFlapping);
-        var never = d.Endpoints.Count(e => e.Status is null);
-        var ok = d.Endpoints.Count - down - flapping - never;
+        var down = d.Endpoints.Where(IsDown).ToList();
+        var flapping = d.Endpoints.Where(IsFlapping).ToList();
+        var never = d.Endpoints.Where(e => e.Status is null).ToList();
+        var healthy = d.Endpoints.Count - down.Count - flapping.Count - never.Count;
 
-        var summary = new List<string> { $"{ok} 项正常" };
-        if (down > 0) summary.Add($"{down} 项不通");
-        if (flapping > 0) summary.Add($"{flapping} 项在抖");
-        if (never > 0) summary.Add($"{never} 项尚未探测");
-        if (d.DisabledEndpoints > 0) summary.Add($"{d.DisabledEndpoints} 项已停用");
+        var stale = AnyStale(d.Endpoints);
 
-        body.AppendLine($"业务探测：{string.Join("，", summary)}");
+        var trouble = new List<string>();
+        if (down.Count > 0) trouble.Add($"{down.Count} 项不通");
+        if (flapping.Count > 0) trouble.Add($"{flapping.Count} 项在抖");
+        if (never.Count > 0) trouble.Add($"{never.Count} 项尚未探测");
+        // 探测停了的时候表头绝不能写「全部正常」：下一行紧接着就是「探测已停」，
+        // 两句话摆在一起自相矛盾，而读的人会信上面那句。
+        if (stale) trouble.Add("状态已旧");
 
-        // 这一句要在清单之前：清单上满屏的 ✓ 说的是「最后一次探的时候是通的」，
-        // 人得先知道那是什么时候的事，再去看下面每一行。
-        if (AnyStale(d.Endpoints))
+        body.AppendLine(trouble.Count == 0
+            ? $"【业务探测】{d.Endpoints.Count} 项全部正常"
+            : $"【业务探测】{d.Endpoints.Count} 项，{string.Join("、", trouble)}");
+
+        // 这一句要顶在清单前面：下面写的「正常」说的是「最后一次探的时候是通的」，
+        // 人得先知道那是什么时候的事，再去读后面每一行。
+        if (stale)
         {
             var latest = d.Endpoints.Where(e => e.LastProbedAtUtc is not null)
                 .Max(e => e.LastProbedAtUtc);
             body.AppendLine(latest is null
-                ? "⚠ 探测已停：下面的状态都是旧的。"
-                : $"⚠ 探测已停：最近一次探测在 {Ago(latest.Value)}前，下面的状态都是那时候的。");
+                ? "⚠ 探测已停：下面的状态都是旧的"
+                : $"⚠ 探测已停：最近一次探测在 {Ago(latest.Value)}前");
+            body.AppendLine("  下面的状态都是那时候的，不能当作「现在是通的」");
         }
 
-        foreach (var e in d.Endpoints)
-            AppendEndpoint(body, e);
+        foreach (var e in down.Concat(flapping))
+            AppendFailingEndpoint(body, e);
+
+        foreach (var e in never)
+        {
+            body.AppendLine($"? {Who(e)}");
+            body.AppendLine($"  {e.Target}  尚未探测");
+        }
+
+        AppendHealthyEndpointSummary(body, d, healthy, trouble.Count == 0, stale);
+
+        if (d.DisabledEndpoints > 0)
+            body.AppendLine($"另有 {d.DisabledEndpoints} 项已停用");
 
         body.AppendLine();
     }
 
-    private static void AppendEndpoint(StringBuilder body, EndpointHealth e)
+    /// <summary>
+    /// 正常那些的一行小结。
+    ///
+    /// 带上最慢的那条：正常项里唯一会变化的就是这个数，而它变慢是塌之前最早能看见的信号——
+    /// 从 200 毫秒变成 8 秒的时候，状态码还是 200，告警一声不吭。
+    /// </summary>
+    private static void AppendHealthyEndpointSummary(
+        StringBuilder body, DigestData d, int healthy, bool allClear, bool stale)
     {
-        var who = e.ClientName is null ? e.Name : $"{e.Name} · {e.ClientName}";
+        if (healthy <= 0)
+            return;
 
-        if (e.Status is null)
+        var slowest = d.Endpoints
+            .Where(e => e.Status == "up" && e.LatencyMs is not null && !IsDown(e) && !IsFlapping(e))
+            .OrderByDescending(e => e.LatencyMs!.Value)
+            .FirstOrDefault();
+
+        // 全部正常时表头已经写了总数，这里只补「最慢的那条」，不再重复数一遍。
+        if (allClear)
         {
-            body.AppendLine($"? {who}  {e.Target}  尚未探测");
+            if (slowest is not null)
+                body.AppendLine($"最慢 {slowest.LatencyMs} ms：{Who(slowest)}");
             return;
         }
 
-        if (e.Status != "down")
+        // 探测停了就不能说「正常」，只能说「最后一次探的时候是正常的」——
+        // 这两句话之间隔着的可能是一整夜。
+        if (stale)
         {
-            // 耗时带上：正常项里唯一会变化的就是这个数，而它变慢是塌之前最早能看见的信号。
-            var latency = e.LatencyMs is null ? string.Empty : $"  {e.LatencyMs} ms";
-            var mark = IsStale(e) ? "  ⚠ 状态已旧" : string.Empty;
-            body.AppendLine($"✓ {who}  {e.Target}{latency}{mark}");
+            body.AppendLine($"{healthy} 项在最后一次探测时是正常的");
             return;
         }
 
-        // 不通 / 在抖：第一行是「是什么、在哪、有多久」，第二行是原因原文。
-        // 原因不概括——「状态码 200 正常，但响应里找不到「欢迎登录」」和
-        // 「10 秒内没有响应」指向完全不同的两件事，概括掉就只剩「失败」了。
+        body.AppendLine(slowest is null
+            ? $"其余 {healthy} 项正常"
+            : $"其余 {healthy} 项正常，最慢 {slowest.LatencyMs} ms");
+    }
+
+    /// <summary>
+    /// 不通 / 在抖的那一条，四行：是什么、在哪、多久了、为什么。
+    ///
+    /// 原因写原文不概括——「状态码 200 正常，但响应里找不到某段文字」
+    /// 和「10 秒内没有响应」指向完全不同的两件事，概括掉就只剩一个「失败」，
+    /// 而人拿着「失败」两个字是没法决定下一步去做什么的。
+    /// </summary>
+    private static void AppendFailingEndpoint(StringBuilder body, EndpointHealth e)
+    {
         // ✗ 是「已经不通了」，! 是「开始抖但还没到门槛」。
         // 两者刻意不同形：一眼扫过去，该现在处理的和该留意的不该长成一个样子。
         var head = IsDown(e) ? "✗" : "!";
         var howLong = e.LastSuccessAtUtc is null
             ? "从来没有通过过"
-            : $"已 {Ago(e.LastSuccessAtUtc.Value)}没有通过";
+            : $"已 {Ago(e.LastSuccessAtUtc.Value)}没通过";
         var threshold = IsDown(e)
             ? $"连续失败 {e.ConsecutiveFailures} 次"
-            : $"连续失败 {e.ConsecutiveFailures} 次（还没到 {Math.Clamp(e.FailureThreshold, 1, 100)} 次的报警门槛）";
+            : $"连续失败 {e.ConsecutiveFailures} 次（未到 {Math.Clamp(e.FailureThreshold, 1, 100)} 次门槛）";
 
-        body.AppendLine($"{head} {who}  {e.Target}");
-        body.AppendLine($"    {threshold}，{howLong}");
-        body.AppendLine($"    {e.Error ?? "失败"}");
+        body.AppendLine($"{head} {Who(e)}");
+        body.AppendLine($"  {e.Target}");
+        body.AppendLine($"  {threshold}，{howLong}");
+        body.AppendLine($"  {e.Error ?? "失败"}");
+    }
+
+    /// <summary>「探测名 · 机器名」。一条叫「加密服务」的探测，光看名字不知道是哪台机器上的。</summary>
+    private static string Who(EndpointHealth e) =>
+        e.ClientName is null ? e.Name : $"{e.Name} · {e.ClientName}";
+
+    /// <summary>
+    /// 昨日那一块。
+    ///
+    /// 为 0 的行一律不写。一周备一两次的现场，天天看见「传输失败 0 次、
+    /// 未按计划 0 项」，读到的其实是「这几行永远是 0」，
+    /// 然后连带把真变成 1 的那天也一起划走了。
+    /// </summary>
+    private static void AppendYesterday(StringBuilder body, DigestData d)
+    {
+        var lines = new List<string>();
+
+        if (d.SuccessCount > 0)
+            lines.Add($"入库 {d.SuccessCount} 份，共 {FormatBytes(d.SuccessBytes)}");
+        if (d.SuspiciousCount > 0)
+            lines.Add($"大小可疑 {d.SuspiciousCount} 份");
+        if (d.FailedCount > 0)
+            lines.Add($"传输失败 {d.FailedCount} 次");
+        if (d.MissedCount > 0)
+            lines.Add($"未按计划 {d.MissedCount} 项");
+        if (d.EndpointOutages > 0)
+            lines.Add($"业务中断 {d.EndpointOutages} 次");
+
+        // 只有一条就并进标题里：一个【昨日】表头底下孤零零挂一行，读起来像是漏了东西。
+        if (lines.Count == 0)
+        {
+            body.AppendLine("【昨日】无备份入库，无异常");
+        }
+        else if (lines.Count == 1)
+        {
+            body.AppendLine($"【昨日】{lines[0]}");
+        }
+        else
+        {
+            body.AppendLine("【昨日】");
+            foreach (var line in lines)
+                body.AppendLine(line);
+        }
+
+        body.AppendLine();
+    }
+
+    /// <summary>
+    /// 结论与提示。
+    ///
+    /// 这里的每一句都对应一个「看到了但不知道该干嘛」的时刻——
+    /// 只写数字不写它意味着什么，人下一步还是得来问。
+    /// </summary>
+    private static void AppendNotes(StringBuilder body, DigestData d)
+    {
+        // 一切正常时这里一个字都不写。标题已经写了「一切正常」，
+        // 上面每一块的表头也各自写了「全部在线」「全部正常」「无异常」——
+        // 再加一句「没有发现问题」只是让这封信的结尾多出一个空段落。
+        if (IsAllClear(d))
+            return;
+
+        if (d.Endpoints.Any(IsDown))
+            body.AppendLine("✗ 的那几项是业务本身连不上，不是备份失败——进程可能还好好的，但用户已经用不了了。");
+        if (AnyStale(d.Endpoints))
+            body.AppendLine("探测已经很久没跑了，上面的探测状态是旧的，不能当作「现在是通的」来看。");
+        if (d.SuspiciousCount > 0)
+            body.AppendLine("「大小可疑」的备份已经正常入库，只是比历史基线小得反常，请到备份列表里确认它们是否完整。");
+        if (d.MissedCount > 0)
+            body.AppendLine("「未按计划」表示到了计划时刻仍然没有收到新备份，请到告警中心查看是哪些任务。");
+
+        body.AppendLine();
     }
 
     /// <summary>「已 3 小时 12 分钟」这种说法。绝对时刻还要人心算，而这里要的就是那个差值。</summary>

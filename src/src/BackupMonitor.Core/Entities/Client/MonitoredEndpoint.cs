@@ -1,4 +1,4 @@
-namespace BackupMonitor.Core.Entities.Client;
+﻿namespace BackupMonitor.Core.Entities.Client;
 
 /// <summary>探测类型。</summary>
 public enum EndpointProbeType
@@ -60,8 +60,11 @@ public class MonitoredEndpoint
     public int FailureThreshold { get; set; } = 3;
 
     /// <summary>
-    /// 响应慢于这么多毫秒也算异常（HTTP，可空表示不判）。
-    /// 从 200ms 变成 8 秒是最早的预警，而那时状态码还是 200。
+    /// 慢于这么多毫秒也算异常（可空表示不判）。HTTP 比响应耗时，TCP 比连接耗时。
+    ///
+    /// 从 200 毫秒变成 8 秒是最早的预警，而那时状态码还是 200。
+    /// TCP 上同样成立而且更隐蔽：堆开得大的 JVM 在 Full GC 停顿期间连 accept 都会卡住，
+    /// 端口照样开着，只看「连不连得上」的探测仍然是绿的。
     /// </summary>
     public int? SlowMilliseconds { get; set; }
 

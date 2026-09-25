@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net.Sockets;
 using BackupMonitor.Core.Entities.Client;
 
@@ -80,7 +80,22 @@ public sealed class EndpointProber : IEndpointProber
 
         using var client = new TcpClient();
         await client.ConnectAsync(endpoint.Target.Trim(), endpoint.Port.Value, ct);
-        return new EndpointProbeResult(true, (int)stopwatch.ElapsedMilliseconds, null);
+        var latency = (int)stopwatch.ElapsedMilliseconds;
+
+        // 连上了，但连得很慢也算异常。
+        //
+        // 这一条对 JVM 尤其有用：堆开得大的 Java 进程在 Full GC 停顿期间
+        // 连 accept 都会跟着卡住，平时 0~1 毫秒的连接突然要几秒。
+        // 那是 OOM 之前最早能看见的信号，而那个时候端口还开着、
+        // 只看「连不连得上」的探测仍然是绿的。
+        if (IsTooSlow(latency, endpoint.SlowMilliseconds))
+        {
+            return new EndpointProbeResult(
+                false, latency,
+                $"连接耗时 {latency} 毫秒，超过 {endpoint.SlowMilliseconds} 毫秒");
+        }
+
+        return new EndpointProbeResult(true, latency, null);
     }
 
     private static async Task<EndpointProbeResult> ProbeHttpAsync(
@@ -124,7 +139,7 @@ public sealed class EndpointProber : IEndpointProber
                 status, preview);
         }
 
-        if (endpoint.SlowMilliseconds is > 0 && latency >= endpoint.SlowMilliseconds)
+        if (IsTooSlow(latency, endpoint.SlowMilliseconds))
         {
             return new EndpointProbeResult(
                 false, latency,
@@ -134,6 +149,18 @@ public sealed class EndpointProber : IEndpointProber
 
         return new EndpointProbeResult(true, latency, null, status, preview);
     }
+
+    /// <summary>
+    /// 慢到该算异常了没有。HTTP 比的是响应耗时，TCP 比的是连接耗时。
+    ///
+    /// 抽出来是因为两条探测路径要用同一个口径：分头各写一遍，
+    /// 迟早会变成「HTTP 上 >= 算慢、TCP 上 > 才算慢」这种谁也说不清的差异。
+    ///
+    /// 阈值为空或非正数都表示不判——界面上那一栏留空就是这个意思，
+    /// 而 0 如果当成「0 毫秒以上都算慢」，会让一条探测永远是红的。
+    /// </summary>
+    internal static bool IsTooSlow(int latencyMs, int? thresholdMs) =>
+        thresholdMs is > 0 && latencyMs >= thresholdMs.Value;
 
     /// <summary>期望状态码。为空按 200 处理；支持逗号分隔（登录页常会 302）。</summary>
     internal static bool StatusAllowed(int status, string? expected)
