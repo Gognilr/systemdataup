@@ -193,3 +193,26 @@ initdb: 错误: 无法访问目录
 | 最终客户端安装包 | 161,925,626 bytes；SHA-256 `d52b9dacbbfb2b7e4727b16f1fb713b2826bfae406e7f9f194bbb94acb9d04ff`。 |
 
 `dist/SHA256SUMS.txt` 已与实际文件重新计算并一致。此前所有服务端/客户端安装包（包括第二轮 `a0ed4937...` / `7436f8f2...`）均已过期，只能使用本节两个最终 SHA-256 对应的文件。现场数据簇没有被删除或重建；用户无需清理 `C:\ProgramData\BackupMonitor\PostgreSQL\data`，新版安装器会按修复/续装语义接管。
+
+## 2026-09-26 本机管理页被企业代理拦截：改用 localhost
+
+### 问题
+
+安装完成后，安装器和服务端托盘原先用 `https://<机器名>:5080/` 打开管理页。该地址不是代理域名，但在深信服等强制代理/上网行为管理环境中，主机名请求仍可能被送入外网代理并显示拦截页；“主机名不含句点因此一定绕过代理”不能作为企业策略下的可靠保证。
+
+### 修复边界
+
+- 服务端安装完成后的本机浏览器入口改为 `https://localhost:<端口>/`。
+- 服务端托盘的“打开管理网页”入口同步改为 `https://localhost:<端口>/`。
+- `Server:AdvertisedUrl`、`LanMode:AdvertisedUrl`、LAN 发现、Agent 远程连接仍继续使用机器名或配置的对外地址，不能改成 `localhost`。
+- 当前服务端证书 SAN 已包含 `localhost`，Turnkey Kestrel 继续监听所有接口，不需要改变证书生成或网络监听逻辑。
+
+### 门禁与产物
+
+- `dotnet build src/BackupMonitor.sln -c Release --nologo`：9 个项目、0 警告、0 错误。
+- 完整测试：Agent 54/54、Infrastructure 782/782，合计 836/836 通过。
+- 重新执行 `scripts/build-turnkey.ps1 -Configuration Release -Runtime win-x64`，生成了新的安装包及 SHA-256 清单。
+- 最终服务端安装包：581,746,292 bytes；SHA-256 `196734933e1a436ea3dc513a56f85dde7d5f2c18f6d7d7f52a1549f437c5a532`。
+- 最终客户端安装包：162,103,290 bytes；SHA-256 `427e79bb4fec56bf6c81ce0fc6dfc747fbf92531fdb27724122f9038d3eaf97d`。
+
+如果企业安全策略连 `localhost` 也通过透明代理或浏览器内核强制拦截，则仍需在深信服策略中将本机回环地址加入直连/白名单；本次修复已经消除了机器名被识别为外网请求这一层问题。

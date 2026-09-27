@@ -380,8 +380,11 @@ internal sealed class ServerTrayContext : ApplicationContext
         }
     }
 
+    // 托盘运行在服务端本机。使用 localhost 避免企业代理/上网行为管理把
+    // 机器名请求误判为外网流量；对外公告地址仍由 Server/LanMode:AdvertisedUrl
+    // 提供，不能在这里改成 localhost。
     private void OpenManagementSite() =>
-        OpenExternal($"https://{Environment.MachineName}:{_apiPort}/", "无法打开管理网页");
+        OpenExternal($"https://localhost:{_apiPort}/", "无法打开管理网页");
 
     private void OpenSetupConsole()
     {

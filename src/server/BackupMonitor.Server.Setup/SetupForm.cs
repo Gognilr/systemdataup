@@ -1071,22 +1071,23 @@ internal sealed class SetupForm : Form
     }
 
     /// <summary>
-    /// 打开管理网页。地址用机器名而不是 127.0.0.1，与托盘的「打开管理网页」保持一致。
+    /// 在服务端本机打开管理网页。
     ///
-    /// 这不是风格问题，是能不能打开的问题。Windows 代理例外列表里的 &lt;local&gt;
-    /// （界面上叫「跳过本地地址」）只匹配**不含句点的主机名**，PAC 脚本里的
-    /// isPlainHostName() 同理。机器名不含点，命中例外、直连；而 "127.0.0.1" 含三个点，
-    /// 一律被交给代理——在装了上网行为管理的环境里，代理会把它当成一次普通外网访问拦下来，
-    /// 用户看到的是一张拦截页，而不是管理页。
+    /// 这里必须使用 localhost：企业上网行为管理可能强制接管所有主机名请求，
+    /// 即使主机名不含句点、理论上应命中浏览器的本地地址例外，也可能仍被送入
+    /// 深信服代理并显示外网拦截页。localhost 不依赖 DNS/NetBIOS，也不走对外公告
+    /// 地址；服务端证书包含 localhost，Turnkey Kestrel 监听所有接口，因此它是本机
+    /// 安装完成和维护入口最稳定的地址。
     ///
-    /// 另外服务端证书是按机器名签的，用机器名打开还少一次证书名称不匹配的警告。
+    /// 这里只改变本机浏览器入口。Server/LanMode:AdvertisedUrl 仍保留机器名或配置的
+    /// 对外地址，不能改成 localhost，否则远程 Agent 和局域网发现会失效。
     /// </summary>
     private void OpenWeb()
     {
         try
         {
             var port = _maintenance.GetInstalledApiPort(_installDirectory);
-            Process.Start(new ProcessStartInfo($"https://{Environment.MachineName}:{port}/") { UseShellExecute = true });
+            Process.Start(new ProcessStartInfo($"https://localhost:{port}/") { UseShellExecute = true });
         }
         catch (Exception ex)
         {
